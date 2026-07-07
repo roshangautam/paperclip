@@ -1250,6 +1250,7 @@ export interface WorkerToHostMethods {
       description?: string;
       status?: string;
       priority?: string;
+      workMode?: string;
       assigneeAgentId?: string;
       assigneeUserId?: string | null;
       requestDepth?: number;
