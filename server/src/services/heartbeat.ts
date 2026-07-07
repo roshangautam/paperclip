@@ -4980,6 +4980,13 @@ export function buildPaperclipTaskMarkdown(input: {
         "Ask mode directive:",
         "Answer the question directly in the issue thread. Do not write implementation code, and do not produce an implementation plan. Use tools only for investigation or temporary scratch work when needed; the deliverable is the answer.",
       );
+    } else if (issue.workMode === "chat") {
+      lines.push(
+        `- Work mode: ${quoteTaskScalar("chat")}`,
+        "",
+        "Chat mode directive:",
+        "Reply conversationally in the issue thread. Use minimal tools and do not perform repo exploration or implementation work. Keep the response short and direct. Only escalate to a full work run (or hand off to standard mode) if the message actually requests real work; when the intent is ambiguous, ask a brief clarifying question rather than starting implementation.",
+      );
     } else if (issue.workMode === "planning") {
       let directive = "Make the plan only. Do not write code or perform implementation work.";
       if (wakeComment) {

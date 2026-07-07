@@ -1,7 +1,7 @@
 import type { IssueWorkMode } from "@paperclipai/shared";
-import { ClipboardList, Hammer, MessageCircleQuestion, type LucideIcon } from "lucide-react";
+import { ClipboardList, Hammer, MessageCircle, MessageCircleQuestion, type LucideIcon } from "lucide-react";
 
-export type WorkModeTone = "neutral" | "ask" | "planning";
+export type WorkModeTone = "neutral" | "ask" | "planning" | "chat";
 
 export interface WorkModeMeta {
   value: IssueWorkMode;
@@ -38,8 +38,15 @@ const PLANNING_CLASSES = {
   badge: "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
 };
 
+const CHAT_CLASSES = {
+  chip: "border-emerald-500/60 bg-emerald-500/15 text-emerald-800 hover:bg-emerald-500/25 dark:border-emerald-500/50 dark:bg-emerald-500/15 dark:text-emerald-200 dark:hover:bg-emerald-500/25",
+  container: "border-emerald-500/60 bg-emerald-50/60 supports-[backdrop-filter]:bg-emerald-50/40 dark:border-emerald-500/50 dark:bg-emerald-500/[0.07] dark:supports-[backdrop-filter]:bg-emerald-500/[0.07]",
+  menuItem: "text-emerald-700 dark:text-emerald-300",
+  badge: "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+};
+
 export function isIssueWorkMode(value: unknown): value is IssueWorkMode {
-  return value === "standard" || value === "ask" || value === "planning";
+  return value === "standard" || value === "ask" || value === "planning" || value === "chat";
 }
 
 export function workModeMetaList(): WorkModeMeta[] {
@@ -68,6 +75,14 @@ export function workModeMetaList(): WorkModeMeta[] {
       tone: "ask",
       classes: ASK_CLASSES,
     },
+    {
+      value: "chat",
+      label: "Chat mode",
+      shortLabel: "Chat",
+      icon: MessageCircle,
+      tone: "chat",
+      classes: CHAT_CLASSES,
+    },
   ];
 }
 
@@ -88,6 +103,9 @@ export function titleForPendingWorkMode(mode: IssueWorkMode): string {
   }
   if (mode === "planning") {
     return "Plan mode is on for this submission. Click to change.";
+  }
+  if (mode === "chat") {
+    return "Chat mode for this submission. Click to change. The assignee replies conversationally in this thread; minimal tools, no repo exploration.";
   }
   return "Agent mode for this submission. Click to change.";
 }
