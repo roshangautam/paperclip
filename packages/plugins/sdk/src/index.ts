@@ -99,6 +99,7 @@ export type {
   PluginConfigChangeContext,
   PluginConfigValidationResult,
   PluginWebhookInput,
+  PluginWebhookResponse,
   PluginApiRequestInput,
   PluginApiResponse,
 } from "./define-plugin.js";
