@@ -119,6 +119,7 @@ describe("GET /health", () => {
       const app = createApp(db);
 
       const res = await request(app).get("/health");
+      const retryRes = await request(app).get("/health");
 
       expect(res.status).toBe(503);
       expect(res.body).toEqual({
@@ -127,6 +128,9 @@ describe("GET /health", () => {
         error: "database_timeout",
         serverInfo: testServerInfo,
       });
+      expect(retryRes.status).toBe(503);
+      expect(retryRes.body).toEqual(res.body);
+      expect(db.execute).toHaveBeenCalledTimes(1);
     } finally {
       if (previousTimeoutEnv === undefined) {
         delete process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;

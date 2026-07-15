@@ -79,16 +79,42 @@ class DatabaseProbeTimeoutError extends Error {
   }
 }
 
+type DatabaseReadinessProbeState = {
+  query: Promise<void>;
+  result: Promise<void>;
+};
+
+const databaseReadinessProbes = new WeakMap<object, DatabaseReadinessProbeState>();
+
 async function probeDatabaseReadiness(db: Db, timeoutMs: number): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new DatabaseProbeTimeoutError(timeoutMs)), timeoutMs);
-  });
-  try {
-    await Promise.race([db.execute(sql`SELECT 1`), timeout]);
-  } finally {
-    if (timer) clearTimeout(timer);
+  const key = db as object;
+  let state = databaseReadinessProbes.get(key);
+  if (!state) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const query = Promise.resolve().then(async () => {
+      await db.execute(sql`SELECT 1`);
+    });
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new DatabaseProbeTimeoutError(timeoutMs)), timeoutMs);
+    });
+    const result = Promise.race([query, timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+    const createdState = { query, result };
+    databaseReadinessProbes.set(key, createdState);
+    state = createdState;
+
+    // Keep a timed-out probe single-flight until its uncancelled driver query settles.
+    void query
+      .finally(() => {
+        if (databaseReadinessProbes.get(key) === createdState) {
+          databaseReadinessProbes.delete(key);
+        }
+      })
+      .catch(() => undefined);
   }
+
+  await state.result;
 }
 
 export function healthRoutes(
@@ -172,11 +198,9 @@ export function healthRoutes(
     } catch (error) {
       const isTimeout = error instanceof DatabaseProbeTimeoutError;
       logger.warn({ err: error, timedOut: isTimeout }, "Health check database probe failed");
-      // Degraded (not unhealthy/500): the HTTP process itself is alive and can still serve
-      // this response -- only the DB dependency is unavailable or too slow. Distinguishing
-      // "process liveness" from "DB readiness" lets an orchestrator's liveness probe stay
-      // green (no unnecessary container restart) while a readiness/LB probe can still route
-      // traffic away. `error: database_unreachable` is kept for existing consumers.
+      // The HTTP process is alive, but this combined health/readiness endpoint returns 503
+      // because its DB dependency is unavailable or too slow. The structured degraded body
+      // distinguishes that dependency failure from an unresponsive process.
       res.status(503).json({
         status: "degraded",
         error: isTimeout ? "database_timeout" : "database_unreachable",
