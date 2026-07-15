@@ -2786,7 +2786,13 @@ export function pluginRoutes(
         applyPluginScopedApiResponseHeaders(res, result.headers);
       }
       if (result && "body" in result && result.body !== undefined) {
-        res.status(status).json(result.body);
+        if (typeof result.body === "string") {
+          // Send plain strings as-is (e.g. Slack's url_verification challenge
+          // echo must be returned verbatim, not JSON-quoted).
+          res.status(status).send(result.body);
+        } else {
+          res.status(status).json(result.body);
+        }
       } else if (result) {
         res.status(status).json({
           deliveryId: delivery.id,
