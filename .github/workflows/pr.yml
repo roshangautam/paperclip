@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - master
+      - truenas/local
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}
