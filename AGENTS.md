@@ -173,6 +173,10 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 - **Model Used** — the AI model that produced or assisted with the change (provider, exact model ID, context window, capabilities). Write "None — human-authored" if no AI was used.
 - **Checklist** — all items checked
 
+### Fork Branch Policy
+
+For `roshangautam/paperclip`, create fork-development PRs with `--base truenas/local`. The `master` branch mirrors `paperclipai/paperclip:master` and is reserved for upstream synchronization; do not merge fork-only changes into it. Configure Paperclip execution workspaces for this repository with `baseRef: "origin/truenas/local"` rather than relying on the runtime's `origin/master` fallback.
+
 ## 11. Definition of Done
 
 A change is done when all are true:
