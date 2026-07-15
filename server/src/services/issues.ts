@@ -4293,21 +4293,24 @@ export function issueService(db: Db) {
           sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
         ),
       ]);
-      const [existingRun, actorRun] = await Promise.all([
-        tx
-          .select({ status: heartbeatRuns.status })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
-          .then((rows) => rows[0] ?? null),
-        tx
-          .select({ status: heartbeatRuns.status })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, input.actorRunId))
-          .then((rows) => rows[0] ?? null),
-      ]);
+      const existingRun = await tx
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
+        .then((rows) => rows[0] ?? null);
       const stale = !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
-      const actorLive = actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
-      if (!stale || !actorLive) {
+      // NOTE: this branch is only reached when lockedIssue.assigneeAgentId === input.actorAgentId
+      // (checked above), i.e. the agent taking over is the SAME agent that already owns the
+      // issue -- there is no cross-agent contention to arbitrate here. Previously we also
+      // required the actor's own heartbeat_runs row to report a non-terminal ("live") status
+      // before allowing the takeover. That extra gate was actively harmful: a run's status can
+      // flip to a terminal state (e.g. "succeeded") moments before the run's own late PATCH
+      // calls land (row-finalization vs. in-flight-request race), or before its heartbeat_runs
+      // row exists at all yet. In both cases the owning agent's own attempt to reconcile a
+      // stale checkoutRunId from a *prior* run was rejected with "Issue run ownership conflict"
+      // even though there was never a real dispute -- see DRO-1078. Drop the actorLive
+      // requirement: staleness of the *previous* owning run is the only thing that matters here.
+      if (!stale) {
         return { adopted: null, latest: lockedIssue };
       }
 
@@ -4364,13 +4367,15 @@ export function issueService(db: Db) {
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
-      const actorRun = await tx
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, input.actorRunId))
-        .then((rows) => rows[0] ?? null);
-      if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status)) return null;
-
+      // NOTE: this helper is only invoked (see canAdoptUnownedCheckout) when
+      // candidate.assigneeAgentId === actorAgentId -- the agent re-claiming the
+      // unowned checkout lock is the SAME agent already assigned to the issue,
+      // so there is no cross-agent contention to arbitrate. We intentionally do
+      // NOT require the actor's own heartbeat_runs row to still report a
+      // non-terminal ("live") status here: a run can flip to a terminal status
+      // (e.g. "succeeded") moments before that same run's own late PATCH/checkout
+      // calls land -- a row-finalization vs. in-flight-request race, not a real
+      // ownership dispute. See DRO-1078.
       const now = new Date();
       const adopted = await tx
         .update(issues)
