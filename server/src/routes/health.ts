@@ -179,9 +179,13 @@ export function healthRoutes(
       // traffic away. `error: database_unreachable` is kept for existing consumers.
       res.status(503).json({
         status: "degraded",
-        version: serverVersion,
         error: isTimeout ? "database_timeout" : "database_unreachable",
-        ...(exposeFullDetails ? { serverInfo } : {}),
+        ...(exposeFullDetails
+          ? { version: serverVersion, serverInfo }
+          : {
+              deploymentMode: opts.deploymentMode,
+              deploymentExposure: opts.deploymentExposure,
+            }),
       });
       return;
     }

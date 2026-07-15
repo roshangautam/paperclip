@@ -136,6 +136,49 @@ describe("GET /health", () => {
     }
   });
 
+  it("redacts a database timeout for anonymous authenticated probes", async () => {
+    const previousTimeoutEnv = process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;
+    process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS = "50";
+    try {
+      const db = {
+        execute: vi.fn().mockImplementation(() => new Promise(() => {})),
+      } as unknown as Db;
+      const app = express();
+      app.use((req, _res, next) => {
+        (req as any).actor = { type: "none", source: "none" };
+        next();
+      });
+      app.use(
+        "/health",
+        healthRoutes(db, {
+          deploymentMode: "authenticated",
+          deploymentExposure: "public",
+          authReady: true,
+          companyDeletionEnabled: false,
+          serverInfo: testServerInfo,
+        }),
+      );
+
+      const res = await request(app).get("/health");
+
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({
+        status: "degraded",
+        error: "database_timeout",
+        deploymentMode: "authenticated",
+        deploymentExposure: "public",
+      });
+      expect(res.body.version).toBeUndefined();
+      expect(res.body.serverInfo).toBeUndefined();
+    } finally {
+      if (previousTimeoutEnv === undefined) {
+        delete process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;
+      } else {
+        process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS = previousTimeoutEnv;
+      }
+    }
+  });
+
   it("returns safe server info fallbacks when git metadata is unavailable", async () => {
     const app = createApp(undefined, {
       processStartedAt: "2026-06-26T00:00:00.000Z",
