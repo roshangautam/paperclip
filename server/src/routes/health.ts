@@ -56,6 +56,41 @@ function redactedDatabaseBackupHealth(databaseBackup: DatabaseBackupHealthStatus
   };
 }
 
+// INC-2026-07-14-001 (DRO-1075/DRO-1077): an orphaned agent-wake transaction held a row
+// lock with no timeout, chaining concurrent DB work and exhausting the connection pool.
+// Readiness's own `SELECT 1` probe rode the same pool, so it hung too -- Docker's
+// healthcheck timeout (see docker/docker-compose.yml) eventually fired, but only after
+// the container had already been wedged for the full unhealthy `retries` window.
+// Bound the DB probe itself well below that timeout so readiness fails fast with a
+// clear "degraded" JSON body instead of hanging until Docker gives up.
+const DEFAULT_READINESS_DB_PROBE_TIMEOUT_MS = 3_000;
+
+function readinessDbProbeTimeoutMs(): number {
+  const raw = process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS?.trim();
+  if (!raw) return DEFAULT_READINESS_DB_PROBE_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_READINESS_DB_PROBE_TIMEOUT_MS;
+}
+
+class DatabaseProbeTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Database readiness probe did not complete within ${timeoutMs}ms`);
+    this.name = "DatabaseProbeTimeoutError";
+  }
+}
+
+async function probeDatabaseReadiness(db: Db, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new DatabaseProbeTimeoutError(timeoutMs)), timeoutMs);
+  });
+  try {
+    await Promise.race([db.execute(sql`SELECT 1`), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export function healthRoutes(
   db?: Db,
   opts: {
@@ -133,13 +168,19 @@ export function healthRoutes(
     }
 
     try {
-      await db.execute(sql`SELECT 1`);
+      await probeDatabaseReadiness(db, readinessDbProbeTimeoutMs());
     } catch (error) {
-      logger.warn({ err: error }, "Health check database probe failed");
+      const isTimeout = error instanceof DatabaseProbeTimeoutError;
+      logger.warn({ err: error, timedOut: isTimeout }, "Health check database probe failed");
+      // Degraded (not unhealthy/500): the HTTP process itself is alive and can still serve
+      // this response -- only the DB dependency is unavailable or too slow. Distinguishing
+      // "process liveness" from "DB readiness" lets an orchestrator's liveness probe stay
+      // green (no unnecessary container restart) while a readiness/LB probe can still route
+      // traffic away. `error: database_unreachable` is kept for existing consumers.
       res.status(503).json({
-        status: "unhealthy",
+        status: "degraded",
         version: serverVersion,
-        error: "database_unreachable",
+        error: isTimeout ? "database_timeout" : "database_unreachable",
         ...(exposeFullDetails ? { serverInfo } : {}),
       });
       return;

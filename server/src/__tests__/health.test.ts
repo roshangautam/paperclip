@@ -92,7 +92,7 @@ describe("GET /health", () => {
     });
   });
 
-  it("returns 503 when the database probe fails", async () => {
+  it("returns 503 degraded when the database probe fails", async () => {
     const db = {
       execute: vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED")),
     } as unknown as Db;
@@ -102,11 +102,38 @@ describe("GET /health", () => {
 
     expect(res.status).toBe(503);
     expect(res.body).toEqual({
-      status: "unhealthy",
+      status: "degraded",
       version: serverVersion,
       error: "database_unreachable",
       serverInfo: testServerInfo,
     });
+  });
+
+  it("returns 503 degraded with database_timeout when the DB probe hangs past the bound", async () => {
+    const previousTimeoutEnv = process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;
+    process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS = "50";
+    try {
+      const db = {
+        execute: vi.fn().mockImplementation(() => new Promise(() => {})), // never resolves
+      } as unknown as Db;
+      const app = createApp(db);
+
+      const res = await request(app).get("/health");
+
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({
+        status: "degraded",
+        version: serverVersion,
+        error: "database_timeout",
+        serverInfo: testServerInfo,
+      });
+    } finally {
+      if (previousTimeoutEnv === undefined) {
+        delete process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;
+      } else {
+        process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS = previousTimeoutEnv;
+      }
+    }
   });
 
   it("returns safe server info fallbacks when git metadata is unavailable", async () => {

@@ -875,7 +875,7 @@ registry.registerPath({
   summary: "Health check",
   responses: {
     200: r.ok(z.object({
-      status: z.enum(["ok", "unhealthy"]),
+      status: z.enum(["ok", "unhealthy", "degraded"]),
       version: z.string().optional(),
       deploymentMode: z.string().optional(),
       bootstrapStatus: z.enum(["ready", "bootstrap_pending"]).optional(),
