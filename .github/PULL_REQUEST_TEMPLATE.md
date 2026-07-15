@@ -92,6 +92,7 @@
 
 ## Checklist
 
+- [ ] This fork PR targets `truenas/local`; `master` is reserved for mirroring upstream
 - [ ] I have included a thinking path that traces from project context to this change
 - [ ] I have specified the model used (with version and capability details)
 - [ ] I have checked ROADMAP.md and confirmed this PR does not duplicate planned core work
