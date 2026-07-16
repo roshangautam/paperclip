@@ -16,8 +16,11 @@ Query parameters:
 | Param | Description |
 |-------|-------------|
 | `status` | Filter by status (comma-separated: `todo,in_progress`) |
+| `priority` | Filter by priority (comma-separated) |
 | `assigneeAgentId` | Filter by assigned agent |
 | `projectId` | Filter by project |
+| `goalId` | Filter by goal UUID |
+| `createdByAgentId` | Filter by creator agent UUID |
 
 Results sorted by priority.
 

@@ -3423,6 +3423,19 @@ export function issueRoutes(
     return null;
   }
 
+  function parseOptionalUuidQuery(value: unknown, field: string) {
+    if (value === undefined) return undefined;
+    if (typeof value !== "string") {
+      throw unprocessable(`${field} must be a UUID`);
+    }
+    const normalized = value.trim();
+    if (!normalized) return undefined;
+    if (!isUuidLike(normalized)) {
+      throw unprocessable(`${field} must be a UUID`);
+    }
+    return normalized;
+  }
+
   function shouldIncludeDocumentAnnotations(req: Request) {
     if (req.query.includeAnnotations === "false" || req.query.includeAnnotations === "0") return false;
     return req.actor.type === "agent" || parseBooleanQuery(req.query.includeAnnotations);
@@ -5816,6 +5829,8 @@ export function issueRoutes(
     const compactView = view === "compact";
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
     const includeLiveDescendantSummary = parseOptionalBooleanQuery(req.query.includeLiveDescendantSummary);
+    const goalId = parseOptionalUuidQuery(req.query.goalId, "goalId");
+    const createdByAgentId = parseOptionalUuidQuery(req.query.createdByAgentId, "createdByAgentId");
     const assigneeAgentFilterRaw = req.query.assigneeAgentId;
     let assigneeAgentId: string | null | undefined;
     const rawUpdatedSince = req.query.updatedSince as string | undefined;
@@ -5909,6 +5924,9 @@ export function issueRoutes(
       originKind: req.query.originKind as string | undefined,
       originKindPrefix: req.query.originKindPrefix as string | undefined,
       originId: req.query.originId as string | undefined,
+      goalId,
+      createdByAgentId,
+      priority: req.query.priority as string | string[] | undefined,
       includeRoutineExecutions:
         req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
       excludeRoutineExecutions:
@@ -6074,6 +6092,8 @@ export function issueRoutes(
     }
     const attention = req.query.attention as string | undefined;
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
+    const goalId = parseOptionalUuidQuery(req.query.goalId, "goalId");
+    const createdByAgentId = parseOptionalUuidQuery(req.query.createdByAgentId, "createdByAgentId");
     if (attention !== "blocked") {
       res.status(400).json({ error: "issues/count currently requires attention=blocked" });
       return;
@@ -6102,6 +6122,9 @@ export function issueRoutes(
       originKind: req.query.originKind as string | undefined,
       originKindPrefix: req.query.originKindPrefix as string | undefined,
       originId: req.query.originId as string | undefined,
+      goalId,
+      createdByAgentId,
+      priority: req.query.priority as string | string[] | undefined,
       includeRoutineExecutions:
         req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
       excludeRoutineExecutions:
