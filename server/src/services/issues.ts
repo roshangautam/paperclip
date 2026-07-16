@@ -616,6 +616,29 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
+function isOpenRoutineExecutionSlotConflict(error: unknown): boolean {
+  let current: unknown = error;
+  const seen = new Set<unknown>();
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const candidate = current as {
+      code?: unknown;
+      constraint?: unknown;
+      constraint_name?: unknown;
+      cause?: unknown;
+    };
+    if (
+      candidate.code === "23505" &&
+      (candidate.constraint === "issues_open_routine_execution_uq" ||
+        candidate.constraint_name === "issues_open_routine_execution_uq")
+    ) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
+}
+
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
@@ -4377,6 +4400,24 @@ export function issueService(db: Db) {
         .where(eq(issues.id, input.issueId))
         .then((rows) => rows[0] ?? null);
       return { adopted: null, latest };
+    }).catch(async (error) => {
+      if (!isOpenRoutineExecutionSlotConflict(error)) throw error;
+      logger.warn(
+        { issueId: input.issueId, actorAgentId: input.actorAgentId, actorRunId: input.actorRunId },
+        "Stale checkout adoption lost the open routine-execution slot",
+      );
+      const latest = await db
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .then((rows) => rows[0] ?? null);
+      return { adopted: null, latest };
     });
   }
 
@@ -4434,6 +4475,13 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
 
       return adopted;
+    }).catch((error) => {
+      if (!isOpenRoutineExecutionSlotConflict(error)) throw error;
+      logger.warn(
+        { issueId: input.issueId, actorAgentId: input.actorAgentId, actorRunId: input.actorRunId },
+        "Unowned checkout adoption lost the open routine-execution slot",
+      );
+      return null;
     });
   }
 
