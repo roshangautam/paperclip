@@ -93,7 +93,7 @@ describe("GET /health", () => {
     });
   });
 
-  it("returns 503 when the database probe fails", async () => {
+  it("returns 503 degraded when the database probe fails", async () => {
     const db = {
       execute: vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED")),
     } as unknown as Db;
@@ -103,12 +103,109 @@ describe("GET /health", () => {
 
     expect(res.status).toBe(503);
     expect(res.body).toEqual({
-      status: "unhealthy",
+      status: "degraded",
       version: serverVersion,
       serverVersion,
       error: "database_unreachable",
       serverInfo: testServerInfo,
     });
+  });
+
+  it("returns 503 degraded with database_timeout when the DB probe hangs past the bound", async () => {
+    const previousTimeoutEnv = process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;
+    process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS = "50";
+    try {
+      const cancel = vi.fn();
+      let rejectFirstQuery!: (error: Error) => void;
+      const firstQuery = new Promise((_resolve, reject) => {
+        rejectFirstQuery = reject;
+      });
+      const cancelableQuery = Object.assign(firstQuery, {
+        cancel: () => {
+          cancel();
+          rejectFirstQuery(new Error("cancelled"));
+        },
+      });
+      const unsafe = vi
+        .fn()
+        .mockReturnValueOnce(cancelableQuery)
+        .mockResolvedValueOnce([]);
+      const db = {
+        $client: { unsafe },
+      } as unknown as Db;
+      const app = createApp(db);
+
+      const [res, retryRes] = await Promise.all([
+        request(app).get("/health"),
+        request(app).get("/health"),
+      ]);
+
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({
+        status: "degraded",
+        version: serverVersion,
+        error: "database_timeout",
+        serverInfo: testServerInfo,
+      });
+      expect(retryRes.status).toBe(503);
+      expect(retryRes.body).toEqual(res.body);
+      expect(unsafe).toHaveBeenCalledTimes(1);
+      expect(cancel).toHaveBeenCalledTimes(1);
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const recoveredRes = await request(app).get("/health");
+      expect(recoveredRes.status).toBe(200);
+      expect(unsafe).toHaveBeenCalledTimes(2);
+    } finally {
+      if (previousTimeoutEnv === undefined) {
+        delete process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;
+      } else {
+        process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS = previousTimeoutEnv;
+      }
+    }
+  });
+
+  it("redacts a database timeout for anonymous authenticated probes", async () => {
+    const previousTimeoutEnv = process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;
+    process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS = "50";
+    try {
+      const db = {
+        execute: vi.fn().mockImplementation(() => new Promise(() => {})),
+      } as unknown as Db;
+      const app = express();
+      app.use((req, _res, next) => {
+        (req as any).actor = { type: "none", source: "none" };
+        next();
+      });
+      app.use(
+        "/health",
+        healthRoutes(db, {
+          deploymentMode: "authenticated",
+          deploymentExposure: "public",
+          authReady: true,
+          companyDeletionEnabled: false,
+          serverInfo: testServerInfo,
+        }),
+      );
+
+      const res = await request(app).get("/health");
+
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({
+        status: "degraded",
+        error: "database_timeout",
+        deploymentMode: "authenticated",
+        deploymentExposure: "public",
+      });
+      expect(res.body.version).toBeUndefined();
+      expect(res.body.serverInfo).toBeUndefined();
+    } finally {
+      if (previousTimeoutEnv === undefined) {
+        delete process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;
+      } else {
+        process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS = previousTimeoutEnv;
+      }
+    }
   });
 
   it("returns safe server info fallbacks when git metadata is unavailable", async () => {

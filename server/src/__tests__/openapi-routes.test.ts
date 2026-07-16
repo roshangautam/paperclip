@@ -159,6 +159,17 @@ describe("openapi routes", () => {
       AgentBearerAuth: { type: "http", scheme: "bearer" },
     });
     expect(res.body.paths["/api/health"].get.security).toEqual([]);
+    expect(
+      res.body.paths["/api/health"].get.responses["200"].content["application/json"].schema
+        .properties.status.enum,
+    ).toEqual(["ok"]);
+    expect(
+      res.body.paths["/api/health"].get.responses["503"].content["application/json"].schema
+        .properties,
+    ).toMatchObject({
+      status: { enum: ["degraded"] },
+      error: { enum: ["database_unreachable", "database_timeout"] },
+    });
     expect(res.body.paths["/mcp/gateways/{gatewayPublicId}"].post.security).toEqual([]);
     expect(res.body.paths["/api/mcp/gateways/{gatewayPublicId}"]).toBeUndefined();
     expect(res.body.paths["/api/companies"].post.responses["201"]).toBeDefined();
