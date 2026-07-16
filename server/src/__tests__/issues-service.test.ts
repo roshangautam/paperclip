@@ -5873,6 +5873,8 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     checkoutStatus: "running" | "failed" | "timed_out";
     actorRunStatus?: "running" | "failed" | "timed_out" | "succeeded";
     assigneeMatchesActor?: boolean;
+    actorRunExists?: boolean;
+    actorRunBelongsToActor?: boolean;
   }) {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -5881,6 +5883,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     const actorRunId = randomUUID();
     const issueId = randomUUID();
     const actorRunStatus = params.actorRunStatus ?? "running";
+    const actorRunAgentId = params.actorRunBelongsToActor === false ? randomUUID() : actorAgentId;
 
     await db.insert(companies).values({
       id: companyId,
@@ -5914,26 +5917,39 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
         permissions: {},
       });
     }
-    await db.insert(agents).values(agentRows);
-    await db.insert(heartbeatRuns).values([
-      {
-        id: staleRunId,
+    if (actorRunAgentId !== assigneeAgentId && actorRunAgentId !== actorAgentId) {
+      agentRows.push({
+        id: actorRunAgentId,
         companyId,
-        agentId: assigneeAgentId,
-        status: params.checkoutStatus,
-        invocationSource: "manual",
-        finishedAt: params.checkoutStatus === "running" ? null : new Date(),
-      },
-      {
+        name: "Actor run owner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+    await db.insert(agents).values(agentRows);
+    await db.insert(heartbeatRuns).values({
+      id: staleRunId,
+      companyId,
+      agentId: assigneeAgentId,
+      status: params.checkoutStatus,
+      invocationSource: "manual",
+      finishedAt: params.checkoutStatus === "running" ? null : new Date(),
+    });
+    if (params.actorRunExists !== false) {
+      await db.insert(heartbeatRuns).values({
         id: actorRunId,
         companyId,
-        agentId: actorAgentId,
+        agentId: actorRunAgentId,
         status: actorRunStatus,
         invocationSource: "manual",
         startedAt: actorRunStatus === "running" ? new Date() : null,
         finishedAt: actorRunStatus === "running" ? null : new Date(),
-      },
-    ]);
+      });
+    }
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -5985,12 +6001,20 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     ).rejects.toMatchObject({ status: 409 });
   });
 
-  it("does not let terminal actor runs adopt stale checkout ownership", async () => {
+  it("lets the same assignee adopt a stale checkout even if their own run already finished (DRO-1078)", async () => {
+    // Regression for DRO-1078: an agent's own heartbeat run can flip to a
+    // terminal status (e.g. "succeeded") moments before that same run's
+    // late PATCH/checkout calls land -- a row-finalization vs. in-flight
+    // request race, not a real ownership dispute. assigneeAgentId ===
+    // actorAgentId here, so requiring the actor's *own* run to still be
+    // "live" only served to lock the rightful owner out of their own issue.
     const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunStatus: "succeeded" });
 
-    await expect(
-      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
-    ).rejects.toMatchObject({ status: 409 });
+    const ownership = await svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId);
+
+    expect(ownership.checkoutRunId).toBe(seeded.actorRunId);
+    expect(ownership.executionRunId).toBe(seeded.actorRunId);
+    expect(ownership.adoptedFromRunId).toBeNull();
 
     const row = await db
       .select({
@@ -6001,9 +6025,49 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
       .where(eq(issues.id, seeded.issueId))
       .then((rows) => rows[0]);
     expect(row).toEqual({
+      checkoutRunId: seeded.actorRunId,
+      executionRunId: seeded.actorRunId,
+    });
+  });
+
+  it("rejects stale checkout adoption when the actor run does not exist", async () => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed", actorRunExists: false });
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
       checkoutRunId: null,
       executionRunId: null,
     });
+  });
+
+  it("rejects unowned checkout adoption when the actor run belongs to another agent", async () => {
+    const seeded = await seedOwnershipIssue({
+      checkoutStatus: "failed",
+      actorRunBelongsToActor: false,
+    });
+    await db
+      .update(issues)
+      .set({ checkoutRunId: null, executionRunId: null })
+      .where(eq(issues.id, seeded.issueId));
+
+    await expect(
+      svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: null, executionRunId: null });
   });
 
   it("adopts unowned checkout after a concurrent stale-checkout clear wins the lock race", async () => {
