@@ -372,6 +372,72 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  it("returns 409 when terminal-run checkout adoption collides with a sibling routine execution slot", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const siblingRunId = randomUUID();
+    const siblingIssueId = randomUUID();
+    const targetIssueId = randomUUID();
+    const originId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: siblingRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+    });
+    await db.insert(issues).values([
+      {
+        id: siblingIssueId,
+        companyId,
+        title: "Sibling routine execution",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        executionRunId: siblingRunId,
+        originKind: "routine_execution",
+        originId,
+        originFingerprint: "dispatch-1",
+      },
+      {
+        id: targetIssueId,
+        companyId,
+        title: "Target routine execution",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        originKind: "routine_execution",
+        originId,
+        originFingerprint: "dispatch-1",
+      },
+    ]);
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${targetIssueId}`)
+      .send({ title: "Must not partially update" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body).toMatchObject({ error: "Issue run ownership conflict" });
+    const target = await db
+      .select({
+        title: issues.title,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, targetIssueId))
+      .then((rows) => rows[0]);
+    expect(target).toEqual({
+      title: "Target routine execution",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+  });
+
   it("still returns 409 when a different live checkout owner is active", async () => {
     const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
     const liveOwnerRunId = randomUUID();
