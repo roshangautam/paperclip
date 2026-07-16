@@ -1987,6 +1987,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (!candidatesById.has(run.id)) candidatesById.set(run.id, run);
     }
     const candidates = [...candidatesById.values()];
+    const currentRuns = candidates.length === 0
+      ? []
+      : await db
+          .select()
+          .from(heartbeatRuns)
+          .where(inArray(heartbeatRuns.id, candidates.map((run) => run.id)));
+    const currentRunsById = new Map(currentRuns.map((run) => [run.id, run]));
 
     const result = {
       scanned: candidates.length,
@@ -2002,11 +2009,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     for (const run of candidates) {
       // Candidate selection and evaluation are separate queries. Reload immediately before
       // evaluating so output written during that gap suppresses stale recovery work.
-      const currentRun = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
-        .then((rows) => rows[0] ?? null);
+      const currentRun = currentRunsById.get(run.id) ?? null;
       const currentThreshold = currentRun && isProcessLossRetryRun(currentRun)
         ? PROCESS_LOST_RETRY_OUTPUT_SUSPICION_THRESHOLD_MS
         : ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS;
