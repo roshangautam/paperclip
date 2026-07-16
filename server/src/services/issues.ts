@@ -619,24 +619,35 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 function isOpenRoutineExecutionSlotConflict(error: unknown): boolean {
   let current: unknown = error;
   const seen = new Set<unknown>();
+  let hasUniqueViolation = false;
+  let hasConstraint = false;
   while (current && typeof current === "object" && !seen.has(current)) {
     seen.add(current);
     const candidate = current as {
       code?: unknown;
       constraint?: unknown;
       constraint_name?: unknown;
+      message?: unknown;
       cause?: unknown;
     };
+    if (candidate.code === "23505") hasUniqueViolation = true;
     if (
-      candidate.code === "23505" &&
-      (candidate.constraint === "issues_open_routine_execution_uq" ||
-        candidate.constraint_name === "issues_open_routine_execution_uq")
+      candidate.constraint === "issues_open_routine_execution_uq" ||
+      candidate.constraint_name === "issues_open_routine_execution_uq"
     ) {
-      return true;
+      hasConstraint = true;
+    }
+    if (typeof candidate.message === "string") {
+      if (candidate.message.includes("duplicate key value violates unique constraint")) {
+        hasUniqueViolation = true;
+      }
+      if (candidate.message.includes("issues_open_routine_execution_uq")) {
+        hasConstraint = true;
+      }
     }
     current = candidate.cause;
   }
-  return false;
+  return hasUniqueViolation && hasConstraint;
 }
 
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
