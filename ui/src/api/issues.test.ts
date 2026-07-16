@@ -93,6 +93,26 @@ describe("issuesApi.list", () => {
     );
   });
 
+  it("passes issue query filters through list and count endpoints", async () => {
+    const filters = {
+      goalId: "goal-1",
+      createdByAgentId: "agent-1",
+      priority: "high,critical",
+    };
+
+    await issuesApi.list("company-1", filters);
+    await issuesApi.count("company-1", { attention: "blocked", ...filters });
+
+    expect(mockApi.get).toHaveBeenNthCalledWith(
+      1,
+      "/companies/company-1/issues?goalId=goal-1&createdByAgentId=agent-1&priority=high%2Ccritical",
+    );
+    expect(mockApi.get).toHaveBeenNthCalledWith(
+      2,
+      "/companies/company-1/issues/count?attention=blocked&goalId=goal-1&createdByAgentId=agent-1&priority=high%2Ccritical",
+    );
+  });
+
   it("posts recovery action resolution to the source issue endpoint", async () => {
     await issuesApi.resolveRecoveryAction("issue-1", {
       actionId: "00000000-0000-0000-0000-0000000000aa",

@@ -54,6 +54,9 @@ export type IssueListFilters = {
   originKind?: string;
   originKindPrefix?: string;
   originId?: string;
+  goalId?: string;
+  createdByAgentId?: string;
+  priority?: string;
   descendantOf?: string;
   includeRoutineExecutions?: boolean;
   includeBlockedBy?: boolean;
@@ -85,6 +88,9 @@ function issueListSearchParams(filters?: IssueListFilters) {
   if (filters?.originKind) params.set("originKind", filters.originKind);
   if (filters?.originKindPrefix) params.set("originKindPrefix", filters.originKindPrefix);
   if (filters?.originId) params.set("originId", filters.originId);
+  if (filters?.goalId) params.set("goalId", filters.goalId);
+  if (filters?.createdByAgentId) params.set("createdByAgentId", filters.createdByAgentId);
+  if (filters?.priority) params.set("priority", filters.priority);
   if (filters?.descendantOf) params.set("descendantOf", filters.descendantOf);
   if (filters?.includeRoutineExecutions) params.set("includeRoutineExecutions", "true");
   if (filters?.includeBlockedBy) params.set("includeBlockedBy", "true");
@@ -126,6 +132,9 @@ export const issuesApi = {
       assigneeAgentId?: string;
       assigneeUserId?: string;
       projectId?: string;
+      goalId?: string;
+      createdByAgentId?: string;
+      priority?: string;
       labelId?: string;
       q?: string;
     },
@@ -136,6 +145,9 @@ export const issuesApi = {
     if (filters.assigneeAgentId) params.set("assigneeAgentId", filters.assigneeAgentId);
     if (filters.assigneeUserId) params.set("assigneeUserId", filters.assigneeUserId);
     if (filters.projectId) params.set("projectId", filters.projectId);
+    if (filters.goalId) params.set("goalId", filters.goalId);
+    if (filters.createdByAgentId) params.set("createdByAgentId", filters.createdByAgentId);
+    if (filters.priority) params.set("priority", filters.priority);
     if (filters.labelId) params.set("labelId", filters.labelId);
     if (filters.q) params.set("q", filters.q);
     return api.get<{ count: number }>(`/companies/${companyId}/issues/count?${params.toString()}`);
