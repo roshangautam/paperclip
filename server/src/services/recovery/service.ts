@@ -191,10 +191,9 @@ function readNonEmptyString(value: unknown): string | null {
 
 // Identify only retries created by heartbeat.ts's enqueueProcessLossRetry. Other retry
 // paths also set retryOfRunId, so the persisted retry counter and wake reason must agree.
-function isProcessLossRetryRun(run: Pick<
-  typeof heartbeatRuns.$inferSelect,
-  "retryOfRunId" | "processLossRetryCount"
-> & {
+function isProcessLossRetryRun(run: {
+  retryOfRunId?: string | null;
+  processLossRetryCount?: number | null;
   contextSnapshot?: unknown;
   processLossRetryWakeReason?: string | null;
 }): boolean {
@@ -1089,9 +1088,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       | "processStartedAt"
       | "startedAt"
       | "createdAt"
-      | "retryOfRunId"
-      | "processLossRetryCount"
-    > & { contextSnapshot?: unknown; processLossRetryWakeReason?: string | null },
+    > & {
+      retryOfRunId?: string | null;
+      processLossRetryCount?: number | null;
+      contextSnapshot?: unknown;
+      processLossRetryWakeReason?: string | null;
+    },
     now = new Date(),
   ): Promise<RunOutputSilenceSummary> {
     const [quietUntilDecision, evaluation] = await Promise.all([

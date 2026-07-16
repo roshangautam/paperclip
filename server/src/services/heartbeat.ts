@@ -9894,9 +9894,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       | "processStartedAt"
       | "startedAt"
       | "createdAt"
-      | "retryOfRunId"
-      | "processLossRetryCount"
-    > & { contextSnapshot?: unknown; processLossRetryWakeReason?: string | null },
+    > & {
+      retryOfRunId?: string | null;
+      processLossRetryCount?: number | null;
+      contextSnapshot?: unknown;
+      processLossRetryWakeReason?: string | null;
+    },
     now = new Date(),
   ) {
     return recovery.buildRunOutputSilence(run, now);
