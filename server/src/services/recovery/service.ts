@@ -74,6 +74,18 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "ti
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+// A run spawned by enqueueProcessLossRetry (see heartbeat.ts) inherits no
+// scheduledRetry/monitor/watchdog of its own -- the only safety net that can
+// ever look at it again is the generic silent-active-run sweep, gated on the
+// full ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS (1h). That is the "born
+// stranded" defect: when the same fleet-wide event that killed the original
+// run (host/container restart, OOM, supervisor recycle) also takes down
+// sibling agents, nobody is left to notice a retry that came up with zero
+// output until the full hour elapses. Give process-loss retries a much
+// tighter self-check instead, so a retry that is genuinely dead surfaces as
+// recovery work in minutes, not up to an hour -- while a retry that is
+// actually producing output is left alone exactly like any other healthy run.
+export const PROCESS_LOST_RETRY_OUTPUT_SUSPICION_THRESHOLD_MS = 10 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
@@ -175,6 +187,17 @@ export type RunOutputSilenceSummary = {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+// Identify only retries created by heartbeat.ts's enqueueProcessLossRetry. Other retry
+// paths also set retryOfRunId, so the persisted retry counter and wake reason must agree.
+function isProcessLossRetryRun(run: Pick<
+  typeof heartbeatRuns.$inferSelect,
+  "retryOfRunId" | "processLossRetryCount" | "contextSnapshot"
+>): boolean {
+  if (!run.retryOfRunId || (run.processLossRetryCount ?? 0) <= 0) return false;
+  const context = parseObject(run.contextSnapshot);
+  return context.wakeReason === "process_lost_retry";
 }
 
 function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
@@ -1550,8 +1573,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         `- ${issueUiLink({ identifier: issue.identifier, id: issue.id }, input.prefix)} \`${issue.status}\`: ${issue.title}`,
       ).join("\n")
       : "- none detected";
+    const isProcessLossRetry = isProcessLossRetryRun(input.run);
     return [
       `Paperclip detected ${input.level} output silence on an active heartbeat run.`,
+      ...(isProcessLossRetry
+        ? [
+            "",
+            "**This run is itself an automatic retry after a process-loss failure** " +
+              `(retry of run \`${input.run.retryOfRunId}\`). It has no scheduledRetry/monitor/watchdog of its own, ` +
+              "so it is held to a much shorter silence threshold and flagged critical immediately: if the same event " +
+              "that killed its predecessor also took out other agents, this retry could otherwise sit silent for the " +
+              "full generic suspicion window with nothing else watching it.",
+          ]
+        : []),
       "",
       "## Run",
       "",
@@ -1564,7 +1598,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       `- Last output at: ${input.run.lastOutputAt?.toISOString() ?? "none recorded"}`,
       `- Last output sequence: ${input.run.lastOutputSeq ?? 0}`,
       `- Silent for: ${formatDuration(input.evidence.silenceAgeMs)}`,
-      `- Thresholds: suspicious after ${formatDuration(ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS)}, critical after ${formatDuration(ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS)}`,
+      isProcessLossRetry
+        ? `- Thresholds: process-loss-retry suspicion after ${formatDuration(PROCESS_LOST_RETRY_OUTPUT_SUSPICION_THRESHOLD_MS)} (flagged critical immediately, no separate critical bar)`
+        : `- Thresholds: suspicious after ${formatDuration(ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS)}, critical after ${formatDuration(ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS)}`,
       `- Process metadata: pid \`${input.run.processPid ?? "unknown"}\`, process group \`${input.run.processGroupId ?? "unknown"}\`, in-memory handle \`${runningProcesses.has(input.run.id) ? "yes" : "no"}\``,
       "",
       "## Last Output Excerpt",
@@ -1784,7 +1820,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       prefix,
       now: input.now,
     });
-    const level = (evidence.silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS ? "critical" : "suspicious";
+    // A silent process-loss retry is treated as critical as soon as it crosses its own
+    // (much shorter) suspicion threshold rather than waiting for the generic 4h critical
+    // bar: unlike an ordinary run, nothing else is watching it, so the same fleet-wide
+    // event that killed its predecessor run is actively at risk of leaving it stranded for
+    // hours with no other recovery path armed.
+    const level = isProcessLossRetryRun(input.run) || (evidence.silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS
+      ? "critical"
+      : "suspicious";
     if (existing) {
       if (level === "critical" && existing.priority !== "high") {
         await issuesSvc.update(existing.id, {
@@ -1901,7 +1944,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
     const now = opts?.now ?? new Date();
     const suspicionBefore = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
-    const candidates = await db
+    const genericCandidates = await db
       .select()
       .from(heartbeatRuns)
       .where(
@@ -1913,6 +1956,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       )
       .orderBy(asc(heartbeatRuns.createdAt))
       .limit(100);
+
+    // Separate, narrowly-scoped query for the "born stranded" process-loss-retry defect:
+    // a run enqueueProcessLossRetry spawned has no scheduledRetry/monitor/watchdog of its
+    // own, so without this it would only ever surface via the generic sweep above, gated
+    // on the full 1h ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS. Filtering by canonical
+    // process-loss metadata at the SQL level (rather than lowering the generic threshold)
+    // keeps this from competing with genericCandidates' own `.limit(100)` against ordinary
+    // long-running, healthily-quiet work -- this set is expected to be small (only actual
+    // process-loss retries) even on a busy fleet.
+    const processLossRetrySuspicionBefore = new Date(now.getTime() - PROCESS_LOST_RETRY_OUTPUT_SUSPICION_THRESHOLD_MS);
+    const processLossRetryCandidates = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
+          eq(heartbeatRuns.status, "running"),
+          sql`${heartbeatRuns.retryOfRunId} is not null`,
+          gt(heartbeatRuns.processLossRetryCount, 0),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' = 'process_lost_retry'`,
+          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${processLossRetrySuspicionBefore.toISOString()}::timestamptz`,
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.createdAt))
+      .limit(100);
+
+    const candidatesById = new Map(genericCandidates.map((run) => [run.id, run]));
+    for (const run of processLossRetryCandidates) {
+      if (!candidatesById.has(run.id)) candidatesById.set(run.id, run);
+    }
+    const candidates = [...candidatesById.values()];
 
     const result = {
       scanned: candidates.length,
@@ -1926,11 +2000,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
 
     for (const run of candidates) {
-      if (await latestActiveOutputQuietUntilDecision(run.companyId, run.id, now)) {
+      // Candidate selection and evaluation are separate queries. Reload immediately before
+      // evaluating so output written during that gap suppresses stale recovery work.
+      const currentRun = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null);
+      const currentThreshold = currentRun && isProcessLossRetryRun(currentRun)
+        ? PROCESS_LOST_RETRY_OUTPUT_SUSPICION_THRESHOLD_MS
+        : ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS;
+      if (
+        !currentRun ||
+        currentRun.status !== "running" ||
+        (silenceAgeMsForRun(currentRun, now) ?? 0) < currentThreshold
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+      if (await latestActiveOutputQuietUntilDecision(currentRun.companyId, currentRun.id, now)) {
         result.snoozed += 1;
         continue;
       }
-      const outcome = await createOrUpdateStaleRunEvaluation({ run, now });
+      const outcome = await createOrUpdateStaleRunEvaluation({ run: currentRun, now });
       if (outcome.kind === "created") result.created += 1;
       else if (outcome.kind === "existing") result.existing += 1;
       else if (outcome.kind === "escalated") result.escalated += 1;
