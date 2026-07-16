@@ -114,18 +114,29 @@ describe("GET /health", () => {
     process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS = "50";
     try {
       const cancel = vi.fn();
-      const neverSettles = Object.assign(new Promise(() => {}), { cancel });
+      let rejectFirstQuery!: (error: Error) => void;
+      const firstQuery = new Promise((_resolve, reject) => {
+        rejectFirstQuery = reject;
+      });
+      const cancelableQuery = Object.assign(firstQuery, {
+        cancel: () => {
+          cancel();
+          rejectFirstQuery(new Error("cancelled"));
+        },
+      });
       const unsafe = vi
         .fn()
-        .mockReturnValueOnce(neverSettles)
+        .mockReturnValueOnce(cancelableQuery)
         .mockResolvedValueOnce([]);
       const db = {
         $client: { unsafe },
       } as unknown as Db;
       const app = createApp(db);
 
-      const res = await request(app).get("/health");
-      const retryRes = await request(app).get("/health");
+      const [res, retryRes] = await Promise.all([
+        request(app).get("/health"),
+        request(app).get("/health"),
+      ]);
 
       expect(res.status).toBe(503);
       expect(res.body).toEqual({
@@ -139,7 +150,7 @@ describe("GET /health", () => {
       expect(unsafe).toHaveBeenCalledTimes(1);
       expect(cancel).toHaveBeenCalledTimes(1);
 
-      await new Promise((resolve) => setTimeout(resolve, 60));
+      await new Promise((resolve) => setTimeout(resolve, 0));
       const recoveredRes = await request(app).get("/health");
       expect(recoveredRes.status).toBe(200);
       expect(unsafe).toHaveBeenCalledTimes(2);

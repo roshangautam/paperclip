@@ -82,7 +82,6 @@ class DatabaseProbeTimeoutError extends Error {
 type DatabaseReadinessProbeState = {
   query: Promise<void>;
   result: Promise<void>;
-  retryAt: number | null;
 };
 
 const databaseReadinessProbes = new WeakMap<object, DatabaseReadinessProbeState>();
@@ -108,23 +107,21 @@ function startDatabaseReadinessQuery(db: Db) {
 async function probeDatabaseReadiness(db: Db, timeoutMs: number): Promise<void> {
   const key = db as object;
   let state = databaseReadinessProbes.get(key);
-  if (state?.retryAt && Date.now() >= state.retryAt) {
-    databaseReadinessProbes.delete(key);
-    state = undefined;
-  }
   if (!state) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const { query, cancel } = startDatabaseReadinessQuery(db);
     const createdState: DatabaseReadinessProbeState = {
       query,
       result: Promise.resolve(),
-      retryAt: null,
     };
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        createdState.retryAt = Date.now() + timeoutMs;
         reject(new DatabaseProbeTimeoutError(timeoutMs));
-        cancel?.();
+        try {
+          cancel?.();
+        } catch (error) {
+          logger.warn({ err: error }, "Failed to cancel timed-out database health probe");
+        }
       }, timeoutMs);
     });
     createdState.result = Promise.race([query, timeout]).finally(() => {
@@ -134,7 +131,7 @@ async function probeDatabaseReadiness(db: Db, timeoutMs: number): Promise<void> 
     state = createdState;
 
     // Keep a timed-out probe single-flight while postgres-js cancels it. If cancellation
-    // never settles, allow one recovery probe after the timeout-sized cooldown.
+    // itself never settles, remaining degraded is safer than queuing more DB work.
     void query
       .finally(() => {
         if (databaseReadinessProbes.get(key) === createdState) {
