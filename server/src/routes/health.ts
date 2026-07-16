@@ -82,29 +82,59 @@ class DatabaseProbeTimeoutError extends Error {
 type DatabaseReadinessProbeState = {
   query: Promise<void>;
   result: Promise<void>;
+  retryAt: number | null;
 };
 
 const databaseReadinessProbes = new WeakMap<object, DatabaseReadinessProbeState>();
 
+function startDatabaseReadinessQuery(db: Db) {
+  const client = (db as Db & {
+    $client?: { unsafe?: (query: string) => Promise<unknown> & { cancel?: () => void } };
+  }).$client;
+  if (client && typeof client.unsafe === "function") {
+    const pending = client.unsafe("SELECT 1");
+    return {
+      query: pending.then(() => undefined),
+      cancel: () => pending.cancel?.(),
+    };
+  }
+
+  return {
+    query: Promise.resolve(db.execute(sql`SELECT 1`)).then(() => undefined),
+    cancel: undefined,
+  };
+}
+
 async function probeDatabaseReadiness(db: Db, timeoutMs: number): Promise<void> {
   const key = db as object;
   let state = databaseReadinessProbes.get(key);
+  if (state?.retryAt && Date.now() >= state.retryAt) {
+    databaseReadinessProbes.delete(key);
+    state = undefined;
+  }
   if (!state) {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const query = Promise.resolve().then(async () => {
-      await db.execute(sql`SELECT 1`);
-    });
+    const { query, cancel } = startDatabaseReadinessQuery(db);
+    const createdState: DatabaseReadinessProbeState = {
+      query,
+      result: Promise.resolve(),
+      retryAt: null,
+    };
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new DatabaseProbeTimeoutError(timeoutMs)), timeoutMs);
+      timer = setTimeout(() => {
+        createdState.retryAt = Date.now() + timeoutMs;
+        reject(new DatabaseProbeTimeoutError(timeoutMs));
+        cancel?.();
+      }, timeoutMs);
     });
-    const result = Promise.race([query, timeout]).finally(() => {
+    createdState.result = Promise.race([query, timeout]).finally(() => {
       if (timer) clearTimeout(timer);
     });
-    const createdState = { query, result };
     databaseReadinessProbes.set(key, createdState);
     state = createdState;
 
-    // Keep a timed-out probe single-flight until its uncancelled driver query settles.
+    // Keep a timed-out probe single-flight while postgres-js cancels it. If cancellation
+    // never settles, allow one recovery probe after the timeout-sized cooldown.
     void query
       .finally(() => {
         if (databaseReadinessProbes.get(key) === createdState) {

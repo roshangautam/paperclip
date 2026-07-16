@@ -908,6 +908,7 @@ registry.registerPath({
       status: z.literal("ok"),
       version: z.string().optional(),
       deploymentMode: z.string().optional(),
+      deploymentExposure: z.string().optional(),
       bootstrapStatus: z.enum(["ready", "bootstrap_pending"]).optional(),
       bootstrapInviteActive: z.boolean().optional(),
       databaseBackup: z.object({

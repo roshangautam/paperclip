@@ -113,8 +113,14 @@ describe("GET /health", () => {
     const previousTimeoutEnv = process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;
     process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS = "50";
     try {
+      const cancel = vi.fn();
+      const neverSettles = Object.assign(new Promise(() => {}), { cancel });
+      const unsafe = vi
+        .fn()
+        .mockReturnValueOnce(neverSettles)
+        .mockResolvedValueOnce([]);
       const db = {
-        execute: vi.fn().mockImplementation(() => new Promise(() => {})), // never resolves
+        $client: { unsafe },
       } as unknown as Db;
       const app = createApp(db);
 
@@ -130,7 +136,13 @@ describe("GET /health", () => {
       });
       expect(retryRes.status).toBe(503);
       expect(retryRes.body).toEqual(res.body);
-      expect(db.execute).toHaveBeenCalledTimes(1);
+      expect(unsafe).toHaveBeenCalledTimes(1);
+      expect(cancel).toHaveBeenCalledTimes(1);
+
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      const recoveredRes = await request(app).get("/health");
+      expect(recoveredRes.status).toBe(200);
+      expect(unsafe).toHaveBeenCalledTimes(2);
     } finally {
       if (previousTimeoutEnv === undefined) {
         delete process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS;
