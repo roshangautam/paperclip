@@ -257,6 +257,62 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  it("lets the current assignee recover a stale checkout even if their own run's status already flipped terminal (DRO-1078)", async () => {
+    // Reproduces the DRO-1078 race: the actor's PATCH is in flight for run `currentRunId`, but
+    // by the time this request is handled, the heartbeat harness has already marked that same
+    // run "succeeded" (e.g. a late/duplicate request after the run wrapped up). Since
+    // assigneeAgentId === actorAgentId throughout, there is no real cross-agent ownership
+    // dispute -- the previous checkoutRunId is what must be judged stale, not the actor's own
+    // run status.
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const timedOutRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: timedOutRunId,
+      companyId,
+      agentId,
+      status: "timed_out",
+      invocationSource: "manual",
+      finishedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stale checkout lock, actor run already terminal",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: timedOutRunId,
+      executionRunId: timedOutRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    // Actor's own run has already finished by the time this request is processed.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Recovered despite actor run flipping terminal" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+    });
+  });
+
   it("still returns 409 when a different live checkout owner is active", async () => {
     const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
     const liveOwnerRunId = randomUUID();
