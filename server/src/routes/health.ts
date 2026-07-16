@@ -56,6 +56,94 @@ function redactedDatabaseBackupHealth(databaseBackup: DatabaseBackupHealthStatus
   };
 }
 
+// INC-2026-07-14-001 (DRO-1075/DRO-1077): an orphaned agent-wake transaction held a row
+// lock with no timeout, chaining concurrent DB work and exhausting the connection pool.
+// Readiness's own `SELECT 1` probe rode the same pool, so it hung too -- Docker's
+// healthcheck timeout (see docker/docker-compose.yml) eventually fired, but only after
+// the container had already been wedged for the full unhealthy `retries` window.
+// Bound the DB probe itself well below that timeout so readiness fails fast with a
+// clear "degraded" JSON body instead of hanging until Docker gives up.
+const DEFAULT_READINESS_DB_PROBE_TIMEOUT_MS = 3_000;
+
+function readinessDbProbeTimeoutMs(): number {
+  const raw = process.env.PAPERCLIP_HEALTH_DB_TIMEOUT_MS?.trim();
+  if (!raw) return DEFAULT_READINESS_DB_PROBE_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_READINESS_DB_PROBE_TIMEOUT_MS;
+}
+
+class DatabaseProbeTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Database readiness probe did not complete within ${timeoutMs}ms`);
+    this.name = "DatabaseProbeTimeoutError";
+  }
+}
+
+type DatabaseReadinessProbeState = {
+  query: Promise<void>;
+  result: Promise<void>;
+};
+
+const databaseReadinessProbes = new WeakMap<object, DatabaseReadinessProbeState>();
+
+function startDatabaseReadinessQuery(db: Db) {
+  const client = (db as Db & {
+    $client?: { unsafe?: (query: string) => Promise<unknown> & { cancel?: () => void } };
+  }).$client;
+  if (client && typeof client.unsafe === "function") {
+    const pending = client.unsafe("SELECT 1");
+    return {
+      query: pending.then(() => undefined),
+      cancel: () => pending.cancel?.(),
+    };
+  }
+
+  return {
+    query: Promise.resolve(db.execute(sql`SELECT 1`)).then(() => undefined),
+    cancel: undefined,
+  };
+}
+
+async function probeDatabaseReadiness(db: Db, timeoutMs: number): Promise<void> {
+  const key = db as object;
+  let state = databaseReadinessProbes.get(key);
+  if (!state) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const { query, cancel } = startDatabaseReadinessQuery(db);
+    const createdState: DatabaseReadinessProbeState = {
+      query,
+      result: Promise.resolve(),
+    };
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new DatabaseProbeTimeoutError(timeoutMs));
+        try {
+          cancel?.();
+        } catch (error) {
+          logger.warn({ err: error }, "Failed to cancel timed-out database health probe");
+        }
+      }, timeoutMs);
+    });
+    createdState.result = Promise.race([query, timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+    databaseReadinessProbes.set(key, createdState);
+    state = createdState;
+
+    // Keep a timed-out probe single-flight while postgres-js cancels it. If cancellation
+    // itself never settles, remaining degraded is safer than queuing more DB work.
+    void query
+      .finally(() => {
+        if (databaseReadinessProbes.get(key) === createdState) {
+          databaseReadinessProbes.delete(key);
+        }
+      })
+      .catch(() => undefined);
+  }
+
+  await state.result;
+}
+
 export function healthRoutes(
   db?: Db,
   opts: {
@@ -133,14 +221,22 @@ export function healthRoutes(
     }
 
     try {
-      await db.execute(sql`SELECT 1`);
+      await probeDatabaseReadiness(db, readinessDbProbeTimeoutMs());
     } catch (error) {
-      logger.warn({ err: error }, "Health check database probe failed");
+      const isTimeout = error instanceof DatabaseProbeTimeoutError;
+      logger.warn({ err: error, timedOut: isTimeout }, "Health check database probe failed");
+      // The HTTP process is alive, but this combined health/readiness endpoint returns 503
+      // because its DB dependency is unavailable or too slow. The structured degraded body
+      // distinguishes that dependency failure from an unresponsive process.
       res.status(503).json({
-        status: "unhealthy",
-        version: serverVersion,
-        error: "database_unreachable",
-        ...(exposeFullDetails ? { serverInfo } : {}),
+        status: "degraded",
+        error: isTimeout ? "database_timeout" : "database_unreachable",
+        ...(exposeFullDetails
+          ? { version: serverVersion, serverInfo }
+          : {
+              deploymentMode: opts.deploymentMode,
+              deploymentExposure: opts.deploymentExposure,
+            }),
       });
       return;
     }

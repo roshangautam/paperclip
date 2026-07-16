@@ -29,11 +29,25 @@ services:
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "private"
       PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://localhost:3100}"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      # DRO-1077 (INC-2026-07-14-001 follow-up): bound the readiness route's own DB probe
+      # (server/src/routes/health.ts) well below this healthcheck's `timeout` below, so a
+      # stuck DB dependency surfaces as a fast "degraded" JSON response instead of hanging
+      # the whole healthcheck window.
+      PAPERCLIP_HEALTH_DB_TIMEOUT_MS: "3000"
     volumes:
       - paperclip-data:/paperclip
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      # /api/health is process-liveness + DB-readiness combined today; bounding the DB
+      # probe (PAPERCLIP_HEALTH_DB_TIMEOUT_MS above) keeps this curl call itself fast even
+      # when Postgres is wedged, instead of hanging until `timeout` below fires.
+      test: ["CMD-SHELL", "curl -f http://localhost:3100/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
 volumes:
   pgdata:
