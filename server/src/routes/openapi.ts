@@ -1142,12 +1142,14 @@ registry.registerPath({
   summary: "Health check",
   responses: {
     200: r.ok(z.object({
-      status: z.enum(["ok", "unhealthy"]),
+      status: z.literal("ok"),
       version: z.string().optional(),
       // Running build commit (full git SHA), or null when git metadata is
       // unavailable. Present on every response shape, including redacted ones.
       commit: z.string().nullable(),
       deploymentMode: z.string().optional(),
+      deploymentExposure: z.string().optional(),
+      authReady: z.boolean().optional(),
       cloud: z.object({
         managed: z.literal(true),
         managedBy: z.literal("paperclip-cloud"),
@@ -1157,6 +1159,26 @@ registry.registerPath({
       }).strict().optional(),
       bootstrapStatus: z.enum(["ready", "bootstrap_pending"]).optional(),
       bootstrapInviteActive: z.boolean().optional(),
+      features: z.object({
+        companyDeletionEnabled: z.boolean(),
+      }).optional(),
+      devServer: z.object({
+        enabled: z.literal(true),
+        restartRequired: z.boolean(),
+        reason: z.enum([
+          "backend_changes",
+          "pending_migrations",
+          "backend_changes_and_pending_migrations",
+        ]).nullable(),
+        lastChangedAt: z.string().datetime().nullable(),
+        changedPathCount: z.number().int().nonnegative(),
+        changedPathsSample: z.array(z.string()),
+        pendingMigrations: z.array(z.string()),
+        autoRestartEnabled: z.boolean(),
+        activeRunCount: z.number().int().nonnegative(),
+        waitingForIdle: z.boolean(),
+        lastRestartAt: z.string().datetime().nullable(),
+      }).optional(),
       databaseBackup: z.object({
         enabled: z.boolean(),
         status: z.enum(["ok", "warning"]),
@@ -1190,19 +1212,28 @@ registry.registerPath({
       })).optional(),
       serverInfo: healthServerInfoSchema.optional(),
     })),
-    // The database-unreachable body still carries version and commit so
-    // deployment tooling can verify the running build during an outage;
-    // serverInfo rides only on full-details (board/agent) responses.
+    // The database-unreachable body still carries commit so deployment tooling
+    // can verify the running build during an outage; serverInfo rides only on
+    // full-details (board/agent) responses.
     503: {
-      description: "Service unavailable",
+      description: "Database unavailable or readiness probe timed out",
       content: {
         "application/json": {
           schema: z.object({
-            status: z.literal("unhealthy"),
-            version: z.string(),
-            serverVersion: z.string(),
+            status: z.literal("degraded"),
+            error: z.enum(["database_unreachable", "database_timeout"]),
+            version: z.string().optional(),
+            serverVersion: z.string().optional(),
             commit: z.string().nullable(),
-            error: z.literal("database_unreachable"),
+            deploymentMode: z.string().optional(),
+            deploymentExposure: z.string().optional(),
+            cloud: z.object({
+              managed: z.literal(true),
+              managedBy: z.literal("paperclip-cloud"),
+              stackSlug: z.string().nullable(),
+              stackDisplayName: z.string().optional(),
+              cloudBaseUrl: z.string().nullable(),
+            }).strict().optional(),
             serverInfo: healthServerInfoSchema.optional(),
           }),
         },
