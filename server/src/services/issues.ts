@@ -4414,7 +4414,7 @@ export function issueService(db: Db) {
     }).catch(async (error) => {
       if (!isOpenRoutineExecutionSlotConflict(error)) throw error;
       logger.warn(
-        { issueId: input.issueId, actorAgentId: input.actorAgentId, actorRunId: input.actorRunId },
+        { err: error, issueId: input.issueId, actorAgentId: input.actorAgentId, actorRunId: input.actorRunId },
         "Stale checkout adoption lost the open routine-execution slot",
       );
       const latest = await db
@@ -4489,7 +4489,7 @@ export function issueService(db: Db) {
     }).catch((error) => {
       if (!isOpenRoutineExecutionSlotConflict(error)) throw error;
       logger.warn(
-        { issueId: input.issueId, actorAgentId: input.actorAgentId, actorRunId: input.actorRunId },
+        { err: error, issueId: input.issueId, actorAgentId: input.actorAgentId, actorRunId: input.actorRunId },
         "Unowned checkout adoption lost the open routine-execution slot",
       );
       return null;
