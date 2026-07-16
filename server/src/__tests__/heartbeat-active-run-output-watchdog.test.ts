@@ -416,6 +416,13 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       /output silence on an active heartbeat run\.\n\n\*\*This run is itself an automatic retry/,
     );
     expect(evaluation?.description).toMatch(/no scheduledRetry\/monitor\/watchdog.*\n\n## Run\n/s);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await expect(recoveryService(db, { enqueueWakeup: vi.fn() }).buildRunOutputSilence(run!, now))
+      .resolves.toMatchObject({
+        level: "critical",
+        suspicionThresholdMs: PROCESS_LOST_RETRY_OUTPUT_SUSPICION_THRESHOLD_MS,
+        criticalThresholdMs: PROCESS_LOST_RETRY_OUTPUT_SUSPICION_THRESHOLD_MS,
+      });
   });
 
   it("does not flag a process-loss retry before its short threshold", async () => {

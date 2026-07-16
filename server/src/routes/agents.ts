@@ -3510,6 +3510,9 @@ export function agentRoutes(
       lastOutputStream: heartbeatRuns.lastOutputStream,
       lastOutputBytes: heartbeatRuns.lastOutputBytes,
       processStartedAt: heartbeatRuns.processStartedAt,
+      retryOfRunId: heartbeatRuns.retryOfRunId,
+      processLossRetryCount: heartbeatRuns.processLossRetryCount,
+      processLossRetryWakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`.as("processLossRetryWakeReason"),
       issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
     };
 
@@ -3749,6 +3752,9 @@ export function agentRoutes(
         lastOutputStream: heartbeatRuns.lastOutputStream,
         lastOutputBytes: heartbeatRuns.lastOutputBytes,
         processStartedAt: heartbeatRuns.processStartedAt,
+        retryOfRunId: heartbeatRuns.retryOfRunId,
+        processLossRetryCount: heartbeatRuns.processLossRetryCount,
+        processLossRetryWakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`.as("processLossRetryWakeReason"),
       })
       .from(heartbeatRuns)
       .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))

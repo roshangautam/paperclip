@@ -1826,6 +1826,9 @@ const heartbeatRunIssueSummaryColumns = {
   lastOutputSeq: heartbeatRuns.lastOutputSeq,
   lastOutputStream: heartbeatRuns.lastOutputStream,
   lastOutputBytes: heartbeatRuns.lastOutputBytes,
+  retryOfRunId: heartbeatRuns.retryOfRunId,
+  processLossRetryCount: heartbeatRuns.processLossRetryCount,
+  processLossRetryWakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`.as("processLossRetryWakeReason"),
   issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
 } as const;
 
@@ -9882,8 +9885,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function buildRunOutputSilence(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "companyId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt"
-    >,
+      | "id"
+      | "companyId"
+      | "status"
+      | "lastOutputAt"
+      | "lastOutputSeq"
+      | "lastOutputStream"
+      | "processStartedAt"
+      | "startedAt"
+      | "createdAt"
+      | "retryOfRunId"
+      | "processLossRetryCount"
+    > & { contextSnapshot?: unknown; processLossRetryWakeReason?: string | null },
     now = new Date(),
   ) {
     return recovery.buildRunOutputSilence(run, now);

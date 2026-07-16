@@ -193,11 +193,14 @@ function readNonEmptyString(value: unknown): string | null {
 // paths also set retryOfRunId, so the persisted retry counter and wake reason must agree.
 function isProcessLossRetryRun(run: Pick<
   typeof heartbeatRuns.$inferSelect,
-  "retryOfRunId" | "processLossRetryCount" | "contextSnapshot"
->): boolean {
+  "retryOfRunId" | "processLossRetryCount"
+> & {
+  contextSnapshot?: unknown;
+  processLossRetryWakeReason?: string | null;
+}): boolean {
   if (!run.retryOfRunId || (run.processLossRetryCount ?? 0) <= 0) return false;
-  const context = parseObject(run.contextSnapshot);
-  return context.wakeReason === "process_lost_retry";
+  const wakeReason = run.processLossRetryWakeReason ?? parseObject(run.contextSnapshot).wakeReason;
+  return wakeReason === "process_lost_retry";
 }
 
 function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
@@ -1077,8 +1080,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function buildRunOutputSilence(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "companyId" | "status" | "lastOutputAt" | "lastOutputSeq" | "lastOutputStream" | "processStartedAt" | "startedAt" | "createdAt"
-    >,
+      | "id"
+      | "companyId"
+      | "status"
+      | "lastOutputAt"
+      | "lastOutputSeq"
+      | "lastOutputStream"
+      | "processStartedAt"
+      | "startedAt"
+      | "createdAt"
+      | "retryOfRunId"
+      | "processLossRetryCount"
+    > & { contextSnapshot?: unknown; processLossRetryWakeReason?: string | null },
     now = new Date(),
   ): Promise<RunOutputSilenceSummary> {
     const [quietUntilDecision, evaluation] = await Promise.all([
@@ -1087,13 +1100,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ]);
     const silenceStartedAt = silenceStartedAtForRun(run);
     const silenceAgeMs = run.status === "running" ? silenceAgeMsForRun(run, now) : null;
+    const processLossRetry = isProcessLossRetryRun(run);
+    const suspicionThresholdMs = processLossRetry
+      ? PROCESS_LOST_RETRY_OUTPUT_SUSPICION_THRESHOLD_MS
+      : ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS;
+    const criticalThresholdMs = processLossRetry
+      ? PROCESS_LOST_RETRY_OUTPUT_SUSPICION_THRESHOLD_MS
+      : ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS;
     const level = run.status !== "running"
       ? "not_applicable"
       : quietUntilDecision
         ? "snoozed"
-        : (silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS
+        : (silenceAgeMs ?? 0) >= criticalThresholdMs
           ? "critical"
-          : (silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS
+          : (silenceAgeMs ?? 0) >= suspicionThresholdMs
             ? "suspicious"
             : "ok";
     return {
@@ -1105,8 +1125,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       silenceStartedAt,
       silenceAgeMs,
       level,
-      suspicionThresholdMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
-      criticalThresholdMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
+      suspicionThresholdMs,
+      criticalThresholdMs,
       snoozedUntil: quietUntilDecision?.snoozedUntil ?? null,
       evaluationIssueId: evaluation?.id ?? null,
       evaluationIssueIdentifier: evaluation?.identifier ?? null,
