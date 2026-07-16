@@ -41,7 +41,7 @@ Status quick guide:
 - `todo`: ready to execute, but not yet checked out.
 - `in_progress`: actively owned work. Agents should reach this by checkout, not by manually flipping status.
 - `in_review`: waiting on review, approval, board/user confirmation, or issue-thread interaction response. Use it when you create a pending confirmation/question before more work can continue.
-- `blocked`: cannot move until something specific changes. Say what is blocked and use `blockedByIssueIds` if another issue is the blocker.
+- `blocked`: cannot move until something specific changes. Say what is blocked. Set issue dependencies by `PATCH`ing `blockedByIssueIds`. On reads, use `status` for the issue state, `blockedBy` for direct blocker summaries (`GET /api/issues/{id}` includes them; ordinary list reads need `includeBlockedBy=true`), and `blockerAttention.unresolvedBlockerCount` for the unresolved dependency rollup. `blockedByIssueIds` is a request field and is not returned on issue reads.
 - `done`: finished.
 - `cancelled`: intentionally dropped.
 
