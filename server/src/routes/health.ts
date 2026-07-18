@@ -214,7 +214,7 @@ export function healthRoutes(
     if (!db) {
       res.json(
         exposeFullDetails
-          ? { status: "ok", version: serverVersion, serverInfo }
+          ? { status: "ok", version: serverVersion, serverVersion: serverVersion, serverInfo }
           : { status: "ok", deploymentMode: opts.deploymentMode },
       );
       return;
@@ -232,7 +232,7 @@ export function healthRoutes(
         status: "degraded",
         error: isTimeout ? "database_timeout" : "database_unreachable",
         ...(exposeFullDetails
-          ? { version: serverVersion, serverInfo }
+          ? { version: serverVersion, serverVersion, serverInfo }
           : {
               deploymentMode: opts.deploymentMode,
               deploymentExposure: opts.deploymentExposure,
@@ -310,6 +310,7 @@ export function healthRoutes(
     res.json({
       status: "ok",
       version: serverVersion,
+      serverVersion,
       deploymentMode: opts.deploymentMode,
       deploymentExposure: opts.deploymentExposure,
       authReady: opts.authReady,

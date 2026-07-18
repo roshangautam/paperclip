@@ -8,8 +8,10 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  canBoardManageRuntime,
   canBoardResolveRecoveryAction,
   IssueDetail,
+  readRecoveryReconcileWorkspaceId,
   shouldScrollIssueDetailToTopOnNavigation,
 } from "./IssueDetail";
 import { queryKeys } from "../lib/queryKeys";
@@ -238,6 +240,14 @@ vi.mock("../components/IssueChatThread", () => ({
   IssueChatThread: (props: {
     onWorkModeChange?: (workMode: string) => void;
     issueWorkMode?: string;
+    comments?: Array<{
+      body: string;
+      clientStatus?: string;
+      queueState?: string;
+      queueTargetRunId?: string | null;
+    }>;
+    onAdd?: (body: string) => Promise<void>;
+    onInterruptQueued?: (runId: string) => Promise<void>;
     onStopRun?: (runId: string) => Promise<void>;
     stopRunLabel?: string;
     stoppingRunLabel?: string;
@@ -1263,6 +1273,95 @@ describe("IssueDetail", () => {
     const props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as { comments?: Array<{ id: string; queueState?: string }> };
     const freshComment = props.comments?.find((comment) => comment.id === "comment-fresh");
     expect(freshComment?.queueState).toBeUndefined();
+  });
+
+  it("queues messages against a queued live run and interrupts that exact run", async () => {
+    const postedComment = createDeferred<IssueComment>();
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      status: "in_progress",
+      executionRunId: "run-queued",
+    }));
+    mockIssuesApi.addComment.mockReturnValue(postedComment.promise);
+    mockHeartbeatsApi.cancel.mockResolvedValue({});
+    mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([
+      {
+        id: "run-queued",
+        status: "queued",
+        invocationSource: "issue",
+        triggerDetail: null,
+        contextCommentId: null,
+        contextWakeCommentId: null,
+        startedAt: null,
+        finishedAt: null,
+        createdAt: "2026-04-21T00:00:01.000Z",
+        agentId: "agent-1",
+        agentName: "Coder",
+        adapterType: "codex_local",
+        issueId: "issue-1",
+      },
+    ]);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
+      onAdd: (body: string) => Promise<void>;
+    };
+    await act(async () => {
+      void props.onAdd("Queued run message");
+      await Promise.resolve();
+    });
+    await flushReact();
+
+    const queuedProps = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
+      comments?: Array<{
+        body: string;
+        clientStatus?: string;
+        queueState?: string;
+        queueTargetRunId?: string | null;
+      }>;
+      onInterruptQueued: (runId: string) => Promise<void>;
+    };
+    const optimisticComment = queuedProps.comments?.find((comment) => comment.body === "Queued run message");
+    expect(optimisticComment).toMatchObject({
+      clientStatus: "queued",
+      queueState: "queued",
+      queueTargetRunId: "run-queued",
+    });
+
+    await act(async () => {
+      postedComment.resolve(createIssueComment({ body: "Queued run message" }));
+    });
+    await flushReact();
+
+    const persistedProps = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
+      comments?: Array<{
+        body: string;
+        clientStatus?: string;
+        queueState?: string;
+        queueTargetRunId?: string | null;
+      }>;
+      onInterruptQueued: (runId: string) => Promise<void>;
+    };
+    const persistedComment = persistedProps.comments?.find((comment) => comment.body === "Queued run message");
+    expect(persistedComment).toMatchObject({
+      queueState: "queued",
+      queueTargetRunId: "run-queued",
+    });
+
+    await act(async () => {
+      await persistedProps.onInterruptQueued(persistedComment!.queueTargetRunId!);
+    });
+
+    expect(mockHeartbeatsApi.cancel).toHaveBeenCalledWith("run-queued");
+    mockHeartbeatsApi.cancel.mockClear();
   });
 
   it("does not optimistically queue a fresh comment from an unlocked stale active-run cache", async () => {
@@ -2438,7 +2537,7 @@ describe("IssueDetail", () => {
 
     const dialogContent = container.querySelector('[data-slot="dialog-content"]') as HTMLDivElement | null;
     expect(dialogContent).toBeTruthy();
-    expect(dialogContent!.className).toContain("max-h-[calc(100dvh-2rem)]");
+    expect(dialogContent!.className).toContain("max-h-(--sz-calc-18)");
     expect(dialogContent!.className).toContain("overflow-hidden");
     expect(dialogContent!.className).toContain("flex-col");
 
@@ -2507,6 +2606,132 @@ describe("canBoardResolveRecoveryAction", () => {
         userId: "user-1",
       }),
     ).toBe(false);
+  });
+});
+
+describe("canBoardManageRuntime", () => {
+  it("falls back to companyIds when memberships are not populated", () => {
+    expect(
+      canBoardManageRuntime("company-1", {
+        companyIds: ["company-1"],
+        memberships: [],
+        isInstanceAdmin: false,
+        source: "session",
+        keyId: null,
+        user: null,
+        userId: "user-1",
+      }),
+    ).toBe(true);
+  });
+
+  it("denies viewers the runtime-manage-gated break-glass affordance", () => {
+    expect(
+      canBoardManageRuntime("company-1", {
+        companyIds: ["company-1"],
+        memberships: [
+          {
+            companyId: "company-1",
+            membershipRole: "viewer",
+            status: "active",
+          },
+        ],
+        isInstanceAdmin: false,
+        source: "session",
+        keyId: null,
+        user: null,
+        userId: "user-1",
+      }),
+    ).toBe(false);
+  });
+
+  it("allows non-viewer active members (mirrors the backend runtime:manage member gate)", () => {
+    expect(
+      canBoardManageRuntime("company-1", {
+        companyIds: ["company-1"],
+        memberships: [
+          {
+            companyId: "company-1",
+            membershipRole: "operator",
+            status: "active",
+          },
+        ],
+        isInstanceAdmin: false,
+        source: "session",
+        keyId: null,
+        user: null,
+        userId: "user-1",
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("readRecoveryReconcileWorkspaceId", () => {
+  const makeAction = (evidence: Record<string, unknown>, kind = "workspace_validation") =>
+    ({ kind, evidence } as unknown as Parameters<typeof readRecoveryReconcileWorkspaceId>[0]);
+
+  it("returns null when the action is missing", () => {
+    expect(readRecoveryReconcileWorkspaceId(null)).toBeNull();
+    expect(readRecoveryReconcileWorkspaceId(undefined)).toBeNull();
+  });
+
+  it("returns null for non-workspace_validation actions even with a workspace id in evidence", () => {
+    expect(
+      readRecoveryReconcileWorkspaceId(
+        makeAction(
+          { workspaceValidation: { persistedExecutionWorkspaceId: "ws-1" } },
+          "stranded_assigned_issue",
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  it("prefers persistedExecutionWorkspaceId (git_worktree_branch_incoherence shape)", () => {
+    expect(
+      readRecoveryReconcileWorkspaceId(
+        makeAction({
+          workspaceValidation: {
+            reason: "git_worktree_branch_incoherence",
+            persistedExecutionWorkspaceId: "ws-diverged",
+            executionWorkspaceId: "ws-other",
+          },
+        }),
+      ),
+    ).toBe("ws-diverged");
+  });
+
+  it("falls back to executionWorkspaceId (git_worktree_not_reusable shape)", () => {
+    expect(
+      readRecoveryReconcileWorkspaceId(
+        makeAction({
+          workspaceValidation: {
+            reason: "git_worktree_not_reusable",
+            executionWorkspaceId: "ws-not-reusable",
+          },
+        }),
+      ),
+    ).toBe("ws-not-reusable");
+  });
+
+  it("returns null when the evidence carries no workspace reference (so the caller falls back to the page-level id)", () => {
+    expect(readRecoveryReconcileWorkspaceId(makeAction({}))).toBeNull();
+    expect(
+      readRecoveryReconcileWorkspaceId(
+        makeAction({ workspaceValidation: { reason: "git_worktree_branch_incoherence" } }),
+      ),
+    ).toBeNull();
+  });
+
+  it("ignores non-string / empty workspace ids", () => {
+    expect(
+      readRecoveryReconcileWorkspaceId(
+        makeAction({ workspaceValidation: { persistedExecutionWorkspaceId: "" } }),
+      ),
+    ).toBeNull();
+    expect(
+      readRecoveryReconcileWorkspaceId(
+        makeAction({ workspaceValidation: { persistedExecutionWorkspaceId: 42 } }),
+      ),
+    ).toBeNull();
   });
 });
 
