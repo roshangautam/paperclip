@@ -2659,6 +2659,7 @@ export function buildHostServices(
 
             if (event.type === "heartbeat.run.log" || event.type === "heartbeat.run.event") {
               notifyWorker("agents.sessions.event", {
+                companyId,
                 sessionId: params.sessionId,
                 runId: run.id,
                 seq: (payload.seq as number) ?? 0,
@@ -2671,6 +2672,7 @@ export function buildHostServices(
               const status = payload.status as string;
               if (TERMINAL_STATUSES.has(status)) {
                 notifyWorker("agents.sessions.event", {
+                  companyId,
                   sessionId: params.sessionId,
                   runId: run.id,
                   seq: 0,
@@ -2682,6 +2684,7 @@ export function buildHostServices(
                 cleanup();
               } else {
                 notifyWorker("agents.sessions.event", {
+                  companyId,
                   sessionId: params.sessionId,
                   runId: run.id,
                   seq: 0,

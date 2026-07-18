@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { definePlugin } from "../src/define-plugin.js";
 import {
+  createNotification,
   createRequest,
   createErrorResponse,
   createSuccessResponse,
@@ -288,6 +289,123 @@ describe("worker invocation scope propagation", () => {
       await companyAExpectation;
 
       expect(nestedInvocationIds).toEqual(["invocation-b", "invocation-a"]);
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  });
+
+  it("echoes the session notification invocation id from onEvent host calls", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    const callbackInvocationIds: string[] = [];
+    let nextRequestId = 1;
+    let sendSessionMessage: (() => Promise<unknown>) | null = null;
+    let resolveCallback!: () => void;
+    const callbackComplete = new Promise<void>((resolve) => {
+      resolveCallback = resolve;
+    });
+
+    const plugin = definePlugin({
+      async setup(ctx) {
+        sendSessionMessage = () => ctx.agents.sessions.sendMessage(
+          "session-1",
+          "company-a",
+          {
+            prompt: "hello",
+            onEvent: async () => {
+              await ctx.config.get();
+              resolveCallback();
+            },
+          },
+        );
+      },
+    });
+    const worker = startWorkerRpcHost({
+      plugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+
+    function callWorker(method: string, params: unknown) {
+      const id = `host-${nextRequestId++}`;
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new Error(response.error.message));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (isJsonRpcResponse(message)) {
+        pending.get(String(message.id))?.(message);
+        pending.delete(String(message.id));
+        return;
+      }
+      if (!isJsonRpcRequest(message)) return;
+
+      if (message.method === "agents.sessions.sendMessage") {
+        hostToWorker.write(serializeMessage(createSuccessResponse(message.id, { runId: "run-1" })));
+        return;
+      }
+      if (message.method === "config.get") {
+        callbackInvocationIds.push(
+          (message as { paperclipInvocationId?: string }).paperclipInvocationId ?? "",
+        );
+        hostToWorker.write(serializeMessage(createSuccessResponse(message.id, {})));
+      }
+    });
+
+    try {
+      await callWorker("initialize", {
+        manifest: {
+          id: "paperclip.session-scope-test",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Session scope test",
+          description: "Session scope test",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: ["agent.sessions.send"],
+          entrypoints: { worker: "dist/worker.js" },
+        },
+        config: {},
+        instanceInfo: { instanceId: "test", hostVersion: "0.0.0" },
+        apiVersion: 1,
+      });
+
+      expect(sendSessionMessage).not.toBeNull();
+      await sendSessionMessage!();
+      hostToWorker.write(serializeMessage({
+        ...createNotification("agents.sessions.event", {
+          companyId: "company-a",
+          sessionId: "session-1",
+          runId: "run-1",
+          seq: 1,
+          eventType: "done",
+          stream: "system",
+          message: "Run completed",
+          payload: null,
+        }),
+        paperclipInvocation: {
+          id: "session-event-invocation",
+          scope: { companyId: "company-a" },
+        },
+      }));
+
+      await callbackComplete;
+      expect(callbackInvocationIds).toEqual(["session-event-invocation"]);
     } finally {
       worker.stop();
       hostReadline.close();
