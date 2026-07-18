@@ -708,6 +708,36 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  it("renders a standalone plugin invocation as the adapter-visible primary request", () => {
+    const payload = {
+      reason: "slack_message",
+      invocationPrompt: "Reply to Slack message D0123: hello from QA",
+      invocationPromptTruncated: false,
+    };
+
+    const serialized = stringifyPaperclipWakePayload(payload);
+    expect(JSON.parse(serialized ?? "{}")).toMatchObject(payload);
+
+    const prompt = renderPaperclipWakePrompt(JSON.parse(serialized ?? "{}"));
+    expect(prompt).toContain("## Paperclip Plugin Invocation");
+    expect(prompt).toContain("Reply to Slack message D0123: hello from QA");
+    expect(prompt).not.toContain("issue: unknown");
+  });
+
+  it("keeps a plugin invocation visible when an issue wake is also present", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "plugin_message",
+      invocationPrompt: "Answer the provider message",
+      invocationPromptTruncated: true,
+      issue: { id: "issue-1", title: "Handle provider message" },
+    });
+
+    expect(prompt).toContain("## Paperclip Wake Payload");
+    expect(prompt).toContain("Plugin invocation request:");
+    expect(prompt).toContain("Answer the provider message");
+    expect(prompt).toContain("[invocation prompt truncated by Paperclip]");
+  });
+
   it("keeps the default local-agent prompt action-oriented", () => {
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain("Start actionable work in this heartbeat");
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain("do not stop at a plan");

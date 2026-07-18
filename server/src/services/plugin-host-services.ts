@@ -36,7 +36,7 @@ import { issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
-import { heartbeatService } from "./heartbeat.js";
+import { createInvocationPromptWakeContext, heartbeatService } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
@@ -2155,6 +2155,7 @@ export function buildHostServices(
           triggerDetail: "system",
           reason: params.reason ?? null,
           payload: { prompt: params.prompt },
+          contextSnapshot: createInvocationPromptWakeContext(params.prompt),
           requestedByActorType: "system",
           requestedByActorId: pluginId,
         });
@@ -2635,6 +2636,7 @@ export function buildHostServices(
             taskKey: session.taskKey,
             wakeSource: "automation",
             wakeTriggerDetail: "system",
+            ...createInvocationPromptWakeContext(params.prompt),
           },
           requestedByActorType: "system",
           requestedByActorId: pluginId,

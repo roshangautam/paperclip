@@ -315,6 +315,7 @@ const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
+export const MAX_INVOCATION_PROMPT_CHARS = 32_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -2032,6 +2033,17 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+}
+
+export function createInvocationPromptWakeContext(prompt: unknown): Record<string, unknown> {
+  if (typeof prompt !== "string") return {};
+  const normalized = prompt.trim();
+  if (!normalized) return {};
+  const truncated = normalized.length > MAX_INVOCATION_PROMPT_CHARS;
+  return {
+    invocationPrompt: truncated ? normalized.slice(0, MAX_INVOCATION_PROMPT_CHARS) : normalized,
+    invocationPromptTruncated: truncated,
+  };
 }
 
 type UsageTotals = {
@@ -4391,6 +4403,7 @@ export async function buildPaperclipWakePayload(input: {
     | null;
   exposeLowTrustRaw?: boolean;
 }) {
+  const invocationPrompt = readNonEmptyString(input.contextSnapshot.invocationPrompt);
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
   const annotationCommentId = readNonEmptyString(input.contextSnapshot.annotationCommentId);
@@ -4412,7 +4425,7 @@ export async function buildPaperclipWakePayload(input: {
           .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null);
-  if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
+  if (!invocationPrompt && commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
 
   const commentRows =
     commentIds.length === 0
@@ -4610,6 +4623,10 @@ export async function buildPaperclipWakePayload(input: {
           routingFallbackReason: readNonEmptyString(recoveryEvidence.routingFallbackReason),
         }
       : null,
+    invocationPrompt,
+    invocationPromptTruncated: invocationPrompt
+      ? input.contextSnapshot.invocationPromptTruncated === true
+      : false,
     issue: issueSummary
       ? {
           id: issueSummary.id,
