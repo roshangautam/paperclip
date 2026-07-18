@@ -1326,16 +1326,33 @@ export function renderPaperclipWakePrompt(
   if (!normalized) return "";
   const isStandaloneInvocation = Boolean(
     normalized.invocationPrompt &&
+      !normalized.recovery &&
       !normalized.issue &&
+      !normalized.checkedOutByHarness &&
+      !normalized.dependencyBlockedInteraction &&
+      !normalized.treeHoldInteraction &&
+      !normalized.activeTreeHold &&
+      normalized.unresolvedBlockerIssueIds.length === 0 &&
+      normalized.unresolvedBlockerSummaries.length === 0 &&
       normalized.commentIds.length === 0 &&
       normalized.comments.length === 0 &&
       normalized.annotationDeltas.length === 0 &&
       normalized.childIssueSummaries.length === 0 &&
+      !normalized.childIssueSummaryTruncated &&
       !normalized.executionStage &&
       !normalized.continuationSummary &&
       !normalized.planReviewContext &&
       !normalized.livenessContinuation &&
-      !normalized.taskWatchdog,
+      !normalized.taskWatchdog &&
+      !normalized.interactionKind &&
+      !normalized.interactionStatus &&
+      !normalized.checkboxSelection &&
+      !normalized.executionWorkspace &&
+      normalized.requestedCount === 0 &&
+      normalized.includedCount === 0 &&
+      normalized.missingCount === 0 &&
+      !normalized.truncated &&
+      !normalized.fallbackFetchNeeded,
   );
   if (isStandaloneInvocation) {
     return [

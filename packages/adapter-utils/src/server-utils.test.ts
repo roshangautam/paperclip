@@ -738,6 +738,24 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).toContain("[invocation prompt truncated by Paperclip]");
   });
 
+  it("keeps recovery instructions when a plugin invocation is coalesced into the wake", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "source_scoped_recovery_action",
+      invocationPrompt: "Retry the provider request",
+      invocationPromptTruncated: false,
+      recovery: {
+        cause: "process_lost",
+        failureSummary: "worker exited",
+      },
+    });
+
+    expect(prompt).toContain("## Paperclip Wake Payload");
+    expect(prompt).toContain("Recovery contract:");
+    expect(prompt).toContain("Plugin invocation request:");
+    expect(prompt).toContain("Retry the provider request");
+    expect(prompt).not.toContain("## Paperclip Plugin Invocation");
+  });
+
   it("keeps the default local-agent prompt action-oriented", () => {
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain("Start actionable work in this heartbeat");
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain("do not stop at a plan");

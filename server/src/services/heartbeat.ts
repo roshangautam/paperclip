@@ -316,6 +316,8 @@ const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 export const MAX_INVOCATION_PROMPT_CHARS = 32_000;
+const COALESCED_INVOCATION_PROMPT_SEPARATOR = "\n\n---\n\n[paperclip coalesced invocation]\n\n";
+const TRUNCATED_INVOCATION_PROMPT_MARKER = "\n\n[paperclip truncated coalesced invocation prompt]\n\n";
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -2044,6 +2046,14 @@ export function createInvocationPromptWakeContext(prompt: unknown): Record<strin
     invocationPrompt: truncated ? normalized.slice(0, MAX_INVOCATION_PROMPT_CHARS) : normalized,
     invocationPromptTruncated: truncated,
   };
+}
+
+function truncateInvocationPrompt(prompt: string, maxChars: number) {
+  if (prompt.length <= maxChars) return prompt;
+  const retainedChars = maxChars - TRUNCATED_INVOCATION_PROMPT_MARKER.length;
+  const headChars = Math.ceil(retainedChars / 2);
+  const tailChars = retainedChars - headChars;
+  return `${prompt.slice(0, headChars)}${TRUNCATED_INVOCATION_PROMPT_MARKER}${prompt.slice(-tailChars)}`;
 }
 
 type UsageTotals = {
@@ -4359,6 +4369,40 @@ export function mergeCoalescedContextSnapshot(
   };
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
+  }
+  const existingInvocationPrompt = readNonEmptyString(existing.invocationPrompt);
+  const incomingInvocationPrompt = readNonEmptyString(incoming.invocationPrompt);
+  if (existingInvocationPrompt && incomingInvocationPrompt) {
+    const availablePromptChars =
+      MAX_INVOCATION_PROMPT_CHARS - COALESCED_INVOCATION_PROMPT_SEPARATOR.length;
+    const halfAvailablePromptChars = Math.floor(availablePromptChars / 2);
+    let existingPromptBudget: number;
+    let incomingPromptBudget: number;
+    if (existingInvocationPrompt.length <= halfAvailablePromptChars) {
+      existingPromptBudget = existingInvocationPrompt.length;
+      incomingPromptBudget = availablePromptChars - existingPromptBudget;
+    } else if (incomingInvocationPrompt.length <= halfAvailablePromptChars) {
+      incomingPromptBudget = incomingInvocationPrompt.length;
+      existingPromptBudget = availablePromptChars - incomingPromptBudget;
+    } else {
+      existingPromptBudget = halfAvailablePromptChars;
+      incomingPromptBudget = availablePromptChars - existingPromptBudget;
+    }
+    const retainedExistingPrompt = truncateInvocationPrompt(
+      existingInvocationPrompt,
+      existingPromptBudget,
+    );
+    const retainedIncomingPrompt = truncateInvocationPrompt(
+      incomingInvocationPrompt,
+      incomingPromptBudget,
+    );
+    merged.invocationPrompt =
+      `${retainedExistingPrompt}${COALESCED_INVOCATION_PROMPT_SEPARATOR}${retainedIncomingPrompt}`;
+    merged.invocationPromptTruncated =
+      retainedExistingPrompt.length < existingInvocationPrompt.length ||
+      retainedIncomingPrompt.length < incomingInvocationPrompt.length ||
+      existing.invocationPromptTruncated === true ||
+      incoming.invocationPromptTruncated === true;
   }
   const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {

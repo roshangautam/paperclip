@@ -2150,12 +2150,13 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
+        const invocationPromptContext = createInvocationPromptWakeContext(params.prompt);
         const run = await heartbeat.wakeup(params.agentId, {
           source: "automation",
           triggerDetail: "system",
           reason: params.reason ?? null,
-          payload: { prompt: params.prompt },
-          contextSnapshot: createInvocationPromptWakeContext(params.prompt),
+          payload: { prompt: invocationPromptContext.invocationPrompt ?? null },
+          contextSnapshot: invocationPromptContext,
           requestedByActorType: "system",
           requestedByActorId: pluginId,
         });
@@ -2627,16 +2628,17 @@ export function buildHostServices(
           .then((rows) => rows[0] ?? null);
         if (!session) throw new Error(`Session not found: ${params.sessionId}`);
 
+        const invocationPromptContext = createInvocationPromptWakeContext(params.prompt);
         const run = await heartbeat.wakeup(session.agentId, {
           source: "automation",
           triggerDetail: "system",
           reason: params.reason ?? null,
-          payload: { prompt: params.prompt },
+          payload: { prompt: invocationPromptContext.invocationPrompt ?? null },
           contextSnapshot: {
             taskKey: session.taskKey,
             wakeSource: "automation",
             wakeTriggerDetail: "system",
-            ...createInvocationPromptWakeContext(params.prompt),
+            ...invocationPromptContext,
           },
           requestedByActorType: "system",
           requestedByActorId: pluginId,
