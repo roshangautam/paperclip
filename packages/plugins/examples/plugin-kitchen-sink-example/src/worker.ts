@@ -50,6 +50,7 @@ type KitchenSinkConfig = {
 
 type DemoRecord = {
   id: string;
+  companyId?: string;
   level: "info" | "warning" | "error";
   source: string;
   message: string;
@@ -112,6 +113,18 @@ async function writeInstanceState(ctx: PluginContext, stateKey: string, value: u
 
 async function readInstanceState<T = unknown>(ctx: PluginContext, stateKey: string): Promise<T | null> {
   return await ctx.state.get({ scopeKind: "instance", stateKey }) as T | null;
+}
+
+async function readCompanyState<T = unknown>(
+  ctx: PluginContext,
+  companyId: string,
+  stateKey: string,
+): Promise<T | null> {
+  return await ctx.state.get({
+    scopeKind: "company",
+    scopeId: companyId,
+    stateKey,
+  }) as T | null;
 }
 
 async function resolveWorkspace(
@@ -246,8 +259,10 @@ async function listGoalsForCompany(ctx: PluginContext, companyId: string, limit 
   return await ctx.goals.list({ companyId, limit, offset: 0 });
 }
 
-function recentRecordsSnapshot(): DemoRecord[] {
-  return recentRecords.slice(0, 20);
+function recentRecordsSnapshot(companyId?: string): DemoRecord[] {
+  return recentRecords
+    .filter((record) => !record.companyId || record.companyId === companyId)
+    .slice(0, 20);
 }
 
 function runtimeLaunchersSnapshot(): PluginLauncherRegistration[] {
@@ -269,7 +284,9 @@ async function registerDataHandlers(ctx: PluginContext): Promise<void> {
     const goals = companyId ? await listGoalsForCompany(ctx, companyId, 200) : [];
     const agents = companyId ? await ctx.agents.list({ companyId, limit: 200, offset: 0 }) : [];
     const lastJob = await readInstanceState(ctx, "last-job-run");
-    const lastWebhook = await readInstanceState(ctx, "last-webhook");
+    const lastWebhook = companyId
+      ? await readCompanyState(ctx, companyId, "last-webhook")
+      : null;
     const entityRecords = await ctx.entities.list({ limit: 10 } satisfies PluginEntityQuery);
     return {
       pluginId: PLUGIN_ID,
@@ -277,7 +294,7 @@ async function registerDataHandlers(ctx: PluginContext): Promise<void> {
       capabilities: ctx.manifest.capabilities,
       config,
       runtimeLaunchers: runtimeLaunchersSnapshot(),
-      recentRecords: recentRecordsSnapshot(),
+      recentRecords: recentRecordsSnapshot(companyId || undefined),
       counts: {
         companies: companies.length,
         projects: projects.length,
@@ -407,6 +424,7 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
       emittedAt: new Date().toISOString(),
     });
     pushRecord({
+      companyId,
       level: "info",
       source: "events.emit",
       message,
@@ -1028,6 +1046,7 @@ const plugin: PaperclipPlugin = definePlugin({
 
   async onWebhook(input: PluginWebhookInput) {
     const payload = {
+      companyId: input.companyId,
       endpointKey: input.endpointKey,
       requestId: input.requestId,
       rawBody: input.rawBody,
@@ -1036,9 +1055,14 @@ const plugin: PaperclipPlugin = definePlugin({
     };
     const ctx = currentContext;
     if (ctx) {
-      await writeInstanceState(ctx, "last-webhook", payload);
+      await ctx.state.set({
+        scopeKind: "company",
+        scopeId: input.companyId,
+        stateKey: "last-webhook",
+      }, payload);
     }
     pushRecord({
+      companyId: input.companyId,
       level: "info",
       source: "webhook",
       message: `Received webhook ${input.endpointKey}`,

@@ -816,8 +816,8 @@ pnpm paperclipai plugin config:test <plugin-id> --company-id <company-id> --payl
 pnpm paperclipai plugin jobs <plugin-id>
 pnpm paperclipai plugin job:runs <plugin-id> <job-id>
 pnpm paperclipai plugin job:trigger <plugin-id> <job-id> [--payload-json '{...}']
-pnpm paperclipai plugin webhook <plugin-id> <endpoint-key> [--payload-json '{...}']
-pnpm paperclipai plugin dashboard <plugin-id>
+pnpm paperclipai plugin webhook <plugin-id> <endpoint-key> --company-id <company-id> [--payload-json '{...}']
+pnpm paperclipai plugin dashboard <plugin-id> --company-id <company-id>
 pnpm paperclipai plugin bridge:data <plugin-id> --payload-json '{...}'
 pnpm paperclipai plugin bridge:action <plugin-id> --payload-json '{...}'
 pnpm paperclipai plugin bridge:stream <plugin-id> <channel> [--duration-ms 10000]

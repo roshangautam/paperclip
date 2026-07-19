@@ -798,13 +798,12 @@ export function pluginRegistryService(db: Db) {
      *
      * Pass the owning `companyId` so `plugin_webhook_deliveries.company_id` is
      * populated and the row participates in the `ON DELETE CASCADE` from
-     * `companies`. `null` is the explicit instance-scope marker (public
-     * webhooks without a tenant); those rows survive company deletes but are
-     * still attributable.
+     * `companies`. `null` is reserved for legacy or internal instance-scope
+     * records; those rows survive company deletes but are still attributable.
      *
      * @param pluginId - The UUID of the receiving plugin.
      * @param webhookKey - The endpoint key defined in the manifest.
-     * @param companyId - Tenant scope; `null` for instance-scope deliveries.
+     * @param companyId - Tenant scope; `null` only for legacy or internal records.
      * @param input - The payload, headers, and optional external ID.
      * @returns The newly created `PluginWebhookDeliveryRecord` in 'pending' status.
      */

@@ -153,6 +153,19 @@ describe("openapi routes", () => {
     expect(res.body.paths["/api/openapi.json"].get.summary).toBe("Get the generated OpenAPI document");
     expect(res.body.paths["/api/companies/{companyId}/agents"].get.summary).toBe("List agents in a company");
     expect(res.body.paths["/api/agents/{id}/keys"].post.summary).toBe("Create an agent API key");
+    expect(
+      res.body.paths["/api/companies/{companyId}/plugins/{pluginId}/webhooks/{endpointKey}"].post,
+    ).toMatchObject({
+      summary: "Deliver a company-scoped external webhook payload to a plugin",
+      security: [],
+    });
+    expect(
+      res.body.paths["/api/plugins/{pluginId}/webhooks/{endpointKey}"].post,
+    ).toMatchObject({
+      summary: "Reject a legacy webhook URL without company scope",
+      security: [],
+      responses: { "404": expect.any(Object) },
+    });
     expect(res.body.components.securitySchemes).toMatchObject({
       BoardSessionAuth: { type: "apiKey", in: "cookie" },
       BoardApiKeyAuth: { type: "http", scheme: "bearer" },

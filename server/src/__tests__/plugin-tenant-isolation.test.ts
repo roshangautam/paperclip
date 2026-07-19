@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
+import express from "express";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   companies,
@@ -13,6 +15,8 @@ import {
 } from "@paperclipai/db";
 import { buildHostServices, flushPluginLogBuffer } from "../services/plugin-host-services.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
+import { errorHandler } from "../middleware/index.js";
+import { pluginRoutes } from "../routes/plugins.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -102,6 +106,23 @@ describeEmbeddedPostgres("plugin tenant isolation (company_id FK)", () => {
     return companyId;
   }
 
+  function createDashboardApp(companyIds: string[]) {
+    const app = express();
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "tenant-dashboard-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds,
+      };
+      next();
+    });
+    app.use("/api", pluginRoutes(db, {} as never));
+    app.use(errorHandler);
+    return app;
+  }
+
   it("allows NULL company_id on plugin_logs (instance-scope rows behave as before)", async () => {
     const pluginId = await seedPlugin();
     await db.insert(pluginLogs).values({
@@ -186,6 +207,40 @@ describeEmbeddedPostgres("plugin tenant isolation (company_id FK)", () => {
     expect(deliveries.map((r) => r.companyId).sort((a, b) => String(a).localeCompare(String(b)))).toEqual(
       [companyB, null].sort((a, b) => String(a).localeCompare(String(b))),
     );
+  });
+
+  it("returns webhook dashboard history only for an authorized company", async () => {
+    const pluginId = await seedPlugin();
+    const companyA = await seedCompany();
+    const companyB = await seedCompany();
+    await db.insert(pluginWebhookDeliveries).values([
+      { pluginId, companyId: companyA, webhookKey: "company-a", payload: { who: "A" } },
+      { pluginId, companyId: companyB, webhookKey: "company-b", payload: { who: "B" } },
+      { pluginId, webhookKey: "instance", payload: { who: "instance" } },
+    ]);
+
+    const app = createDashboardApp([companyA]);
+    const allowed = await request(app)
+      .get(`/api/plugins/${pluginId}/dashboard`)
+      .query({ companyId: companyA });
+
+    expect(allowed.status).toBe(200);
+    expect(allowed.body.recentWebhookDeliveries).toHaveLength(1);
+    expect(allowed.body.recentWebhookDeliveries[0]?.webhookKey).toBe("company-a");
+
+    const forbidden = await request(app)
+      .get(`/api/plugins/${pluginId}/dashboard`)
+      .query({ companyId: companyB });
+    expect(forbidden.status).toBe(403);
+
+    const missingScope = await request(app).get(`/api/plugins/${pluginId}/dashboard`);
+    expect(missingScope.status).toBe(400);
+
+    const invalidScope = await request(app)
+      .get(`/api/plugins/${pluginId}/dashboard`)
+      .query({ companyId: "not-a-uuid" });
+    expect(invalidScope.status).toBe(400);
+    expect(invalidScope.body).toEqual({ error: '"companyId" must be a valid UUID' });
   });
 
   it("plugin_entities unique index is scoped per company — two tenants can share (pluginId, entityType, externalId)", async () => {

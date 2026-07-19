@@ -52,7 +52,7 @@ export const pluginEntities = pgTable(
     /**
      * Per-tenant uniqueness on (companyId, pluginId, entityType, externalId).
      * `.nullsNotDistinct()` is required because companyId is nullable for
-     * instance-scope entities (cron jobs, public webhooks): without it,
+     * instance-scope entities (cron jobs or internal host work): without it,
      * postgres treats two NULL company_ids as distinct and a tuple like
      * `(NULL, pluginId, entityType, externalId)` can be inserted multiple
      * times, losing the dedup guarantee. Same pattern as plugin_state.ts.
