@@ -1002,8 +1002,8 @@ npx paperclipai plugin config:test <plugin-id> --company-id <company-id> --paylo
 npx paperclipai plugin jobs <plugin-id>
 npx paperclipai plugin job:runs <plugin-id> <job-id>
 npx paperclipai plugin job:trigger <plugin-id> <job-id> [--payload-json '{...}']
-npx paperclipai plugin webhook <plugin-id> <endpoint-key> [--payload-json '{...}']
-npx paperclipai plugin dashboard <plugin-id>
+npx paperclipai plugin webhook <plugin-id> <endpoint-key> --company-id <company-id> [--payload-json '{...}']
+npx paperclipai plugin dashboard <plugin-id> --company-id <company-id>
 npx paperclipai plugin bridge:data <plugin-id> --payload-json '{...}'
 npx paperclipai plugin bridge:action <plugin-id> --payload-json '{...}'
 npx paperclipai plugin bridge:stream <plugin-id> <channel> [--duration-ms 10000]

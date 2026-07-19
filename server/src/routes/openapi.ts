@@ -779,6 +779,8 @@ const PUBLIC_OPERATIONS = new Set([
   "POST /mcp/gateways/{gatewayPublicId}",
   "GET /api/tool-gateway/gateways/{gatewayId}/mcp",
   "POST /api/tool-gateway/gateways/{gatewayId}/mcp",
+  "POST /api/plugins/{pluginId}/webhooks/{endpointKey}",
+  "POST /api/companies/{companyId}/plugins/{pluginId}/webhooks/{endpointKey}",
 ]);
 
 const BOARD_ONLY_PREFIXES = [
@@ -5944,20 +5946,38 @@ registry.registerPath({
   method: "post",
   path: "/api/plugins/{pluginId}/webhooks/{endpointKey}",
   tags: ["plugins"],
-  summary: "Deliver an external webhook payload to a plugin",
+  summary: "Reject a legacy webhook URL without company scope",
   request: {
     params: z.object({ pluginId: z.string(), endpointKey: z.string() }),
   },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/plugins/{pluginId}/webhooks/{endpointKey}",
+  tags: ["plugins"],
+  summary: "Deliver a company-scoped external webhook payload to a plugin",
+  request: {
+    params: z.object({
+      companyId: z.string().uuid(),
+      pluginId: z.string(),
+      endpointKey: z.string(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 404: r.notFound },
 });
 
 registry.registerPath({
   method: "get",
   path: "/api/plugins/{pluginId}/dashboard",
   tags: ["plugins"],
-  summary: "Get plugin dashboard data",
-  request: { params: z.object({ pluginId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  summary: "Get company-scoped plugin dashboard data",
+  request: {
+    params: z.object({ pluginId: z.string() }),
+    query: z.object({ companyId: z.string().uuid() }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
