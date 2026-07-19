@@ -15,9 +15,10 @@ import type { PluginWebhookDeliveryStatus } from "@paperclipai/shared";
  * `plugin_webhook_deliveries` table — inbound webhook delivery history for plugins.
  *
  * When an external system sends an HTTP POST to a plugin's registered webhook
- * endpoint (e.g. `/api/plugins/:pluginKey/webhooks/:webhookKey`), the server
- * creates a row in this table before dispatching the payload to the plugin
- * worker. This provides an auditable log of every delivery attempt.
+ * endpoint (e.g.
+ * `/api/companies/:companyId/plugins/:pluginId/webhooks/:webhookKey`), the
+ * server creates a row in this table before dispatching the payload to the
+ * plugin worker. This provides an auditable log of every delivery attempt.
  *
  * The `webhook_key` matches the key declared in the plugin manifest's
  * `webhooks` array. `external_id` is an optional identifier supplied by the
@@ -40,7 +41,7 @@ export const pluginWebhookDeliveries = pgTable(
     pluginId: uuid("plugin_id")
       .notNull()
       .references(() => plugins.id, { onDelete: "cascade" }),
-    /** Company scope — NULL for instance-level webhook deliveries. */
+    /** Company scope — NULL only for legacy or internal instance-level records. */
     companyId: uuid("company_id").references(() => companies.id, { onDelete: "cascade" }),
     /** Identifier matching the key in the plugin manifest's `webhooks` array. */
     webhookKey: text("webhook_key").notNull(),

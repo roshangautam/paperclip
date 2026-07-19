@@ -593,6 +593,7 @@ Receives inbound webhook payload routed by the host.
 
 The host provides:
 
+- company id
 - endpoint key
 - headers
 - raw body
@@ -988,15 +989,17 @@ Plugins may declare webhook endpoints in their manifest.
 
 Webhook route shape:
 
-- `POST /api/plugins/:pluginId/webhooks/:endpointKey`
+- `POST /api/companies/:companyId/plugins/:pluginId/webhooks/:endpointKey`
 
 Rules:
 
 1. The host owns the public route.
-2. The worker receives the request body through `handleWebhook`.
-3. Signature verification happens in plugin code using secret refs resolved by the host.
-4. Every delivery is recorded.
-5. Webhook handling must be idempotent.
+2. The URL company is the authoritative tenant scope; body and header values cannot override it.
+3. The company must exist. A plugin configuration row is optional so newly installed or configless plugins can receive webhooks.
+4. The worker receives the company id and request body through `handleWebhook`.
+5. Signature verification happens in plugin code using secret refs resolved by the host within that company scope.
+6. Every delivery is recorded with its company id.
+7. Webhook handling must be idempotent.
 
 ## 19. UI Extension Model
 
@@ -1369,22 +1372,24 @@ Indexes:
 
 - `id` uuid pk
 - `plugin_id` uuid fk `plugins.id` not null
-- `scope_kind` enum nullable
-- `scope_id` uuid/text null
-- `endpoint_key` text not null
-- `status` enum: `received | processed | failed | ignored`
-- `request_id` text null
-- `headers_json` jsonb null
-- `body_json` jsonb null
-- `received_at` timestamptz not null
-- `handled_at` timestamptz null
-- `response_code` int null
+- `company_id` uuid fk `companies.id` nullable only for legacy or internal records
+- `webhook_key` text not null
+- `external_id` text null
+- `status` enum: `pending | success | failed`
+- `duration_ms` int null
 - `error` text null
+- `payload` jsonb not null
+- `headers` jsonb not null
+- `started_at` timestamptz null
+- `finished_at` timestamptz null
+- `created_at` timestamptz not null
 
 Indexes:
 
-- `(plugin_id, received_at desc)`
-- `(plugin_id, endpoint_key, received_at desc)`
+- `(plugin_id)`
+- `(company_id)`
+- `(status)`
+- `(webhook_key)`
 
 ### `plugin_entities` (optional but recommended)
 

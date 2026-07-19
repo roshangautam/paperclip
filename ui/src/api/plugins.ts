@@ -113,7 +113,8 @@ export interface PluginDashboardWebhookDelivery {
 }
 
 /**
- * Aggregated health dashboard data returned by `GET /api/plugins/:pluginId/dashboard`.
+ * Aggregated health dashboard data returned by
+ * `GET /api/plugins/:pluginId/dashboard?companyId=:companyId`.
  *
  * Contains worker diagnostics, recent job runs, recent webhook deliveries,
  * and the current health check result — all in a single response.
@@ -293,9 +294,12 @@ export const pluginsApi = {
    * {@link PluginSettings} page to render the runtime dashboard section.
    *
    * @param pluginId - UUID of the plugin.
+   * @param companyId - UUID of the company whose webhook deliveries to return.
    */
-  dashboard: (pluginId: string) =>
-    api.get<PluginDashboardData>(`/plugins/${pluginId}/dashboard`),
+  dashboard: (pluginId: string, companyId: string) =>
+    api.get<PluginDashboardData>(
+      `/plugins/${pluginId}/dashboard?companyId=${encodeURIComponent(companyId)}`,
+    ),
 
   /**
    * Fetch recent log entries for a plugin.
