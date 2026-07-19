@@ -136,6 +136,8 @@ export interface PluginConfigValidationResult {
  * @see PLUGIN_SPEC.md §13.7 — `handleWebhook`
  */
 export interface PluginWebhookInput {
+  /** Company whose scoped plugin configuration handles this delivery. */
+  companyId: string;
   /** Endpoint key matching the manifest declaration. */
   endpointKey: string;
   /** Inbound request headers. */
@@ -315,9 +317,10 @@ export interface PluginDefinition {
   /**
    * Called to handle an inbound webhook delivery.
    *
-   * The host routes `POST /api/plugins/:pluginId/webhooks/:endpointKey` to
-   * this handler. The plugin is responsible for signature verification using
-   * a resolved secret ref.
+   * The host routes
+   * `POST /api/companies/:companyId/plugins/:pluginId/webhooks/:endpointKey`
+   * to this handler. The plugin is responsible for signature verification
+   * using a secret ref resolved within that company scope.
    *
    * If not implemented but webhooks are declared in the manifest, the host
    * returns HTTP 501 for webhook deliveries.

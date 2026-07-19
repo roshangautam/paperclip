@@ -418,7 +418,7 @@ interface BufferedLogEntry {
    * Owning tenant for `plugin_logs.company_id` — populated when the caller
    * attributes the log/metric to a specific company so the row participates
    * in the `ON DELETE CASCADE` from `companies`. `null` means instance-scope
-   * (cron jobs / public webhooks without a tenant); those rows survive
+   * (for example, internal host work without a tenant); those rows survive
    * company deletes but are still attributable.
    */
   companyId: string | null;

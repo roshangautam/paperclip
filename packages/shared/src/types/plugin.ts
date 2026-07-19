@@ -88,7 +88,7 @@ export interface PluginJobDeclaration {
 
 /**
  * Declares a webhook endpoint the plugin can receive.
- * Route: `POST /api/plugins/:pluginId/webhooks/:endpointKey`
+ * Route: `POST /api/companies/:companyId/plugins/:pluginId/webhooks/:endpointKey`
  *
  * @see PLUGIN_SPEC.md §18 — Webhooks
  */
@@ -948,6 +948,8 @@ export interface PluginWebhookDeliveryRecord {
   id: string;
   /** FK to `plugins.id`. */
   pluginId: string;
+  /** Owning company scope; null only for legacy or internal instance-level records. */
+  companyId: string | null;
   /** Webhook endpoint key matching the manifest. */
   webhookKey: string;
   /** External identifier from the remote system. */

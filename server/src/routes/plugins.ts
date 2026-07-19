@@ -485,7 +485,7 @@ interface PluginToolExecuteRequest {
  * | GET | /plugins/:pluginId/jobs | List jobs for a plugin |
  * | GET | /plugins/:pluginId/jobs/:jobId/runs | List runs for a job |
  * | POST | /plugins/:pluginId/jobs/:jobId/trigger | Manually trigger a job |
- * | POST | /plugins/:pluginId/webhooks/:endpointKey | Receive inbound webhook |
+ * | POST | /companies/:companyId/plugins/:pluginId/webhooks/:endpointKey | Receive inbound webhook |
  * | GET | /plugins/tools | List all available plugin tools |
  * | GET | /plugins/tools?pluginId=... | List tools for a specific plugin |
  * | POST | /plugins/tools/execute | Execute a plugin tool |
@@ -727,6 +727,9 @@ export function pluginRoutes(
       throw badRequest('"companyId" is required and must be a non-empty string');
     }
     const scopedCompanyId = companyId.trim();
+    if (!UUID_REGEX.test(scopedCompanyId)) {
+      throw badRequest('"companyId" must be a valid UUID');
+    }
     assertCompanyAccess(req, scopedCompanyId);
     return scopedCompanyId;
   }
@@ -2638,15 +2641,16 @@ export function pluginRoutes(
   // ===========================================================================
 
   /**
-   * POST /api/plugins/:pluginId/webhooks/:endpointKey
+   * POST /api/companies/:companyId/plugins/:pluginId/webhooks/:endpointKey
    *
    * Receive an inbound webhook delivery for a plugin.
    *
    * This route is called by external systems (e.g. GitHub, Linear, Stripe) to
    * deliver webhook payloads to a plugin. The host validates that:
-   * 1. The plugin exists and is in 'ready' state
-   * 2. The plugin declares the `webhooks.receive` capability
-   * 3. The `endpointKey` matches a declared webhook in the manifest
+   * 1. The company exists
+   * 2. The plugin exists and is in 'ready' state
+   * 3. The plugin declares the `webhooks.receive` capability
+   * 4. The `endpointKey` matches a declared webhook in the manifest
    *
    * The delivery is recorded in the `plugin_webhook_deliveries` table and
    * dispatched to the worker via the `handleWebhook` RPC method.
@@ -2664,17 +2668,38 @@ export function pluginRoutes(
    *
    * Response: RPC result body (or `{ deliveryId: string, status: string }` by default)
    * Errors:
-   * - 404 if plugin not found or endpointKey not declared
+   * - 404 if the company, plugin, or endpointKey is not found
    * - 400 if plugin is not in ready state or lacks webhooks.receive capability
    * - 502 if the worker is unavailable or the RPC call fails
    */
-  router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
+  router.post("/plugins/:pluginId/webhooks/:endpointKey", (_req, res) => {
+    res.status(404).json({ error: "Company-scoped webhook endpoint required" });
+  });
+
+  router.post("/companies/:companyId/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
     if (!webhookDeps) {
       res.status(501).json({ error: "Webhook ingestion is not enabled" });
       return;
     }
 
-    const { pluginId, endpointKey } = req.params;
+    const { companyId, pluginId, endpointKey } = req.params;
+
+    // The URL is the authoritative tenant scope. Never accept webhook scope
+    // from an unauthenticated request body or header.
+    if (!UUID_REGEX.test(companyId)) {
+      res.status(400).json({ error: "Invalid company ID" });
+      return;
+    }
+
+    const company = await db
+      .select({ id: companies.id })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0] ?? null);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
 
     // Step 1: Resolve the plugin
     const plugin = await resolvePlugin(registry, pluginId);
@@ -2743,6 +2768,7 @@ export function pluginRoutes(
       .insert(pluginWebhookDeliveries)
       .values({
         pluginId: plugin.id,
+        companyId,
         webhookKey: endpointKey,
         status: "pending",
         payload,
@@ -2754,6 +2780,7 @@ export function pluginRoutes(
     // Step 7: Dispatch to the worker via handleWebhook RPC
     try {
       const result = await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
+        companyId,
         endpointKey,
         headers: req.headers as Record<string, string | string[]>,
         rawBody,
@@ -2973,20 +3000,22 @@ export function pluginRoutes(
   // ===========================================================================
 
   /**
-   * GET /api/plugins/:pluginId/dashboard
+   * GET /api/plugins/:pluginId/dashboard?companyId=:companyId
    *
    * Aggregated health dashboard data for a plugin's settings page.
    *
    * Returns worker diagnostics (status, uptime, crash history), recent job
-   * runs, recent webhook deliveries, and the current health check result —
-   * all in a single response to avoid multiple round-trips.
+   * runs, company-scoped recent webhook deliveries, and the current health
+   * check result — all in a single response to avoid multiple round-trips.
    *
    * Response: PluginDashboardData
-   * Errors: 404 if plugin not found
+   * Errors: 400 if companyId is missing, 403 if the actor cannot access the
+   * company, or 404 if the plugin is not found
    */
   router.get("/plugins/:pluginId/dashboard", async (req, res) => {
     assertBoardOrgAccess(req);
     const { pluginId } = req.params;
+    const companyId = requirePluginConfigCompanyId(req, req.query.companyId);
 
     const plugin = await resolvePlugin(registry, pluginId);
     if (!plugin) {
@@ -3090,7 +3119,10 @@ export function pluginRoutes(
           createdAt: pluginWebhookDeliveries.createdAt,
         })
         .from(pluginWebhookDeliveries)
-        .where(eq(pluginWebhookDeliveries.pluginId, plugin.id))
+        .where(and(
+          eq(pluginWebhookDeliveries.pluginId, plugin.id),
+          eq(pluginWebhookDeliveries.companyId, companyId),
+        ))
         .orderBy(desc(pluginWebhookDeliveries.createdAt))
         .limit(10);
 

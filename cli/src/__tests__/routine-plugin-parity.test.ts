@@ -85,8 +85,8 @@ describe("routine and plugin parity commands", () => {
     await run(["plugin", "jobs", "plug"]);
     await run(["plugin", "job:runs", "plug", "job1"]);
     await run(["plugin", "job:trigger", "plug", "job1"]);
-    await run(["plugin", "webhook", "plug", "endpoint", "--payload-json", "{}"]);
-    await run(["plugin", "dashboard", "plug"]);
+    await run(["plugin", "webhook", "plug", "endpoint", "--company-id", COMPANY_ID, "--payload-json", "{}"]);
+    await run(["plugin", "dashboard", "plug", "--company-id", COMPANY_ID]);
     await run(["plugin", "bridge:data", "plug", "--payload-json", "{}"]);
     await run(["plugin", "bridge:action", "plug", "--payload-json", "{}"]);
     await run(["plugin", "bridge:stream", "plug", "events", "--duration-ms", "1"]);
@@ -110,8 +110,8 @@ describe("routine and plugin parity commands", () => {
       ["GET", "http://localhost:3100/api/plugins/plug/jobs"],
       ["GET", "http://localhost:3100/api/plugins/plug/jobs/job1/runs"],
       ["POST", "http://localhost:3100/api/plugins/plug/jobs/job1/trigger"],
-      ["POST", "http://localhost:3100/api/plugins/plug/webhooks/endpoint"],
-      ["GET", "http://localhost:3100/api/plugins/plug/dashboard"],
+      ["POST", `http://localhost:3100/api/companies/${COMPANY_ID}/plugins/plug/webhooks/endpoint`],
+      ["GET", `http://localhost:3100/api/plugins/plug/dashboard?companyId=${COMPANY_ID}`],
       ["POST", "http://localhost:3100/api/plugins/plug/bridge/data"],
       ["POST", "http://localhost:3100/api/plugins/plug/bridge/action"],
       ["GET", "http://localhost:3100/api/plugins/plug/bridge/stream/events"],

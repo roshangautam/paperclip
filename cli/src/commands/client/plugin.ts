@@ -688,8 +688,8 @@ export function registerPluginCommands(program: Command): void {
   addPluginSubGet(plugin, "jobs", "List plugin jobs", "jobs");
   addPluginJobGet(plugin, "job:runs", "List plugin job runs", "runs");
   addPluginJobPost(plugin, "job:trigger", "Trigger a plugin job", "trigger");
-  addPluginKeyPost(plugin, "webhook", "Deliver a plugin webhook", "webhooks");
-  addPluginSubGet(plugin, "dashboard", "Get plugin dashboard data", "dashboard");
+  addPluginWebhookPost(plugin, "webhook", "Deliver a plugin webhook");
+  addPluginDashboardGet(plugin, "dashboard", "Get company-scoped plugin dashboard data");
   addPluginSubPost(plugin, "bridge:data", "Send plugin bridge data", "bridge/data");
   addPluginSubPost(plugin, "bridge:action", "Send plugin bridge action", "bridge/action");
   addCommonClientOptions(
@@ -841,6 +841,58 @@ function addPluginKeyPost(parent: Command, name: string, description: string, su
       handleCommandError(err);
     }
   }));
+}
+
+function addPluginWebhookPost(parent: Command, name: string, description: string): void {
+  addCommonClientOptions(
+    parent
+      .command(name)
+      .description(description)
+      .argument("<pluginId>", "Plugin ID or key")
+      .argument("<endpointKey>", "Webhook endpoint key")
+      .option("--payload-json <json>", "JSON payload", "{}")
+      .action(async (pluginId: string, endpointKey: string, opts: PluginCompanyOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const companyId = ctx.companyId;
+          if (!companyId) throw new Error("Company ID is required");
+          printOutput(
+            await ctx.api.post(
+              `/api/companies/${encodeURIComponent(companyId)}/plugins/${encodeURIComponent(pluginId)}/webhooks/${encodeURIComponent(endpointKey)}`,
+              parseJson(opts.payloadJson ?? "{}"),
+            ),
+            { json: ctx.json },
+          );
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: true },
+  );
+}
+
+function addPluginDashboardGet(parent: Command, name: string, description: string): void {
+  addCommonClientOptions(
+    parent
+      .command(name)
+      .description(description)
+      .argument("<pluginId>", "Plugin ID or key")
+      .action(async (pluginId: string, opts: PluginCompanyOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const companyId = requireCompanyId(ctx);
+          printOutput(
+            await ctx.api.get(
+              `/api/plugins/${encodeURIComponent(pluginId)}/dashboard?companyId=${encodeURIComponent(companyId)}`,
+            ),
+            { json: ctx.json },
+          );
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: true },
+  );
 }
 
 function addPluginLocalFolderGet(parent: Command, name: string, description: string): void {

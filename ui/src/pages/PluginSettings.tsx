@@ -46,7 +46,7 @@ import {
  * - `GET /api/plugins/:pluginId` — plugin record (refreshes on mount).
  * - `GET /api/plugins/:pluginId/health` — health diagnostics (polling).
  *   Only fetched when `plugin.status === "ready"`.
- * - `GET /api/plugins/:pluginId/dashboard` — aggregated runtime dashboard data (polling).
+ * - `GET /api/plugins/:pluginId/dashboard?companyId=:companyId` — aggregated runtime dashboard data (polling).
  * - `GET /api/plugins/:pluginId/config` — current config values.
  * - `POST /api/plugins/:pluginId/config` — save config values.
  * - `POST /api/plugins/:pluginId/config/test` — test configuration.
@@ -79,9 +79,9 @@ export function PluginSettings() {
   });
 
   const { data: dashboardData } = useQuery({
-    queryKey: queryKeys.plugins.dashboard(pluginId!),
-    queryFn: () => pluginsApi.dashboard(pluginId!),
-    enabled: !!pluginId,
+    queryKey: queryKeys.plugins.dashboard(pluginId!, selectedCompanyId!),
+    queryFn: () => pluginsApi.dashboard(pluginId!, selectedCompanyId!),
+    enabled: !!pluginId && !!selectedCompanyId,
     refetchInterval: 30000,
   });
 

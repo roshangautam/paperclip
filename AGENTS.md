@@ -177,6 +177,10 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 
 For `roshangautam/paperclip`, create fork-development PRs with `--base truenas/local`. The `master` branch mirrors `paperclipai/paperclip:master` and is reserved for upstream synchronization; do not merge fork-only changes into it. Configure Paperclip execution workspaces for this repository with `baseRef: "origin/truenas/local"` rather than relying on the runtime's `origin/master` fallback.
 
+#### Fork Review Policy
+
+`roshangautam/paperclip` has no Greptile integration. Do not request, wait for, or report Greptile as a review gate, even when an upstream template or generic skill mentions it. Run an exact-head local review against the fork base (`codex review --base origin/truenas/local`), address actionable findings, and repeat after changes until the local review is clean. GitHub Copilot review may be requested after pushing as an optional second review. Always evaluate CI and review feedback against the PR's latest head SHA.
+
 #### Upstream Release Synchronization
 
 When advancing `truenas/local` to an upstream release, rebuild the fork history on the exact upstream release tag, then replay every fork-only commit on top of that tag. Inventory the old branch first and account for every commit; do not replay commits that are already ancestors of the new tag. Do not merge an upstream tag or `master` into `truenas/local`, and do not squash-merge an integration branch that contains an upstream merge: the resulting tree may be correct while the upstream tag is still absent from the branch's ancestry.

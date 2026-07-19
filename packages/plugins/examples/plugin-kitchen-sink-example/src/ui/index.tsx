@@ -1532,14 +1532,21 @@ function KitchenSinkConsole({ context }: { context: { companyId: string | null; 
   }
 
   async function sendWebhook() {
+    if (!companyId) {
+      setWebhookOutput({ error: "Select a company before sending a webhook." });
+      return;
+    }
     try {
-      const response = await hostFetchJson(`/api/plugins/${PLUGIN_ID}/webhooks/${WEBHOOK_KEYS.demo}`, {
-        method: "POST",
-        body: JSON.stringify({
-          source: "kitchen-sink-ui",
-          sentAt: new Date().toISOString(),
-        }),
-      });
+      const response = await hostFetchJson(
+        `/api/companies/${encodeURIComponent(companyId)}/plugins/${PLUGIN_ID}/webhooks/${WEBHOOK_KEYS.demo}`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            source: "kitchen-sink-ui",
+            sentAt: new Date().toISOString(),
+          }),
+        },
+      );
       setWebhookOutput(response);
       overview.refresh();
     } catch (error) {
