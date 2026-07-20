@@ -26,7 +26,14 @@ import { getRecentProjectIds, trackRecentProject } from "../../lib/recent-projec
 import { orderItemsBySelectedAndRecent } from "../../lib/recent-selections";
 import { formatAssigneeUserLabel, formatUserLabel } from "../../lib/assignees";
 import { buildExecutionPolicy, stageParticipantValues } from "../../lib/issue-execution-policy";
-import { formatMonitorOffset } from "../../lib/issue-monitor";
+import {
+  formatMonitorAbsolute,
+  formatMonitorAbsoluteFull,
+  formatMonitorEta,
+  formatMonitorEtaLabel,
+  formatMonitorOffset,
+  useMonitorCountdown,
+} from "../../lib/issue-monitor";
 import { extractProviderIdWithFallback } from "../../lib/model-utils";
 import { formatRetryReason } from "../../lib/runRetryState";
 import { useRetryNowMutation } from "../../hooks/useRetryNowMutation";
@@ -38,12 +45,14 @@ import { IssueReferencePill } from "../IssueReferencePill";
 import { formatDate, formatDateTime, cn, projectUrl } from "../../lib/utils";
 import type { IssueExternalObjectGroup } from "../../hooks/useIssueExternalObjects";
 import { timeAgo } from "../../lib/timeAgo";
+import { invalidateInboxIssueQueries } from "../../lib/inboxArchiveCache";
 import { Button } from "@/components/ui/button";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { User, ArrowUpRight, Plus, GitBranch, FolderOpen, HardDrive, Check, Clock, RotateCcw, Loader2, CheckCircle2 } from "lucide-react";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { User, ArrowUpRight, Plus, GitBranch, FolderOpen, HardDrive, Check, Clock, RotateCcw, Loader2, CheckCircle2, ArchiveRestore } from "lucide-react";
 import { AgentIcon } from "../AgentIconPicker";
 import { InlineEntitySelector, type InlineEntityOption } from "../InlineEntitySelector";
 import {
@@ -73,7 +82,9 @@ import {
 } from "./helpers";
 import { PropertyPicker } from "./property-picker";
 import { PropertyChip, PropertyRow, PropertySection } from "./primitives";
+import { IssueCasesPanel } from "../IssueCasesPanel";
 import { ExpandRelationListButton, RemovableIssueReferencePill } from "./relation-controls";
+import { Badge } from "@/components/ui/badge";
 
 function TruncatedCopyable({ value, icon: Icon }: { value: string; icon: ComponentType<{ className?: string }> }) {
   const [copied, setCopied] = useState(false);
@@ -123,6 +134,8 @@ interface IssuePropertiesProps {
   externalObjectsLoading?: boolean;
   externalObjectsError?: boolean;
   onRetryExternalObjects?: () => void;
+  onCheckMonitorNow?: () => void;
+  checkingMonitorNow?: boolean;
 }
 
 const ISSUE_BLOCKER_SEARCH_LIMIT = 50;
@@ -139,6 +152,8 @@ export function IssueProperties({
   externalObjectsLoading,
   externalObjectsError,
   onRetryExternalObjects,
+  onCheckMonitorNow,
+  checkingMonitorNow = false,
 }: IssuePropertiesProps) {
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
@@ -173,17 +188,20 @@ export function IssueProperties({
   const [approversOpen, setApproversOpen] = useState(false);
   const [approverSearch, setApproverSearch] = useState("");
   const [monitorOpen, setMonitorOpen] = useState(false);
+  const [monitorDetailsOpen, setMonitorDetailsOpen] = useState(false);
   const [scheduledRetryOpen, setScheduledRetryOpen] = useState(false);
   const [labelsOpen, setLabelsOpen] = useState(false);
   const [assigneeOptionsOpen, setAssigneeOptionsOpen] = useState(false);
   const [labelSearch, setLabelSearch] = useState("");
   const [newLabelName, setNewLabelName] = useState("");
+  // token-extraction: allowlisted — color-picker seed state, persisted into label-create payload; a var() string would break that payload.
   const [newLabelColor, setNewLabelColor] = useState("#6366f1");
   const [monitorAtInput, setMonitorAtInput] = useState(() => toDateTimeLocalValue(issue.executionPolicy?.monitor?.nextCheckAt));
   const [monitorNotesInput, setMonitorNotesInput] = useState(issue.executionPolicy?.monitor?.notes ?? "");
   const [monitorServiceInput, setMonitorServiceInput] = useState(issue.executionPolicy?.monitor?.serviceName ?? "");
   const [runtimeActionMessage, setRuntimeActionMessage] = useState<string | null>(null);
   const [runtimeActionErrorMessage, setRuntimeActionErrorMessage] = useState<string | null>(null);
+  const [unarchiveErrorMessage, setUnarchiveErrorMessage] = useState<string | null>(null);
   const [watchdogOpen, setWatchdogOpen] = useState(false);
   const [watchdogAgentInput, setWatchdogAgentInput] = useState(issue.watchdog?.watchdogAgentId ?? "");
   const [watchdogInstructionsInput, setWatchdogInstructionsInput] = useState(issue.watchdog?.instructions ?? "");
@@ -264,6 +282,26 @@ export function IssueProperties({
       onUpdate({ labelIds: [...(issue.labelIds ?? []), created.id] });
       void queryClient.invalidateQueries({ queryKey: queryKeys.issues.labels(companyId!) });
       setNewLabelName("");
+    },
+  });
+
+  const unarchiveFromInbox = useMutation({
+    mutationFn: () => issuesApi.unarchiveFromInbox(issue.id),
+    onMutate: () => {
+      setUnarchiveErrorMessage(null);
+    },
+    onSuccess: () => {
+      setUnarchiveErrorMessage(null);
+      queryClient.setQueryData<Issue>(queryKeys.issues.detail(issue.id), (current) =>
+        current ? { ...current, archivedAt: null, archivedByActorType: null, archivedByAgentId: null, archivedByRunId: null } : current,
+      );
+      void queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issue.id) });
+      if (companyId) invalidateInboxIssueQueries(queryClient, companyId);
+    },
+    onError: (error) => {
+      setUnarchiveErrorMessage(error instanceof Error && error.message.trim().length > 0
+        ? error.message
+        : "Failed to unarchive this issue. Please try again.");
     },
   });
 
@@ -509,9 +547,13 @@ export function IssueProperties({
         assigneeOverrideThinkingEffort,
         assigneeOverrideChrome ? "Chrome" : "",
       ].filter(Boolean);
+      const summary = details.length > 0 ? `Override · ${details.join(" · ")}` : "Override · adapter options";
       return (
-        <span className="min-w-0 truncate text-sm" title={details.length > 0 ? `Custom · ${details.join(" · ")}` : "Custom adapter options"}>
-          Custom{details.length > 0 ? ` · ${details.join(" · ")}` : " adapter options"}
+        <span
+          className="min-w-0 truncate text-sm"
+          title={`Task-level model override — replaces the agent's primary model for this issue.${details.length > 0 ? ` (${details.join(" · ")})` : ""}`}
+        >
+          {summary}
         </span>
       );
     }
@@ -534,7 +576,7 @@ export function IssueProperties({
               )}
               onClick={() => setAssigneeOverrideLane(lane)}
             >
-              {lane === "primary" ? "Primary" : lane === "cheap" ? "Cheap" : "Custom"}
+              {lane === "primary" ? "Primary" : lane === "cheap" ? "Cheap" : "Override"}
             </button>
           ))}
         </div>
@@ -546,6 +588,11 @@ export function IssueProperties({
               : assigneeCheapProfile
                 ? <>· uses the agent&apos;s configured cheap profile</>
                 : <>· falls back to the primary model if no cheap profile is configured</>}
+          </p>
+        ) : null}
+        {assigneeOverrideLane === "custom" ? (
+          <p className="text-xs text-muted-foreground">
+            Task-level model override — replaces the agent&apos;s primary model for this issue.
           </p>
         ) : null}
       </div>
@@ -956,45 +1003,94 @@ export function IssueProperties({
     updateMonitor(null);
     setMonitorOpen(false);
   };
-  const currentMonitorLabel = (() => {
-    if (issue.executionPolicy?.monitor?.nextCheckAt) {
-      return `Next check ${formatDate(new Date(issue.executionPolicy.monitor.nextCheckAt))}`;
-    }
-    if (issue.executionState?.monitor?.status === "cleared") {
-      return "Cleared";
-    }
-    if (issue.monitorLastTriggeredAt) {
-      return `Last triggered ${timeAgo(issue.monitorLastTriggeredAt)}`;
-    }
-    return "None";
-  })();
-  const monitorNextCheckAt = issue.executionPolicy?.monitor?.nextCheckAt ?? null;
+  const monitorState = issue.executionState?.monitor ?? null;
+  const monitorNextCheckAt = monitorState?.nextCheckAt ?? issue.monitorNextCheckAt ?? issue.executionPolicy?.monitor?.nextCheckAt ?? null;
+  const monitorAttemptCount = issue.monitorAttemptCount ?? monitorState?.attemptCount ?? 0;
+  const monitorLastTriggeredAt = issue.monitorLastTriggeredAt ?? monitorState?.lastTriggeredAt ?? null;
+  const monitorServiceName = issue.executionPolicy?.monitor?.serviceName ?? monitorState?.serviceName ?? null;
+  const monitorNotes = issue.executionPolicy?.monitor?.notes ?? monitorState?.notes ?? null;
+  const monitorNow = useMonitorCountdown(monitorNextCheckAt);
+  const monitorRelative = monitorNextCheckAt ? formatMonitorEta(monitorNextCheckAt, monitorNow) : null;
+  const monitorIsDueNow = monitorRelative === "due now";
+  const monitorIsOverdue = Boolean(monitorRelative?.startsWith("overdue by "));
+  const monitorPrimary = monitorNextCheckAt
+    ? formatMonitorEtaLabel(monitorNextCheckAt, monitorNow)
+    : monitorState?.status === "cleared"
+      ? "Cleared"
+      : "None";
+  const monitorSecondary = monitorNextCheckAt
+    ? monitorIsDueNow
+      ? "checking momentarily…"
+      : `${formatMonitorAbsolute(monitorNextCheckAt, {}, monitorNow)}${monitorIsOverdue ? " · fires on next tick" : monitorAttemptCount > 0 ? ` · Attempt ${monitorAttemptCount}` : ""}`
+    : monitorState?.status === "cleared"
+      ? [
+          monitorLastTriggeredAt ? `last checked ${timeAgo(monitorLastTriggeredAt)}` : null,
+          monitorAttemptCount > 0 ? `after attempt ${monitorAttemptCount}` : null,
+        ].filter(Boolean).join(" · ")
+      : null;
   const monitorTrigger = (
-    <span className="inline-flex min-w-0 items-center gap-1.5">
+    <TooltipProvider>
+      <Tooltip open={monitorDetailsOpen} onOpenChange={setMonitorDetailsOpen}>
+      <TooltipTrigger asChild>
+        <span
+          className="inline-flex min-w-0 items-start gap-1.5"
+          data-testid="monitor-row-trigger"
+          onClick={() => setMonitorDetailsOpen(false)}
+        >
       {monitorNextCheckAt ? (
-        <Clock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+            <Clock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
       ) : null}
-      <span
-        className={cn(
-          "min-w-0 truncate text-sm",
-          monitorNextCheckAt ? "text-foreground" : "text-muted-foreground",
-        )}
-        title={monitorNextCheckAt ? currentMonitorLabel : undefined}
-      >
-        {monitorNextCheckAt ? `Next check ${formatMonitorOffset(monitorNextCheckAt)}` : currentMonitorLabel}
-      </span>
-      {monitorNextCheckAt ? (
-        <span className="shrink-0 text-xs text-muted-foreground" title={currentMonitorLabel}>
-          {formatDate(new Date(monitorNextCheckAt))}
+          <span className="flex min-w-0 flex-col items-start">
+            <span className={cn("text-sm", monitorNextCheckAt ? "font-semibold text-foreground" : "text-muted-foreground")}>{monitorPrimary}</span>
+            {monitorSecondary ? (
+              <span className="text-xs text-muted-foreground">{monitorSecondary}</span>
+            ) : null}
+          </span>
         </span>
+      </TooltipTrigger>
+      {monitorNextCheckAt ? (
+        <TooltipContent
+          side="left"
+          className="w-80 border border-border bg-popover p-0 text-popover-foreground shadow-md"
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <div className="flex items-center justify-between border-b border-border px-4 py-3">
+            <span className="text-sm font-semibold">Monitor</span>
+            {monitorAttemptCount > 0 ? <span className="text-xs text-muted-foreground">Attempt {monitorAttemptCount}</span> : null}
+          </div>
+          <div className="space-y-3 px-4 py-3 text-left">
+            <div>
+              <div className="text-xs text-muted-foreground">Next check</div>
+              <div className="text-sm">{formatMonitorAbsoluteFull(monitorNextCheckAt)}</div>
+              <div className="text-xs text-muted-foreground">{monitorRelative}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Watching</div>
+              <div className="text-sm">{monitorServiceName ?? "—"}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Notes</div>
+              <div className="whitespace-normal text-sm">{monitorNotes ?? "—"}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Last triggered</div>
+              <div className="text-sm">{monitorLastTriggeredAt ? formatMonitorAbsoluteFull(monitorLastTriggeredAt) : "— not yet triggered"}</div>
+            </div>
+          </div>
+          <div className="flex gap-2 border-t border-border px-4 py-3">
+            {onCheckMonitorNow ? (
+              <Button type="button" size="sm" variant="outline" disabled={checkingMonitorNow} onClick={() => { setMonitorDetailsOpen(false); onCheckMonitorNow(); }}>
+                {checkingMonitorNow ? "Checking…" : "Check now"}
+              </Button>
+            ) : null}
+            <Button type="button" size="sm" variant="outline" onClick={() => { setMonitorDetailsOpen(false); setMonitorOpen(true); }}>Edit</Button>
+            <Button type="button" size="sm" variant="outline" onClick={() => { setMonitorDetailsOpen(false); clearMonitor(); }}>Clear</Button>
+          </div>
+        </TooltipContent>
       ) : null}
-    </span>
+      </Tooltip>
+    </TooltipProvider>
   );
-  const monitorAttemptBadge = issue.monitorAttemptCount && issue.monitorAttemptCount > 0 ? (
-    <span className="text-xs text-muted-foreground">
-      Attempt {issue.monitorAttemptCount}
-    </span>
-  ) : null;
 
   const scheduledRetry = issue.scheduledRetry ?? null;
   const retryNow = useRetryNowMutation(issue.id);
@@ -1059,7 +1155,7 @@ export function IssueProperties({
           </span>
         ) : null}
       </div>
-      <dl className="grid grid-cols-[6rem_1fr] gap-y-1">
+      <dl className="grid grid-cols-(--gtc-15) gap-y-1">
         {scheduledRetryReasonLabel ? (
           <>
             <dt className="text-muted-foreground">Reason</dt>
@@ -1234,9 +1330,9 @@ export function IssueProperties({
         </PropertyChip>
       ))}
       {selectedIssueLabels.length > 3 && (
-        <span className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground">
+        <Badge variant="outline" className="border-border text-muted-foreground">
           +{selectedIssueLabels.length - 3} more
-        </span>
+        </Badge>
       )}
     </div>
   ) : (
@@ -1573,7 +1669,7 @@ export function IssueProperties({
     <>
       <span
         className="shrink-0 h-3 w-3 rounded-sm"
-        style={{ backgroundColor: orderedProjects.find((p) => p.id === issue.projectId)?.color ?? "#6366f1" }}
+        style={{ backgroundColor: orderedProjects.find((p) => p.id === issue.projectId)?.color ?? "var(--project-seed)" }}
       />
       <span className="text-sm truncate min-w-0" title={projectName(issue.projectId)}>{projectName(issue.projectId)}</span>
     </>
@@ -1646,7 +1742,7 @@ export function IssueProperties({
               {option.kind === "project" ? (
                 <span
                   className="shrink-0 h-3 w-3 rounded-sm"
-                  style={{ backgroundColor: option.color ?? "#6366f1" }}
+                  style={{ backgroundColor: option.color ?? "var(--project-seed)" }}
                 />
               ) : null}
               {option.name}
@@ -1946,7 +2042,7 @@ export function IssueProperties({
           onOpenChange={(open) => { setProjectOpen(open); if (!open) setProjectSearch(""); }}
           triggerContent={projectTrigger}
           triggerClassName="min-w-0 max-w-full"
-          popoverClassName="w-fit min-w-[11rem]"
+          popoverClassName="w-fit min-w-(--sz-11rem)"
           extra={issue.projectId ? (
             <Link
               to={projectLink(issue.projectId)!}
@@ -2142,7 +2238,7 @@ export function IssueProperties({
             onOpenChange={setScheduledRetryOpen}
             triggerContent={scheduledRetryTrigger}
             triggerClassName="min-w-0 max-w-full"
-            popoverClassName={cn("max-w-full", inline ? "w-full" : "w-80 sm:w-[32rem]")}
+            popoverClassName={cn("max-w-full", inline ? "w-full" : "w-80 sm:w-(--sz-32rem)")}
             extra={scheduledRetryAttemptBadge}
           >
             {scheduledRetryContent}
@@ -2156,8 +2252,7 @@ export function IssueProperties({
           onOpenChange={setMonitorOpen}
           triggerContent={monitorTrigger}
           triggerClassName="min-w-0 max-w-full"
-          popoverClassName={cn("max-w-full", inline ? "w-full" : "w-80 sm:w-[32rem]")}
-          extra={monitorAttemptBadge}
+          popoverClassName={cn("max-w-full", inline ? "w-full" : "w-80 sm:w-(--sz-32rem)")}
         >
           {monitorContent}
         </PropertyPicker>
@@ -2290,12 +2385,64 @@ export function IssueProperties({
         <PropertyRow label="Updated">
           <span className="text-sm">{timeAgo(issue.updatedAt)}</span>
         </PropertyRow>
+        {issue.archivedAt && issue.archivedByActorType === "agent" && issue.archivedByAgentId ? (
+          (() => {
+            const archivedByAgent = (agents ?? []).find((candidate) => candidate.id === issue.archivedByAgentId);
+            const archivedByName = agentName(issue.archivedByAgentId);
+            return (
+              <PropertyRow label="Archived">
+                <div className="flex min-w-0 max-w-full flex-col items-start gap-1">
+                  {/* The row label already reads "Archived", so the value shows just
+                      the attributing agent (icon + name) — this gives the name the
+                      full ~164px value column at the real 320px pane width, where an
+                      "Archived by …" prefix would clip even short names. The full
+                      phrasing + timestamp live in the tooltip so any residual
+                      truncation on genuinely long names is recoverable. */}
+                  <span
+                    className="flex min-w-0 max-w-full items-center gap-1.5 text-sm"
+                    title={`Archived by ${archivedByName} · ${formatDateTime(issue.archivedAt)}`}
+                  >
+                    {archivedByAgent
+                      ? <AgentIcon icon={archivedByAgent.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      : null}
+                    <span className="min-w-0 truncate">
+                      {archivedByName}
+                    </span>
+                  </span>
+                  <div className="flex min-w-0 max-w-full items-center gap-2">
+                    <span className="shrink-0 text-xs text-muted-foreground">{timeAgo(issue.archivedAt)}</span>
+                    <button
+                      type="button"
+                      className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground disabled:opacity-50"
+                      onClick={() => unarchiveFromInbox.mutate()}
+                      disabled={unarchiveFromInbox.isPending}
+                    >
+                      <ArchiveRestore className="h-3 w-3" />
+                      {unarchiveFromInbox.isPending ? "Unarchiving…" : "Unarchive"}
+                    </button>
+                  </div>
+                  {unarchiveErrorMessage ? (
+                    <p className="text-xs text-destructive" role="alert">
+                      {unarchiveErrorMessage}
+                    </p>
+                  ) : null}
+                </div>
+              </PropertyRow>
+            );
+          })()
+        ) : null}
         {issue.requestDepth > 0 && (
           <PropertyRow label="Depth">
             <span className="text-sm font-mono">{issue.requestDepth}</span>
           </PropertyRow>
         )}
       </PropertySection>
+
+      {/* Experimental Cases rail (PAP-12969) — self-gates on the flag and
+          renders nothing when no cases are linked. */}
+      <div className="pt-3">
+        <IssueCasesPanel issueId={issue.id} />
+      </div>
     </div>
   );
 }

@@ -196,6 +196,48 @@ describe("IssueRecoveryActionCard", () => {
     expect(node.textContent).toContain("Manual repair required");
   });
 
+  it("renders a human evidence summary as prose, not a mono log line", () => {
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildAction({
+          kind: "stranded_assigned_issue",
+          cause: "stranded_assigned_issue",
+          evidence: {
+            summary: "Unmanaged background task stopped; no durable live path.",
+            latestRunStatus: "failed",
+            latestRunErrorCode: "unmanaged_background_task_stopped",
+            sourceRunId: "7accd7a4-c9ca-4db2-9233-3228a037cc09",
+          },
+        })}
+      />,
+    );
+    const summary = Array.from(node.querySelectorAll("span")).find((el) =>
+      el.textContent === "Unmanaged background task stopped; no durable live path.",
+    );
+    expect(summary).toBeTruthy();
+    expect(summary?.className).toContain("text-xs");
+    expect(summary?.className).not.toContain("font-mono");
+  });
+
+  it("keeps code-shaped evidence (error code, no summary) in the mono treatment", () => {
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildAction({
+          kind: "workspace_validation",
+          cause: "workspace_validation_failed",
+          evidence: {
+            latestRunErrorCode: "workspace_validation_failed",
+          },
+        })}
+      />,
+    );
+    const code = Array.from(node.querySelectorAll("span")).find((el) =>
+      el.textContent === "workspace_validation_failed",
+    );
+    expect(code).toBeTruthy();
+    expect(code?.className).toContain("font-mono");
+  });
+
   it("renders the resolved label and outcome when resolved", () => {
     const node = render(
       <IssueRecoveryActionCard action={buildAction({ status: "resolved", outcome: "restored", resolvedAt: "2026-05-09T19:35:00.000Z" })} />,
@@ -376,5 +418,289 @@ describe("IssueRecoveryActionCard workspace_validation divergence", () => {
     );
     const trigger = node.querySelector<HTMLButtonElement>("[data-testid='recovery-action-reissue-trigger']");
     expect(trigger?.disabled).toBe(true);
+  });
+});
+
+function setTextareaValue(element: HTMLTextAreaElement | null, value: string) {
+  if (!element) throw new Error("Expected a textarea to exist");
+  const setter = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype,
+    "value",
+  )?.set;
+  act(() => {
+    setter?.call(element, value);
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+describe("IssueRecoveryActionCard W7 reconcile actions", () => {
+  it("offers 'Reconcile forward & continue' only for an ancestor verdict and calls the handler", () => {
+    const onReconcileForward = vi.fn();
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildWorkspaceValidationAction({ provenance: { ancestryVerdict: "ancestor" } })}
+        onReconcileForward={onReconcileForward}
+      />,
+    );
+    const button = node.querySelector("[data-testid='recovery-action-reconcile-forward']");
+    expect(button).not.toBeNull();
+    click(button);
+    expect(onReconcileForward).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides 'Reconcile forward & continue' when the verdict is not an ancestor", () => {
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildWorkspaceValidationAction({ provenance: { ancestryVerdict: "diverged" } })}
+        onReconcileForward={() => {}}
+      />,
+    );
+    expect(node.querySelector("[data-testid='recovery-action-reconcile-forward']")).toBeNull();
+  });
+
+  it("disables reconcile-forward while a reconcile is pending", () => {
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildWorkspaceValidationAction({ provenance: { ancestryVerdict: "ancestor" } })}
+        onReconcileForward={() => {}}
+        reconcilePending
+      />,
+    );
+    const button = node.querySelector<HTMLButtonElement>("[data-testid='recovery-action-reconcile-forward']");
+    expect(button?.disabled).toBe(true);
+  });
+
+  it("never renders the break-glass action for a non-permitted operator", () => {
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildWorkspaceValidationAction()}
+        onBreakGlassOverride={() => {}}
+        canBreakGlass={false}
+      />,
+    );
+    expect(node.querySelector("[data-testid='recovery-action-breakglass-trigger']")).toBeNull();
+  });
+
+  it("break-glass restates the divergence and gates the override behind a required reason", () => {
+    const onBreakGlassOverride = vi.fn();
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildWorkspaceValidationAction()}
+        onBreakGlassOverride={onBreakGlassOverride}
+        canBreakGlass
+      />,
+    );
+    click(node.querySelector("[data-testid='recovery-action-breakglass-trigger']"));
+
+    // The confirm step restates the divergence: both branches, both short SHAs, and the verdict.
+    const restated = document.body.querySelector("[data-testid='recovery-breakglass-restated-divergence']");
+    const restatedText = restated?.textContent ?? "";
+    expect(restatedText).toContain("PAP-522-recorded");
+    expect(restatedText).toContain("nleach/PAP-1405-live");
+    expect(restatedText).toContain("aaaaaaaaaa");
+    expect(restatedText).toContain("bbbbbbbbbb");
+    expect(restatedText).toContain("Diverged");
+
+    // The override is disabled until a non-empty reason is recorded.
+    const confirm = document.body.querySelector<HTMLButtonElement>(
+      "[data-testid='recovery-action-breakglass-confirm']",
+    );
+    expect(confirm?.disabled).toBe(true);
+    click(confirm);
+    expect(onBreakGlassOverride).not.toHaveBeenCalled();
+
+    // Whitespace-only reason does not enable it.
+    setTextareaValue(
+      document.body.querySelector<HTMLTextAreaElement>("[data-testid='recovery-breakglass-reason']"),
+      "   ",
+    );
+    expect(
+      document.body.querySelector<HTMLButtonElement>("[data-testid='recovery-action-breakglass-confirm']")?.disabled,
+    ).toBe(true);
+
+    // A real reason enables the override and is passed (trimmed) to the handler.
+    setTextareaValue(
+      document.body.querySelector<HTMLTextAreaElement>("[data-testid='recovery-breakglass-reason']"),
+      "  Verified live branch is safe to adopt.  ",
+    );
+    const enabledConfirm = document.body.querySelector<HTMLButtonElement>(
+      "[data-testid='recovery-action-breakglass-confirm']",
+    );
+    expect(enabledConfirm?.disabled).toBe(false);
+    click(enabledConfirm);
+    expect(onBreakGlassOverride).toHaveBeenCalledWith("Verified live branch is safe to adopt.");
+  });
+
+  it("does not offer reconcile actions for non-workspace recovery kinds", () => {
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildAction()}
+        onReconcileForward={() => {}}
+        onBreakGlassOverride={() => {}}
+        canBreakGlass
+      />,
+    );
+    expect(node.querySelector("[data-testid='recovery-action-reconcile-forward']")).toBeNull();
+    expect(node.querySelector("[data-testid='recovery-action-breakglass-trigger']")).toBeNull();
+  });
+});
+
+function buildDirtyDivergenceAction(
+  overrides: {
+    action?: Partial<IssueRecoveryAction>;
+    provenance?: Record<string, unknown>;
+    workspaceValidation?: Record<string, unknown>;
+  } = {},
+): IssueRecoveryAction {
+  return buildWorkspaceValidationAction({
+    ...overrides,
+    workspaceValidation: {
+      cleanliness: "dirty",
+      statusEntryCount: 3,
+      dirtyPathSample: ["src/app.ts", "README.md"],
+      sourceIdentifier: "PAP-1405",
+      ...overrides.workspaceValidation,
+    },
+  });
+}
+
+describe("IssueRecoveryActionCard repair workspace (quarantine_restore)", () => {
+  it("offers the repair action only for a dirty divergence", () => {
+    const cleanNode = render(
+      <IssueRecoveryActionCard
+        action={buildWorkspaceValidationAction({ workspaceValidation: { cleanliness: "clean" } })}
+        onQuarantineRestore={() => {}}
+      />,
+    );
+    expect(cleanNode.querySelector("[data-testid='recovery-action-repair-trigger']")).toBeNull();
+
+    const dirtyNode = render(
+      <IssueRecoveryActionCard action={buildDirtyDivergenceAction()} onQuarantineRestore={() => {}} />,
+    );
+    expect(dirtyNode.querySelector("[data-testid='recovery-action-repair-trigger']")).not.toBeNull();
+  });
+
+  it("does not offer the repair action without a handler or for non-workspace kinds", () => {
+    const noHandler = render(<IssueRecoveryActionCard action={buildDirtyDivergenceAction()} />);
+    expect(noHandler.querySelector("[data-testid='recovery-action-repair-trigger']")).toBeNull();
+
+    const nonWorkspace = render(
+      <IssueRecoveryActionCard action={buildAction()} onQuarantineRestore={() => {}} />,
+    );
+    expect(nonWorkspace.querySelector("[data-testid='recovery-action-repair-trigger']")).toBeNull();
+  });
+
+  it("confirm popover restates the dirty count, live branch, rescue branch and recorded branch, then fires the handler", () => {
+    const onQuarantineRestore = vi.fn();
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildDirtyDivergenceAction()}
+        onQuarantineRestore={onQuarantineRestore}
+      />,
+    );
+    click(node.querySelector("[data-testid='recovery-action-repair-trigger']"));
+    const restated = document.body.querySelector("[data-testid='recovery-repair-restated']");
+    const text = restated?.textContent ?? "";
+    expect(text).toContain("3 uncommitted changes");
+    // live branch is explicitly left untouched
+    expect(text).toContain("nleach/PAP-1405-live");
+    expect(text).toContain("left untouched");
+    // rescue branch preview mirrors the server naming (prefix + timestamp marker)
+    expect(
+      document.body.querySelector("[data-testid='recovery-repair-rescue-branch']")?.textContent,
+    ).toContain("paperclip/rescue/PAP-1405/");
+    // recorded branch to be restored
+    expect(text).toContain("PAP-522-recorded");
+
+    // No reason field is present — the operation is lossless.
+    expect(document.body.querySelector("textarea")).toBeNull();
+
+    click(document.body.querySelector("[data-testid='recovery-action-repair-confirm']"));
+    expect(onQuarantineRestore).toHaveBeenCalledTimes(1);
+  });
+
+  it("singularizes the dirty change count", () => {
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildDirtyDivergenceAction({ workspaceValidation: { statusEntryCount: 1 } })}
+        onQuarantineRestore={() => {}}
+      />,
+    );
+    click(node.querySelector("[data-testid='recovery-action-repair-trigger']"));
+    expect(
+      document.body.querySelector("[data-testid='recovery-repair-dirty-count']")?.textContent,
+    ).toBe("1 uncommitted change");
+  });
+
+  it("disables the repair trigger while a quarantine-restore is pending", () => {
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildDirtyDivergenceAction()}
+        onQuarantineRestore={() => {}}
+        quarantineRestorePending
+      />,
+    );
+    expect(
+      node.querySelector<HTMLButtonElement>("[data-testid='recovery-action-repair-trigger']")?.disabled,
+    ).toBe(true);
+  });
+
+  it("in the contended case disables repair, explains the claimant, and recommends re-issue", () => {
+    const onQuarantineRestore = vi.fn();
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildDirtyDivergenceAction({
+          workspaceValidation: {
+            contention: {
+              claimedByWorkspaceId: "ws-99",
+              claimedByIssueId: "issue-99",
+              claimedByIssueIdentifier: "PAP-9001",
+              activeRun: { id: "run-9001", status: "running", issueId: "issue-99", issueIdentifier: "PAP-9001" },
+            },
+          },
+        })}
+        onQuarantineRestore={onQuarantineRestore}
+        onReissueIsolated={() => {}}
+      />,
+    );
+    // Diagnosis gains a claimant line naming the issue + active run.
+    const notice = node.querySelector("[data-testid='recovery-contention-notice']");
+    expect(notice?.textContent).toContain("PAP-9001");
+    expect(notice?.textContent).toContain("active run");
+
+    // The repair control is present but disabled, with the claimant as the explanation.
+    const disabled = node.querySelector("[data-testid='recovery-action-repair-disabled']");
+    expect(disabled).not.toBeNull();
+    const trigger = disabled?.querySelector<HTMLButtonElement>(
+      "[data-testid='recovery-action-repair-trigger']",
+    );
+    expect(trigger?.disabled).toBe(true);
+    expect(disabled?.textContent).toContain("PAP-9001");
+    // Clicking the disabled control never fires the repair.
+    click(trigger ?? null);
+    expect(onQuarantineRestore).not.toHaveBeenCalled();
+
+    // Re-issue is surfaced as the recommended action.
+    expect(node.querySelector("[data-testid='recovery-reissue-recommended']")).not.toBeNull();
+    expect(
+      node
+        .querySelector("[data-testid='recovery-action-reissue-trigger']")
+        ?.getAttribute("data-recommended"),
+    ).toBe("true");
+  });
+
+  it("compact variant drops the metadata table but keeps the diagnosis and repair action", () => {
+    const node = render(
+      <IssueRecoveryActionCard
+        action={buildDirtyDivergenceAction()}
+        onQuarantineRestore={() => {}}
+        variant="compact"
+      />,
+    );
+    // Metadata rows (e.g. the Owner/Next action table) are dropped in compact mode.
+    expect(node.textContent).not.toContain("Choose and record a valid issue disposition.");
+    // The divergence diagnosis and repair action still render.
+    expect(node.querySelector("[data-testid='recovery-divergence-diagnosis']")).not.toBeNull();
+    expect(node.querySelector("[data-testid='recovery-action-repair-trigger']")).not.toBeNull();
   });
 });

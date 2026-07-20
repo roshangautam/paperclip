@@ -12,6 +12,10 @@ const mockHeartbeatsApi = vi.hoisted(() => ({
   liveRunsForCompany: vi.fn(),
 }));
 
+const mockAttentionApi = vi.hoisted(() => ({
+  list: vi.fn(),
+}));
+
 const mockInstanceSettingsApi = vi.hoisted(() => ({
   getExperimental: vi.fn(),
 }));
@@ -64,6 +68,10 @@ vi.mock("../context/SidebarContext", () => ({
 
 vi.mock("../api/heartbeats", () => ({
   heartbeatsApi: mockHeartbeatsApi,
+}));
+
+vi.mock("../api/attention", () => ({
+  attentionApi: mockAttentionApi,
 }));
 
 vi.mock("../api/instanceSettings", () => ({
@@ -139,6 +147,7 @@ describe("Sidebar", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([]);
+    mockAttentionApi.list.mockResolvedValue({ items: [] });
     mockSidebar.isMobile = false;
     mockSidebar.collapsed = false;
     mockSidebar.peeking = false;
@@ -174,10 +183,15 @@ describe("Sidebar", () => {
     const workSection = [...container.querySelectorAll("nav [data-plugin-launcher-zone]")]
       .find((node) => node.getAttribute("data-plugin-launcher-zone") === "sidebar");
     expect(workSection?.textContent).toContain("Plugin launcher outlet");
-    const workSectionContainer = workSection?.parentElement?.parentElement;
+    // The Work section is a Collapsible now (one extra wrapper level), so
+    // resolve the section root by walking up until the header label appears.
+    let workSectionContainer = workSection?.parentElement ?? null;
+    while (workSectionContainer && !workSectionContainer.textContent?.includes("Work")) {
+      workSectionContainer = workSectionContainer.parentElement;
+    }
     expect(workSectionContainer?.textContent).toContain("Work");
     expect(workSectionContainer?.textContent).toContain("Tasks");
-    expect(workSectionContainer?.textContent).toContain("Goals");
+    expect(workSectionContainer?.textContent).not.toContain("Goals");
 
     flushSync(() => {
       root.unmount();
@@ -284,6 +298,17 @@ describe("Sidebar", () => {
     });
   });
 
+  it("does not poll attention until Decisions is enabled", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableDecisions: false });
+    const root = await renderSidebar();
+
+    expect(mockAttentionApi.list).not.toHaveBeenCalled();
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
   it("shows Skills directly below Artifacts in Work", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
     const root = await renderSidebar();
@@ -294,10 +319,8 @@ describe("Sidebar", () => {
     expect(artifactsLink?.getAttribute("href")).toBe("/artifacts");
 
     const navText = container.querySelector("nav")?.textContent ?? "";
-    expect(navText).toContain("Goals");
     expect(navText).toContain("Artifacts");
     expect(navText).toContain("Skills");
-    expect(navText.indexOf("Goals")).toBeLessThan(navText.indexOf("Artifacts"));
     expect(navText.indexOf("Artifacts")).toBeLessThan(navText.indexOf("Skills"));
 
     const sections = [...container.querySelectorAll("nav > div")];
@@ -305,6 +328,50 @@ describe("Sidebar", () => {
     const companySection = sections.find((section) => section.textContent?.startsWith("Company"));
     expect(workSection?.textContent).toContain("Skills");
     expect(companySection?.textContent).not.toContain("Skills");
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("hides the Goals nav item by default", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIsolatedWorkspaces: false,
+      enableGoalsSidebarLink: false,
+    });
+    const root = await renderSidebar();
+
+    expect([...container.querySelectorAll("nav a")].map((a) => a.textContent?.trim())).not.toContain("Goals");
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("reserves the Goals nav slot while experimental settings are loading", async () => {
+    mockInstanceSettingsApi.getExperimental.mockImplementation(() => new Promise(() => {}));
+    const root = await renderSidebar();
+
+    expect([...container.querySelectorAll("nav a")].map((a) => a.textContent?.trim())).not.toContain("Goals");
+    expect(container.querySelector('[data-testid="sidebar-goals-placeholder"]')).not.toBeNull();
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("shows the Goals nav item when the experimental setting is enabled", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIsolatedWorkspaces: false,
+      enableGoalsSidebarLink: true,
+    });
+    const root = await renderSidebar();
+
+    const link = [...container.querySelectorAll("a")].find((anchor) => anchor.textContent === "Goals");
+    expect(link?.getAttribute("href")).toBe("/goals");
+
+    const navText = container.querySelector("nav")?.textContent ?? "";
+    expect(navText.indexOf("Goals")).toBeLessThan(navText.indexOf("Artifacts"));
 
     flushSync(() => {
       root.unmount();
@@ -382,6 +449,27 @@ describe("Sidebar", () => {
 
     flushSync(() => {
       root.unmount();
+    });
+  });
+
+  it("hides the Apps nav item unless experimental apps are enabled", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableApps: false });
+    const disabledRoot = await renderSidebar();
+
+    expect([...container.querySelectorAll("a")].some((anchor) => anchor.textContent === "Apps")).toBe(false);
+
+    flushSync(() => {
+      disabledRoot.unmount();
+    });
+
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableApps: true });
+    const enabledRoot = await renderSidebar();
+
+    const link = [...container.querySelectorAll("a")].find((anchor) => anchor.textContent === "Apps");
+    expect(link?.getAttribute("href")).toBe("/apps");
+
+    flushSync(() => {
+      enabledRoot.unmount();
     });
   });
 

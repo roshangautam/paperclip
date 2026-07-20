@@ -62,6 +62,7 @@ vi.mock("../api/execution-workspaces", () => ({
 vi.mock("../api/issues", () => ({
   issuesApi: {
     list: apiMocks.issuesList,
+    listCompact: apiMocks.issuesList,
     count: apiMocks.issuesCount,
     listLabels: apiMocks.issueLabels,
     markRead: vi.fn(),
@@ -106,8 +107,9 @@ vi.mock("../context/SidebarContext", () => ({
   useSidebar: () => ({ isMobile: false }),
 }));
 
+const generalSettingsMock = { keyboardShortcutsEnabled: false };
 vi.mock("../context/GeneralSettingsContext", () => ({
-  useGeneralSettings: () => ({ keyboardShortcutsEnabled: false }),
+  useGeneralSettings: () => generalSettingsMock,
 }));
 
 vi.mock("../hooks/useInboxBadge", () => ({
@@ -376,13 +378,18 @@ describe("Inbox toolbar", () => {
       true,
       true,
     ]);
+    expect(apiMocks.issuesList.mock.calls.map((call) => call[1]?.limit)).toEqual([
+      500,
+      500,
+      500,
+    ]);
 
     act(() => {
       root.unmount();
     });
   });
 
-  it("syncs hover with j/k selection on inbox rows", async () => {
+  it("paints row hover via CSS only, without moving React selection state", async () => {
     routerMock.location.pathname = "/inbox/mine";
     const issueA = createIssue({ id: "issue-a", identifier: "PAP-1001", title: "First inbox row" });
     const issueB = createIssue({ id: "issue-b", identifier: "PAP-1002", title: "Second inbox row" });
@@ -413,31 +420,164 @@ describe("Inbox toolbar", () => {
     expect(linkOf(rows[0]!)?.className).toContain("hover:bg-accent/50");
     expect(linkOf(rows[1]!)?.className).toContain("hover:bg-accent/50");
 
+    // Hovering paints via CSS `:hover` only — it must NOT flip a row into the
+    // state-selected band (which would swap to hover:bg-transparent). Coupling
+    // hover to React state was the per-hover re-render storm behind the lag;
+    // scrubbing the list must not touch selection state. (Keyboard nav that
+    // continues from the hovered row is exercised in live/e2e verification —
+    // this unit mocks keyboardShortcutsEnabled off.)
     await act(async () => {
       rows[1]!.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
       rows[1]!.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false }));
     });
-
-    // After hovering row 1, that row is "selected" — same visual state as j/k selection.
-    await vi.waitFor(() => {
-      expect(linkOf(rows[1]!)?.className).toContain("hover:bg-transparent");
-    });
     expect(linkOf(rows[0]!)?.className).toContain("hover:bg-accent/50");
-
-    await act(async () => {
-      rows[0]!.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-      rows[0]!.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false }));
-    });
-
-    // Hovering a different row moves the selection to follow the mouse.
-    await vi.waitFor(() => {
-      expect(linkOf(rows[0]!)?.className).toContain("hover:bg-transparent");
-    });
     expect(linkOf(rows[1]!)?.className).toContain("hover:bg-accent/50");
+    expect(linkOf(rows[1]!)?.className).not.toContain("hover:bg-transparent");
 
     act(() => {
       root.unmount();
     });
+  });
+
+  it("does not indent unread rows: the mark-read dot sits in a reserved leading slot present on every row", async () => {
+    routerMock.location.pathname = "/inbox/mine";
+    // Two sibling leaf rows, one unread and one read, so their leading columns
+    // are directly comparable.
+    const unread = createIssue({
+      id: "issue-unread",
+      identifier: "PAP-2001",
+      title: "Unread inbox row",
+      isUnreadForMe: true,
+    });
+    const read = createIssue({
+      id: "issue-read",
+      identifier: "PAP-2002",
+      title: "Read inbox row",
+      isUnreadForMe: false,
+    });
+    apiMocks.issuesList.mockResolvedValue([unread, read]);
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <Inbox />
+        </QueryClientProvider>,
+      );
+    });
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain("Unread inbox row");
+      expect(container.textContent).toContain("Read inbox row");
+    });
+
+    const rows = Array.from(container.querySelectorAll("[data-inbox-item]"));
+    const rowFor = (text: string) => rows.find((row) => row.textContent?.includes(text));
+    const linkOf = (row: Element) => row.querySelector<HTMLAnchorElement>("a[data-inbox-issue-link]");
+    const markReadButton = (row: Element) => row.querySelector('button[aria-label="Mark as read"]');
+    // The empty spacer that reserves the chevron column on every leaf row.
+    // Excludes the tree-guide span (`.self-stretch`), which only renders on
+    // nested rows.
+    const hasLeadingSpacer = (row: Element) =>
+      !!linkOf(row)?.querySelector("span.hidden.w-4.shrink-0.sm\\:block:not(.self-stretch)");
+    // The reserved leading dot slot, present on read AND unread rows.
+    const dotSlot = (row: Element) =>
+      linkOf(row)?.querySelector('[data-testid="issue-row-unread-slot"]') ?? null;
+
+    const unreadRow = rowFor("Unread inbox row")!;
+    const readRow = rowFor("Read inbox row")!;
+
+    // The dot lives in a fixed leading slot that is reserved on every inbox row
+    // (in flow, NOT an absolute overlay). Because read and unread rows both
+    // reserve it — and both keep the chevron spacer — their status icon + title
+    // land at the same x (the bug this fix addresses: an unread-only dot column
+    // used to push unread rows right).
+    const unreadSlot = dotSlot(unreadRow);
+    const readSlot = dotSlot(readRow);
+    expect(unreadSlot).not.toBeNull();
+    expect(readSlot).not.toBeNull();
+    // In flow, not an absolute overlay.
+    expect(unreadSlot?.className).not.toContain("absolute");
+    // Only the unread row carries the dot button; the read slot is empty.
+    expect(markReadButton(unreadSlot!)).not.toBeNull();
+    expect(readSlot?.querySelector('button[aria-label="Mark as read"]')).toBeNull();
+    expect(hasLeadingSpacer(unreadRow)).toBe(true);
+
+    // Read rows keep the same spacer, so both rows line up.
+    expect(hasLeadingSpacer(readRow)).toBe(true);
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("keeps hover→j/k selection in sync after the list reshapes (PAP-9679)", async () => {
+    routerMock.location.pathname = "/inbox/mine";
+    generalSettingsMock.keyboardShortcutsEnabled = true;
+    const issueA = createIssue({ id: "issue-a", identifier: "PAP-2001", title: "Sync row A" });
+    const issueB = createIssue({ id: "issue-b", identifier: "PAP-2002", title: "Sync row B" });
+    const issueC = createIssue({ id: "issue-c", identifier: "PAP-2003", title: "Sync row C" });
+    apiMocks.issuesList.mockResolvedValue([issueA, issueB, issueC]);
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const root = createRoot(container);
+
+    const linkOf = (row: Element): HTMLAnchorElement | null =>
+      row.querySelector("a[data-inbox-issue-link]");
+    // The keyboard-selected row swaps to `hover:bg-transparent`; find its index.
+    const selectedRowIndex = () =>
+      [...container.querySelectorAll("[data-inbox-item]")].findIndex((row) =>
+        linkOf(row)?.className.includes("hover:bg-transparent"),
+      );
+
+    try {
+      await act(async () => {
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <Inbox />
+          </QueryClientProvider>,
+        );
+      });
+      await vi.waitFor(() => {
+        expect(container.querySelectorAll("[data-inbox-item]").length).toBeGreaterThanOrEqual(3);
+      });
+
+      // Pointer physically moves, then hovers the middle row (index 1).
+      await act(async () => {
+        window.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
+        const rows = container.querySelectorAll("[data-inbox-item]");
+        rows[1]!.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+        rows[1]!.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false }));
+      });
+
+      // A poll reshapes the list (row B's title changes → new nav array) before
+      // the keypress. This is what used to null the hovered index and strand
+      // j/k back at the top.
+      apiMocks.issuesList.mockResolvedValue([issueA, { ...issueB, title: "Sync row B (updated)" }, issueC]);
+      await act(async () => {
+        await queryClient.invalidateQueries();
+      });
+      await vi.waitFor(() => {
+        expect(container.textContent).toContain("Sync row B (updated)");
+      });
+
+      // j must continue from the hovered row (index 1) → index 2, not jump to
+      // the top of the list.
+      await act(async () => {
+        document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "j", bubbles: true }));
+      });
+      expect(selectedRowIndex()).toBe(2);
+    } finally {
+      generalSettingsMock.keyboardShortcutsEnabled = false;
+      act(() => {
+        root.unmount();
+      });
+    }
   });
 
   it("keeps other issue archive controls enabled while one archive is pending", async () => {
@@ -468,7 +608,7 @@ describe("Inbox toolbar", () => {
     });
 
     const initialArchiveButtons = Array.from(
-      container.querySelectorAll<HTMLButtonElement>('button[aria-label="Dismiss from inbox"]'),
+      container.querySelectorAll<HTMLButtonElement>('button[aria-label="Archive"]'),
     );
     expect(initialArchiveButtons.length).toBeGreaterThanOrEqual(2);
 
@@ -483,7 +623,7 @@ describe("Inbox toolbar", () => {
     });
 
     const remainingArchiveButton = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Dismiss from inbox"]',
+      'button[aria-label="Archive"]',
     );
     expect(remainingArchiveButton).not.toBeNull();
     expect(remainingArchiveButton?.disabled).toBe(false);
@@ -617,7 +757,9 @@ describe("InboxIssueMetaLeading", () => {
     );
     const liveBadge = container.querySelector('span[class*="px-1.5"][class*="bg-blue-500/10"]');
     const liveBadgeLabel = Array.from(container.querySelectorAll("span")).find(
-      (node) => node.textContent === "Live" && node.className.includes("text-"),
+      // The pill chassis is a Badge (itself a span with textContent "Live");
+      // the label is the inner span without the rounded-full chassis class.
+      (node) => node.textContent === "Live" && node.className.includes("text-") && !node.className.includes("rounded-full"),
     );
     const liveDot = container.querySelector('span[class*="bg-blue-500"]');
     const pulseRing = container.querySelector('span[class*="animate-pulse"]');
