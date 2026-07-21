@@ -144,6 +144,7 @@ describe("GET /health", () => {
       expect(res.body).toEqual({
         status: "degraded",
         version: serverVersion,
+        serverVersion,
         error: "database_timeout",
         serverInfo: testServerInfo,
       });

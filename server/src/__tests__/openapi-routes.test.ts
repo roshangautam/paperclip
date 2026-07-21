@@ -169,6 +169,7 @@ describe("openapi routes", () => {
     ).toMatchObject({
       status: { enum: ["degraded"] },
       error: { enum: ["database_unreachable", "database_timeout"] },
+      serverVersion: { type: "string" },
     });
     expect(res.body.paths["/mcp/gateways/{gatewayPublicId}"].post.security).toEqual([]);
     expect(res.body.paths["/api/mcp/gateways/{gatewayPublicId}"]).toBeUndefined();

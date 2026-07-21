@@ -1042,6 +1042,7 @@ registry.registerPath({
     200: r.ok(z.object({
       status: z.literal("ok"),
       version: z.string().optional(),
+      serverVersion: z.string().optional(),
       deploymentMode: z.string().optional(),
       deploymentExposure: z.string().optional(),
       authReady: z.boolean().optional(),
@@ -1108,6 +1109,7 @@ registry.registerPath({
             status: z.literal("degraded"),
             error: z.enum(["database_unreachable", "database_timeout"]),
             version: z.string().optional(),
+            serverVersion: z.string().optional(),
             deploymentMode: z.string().optional(),
             deploymentExposure: z.string().optional(),
             serverInfo: healthServerInfoSchema.optional(),
