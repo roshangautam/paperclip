@@ -17,6 +17,7 @@ import {
   issueThreadInteractions,
   issues,
   principalPermissionGrants,
+  plugins,
   secretAccessEvents,
   toolAccessAuditEvents,
   toolActionRequests,
@@ -448,6 +449,7 @@ describeEmbeddedPostgres("tool access service", () => {
     await db.delete(toolCatalogEntries);
     await db.delete(toolConnections);
     await db.delete(toolApplications);
+    await db.delete(plugins);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -802,6 +804,83 @@ describeEmbeddedPostgres("tool access service", () => {
         }),
       ]),
     );
+  });
+
+  it("uses a ready plugin manifest for synthetic plugin app health and catalog discovery", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const pluginKey = `ambitresearch.agent-identities-${randomUUID()}`;
+    const [plugin] = await db.insert(plugins).values({
+      pluginKey,
+      packageName: "@ambitresearch/paperclip-agent-identities",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      status: "ready",
+      manifestJson: {
+        id: pluginKey,
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Agent Identities",
+        description: "Manage agent identity profiles.",
+        author: "Ambit Research",
+        categories: ["automation"],
+        capabilities: ["agent.tools.register"],
+        entrypoints: { worker: "./dist/worker.js" },
+        tools: [{
+          name: "get-agent-identity",
+          displayName: "Get agent identity",
+          description: "Return an agent's configured identity.",
+          parametersSchema: {
+            type: "object",
+            properties: { agentId: { type: "string" } },
+            required: ["agentId"],
+          },
+        }],
+      },
+    }).returning();
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: `paperclip_plugin:${pluginKey}`,
+      name: `Plugin: ${pluginKey}`,
+      type: "paperclip_plugin",
+      status: "active",
+      pluginId: plugin.id,
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application.id,
+      name: `Plugin: ${pluginKey}`,
+      transport: "remote_http",
+      status: "active",
+      enabled: true,
+      config: { pluginKey, type: "paperclip_plugin" },
+      transportConfig: { pluginKey, type: "paperclip_plugin" },
+      healthStatus: "unchecked",
+    }).returning();
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    const health = await service.checkHealth(connection.id, { actorType: "user", actorId: "board" });
+    expect(health.connection).toMatchObject({
+      healthStatus: "ok",
+      healthMessage: `Paperclip plugin ${pluginKey} is ready and its tools are registered.`,
+    });
+
+    const refreshed = await service.refreshCatalog(connection.id, { actorType: "user", actorId: "board" });
+    expect(refreshed.discoveredCount).toBe(1);
+    expect(refreshed.catalog).toEqual([
+      expect.objectContaining({
+        connectionId: connection.id,
+        toolName: "get-agent-identity",
+        title: "Get agent identity",
+        description: "Return an agent's configured identity.",
+        inputSchema: expect.objectContaining({ required: ["agentId"] }),
+      }),
+    ]);
+
+    const paused = await service.updateConnection(connection.id, { enabled: false });
+    expect(paused.enabled).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("sends the MCP Streamable HTTP Accept header and decodes an SSE catalog response", async () => {
