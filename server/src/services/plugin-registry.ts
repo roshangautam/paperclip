@@ -1,8 +1,9 @@
-import { asc, eq, isNull, ne, sql, and } from "drizzle-orm";
+import { asc, eq, inArray, isNull, ne, sql, and } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   plugins,
   pluginConfig,
+  companySecretBindings,
   pluginCompanySettings,
   pluginEntities,
   pluginJobs,
@@ -28,6 +29,8 @@ import type {
   PluginWebhookDeliveryStatus,
 } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
+import type { PluginConfigSecretRefBinding } from "./plugin-secrets-handler.js";
+import { secretService } from "./secrets.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -258,12 +261,28 @@ export function pluginRegistryService(db: Db) {
       if (!plugin) throw notFound("Plugin not found");
 
       if (removeData) {
-        // Hard delete – plugin_config cascades via FK onDelete
-        return db
-          .delete(plugins)
-          .where(eq(plugins.id, id))
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        return db.transaction(async (tx) => {
+          const lockedPlugin = await tx
+            .select()
+            .from(plugins)
+            .where(eq(plugins.id, id))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (!lockedPlugin) throw notFound("Plugin not found");
+
+          const deletedPlugin = await tx
+            .delete(plugins)
+            .where(eq(plugins.id, id))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          await tx
+            .delete(companySecretBindings)
+            .where(and(
+              eq(companySecretBindings.targetType, "plugin"),
+              eq(companySecretBindings.targetId, id),
+            ));
+          return deletedPlugin;
+        });
       }
 
       // Soft delete – mark as uninstalled
@@ -293,38 +312,57 @@ export function pluginRegistryService(db: Db) {
      * If a config row already exists for the plugin/company pair it is replaced;
      * otherwise a new row is inserted.
      */
-    upsertConfig: async (pluginId: string, companyId: string, input: UpsertPluginConfig) => {
+    upsertConfig: async (
+      pluginId: string,
+      companyId: string,
+      input: UpsertPluginConfig,
+      options?: { secretRefs?: PluginConfigSecretRefBinding[] },
+    ) => {
       const plugin = await getById(pluginId);
       if (!plugin) throw notFound("Plugin not found");
 
-      const existing = await db
-        .select()
-        .from(pluginConfig)
-        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
-        .then((rows) => rows[0] ?? null);
+      return db.transaction(async (tx) => {
+        await tx
+          .insert(pluginConfig)
+          .values({ pluginId, companyId, configJson: {} })
+          .onConflictDoNothing();
 
-      if (existing) {
-        return db
+        const existing = await tx
+          .select()
+          .from(pluginConfig)
+          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!existing) throw new Error("Plugin config row was not available after initialization");
+
+        if (options?.secretRefs) {
+          await secretService(db).syncSecretRefsForTarget(
+            companyId,
+            { targetType: "plugin", targetId: pluginId },
+            options.secretRefs,
+            { replaceAll: true, transaction: tx },
+          );
+        } else {
+          await tx
+            .delete(companySecretBindings)
+            .where(and(
+              eq(companySecretBindings.companyId, companyId),
+              eq(companySecretBindings.targetType, "plugin"),
+              eq(companySecretBindings.targetId, pluginId),
+            ));
+        }
+
+        return tx
           .update(pluginConfig)
           .set({
             configJson: input.configJson,
             lastError: null,
             updatedAt: new Date(),
           })
-          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+          .where(eq(pluginConfig.id, existing.id))
           .returning()
           .then((rows) => rows[0]);
-      }
-
-      return db
-        .insert(pluginConfig)
-        .values({
-          pluginId,
-          companyId,
-          configJson: input.configJson,
-        })
-        .returning()
-        .then((rows) => rows[0]);
+      });
     },
 
     /**
@@ -335,35 +373,57 @@ export function pluginRegistryService(db: Db) {
       const plugin = await getById(pluginId);
       if (!plugin) throw notFound("Plugin not found");
 
-      const existing = await db
-        .select()
-        .from(pluginConfig)
-        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
-        .then((rows) => rows[0] ?? null);
+      return db.transaction(async (tx) => {
+        await tx
+          .insert(pluginConfig)
+          .values({ pluginId, companyId, configJson: {} })
+          .onConflictDoNothing();
 
-      if (existing) {
+        const existing = await tx
+          .select()
+          .from(pluginConfig)
+          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!existing) throw new Error("Plugin config row was not available after initialization");
+
+        const changedPrefixes = Object.keys(input.configJson);
+        if (changedPrefixes.length > 0) {
+          const bindings = await tx
+            .select({
+              id: companySecretBindings.id,
+              configPath: companySecretBindings.configPath,
+            })
+            .from(companySecretBindings)
+            .where(and(
+              eq(companySecretBindings.companyId, companyId),
+              eq(companySecretBindings.targetType, "plugin"),
+              eq(companySecretBindings.targetId, pluginId),
+            ));
+          const changedBindingIds = bindings
+            .filter((binding) =>
+              changedPrefixes.some((prefix) =>
+                binding.configPath === prefix || binding.configPath.startsWith(`${prefix}.`)))
+            .map((binding) => binding.id);
+          if (changedBindingIds.length > 0) {
+            await tx
+              .delete(companySecretBindings)
+              .where(inArray(companySecretBindings.id, changedBindingIds));
+          }
+        }
+
         const merged = { ...existing.configJson, ...input.configJson };
-        return db
+        return tx
           .update(pluginConfig)
           .set({
             configJson: merged,
             lastError: null,
             updatedAt: new Date(),
           })
-          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+          .where(eq(pluginConfig.id, existing.id))
           .returning()
           .then((rows) => rows[0]);
-      }
-
-      return db
-        .insert(pluginConfig)
-        .values({
-          pluginId,
-          companyId,
-          configJson: input.configJson,
-        })
-        .returning()
-        .then((rows) => rows[0]);
+      });
     },
 
     /**
@@ -382,14 +442,29 @@ export function pluginRegistryService(db: Db) {
     },
 
     /** Delete a plugin's config row. */
-    deleteConfig: async (pluginId: string, companyId: string) => {
-      const rows = await db
-        .delete(pluginConfig)
-        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
-        .returning();
+    deleteConfig: async (pluginId: string, companyId: string) =>
+      db.transaction(async (tx) => {
+        const existing = await tx
+          .select()
+          .from(pluginConfig)
+          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return null;
 
-      return rows[0] ?? null;
-    },
+        await tx
+          .delete(companySecretBindings)
+          .where(and(
+            eq(companySecretBindings.companyId, companyId),
+            eq(companySecretBindings.targetType, "plugin"),
+            eq(companySecretBindings.targetId, pluginId),
+          ));
+        return tx
+          .delete(pluginConfig)
+          .where(eq(pluginConfig.id, existing.id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      }),
 
     // ----- Company settings ----------------------------------------------
 

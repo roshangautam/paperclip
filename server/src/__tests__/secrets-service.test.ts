@@ -188,6 +188,41 @@ describeEmbeddedPostgres("secretService", () => {
     });
   });
 
+  it("treats LIKE metacharacters literally when replacing secret ref path prefixes", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const secrets = await Promise.all(
+      ["plain", "percent", "underscore", "backslash"].map((name) =>
+        svc.create(companyId, {
+          name: `literal-prefix-${name}-${randomUUID()}`,
+          provider: "local_encrypted",
+          value: name,
+        }),
+      ),
+    );
+    const target = { targetType: "environment" as const, targetId: "env-literal-prefixes" };
+    const refs = [
+      { secretId: secrets[0].id, configPath: "credentials.token" },
+      { secretId: secrets[1].id, configPath: "credentials%.token" },
+      { secretId: secrets[2].id, configPath: "credentials_.token" },
+      { secretId: secrets[3].id, configPath: "credentials\\.token" },
+    ];
+
+    for (const ref of refs) {
+      await svc.syncSecretRefsForTarget(companyId, target, [ref]);
+    }
+    for (const ref of refs.slice(1)) {
+      await svc.syncSecretRefsForTarget(companyId, target, [ref]);
+    }
+
+    const configPaths = await db
+      .select({ configPath: companySecretBindings.configPath })
+      .from(companySecretBindings)
+      .where(eq(companySecretBindings.targetId, target.targetId))
+      .then((rows) => rows.map((row) => row.configPath).sort());
+    expect(configPaths).toEqual(refs.map((ref) => ref.configPath).sort());
+  });
+
   it("reports reference counts and resolves binding target labels", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);

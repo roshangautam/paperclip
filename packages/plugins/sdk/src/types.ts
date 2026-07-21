@@ -433,7 +433,23 @@ export interface PluginConfigClient {
    * companyId; otherwise callers must pass it explicitly.
    */
   get(companyId?: string): Promise<Record<string, unknown>>;
+
+  /**
+   * Atomically patches object-shaped secret references in company config.
+   * Requires the `secrets.bind-ref` capability. Company authority is always
+   * derived from the current invocation.
+   */
+  patchSecretRefs(input: {
+    path: string[];
+    value: PluginSecretRefPatchValue;
+  }): Promise<Record<string, unknown>>;
 }
+
+export type PluginSecretRefPatchValue =
+  | EnvSecretRefBinding
+  | null
+  | PluginSecretRefPatchValue[]
+  | { [key: string]: PluginSecretRefPatchValue };
 
 export interface PluginLocalFolderProblem {
   code:
