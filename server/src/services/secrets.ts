@@ -464,7 +464,10 @@ type RuntimeSecretResolution = {
 
 type SecretResolutionErrorCode =
   | "binding_missing"
+  | "binding_not_allowed"
   | "secret_deleted"
+  | "secret_missing"
+  | "secret_company_mismatch"
   | "secret_inactive"
   | "secret_scope_invalid"
   | "responsible_user_missing"
@@ -565,7 +568,10 @@ function secretResolutionErrorCode(error: unknown): SecretResolutionErrorCode {
     const details = asRecord(error.details);
     switch (details?.code) {
       case "binding_missing":
+      case "binding_not_allowed":
       case "secret_deleted":
+      case "secret_missing":
+      case "secret_company_mismatch":
       case "secret_inactive":
       case "version_missing":
       case "version_inactive":
@@ -573,6 +579,8 @@ function secretResolutionErrorCode(error: unknown): SecretResolutionErrorCode {
         return details.code;
     }
     if (error.message === "Secret is not active") return "secret_inactive";
+    if (error.message === "Secret not found") return "secret_missing";
+    if (error.message === "Secret must belong to same company") return "secret_company_mismatch";
     if (error.message === "User secret value is not configured") return "user_secret_missing";
     if (error.message === "Responsible user is required for user secret resolution") {
       return "responsible_user_missing";
@@ -826,11 +834,11 @@ export function secretService(db: Db) {
 
   async function recordAccessEvent(input: {
     companyId: string;
-    secretId: string;
+    secretId: string | null;
     userSecretDefinitionId?: string | null;
     secretScope?: string | null;
     version: number | null;
-    provider: SecretProvider;
+    provider: SecretProvider | "unknown";
     context: SecretConsumerContext | undefined;
     credentialOwnerUserId?: string | null;
     credentialSubjectType?: string | null;
@@ -1013,18 +1021,41 @@ export function secretService(db: Db) {
   ): Promise<RuntimeSecretResolution> {
     const bindingContext = options?.bindingContext;
     const accessContext = options?.accessContext ?? bindingContext;
-    const secret = await getById(secretId);
-    if (!secret) throw notFound("Secret not found");
-    if (secret.companyId !== companyId) throw unprocessable("Secret must belong to same company");
-    if (secret.scope !== "company" && !options?.allowUserSecretScope) {
-      throw unprocessable("User-scoped secrets must be resolved through user secret declarations", {
-        code: "secret_scope_invalid",
-      });
-    }
-    const resolvedVersion = version === "latest" ? secret.latestVersion : version;
-    const providerId = secret.provider as SecretProvider;
     const configPath = accessContext?.configPath ?? null;
+    let auditSecret: typeof companySecrets.$inferSelect | null = null;
+    let auditVersion: number | null =
+      typeof version === "number" &&
+      Number.isSafeInteger(version) &&
+      version > 0 &&
+      version <= 2_147_483_647
+        ? version
+        : null;
+    let auditProvider: SecretProvider | "unknown" = "unknown";
     try {
+      const secret = await getById(secretId);
+      if (!secret) {
+        throw new HttpError(404, "Secret not found", { code: "secret_missing" });
+      }
+      if (secret.companyId !== companyId) {
+        throw unprocessable("Secret must belong to same company", {
+          code: "secret_company_mismatch",
+        });
+      }
+      auditSecret = secret;
+      const resolvedVersion = version === "latest" ? secret.latestVersion : version;
+      const providerId = secret.provider as SecretProvider;
+      auditVersion =
+        Number.isSafeInteger(resolvedVersion) &&
+        resolvedVersion > 0 &&
+        resolvedVersion <= 2_147_483_647
+          ? resolvedVersion
+          : null;
+      auditProvider = providerId;
+      if (secret.scope !== "company" && !options?.allowUserSecretScope) {
+        throw unprocessable("User-scoped secrets must be resolved through user secret declarations", {
+          code: "secret_scope_invalid",
+        });
+      }
       if (secret.status === "deleted") {
         throw new HttpError(404, "Secret not found", { code: "secret_deleted" });
       }
@@ -1032,6 +1063,9 @@ export function secretService(db: Db) {
         throw unprocessable("Secret is not active", { code: "secret_inactive" });
       }
       const binding = await assertBindingContext(companyId, secret.id, bindingContext);
+      if (auditVersion === null) {
+        throw new HttpError(404, "Secret version not found", { code: "version_missing" });
+      }
       const versionRow = await getSecretVersion(secret.id, resolvedVersion);
       if (!versionRow) throw new HttpError(404, "Secret version not found", { code: "version_missing" });
       if (versionRow.status === "disabled" || versionRow.status === "destroyed" || versionRow.revokedAt) {
@@ -1093,15 +1127,15 @@ export function secretService(db: Db) {
       const errorCode = secretResolutionErrorCode(err);
       await recordAccessEvent({
         companyId,
-        secretId: secret.id,
-        userSecretDefinitionId: secret.userSecretDefinitionId ?? null,
-        secretScope: secret.scope,
-        version: resolvedVersion,
-        provider: providerId,
+        secretId: auditSecret?.id ?? null,
+        userSecretDefinitionId: auditSecret?.userSecretDefinitionId ?? null,
+        secretScope: auditSecret?.scope ?? "company",
+        version: auditVersion,
+        provider: auditProvider,
         context: accessContext,
-        credentialOwnerUserId: secret.ownerUserId ?? null,
-        credentialSubjectType: secret.scope === "user" ? "user" : null,
-        credentialSubjectId: secret.ownerUserId ?? null,
+        credentialOwnerUserId: auditSecret?.ownerUserId ?? null,
+        credentialSubjectType: auditSecret?.scope === "user" ? "user" : null,
+        credentialSubjectId: auditSecret?.ownerUserId ?? null,
         outcome: "failure",
         errorCode,
       }).catch(() => undefined);

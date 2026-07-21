@@ -266,6 +266,41 @@ describeEmbeddedPostgres("secretService", () => {
     expect(JSON.stringify(events)).not.toContain("runtime-secret");
   });
 
+  it("records a null audit version when the resolved selector exceeds PostgreSQL integer bounds", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `invalid-audit-version-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "runtime-secret",
+    });
+
+    await expect(
+      svc.resolveSecretValue(companyId, secret.id, 2_147_483_648, {
+        accessContext: {
+          consumerType: "plugin_worker",
+          consumerId: "plugin-1",
+          configPath: "credentials.apiKey",
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 404,
+      details: { code: "version_missing" },
+    });
+
+    const events = await db
+      .select()
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, secret.id));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      companyId,
+      secretId: secret.id,
+      version: null,
+      outcome: "failure",
+    });
+  });
+
   it("collects declared secret refs that have no binding without resolving values", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);
@@ -642,18 +677,28 @@ describeEmbeddedPostgres("secretService", () => {
       .select()
       .from(secretAccessEvents)
       .where(eq(secretAccessEvents.secretId, userOneSecret.id));
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
-      companyId,
-      secretId: userOneSecret.id,
-      userSecretDefinitionId: definition.id,
-      secretScope: "user",
-      responsibleUserId: "user-1",
-      credentialOwnerUserId: "user-1",
-      credentialSubjectType: "user",
-      credentialSubjectId: "user-1",
-      outcome: "success",
-    });
+    expect(events).toHaveLength(2);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        companyId,
+        secretId: userOneSecret.id,
+        userSecretDefinitionId: definition.id,
+        secretScope: "user",
+        responsibleUserId: "user-1",
+        credentialOwnerUserId: "user-1",
+        credentialSubjectType: "user",
+        credentialSubjectId: "user-1",
+        outcome: "success",
+      }),
+      expect.objectContaining({
+        companyId,
+        secretId: userOneSecret.id,
+        userSecretDefinitionId: definition.id,
+        secretScope: "user",
+        outcome: "failure",
+        errorCode: "secret_scope_invalid",
+      }),
+    ]));
     expect(JSON.stringify(events)).not.toContain("user-one-secret");
   });
 

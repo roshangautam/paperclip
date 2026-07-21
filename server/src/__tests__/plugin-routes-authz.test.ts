@@ -318,7 +318,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true);
   }, 20_000);
 
-  it("allows instance admins to save company-scoped secret refs and sync plugin bindings", async () => {
+  it("allows instance admins to save company-scoped secret refs without replacing existing plugin bindings", async () => {
     readyPlugin();
     const configJson = {
       apiKeyRef: { type: "secret_ref", secretId, version: "latest" },
@@ -345,8 +345,38 @@ describe.sequential("plugin install and upgrade authz", () => {
       companyA,
       { targetType: "plugin", targetId: pluginId },
       [expect.objectContaining({ secretId, configPath: "apiKeyRef", versionSelector: "latest" })],
-      { replaceAll: true },
+      { replaceAll: false },
     );
+    expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, companyA, {
+      companyId: companyA,
+      configJson,
+    });
+  }, 20_000);
+
+  it("preserves existing plugin bindings when an ordinary config save contains no secret refs", async () => {
+    readyPlugin();
+    const configJson = { displayName: "Example" };
+    mockRegistry.upsertConfig.mockResolvedValue({
+      id: "config-1",
+      pluginId,
+      companyId: companyA,
+      configJson,
+    });
+
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyA],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config`)
+      .send({ companyId: companyA, configJson });
+
+    expect(res.status).toBe(200);
+    expect(mockSecretService.syncSecretRefsForTarget).not.toHaveBeenCalled();
     expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, companyA, {
       companyId: companyA,
       configJson,

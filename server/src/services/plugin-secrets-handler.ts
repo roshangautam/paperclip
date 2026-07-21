@@ -5,7 +5,11 @@
 
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companySecretBindings } from "@paperclipai/db";
+import {
+  companySecretBindings,
+  companySecrets,
+  secretAccessEvents,
+} from "@paperclipai/db";
 import type { EnvSecretRefBinding, SecretProjectionClass, SecretVersionSelector } from "@paperclipai/shared";
 import { envBindingSecretRefSchema } from "@paperclipai/shared";
 import {
@@ -14,7 +18,8 @@ import {
   readConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { secretService } from "./secrets.js";
-import { unprocessable } from "../errors.js";
+import { HttpError, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -157,10 +162,6 @@ export interface PluginSecretsResolveParams {
   companyId?: string;
   /** Config path that produced this ref. Required when a secret appears in multiple paths. */
   configPath?: string;
-  actorType?: "agent" | "user" | "system" | "plugin";
-  actorId?: string | null;
-  issueId?: string | null;
-  heartbeatRunId?: string | null;
 }
 
 export interface PluginSecretsHandlerOptions {
@@ -174,10 +175,27 @@ export interface PluginSecretsService {
 
 function createRateLimiter(maxAttempts: number, windowMs: number) {
   const attempts = new Map<string, number[]>();
+  let nextSweepAt = Date.now() + windowMs;
+
+  function sweepStaleKeys(now: number): void {
+    if (now < nextSweepAt) return;
+
+    const windowStart = now - windowMs;
+    for (const [key, timestamps] of attempts) {
+      const active = timestamps.filter((timestamp) => timestamp > windowStart);
+      if (active.length === 0) {
+        attempts.delete(key);
+      } else if (active.length !== timestamps.length) {
+        attempts.set(key, active);
+      }
+    }
+    nextSweepAt = now + windowMs;
+  }
 
   return {
     check(key: string): boolean {
       const now = Date.now();
+      sweepStaleKeys(now);
       const windowStart = now - windowMs;
       const existing = (attempts.get(key) ?? []).filter((ts) => ts > windowStart);
       if (existing.length >= maxAttempts) return false;
@@ -188,11 +206,117 @@ function createRateLimiter(maxAttempts: number, windowMs: number) {
   };
 }
 
+function candidateSecretId(secretRef: unknown): string | null {
+  if (typeof secretRef === "string") {
+    const value = secretRef.trim();
+    return isUuidSecretRef(value) ? value : null;
+  }
+  if (!isPlainRecord(secretRef) || typeof secretRef.secretId !== "string") return null;
+  const value = secretRef.secretId.trim();
+  return isUuidSecretRef(value) ? value : null;
+}
+
+function resolutionErrorCode(error: unknown): string {
+  if (error instanceof HttpError && isPlainRecord(error.details)) {
+    const code = error.details.code;
+    if (typeof code === "string" && code.trim()) return code.trim();
+  }
+  if (error instanceof Error) {
+    if (error.name === "InvalidSecretRefError") return "invalid_secret_ref";
+    if (error.name === "RateLimitExceededError") return "rate_limited";
+  }
+  return "plugin_secret_resolution_rejected";
+}
+
 export function createPluginSecretsHandler(
   options: PluginSecretsHandlerOptions,
 ): PluginSecretsService {
   const { db, pluginId } = options;
   const rateLimiter = createRateLimiter(30, 60_000);
+  const rejectionAuditRateLimiter = createRateLimiter(30, 60_000);
+
+  async function auditRejectedResolution(
+    companyId: string,
+    params: PluginSecretsResolveParams,
+    errorCode: string,
+  ): Promise<void> {
+    const secretId = candidateSecretId(params.secretRef);
+    const [secret] = secretId
+      ? await db
+        .select({
+          id: companySecrets.id,
+          latestVersion: companySecrets.latestVersion,
+          provider: companySecrets.provider,
+          scope: companySecrets.scope,
+        })
+        .from(companySecrets)
+        .where(and(
+          eq(companySecrets.id, secretId),
+          eq(companySecrets.companyId, companyId),
+        ))
+        .limit(1)
+      : [];
+    const parsedRef = parseSecretRefBinding(params.secretRef);
+    const version = parsedRef
+      ? typeof parsedRef.version === "number"
+        ? Number.isSafeInteger(parsedRef.version) &&
+          parsedRef.version > 0 &&
+          parsedRef.version <= 2_147_483_647
+          ? parsedRef.version
+          : null
+        : secret?.latestVersion ?? null
+      : null;
+    const requestedConfigPath = typeof params.configPath === "string"
+      ? params.configPath.trim()
+      : "";
+    const [binding] = secret?.id && requestedConfigPath
+      ? await db
+        .select({ configPath: companySecretBindings.configPath })
+        .from(companySecretBindings)
+        .where(and(
+          eq(companySecretBindings.companyId, companyId),
+          eq(companySecretBindings.targetType, "plugin"),
+          eq(companySecretBindings.targetId, pluginId),
+          eq(companySecretBindings.secretId, secret.id),
+          eq(companySecretBindings.configPath, requestedConfigPath),
+        ))
+        .limit(1)
+      : [];
+
+    await db.insert(secretAccessEvents).values({
+      companyId,
+      secretId: secret?.id ?? null,
+      secretScope: secret?.scope ?? "company",
+      version,
+      provider: secret?.provider ?? "unknown",
+      actorType: "plugin",
+      actorId: pluginId,
+      consumerType: "plugin_worker",
+      consumerId: pluginId,
+      configPath: binding?.configPath ?? null,
+      issueId: null,
+      heartbeatRunId: null,
+      pluginId,
+      outcome: "failure",
+      errorCode,
+    });
+  }
+
+  async function bestEffortAuditRejectedResolution(
+    companyId: string,
+    params: PluginSecretsResolveParams,
+    errorCode: string,
+  ): Promise<void> {
+    if (!rejectionAuditRateLimiter.check(`${companyId}:${pluginId}`)) return;
+    try {
+      await auditRejectedResolution(companyId, params, errorCode);
+    } catch (auditError) {
+      logger.warn(
+        { err: auditError, companyId, pluginId, errorCode },
+        "failed to record rejected plugin secret resolution",
+      );
+    }
+  }
 
   async function lookupBinding(input: {
     companyId: string;
@@ -221,62 +345,76 @@ export function createPluginSecretsHandler(
 
   return {
     async resolve(params: PluginSecretsResolveParams): Promise<string> {
-      if (typeof params.secretRef === "string") {
-        throw invalidSecretRef(params.secretRef.trim() || "<empty>");
-      }
-
-      const bindingRef = parseSecretRefBinding(params.secretRef);
-      if (!bindingRef) throw invalidSecretRef(params.secretRef);
-
       const companyId = requireCompanyId(params.companyId);
+      const configPath = typeof params.configPath === "string"
+        ? params.configPath.trim() || undefined
+        : undefined;
+      const normalizedParams = { ...params, configPath };
+      const prepared = await (async () => {
+        if (typeof params.secretRef === "string") {
+          throw invalidSecretRef(params.secretRef.trim() || "<empty>");
+        }
 
-      if (!rateLimiter.check(`${companyId}:${pluginId}`)) {
-        const err = new Error("Rate limit exceeded for secret resolution");
-        err.name = "RateLimitExceededError";
-        throw err;
-      }
+        const bindingRef = parseSecretRefBinding(params.secretRef);
+        if (!bindingRef) throw invalidSecretRef(params.secretRef);
 
-      const versionSelector = bindingRef.version ?? "latest";
-      const bindings = await lookupBinding({
-        companyId,
-        secretId: bindingRef.secretId,
-        versionSelector,
-        configPath: params.configPath,
+        if (!rateLimiter.check(`${companyId}:${pluginId}`)) {
+          const err = new Error("Rate limit exceeded for secret resolution");
+          err.name = "RateLimitExceededError";
+          throw err;
+        }
+
+        const versionSelector = bindingRef.version ?? "latest";
+        const bindings = await lookupBinding({
+          companyId,
+          secretId: bindingRef.secretId,
+          versionSelector,
+          configPath,
+        });
+
+        if (bindings.length === 0) {
+          throw unprocessable(
+            `Secret is not bound to plugin:${pluginId}${configPath ? ` at ${configPath}` : ""}`,
+            { code: "binding_missing" },
+          );
+        }
+        if (bindings.length > 1) {
+          throw unprocessable(
+            "Plugin secret reference is ambiguous; pass configPath when resolving this secret",
+            { code: "binding_ambiguous" },
+          );
+        }
+
+        return { bindingRef, versionSelector, binding: bindings[0]! };
+      })().catch(async (error: unknown) => {
+        await bestEffortAuditRejectedResolution(
+          companyId,
+          normalizedParams,
+          resolutionErrorCode(error),
+        );
+        throw error;
       });
 
-      if (bindings.length === 0) {
-        throw unprocessable(
-          `Secret is not bound to plugin:${pluginId}${params.configPath ? ` at ${params.configPath}` : ""}`,
-          { code: "binding_missing" },
-        );
-      }
-      if (bindings.length > 1) {
-        throw unprocessable(
-          "Plugin secret reference is ambiguous; pass configPath when resolving this secret",
-          { code: "binding_ambiguous" },
-        );
-      }
-
-      const binding = bindings[0]!;
+      const { bindingRef, versionSelector, binding } = prepared;
       return secretService(db).resolveSecretValue(companyId, bindingRef.secretId, versionSelector, {
         bindingContext: {
           consumerType: "plugin",
           consumerId: pluginId,
           configPath: binding.configPath,
-          actorType: params.actorType ?? "plugin",
-          actorId: params.actorId ?? pluginId,
-          issueId: params.issueId ?? null,
-          heartbeatRunId: params.heartbeatRunId ?? null,
+          actorType: "plugin",
+          actorId: pluginId,
+          issueId: null,
+          heartbeatRunId: null,
           pluginId,
         },
         accessContext: {
           consumerType: "plugin_worker",
           consumerId: pluginId,
           configPath: binding.configPath,
-          actorType: params.actorType ?? "plugin",
-          actorId: params.actorId ?? pluginId,
-          issueId: params.issueId ?? null,
-          heartbeatRunId: params.heartbeatRunId ?? null,
+          actorType: "plugin",
+          actorId: pluginId,
+          issueId: null,
+          heartbeatRunId: null,
           pluginId,
         },
       });

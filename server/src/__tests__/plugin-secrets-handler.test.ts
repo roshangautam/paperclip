@@ -63,13 +63,89 @@ describe("createPluginSecretsHandler fail-closed guards", () => {
   });
 
   it("rejects legacy string refs before provider resolution", async () => {
-    const db = { select: vi.fn(() => { throw new Error("db should not be touched"); }) };
+    const writeAudit = vi.fn().mockResolvedValue(undefined);
+    const limit = vi.fn().mockResolvedValue([]);
+    const where = vi.fn(() => ({ limit }));
+    const from = vi.fn(() => ({ where }));
+    const db = {
+      select: vi.fn(() => ({ from })),
+      insert: vi.fn(() => ({ values: writeAudit })),
+    };
     const handler = createPluginSecretsHandler({ db: db as never, pluginId });
 
     await expect(
-      handler.resolve({ companyId: randomUUID(), secretRef: randomUUID() }),
+      handler.resolve({
+        companyId: randomUUID(),
+        secretRef: randomUUID(),
+        actorType: "agent",
+        actorId: "spoofed-agent",
+      } as Parameters<typeof handler.resolve>[0]),
     ).rejects.toThrow(/use \{ type: "secret_ref"/i);
-    expect(db.select).not.toHaveBeenCalled();
+    expect(db.select).toHaveBeenCalledOnce();
+    expect(writeAudit).toHaveBeenCalledOnce();
+    expect(writeAudit).toHaveBeenCalledWith(expect.objectContaining({
+      actorType: "plugin",
+      actorId: pluginId,
+    }));
+  });
+
+  it("preserves the original secret-gate denial when rejection auditing fails", async () => {
+    const writeAudit = vi.fn().mockRejectedValue(new Error("audit storage unavailable"));
+    const db = {
+      insert: vi.fn(() => ({ values: writeAudit })),
+    };
+    const handler = createPluginSecretsHandler({ db: db as never, pluginId });
+
+    await expect(
+      handler.resolve({ companyId: randomUUID(), secretRef: "not-a-secret-ref" }),
+    ).rejects.toMatchObject({ name: "InvalidSecretRefError" });
+    expect(writeAudit).toHaveBeenCalledOnce();
+  });
+
+  it("rate-limits rejection audit writes", async () => {
+    const writeAudit = vi.fn().mockResolvedValue(undefined);
+    const db = {
+      insert: vi.fn(() => ({ values: writeAudit })),
+    };
+    const handler = createPluginSecretsHandler({ db: db as never, pluginId });
+    const companyId = randomUUID();
+
+    for (let attempt = 0; attempt < 31; attempt += 1) {
+      await expect(
+        handler.resolve({ companyId, secretRef: "not-a-secret-ref" }),
+      ).rejects.toMatchObject({ name: "InvalidSecretRefError" });
+    }
+
+    expect(writeAudit).toHaveBeenCalledTimes(30);
+  });
+
+  it("evicts stale rate-limiter keys without timers", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const deleteSpy = vi.spyOn(Map.prototype, "delete");
+
+    try {
+      const writeAudit = vi.fn().mockResolvedValue(undefined);
+      const db = {
+        insert: vi.fn(() => ({ values: writeAudit })),
+      };
+      const handler = createPluginSecretsHandler({ db: db as never, pluginId });
+      const staleCompanyId = randomUUID();
+
+      await expect(
+        handler.resolve({ companyId: staleCompanyId, secretRef: "not-a-secret-ref" }),
+      ).rejects.toMatchObject({ name: "InvalidSecretRefError" });
+
+      vi.advanceTimersByTime(60_001);
+      await expect(
+        handler.resolve({ companyId: randomUUID(), secretRef: "not-a-secret-ref" }),
+      ).rejects.toMatchObject({ name: "InvalidSecretRefError" });
+
+      expect(deleteSpy).toHaveBeenCalledWith(`${staleCompanyId}:${pluginId}`);
+    } finally {
+      deleteSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -162,7 +238,10 @@ describeEmbeddedPostgres("createPluginSecretsHandler shared vault integration", 
       handler.resolve({
         companyId,
         secretRef: { type: "secret_ref", secretId: secret.id, version: "latest" },
-      }),
+        configPath: "  apiKey  ",
+        actorType: "agent",
+        actorId: "spoofed-agent",
+      } as Parameters<typeof handler.resolve>[0]),
     ).resolves.toBe("resolved-plugin-secret");
 
     const events = await db
@@ -177,8 +256,47 @@ describeEmbeddedPostgres("createPluginSecretsHandler shared vault integration", 
       consumerId: pluginId,
       configPath: "apiKey",
       pluginId,
+      actorType: "plugin",
+      actorId: pluginId,
       outcome: "success",
       errorCode: null,
+    });
+  });
+
+  it("audits an out-of-range requested version as null", async () => {
+    await seedPlugin();
+    const companyId = await seedCompany("Plugin Co");
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `plugin-api-key-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "resolved-plugin-secret",
+    });
+    await svc.syncSecretRefsForTarget(companyId, { targetType: "plugin", targetId: pluginId }, [
+      { secretId: secret.id, configPath: "apiKey" },
+    ], { replaceAll: true });
+
+    const handler = createPluginSecretsHandler({ db, pluginId });
+    await expect(
+      handler.resolve({
+        companyId,
+        secretRef: { type: "secret_ref", secretId: secret.id, version: 2_147_483_648 },
+        configPath: "apiKey",
+      }),
+    ).rejects.toThrow(/not bound/i);
+
+    const events = await db
+      .select()
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, secret.id));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      companyId,
+      secretId: secret.id,
+      version: null,
+      configPath: "apiKey",
+      outcome: "failure",
+      errorCode: "binding_missing",
     });
   });
 
