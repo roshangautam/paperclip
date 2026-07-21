@@ -134,6 +134,19 @@ describe("plugin UI static route", () => {
     expect(mockRegistry.getConfig).not.toHaveBeenCalled();
   });
 
+  it("rejects an explicitly empty companyId before reading devUiUrl config", async () => {
+    readyPlugin(createPluginPackage());
+    const app = await createApp(boardActor([companyA]));
+
+    const res = await request(app)
+      .get(`/_plugins/${pluginId}/ui/index.js`)
+      .query({ companyId: "   " });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/non-empty string/i);
+    expect(mockRegistry.getConfig).not.toHaveBeenCalled();
+  });
+
   it("proxies devUiUrl only after company access succeeds", async () => {
     process.env.NODE_ENV = "development";
     readyPlugin(createPluginPackage());
@@ -160,5 +173,47 @@ describe("plugin UI static route", () => {
       "http://localhost:5173/index.js",
       expect.objectContaining({ signal: expect.any(Object) }),
     );
+  });
+
+  it("inherits company scope from a same-plugin development referer", async () => {
+    process.env.NODE_ENV = "development";
+    readyPlugin(createPluginPackage());
+    mockRegistry.getConfig.mockResolvedValue({
+      configJson: {
+        devUiUrl: "http://localhost:5173/",
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response("hot dependency", {
+      status: 200,
+      headers: { "content-type": "application/javascript" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const app = await createApp(boardActor([companyA]));
+
+    const res = await request(app)
+      .get(`/_plugins/${pluginId}/ui/dependency.js`)
+      .set("Referer", `http://localhost:3100/_plugins/${pluginId}/ui/index.js?companyId=${companyA}`);
+
+    expect(res.status).toBe(200);
+    expect(res.text).toBe("hot dependency");
+    expect(mockRegistry.getConfig).toHaveBeenCalledWith(pluginId, companyA);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:5173/dependency.js",
+      expect.objectContaining({ signal: expect.any(Object) }),
+    );
+  });
+
+  it("does not inherit company scope from another plugin's referer", async () => {
+    process.env.NODE_ENV = "development";
+    readyPlugin(createPluginPackage("export const marker = 'static-bundle';\n"));
+    const app = await createApp(boardActor([companyA]));
+
+    const res = await request(app)
+      .get(`/_plugins/${pluginId}/ui/index.js`)
+      .set("Referer", `http://localhost:3100/_plugins/other.plugin/ui/index.js?companyId=${companyA}`);
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("static-bundle");
+    expect(mockRegistry.getConfig).not.toHaveBeenCalled();
   });
 });
