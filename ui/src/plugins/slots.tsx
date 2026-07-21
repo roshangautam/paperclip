@@ -302,6 +302,22 @@ ${namedExports}
       `;
 }
 
+function createJsxRuntimeShimSource(): string {
+  return `
+        const R = globalThis.__paperclipPluginBridge__?.react;
+        const withKey = ${applyJsxRuntimeKey.toString()};
+        export const jsx = (type, props, key) => R.createElement(type, withKey(props, key));
+        export const jsxs = (type, props, key) => {
+          const keyedProps = withKey(props, key);
+          const { children, ...elementProps } = keyedProps;
+          return Array.isArray(children)
+            ? R.createElement(type, elementProps, ...children)
+            : R.createElement(type, keyedProps);
+        };
+        export const Fragment = R.Fragment;
+      `;
+}
+
 function getShimBlobUrl(specifier: "react" | "react-dom" | "react-dom/client" | "react/jsx-runtime" | "sdk-ui"): string {
   if (shimBlobUrls[specifier]) return shimBlobUrls[specifier];
 
@@ -311,13 +327,7 @@ function getShimBlobUrl(specifier: "react" | "react-dom" | "react-dom/client" | 
       source = createReactShimSource(ReactModule);
       break;
     case "react/jsx-runtime":
-      source = `
-        const R = globalThis.__paperclipPluginBridge__?.react;
-        const withKey = ${applyJsxRuntimeKey.toString()};
-        export const jsx = (type, props, key) => R.createElement(type, withKey(props, key));
-        export const jsxs = (type, props, key) => R.createElement(type, withKey(props, key));
-        export const Fragment = R.Fragment;
-      `;
+      source = createJsxRuntimeShimSource();
       break;
     case "react-dom":
     case "react-dom/client":
@@ -950,5 +960,6 @@ export function _resetPluginModuleLoader(): void {
 
 export const _applyJsxRuntimeKeyForTests = applyJsxRuntimeKey;
 export const _createReactShimSourceForTests = createReactShimSource;
+export const _createJsxRuntimeShimSourceForTests = createJsxRuntimeShimSource;
 export const _rewriteBareSpecifiersForTests = rewriteBareSpecifiers;
 export const _collectRegisterableExportNamesForTests = collectRegisterableExportNames;
