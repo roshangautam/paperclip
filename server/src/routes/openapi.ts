@@ -1138,6 +1138,7 @@ registry.registerPath({
     200: r.ok(z.object({
       status: z.literal("ok"),
       version: z.string().optional(),
+      serverVersion: z.string().optional(),
       // Running build commit (full git SHA), or null when git metadata is
       // unavailable. Present on every response shape, including redacted ones.
       commit: z.string().nullable(),
