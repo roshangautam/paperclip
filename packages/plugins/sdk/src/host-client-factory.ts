@@ -98,10 +98,18 @@ export class InvocationScopeDeniedError extends Error {
  * All methods return promises to support async I/O (database, HTTP, etc.).
  */
 export interface HostServices {
-  /** Provides `config.get`. */
+  /** Provides company-scoped plugin config operations. */
   config: {
     get(
       params: WorkerToHostMethods["config.get"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<Record<string, unknown>>;
+    patchSecretRefs?(
+      params: {
+        companyId: string;
+        path: unknown;
+        value: unknown;
+      },
       context?: WorkerHostCallContext,
     ): Promise<Record<string, unknown>>;
   };
@@ -358,8 +366,9 @@ export type HostClientHandlers = {
  * @see PLUGIN_SPEC.md §15 — Capability Model
  */
 const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | null> = {
-  // Config — always allowed
+  // Config
   "config.get": null,
+  "config.patchSecretRefs": "secrets.bind-ref",
 
   // Trusted local folders
   "localFolders.declarations": null,
@@ -676,6 +685,27 @@ export function createHostClientHandlers(
     "config.get": gated("config.get", async (params, context) => {
       const companyId = resolveRequiredCompanyId("config.get", params, context);
       return services.config.get({ ...params, companyId }, context);
+    }),
+    "config.patchSecretRefs": gated("config.patchSecretRefs", async (params, context) => {
+      if (!services.config.patchSecretRefs) {
+        throw new Error("Host does not support config.patchSecretRefs");
+      }
+      if (
+        !isRecord(params)
+        || !Object.prototype.hasOwnProperty.call(params, "path")
+        || !Array.isArray(params.path)
+        || !Object.prototype.hasOwnProperty.call(params, "value")
+      ) {
+        throw new Error(
+          "config.patchSecretRefs requires an object with path and value fields",
+        );
+      }
+      const companyId = resolveRequiredCompanyId("config.patchSecretRefs", params, context);
+      return services.config.patchSecretRefs({
+        companyId,
+        path: params.path,
+        value: params.value,
+      }, context);
     }),
 
     "localFolders.declarations": gated("localFolders.declarations", async (params) => {

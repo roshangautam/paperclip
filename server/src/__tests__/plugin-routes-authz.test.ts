@@ -318,7 +318,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true);
   }, 20_000);
 
-  it("allows instance admins to save company-scoped secret refs without replacing existing plugin bindings", async () => {
+  it("routes company-scoped secret refs through the registry's atomic config save", async () => {
     readyPlugin();
     const configJson = {
       apiKeyRef: { type: "secret_ref", secretId, version: "latest" },
@@ -341,19 +341,22 @@ describe.sequential("plugin install and upgrade authz", () => {
 
     expect(res.status).toBe(200);
     expect(mockSecretService.getById).toHaveBeenCalledWith(secretId);
-    expect(mockSecretService.syncSecretRefsForTarget).toHaveBeenCalledWith(
-      companyA,
-      { targetType: "plugin", targetId: pluginId },
-      [expect.objectContaining({ secretId, configPath: "apiKeyRef", versionSelector: "latest" })],
-      { replaceAll: false },
-    );
+    expect(mockSecretService.syncSecretRefsForTarget).not.toHaveBeenCalled();
     expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, companyA, {
       companyId: companyA,
       configJson,
+    }, {
+      secretRefs: [
+        expect.objectContaining({
+          secretId,
+          configPath: "apiKeyRef",
+          versionSelector: "latest",
+        }),
+      ],
     });
   }, 20_000);
 
-  it("preserves existing plugin bindings when an ordinary config save contains no secret refs", async () => {
+  it("atomically clears plugin bindings when a full config save contains no secret refs", async () => {
     readyPlugin();
     const configJson = { displayName: "Example" };
     mockRegistry.upsertConfig.mockResolvedValue({
@@ -380,7 +383,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, companyA, {
       companyId: companyA,
       configJson,
-    });
+    }, { secretRefs: [] });
   }, 20_000);
 
   it("rejects plugin config saves that reference another company's secret before syncing bindings", async () => {

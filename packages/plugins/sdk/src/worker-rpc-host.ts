@@ -40,6 +40,7 @@ import path from "node:path";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
+import { envBindingSecretRefSchema } from "@paperclipai/shared";
 import type {
   AskUserQuestionsInteraction,
   PaperclipPluginManifestV1,
@@ -66,6 +67,7 @@ import type {
   ToolResult,
   EventFilter,
   AgentSessionEvent,
+  PluginSecretRefPatchValue,
 } from "./types.js";
 import type {
   JsonRpcId,
@@ -121,6 +123,55 @@ import {
   JsonRpcParseError,
   JsonRpcCallError,
 } from "./protocol.js";
+
+const SECRET_PATCH_PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function normalizeSerializableSecretPatchValue(
+  value: unknown,
+  depth = 0,
+  state: { nodes: number } = { nodes: 0 },
+): PluginSecretRefPatchValue {
+  state.nodes += 1;
+  if (depth > 32 || state.nodes > 1_024) {
+    throw new Error("config.patchSecretRefs patch is too large");
+  }
+  const parsedRef = envBindingSecretRefSchema.safeParse(value);
+  if (parsedRef.success) return parsedRef.data;
+  if (value === null) return null;
+  if (Array.isArray(value)) {
+    if (value.length > 256) {
+      throw new Error("config.patchSecretRefs array is too large");
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(value, index)) {
+        throw new Error("config.patchSecretRefs arrays must not contain sparse entries");
+      }
+    }
+    return value.map((child) =>
+      normalizeSerializableSecretPatchValue(child, depth + 1, state));
+  }
+  const prototype = typeof value === "object" && value !== null
+    ? Object.getPrototypeOf(value)
+    : null;
+  if (
+    typeof value !== "object"
+    || value === null
+    || (prototype !== Object.prototype && prototype !== null)
+    || (value as Record<string, unknown>).type === "secret_ref"
+  ) {
+    throw new Error(
+      "config.patchSecretRefs values may contain only secret_ref objects, nested containers, or null removals",
+    );
+  }
+  const normalized: Record<string, PluginSecretRefPatchValue> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (SECRET_PATCH_PROTOTYPE_KEYS.has(key)) {
+      throw new Error("config.patchSecretRefs values require safe object keys");
+    }
+    normalized[key] = normalizeSerializableSecretPatchValue(child, depth + 1, state);
+  }
+  return normalized;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -425,6 +476,24 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       config: {
         async get(companyId?: string) {
           return callHost("config.get", companyId ? { companyId } : {});
+        },
+        async patchSecretRefs(input) {
+          if (
+            typeof input !== "object"
+            || input === null
+            || Array.isArray(input)
+            || !Object.prototype.hasOwnProperty.call(input, "path")
+            || !Array.isArray(input.path)
+            || !Object.prototype.hasOwnProperty.call(input, "value")
+          ) {
+            throw new Error(
+              "config.patchSecretRefs requires an object with path and value fields",
+            );
+          }
+          return callHost("config.patchSecretRefs", {
+            path: input.path,
+            value: normalizeSerializableSecretPatchValue(input.value),
+          });
         },
       },
 

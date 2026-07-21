@@ -665,6 +665,13 @@ Required SDK clients:
 
 Plugins that need filesystem, git, terminal, or process operations handle those directly using standard Node APIs or libraries. The host provides project workspace metadata through `ctx.projects` so plugins can resolve workspace paths, but the host does not proxy low-level OS operations.
 
+`ctx.config.patchSecretRefs({ path, value })` is the only plugin-worker API that
+may persist object-shaped secret references. It requires the statically granted
+`secrets.bind-ref` capability, derives company authority from the current host
+invocation, validates active company-scoped secret versions, and atomically
+updates config, bindings, and the mutation audit record. Direct config writes
+remain fail-closed for secret references.
+
 ## 14.1 Issue Orchestration APIs
 
 Trusted orchestration plugins can create and update Paperclip issues through `ctx.issues` instead of importing server internals. The public issue contract includes parent/project/goal links, board or agent assignees, blocker IDs, labels, billing code, request depth, execution workspace inheritance, and plugin origin metadata.
@@ -850,6 +857,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `local.folders`
 - `http.outbound`
 - `secrets.read-ref`
+- `secrets.bind-ref`
 - `environment.drivers.register`
 
 ### Agent Tools

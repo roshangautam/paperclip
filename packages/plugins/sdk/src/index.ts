@@ -215,6 +215,7 @@ export type {
 export type {
   PluginContext,
   PluginConfigClient,
+  PluginSecretRefPatchValue,
   PluginLocalFolderProblem,
   PluginLocalFolderStatus,
   PluginLocalFolderConfigureInput,

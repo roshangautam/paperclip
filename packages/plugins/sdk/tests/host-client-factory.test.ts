@@ -36,6 +36,80 @@ describe("createHostClientHandlers invocation company scope", () => {
     expect(secretsResolve).not.toHaveBeenCalled();
   });
 
+  it("gates secret-ref config patches and injects only trusted company scope", async () => {
+    const patchSecretRefs = vi.fn(async () => ({ credentials: { token: "stored" } }));
+    const services = {
+      config: {
+        get: vi.fn(async () => ({})),
+        patchSecretRefs,
+      },
+    } as unknown as HostServices;
+    const deniedHandlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      deniedHandlers["config.patchSecretRefs"]({
+        path: ["credentials"],
+        value: {
+          token: {
+            type: "secret_ref",
+            secretId: "11111111-1111-4111-8111-111111111111",
+          },
+        },
+      }, context),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.bind-ref"],
+      services,
+    });
+    await expect(
+      handlers["config.patchSecretRefs"]({
+        path: ["credentials"],
+        value: null,
+      }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["config.patchSecretRefs"]({
+        companyId: "company-b",
+        path: ["credentials"],
+        value: null,
+      } as never, context),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+
+    const secretRef = {
+      type: "secret_ref" as const,
+      secretId: "11111111-1111-4111-8111-111111111111",
+    };
+    await expect(
+      handlers["config.patchSecretRefs"]({
+        path: ["credentials"],
+        value: { token: secretRef },
+      }, context),
+    ).resolves.toEqual({ credentials: { token: "stored" } });
+    expect(patchSecretRefs).toHaveBeenCalledWith({
+      companyId: "company-a",
+      path: ["credentials"],
+      value: { token: secretRef },
+    }, context);
+
+    await expect(
+      handlers["config.patchSecretRefs"](null as never, context),
+    ).rejects.toThrow(/requires an object with path and value fields/i);
+    await expect(
+      handlers["config.patchSecretRefs"]({ value: null } as never, context),
+    ).rejects.toThrow(/requires an object with path and value fields/i);
+    await expect(
+      handlers["config.patchSecretRefs"]({ path: ["credentials"] } as never, context),
+    ).rejects.toThrow(/requires an object with path and value fields/i);
+    expect(patchSecretRefs).toHaveBeenCalledTimes(1);
+  });
+
   it("allows explicit config and secret company ids only when they match the host invocation scope", async () => {
     const configGet = vi.fn(async () => ({ apiKeyRef: "ref" }));
     const secretsResolve = vi.fn(async () => "resolved");

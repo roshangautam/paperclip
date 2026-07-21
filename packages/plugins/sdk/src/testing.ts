@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import {
+  envBindingSecretRefSchema,
+  pluginOperationIssueOriginKind,
+} from "@paperclipai/shared";
 import type {
   PaperclipPluginManifestV1,
   PluginCapability,
@@ -463,6 +466,159 @@ function isInCompany<T extends { companyId: string | null | undefined }>(
   return Boolean(record && record.companyId === companyId);
 }
 
+const TEST_CONFIG_DELETE = Symbol("test-config-delete");
+const TEST_CONFIG_ARRAY_INDEX = /^(0|[1-9]\d*)$/;
+
+function isTestConfigRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isTestSecretRef(value: unknown): boolean {
+  return envBindingSecretRefSchema.safeParse(value).success;
+}
+
+function validateTestSecretPatchPath(path: string[]): void {
+  if (
+    !Array.isArray(path)
+    || path.length === 0
+    || path.length > 32
+    || path.some((segment) =>
+      typeof segment !== "string"
+      || segment.length === 0
+      || segment !== segment.trim()
+      || segment.includes(".")
+      || segment.length > 256
+      || ["__proto__", "constructor", "prototype"].includes(segment)
+      || (TEST_CONFIG_ARRAY_INDEX.test(segment) && Number(segment) >= 256))
+  ) {
+    throw new Error("config.patchSecretRefs requires a safe, non-empty path");
+  }
+}
+
+function normalizeTestSecretPatch(value: unknown, depth = 0): unknown {
+  if (depth > 32) throw new Error("config.patchSecretRefs patch is too deep");
+  const parsedRef = envBindingSecretRefSchema.safeParse(value);
+  if (parsedRef.success) return parsedRef.data;
+  if (value === null) return null;
+  if (Array.isArray(value)) {
+    if (value.length > 256) throw new Error("config.patchSecretRefs array is too large");
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(value, index)) {
+        throw new Error("config.patchSecretRefs arrays must not contain sparse entries");
+      }
+    }
+    return value.map((item) => normalizeTestSecretPatch(item, depth + 1));
+  }
+  if (!isTestConfigRecord(value) || value.type === "secret_ref") {
+    throw new Error(
+      "config.patchSecretRefs values may contain only secret_ref objects, nested containers, or null removals",
+    );
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => {
+      validateTestSecretPatchPath([key]);
+      return [key, normalizeTestSecretPatch(child, depth + 1)];
+    }),
+  );
+}
+
+function mergeTestSecretPatch(
+  current: unknown,
+  patch: unknown,
+): unknown | typeof TEST_CONFIG_DELETE {
+  if (patch === null) {
+    if (!isTestSecretRef(current)) {
+      throw new Error("config.patchSecretRefs may remove only currently bound secret refs");
+    }
+    return TEST_CONFIG_DELETE;
+  }
+  if (isTestSecretRef(patch)) return structuredClone(patch);
+  if (Array.isArray(patch)) {
+    if (current !== undefined && !Array.isArray(current)) {
+      throw new Error("config.patchSecretRefs cannot traverse an incompatible config value");
+    }
+    const result = Array.isArray(current) ? [...current] : [];
+    patch.forEach((child, index) => {
+      const merged = mergeTestSecretPatch(result[index], child);
+      result[index] = merged === TEST_CONFIG_DELETE ? null : merged;
+    });
+    return result;
+  }
+  if (
+    !isTestConfigRecord(patch)
+    || (current !== undefined && (!isTestConfigRecord(current) || isTestSecretRef(current)))
+  ) {
+    throw new Error("config.patchSecretRefs cannot traverse an incompatible config value");
+  }
+  const result = isTestConfigRecord(current) ? { ...current } : {};
+  for (const [key, child] of Object.entries(patch)) {
+    const merged = mergeTestSecretPatch(result[key], child);
+    if (merged === TEST_CONFIG_DELETE) delete result[key];
+    else result[key] = merged;
+  }
+  return result;
+}
+
+function clearTestSecretRefs(
+  current: unknown,
+): { value: unknown | typeof TEST_CONFIG_DELETE; removed: number } {
+  if (isTestSecretRef(current)) {
+    return { value: TEST_CONFIG_DELETE, removed: 1 };
+  }
+  if (Array.isArray(current)) {
+    let removed = 0;
+    const result = current.map((child) => {
+      const cleared = clearTestSecretRefs(child);
+      removed += cleared.removed;
+      return cleared.value === TEST_CONFIG_DELETE ? null : cleared.value;
+    });
+    return { value: result, removed };
+  }
+  if (isTestConfigRecord(current)) {
+    let removed = 0;
+    const result = { ...current };
+    for (const [key, child] of Object.entries(current)) {
+      const cleared = clearTestSecretRefs(child);
+      removed += cleared.removed;
+      if (cleared.value === TEST_CONFIG_DELETE) delete result[key];
+      else result[key] = cleared.value;
+    }
+    return { value: result, removed };
+  }
+  return { value: current, removed: 0 };
+}
+
+function updateTestConfigAtPath(
+  current: unknown,
+  path: string[],
+  update: (value: unknown) => unknown | typeof TEST_CONFIG_DELETE,
+): unknown | typeof TEST_CONFIG_DELETE {
+  if (path.length === 0) return update(current);
+  const [segment, ...rest] = path;
+
+  if (Array.isArray(current)) {
+    if (!TEST_CONFIG_ARRAY_INDEX.test(segment)) {
+      throw new Error("config.patchSecretRefs requires numeric path segments for arrays");
+    }
+    const result = [...current];
+    const index = Number(segment);
+    if (index > result.length) {
+      throw new Error("config.patchSecretRefs cannot create sparse arrays");
+    }
+    const updated = updateTestConfigAtPath(result[index], rest, update);
+    result[index] = updated === TEST_CONFIG_DELETE ? null : updated;
+    return result;
+  }
+  if (current !== undefined && (!isTestConfigRecord(current) || isTestSecretRef(current))) {
+    throw new Error("config.patchSecretRefs cannot traverse an incompatible config value");
+  }
+  const result = isTestConfigRecord(current) ? { ...current } : {};
+  const updated = updateTestConfigAtPath(result[segment], rest, update);
+  if (updated === TEST_CONFIG_DELETE) delete result[segment];
+  else result[segment] = updated;
+  return result;
+}
+
 /**
  * Create an in-memory host harness for plugin worker tests.
  *
@@ -706,6 +862,32 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     config: {
       async get() {
         return { ...currentConfig };
+      },
+      async patchSecretRefs(input) {
+        requireCapability(manifest, capabilitySet, "secrets.bind-ref");
+        validateTestSecretPatchPath(input.path);
+        const next = structuredClone(currentConfig);
+        const updated = input.value === null
+          ? updateTestConfigAtPath(next, input.path, (current) => {
+            const cleared = clearTestSecretRefs(current);
+            if (cleared.removed === 0) {
+              throw new Error("config.patchSecretRefs found no bound secret refs to remove");
+            }
+            return cleared.value;
+          })
+          : updateTestConfigAtPath(
+            next,
+            input.path,
+            (current) => mergeTestSecretPatch(
+              current,
+              normalizeTestSecretPatch(input.value),
+            ),
+          );
+        if (!isTestConfigRecord(updated)) {
+          throw new Error("config.patchSecretRefs must preserve an object-shaped plugin config");
+        }
+        currentConfig = updated;
+        return structuredClone(currentConfig);
       },
     },
     localFolders: {
