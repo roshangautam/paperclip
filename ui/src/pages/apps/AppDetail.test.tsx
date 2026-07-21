@@ -326,6 +326,39 @@ describe("AppDetail", () => {
     expect(container.textContent).not.toContain("zapier-secret");
   });
 
+  it("treats a plugin-backed app as plugin-managed instead of requesting a remote URL or key", async () => {
+    mockParams.tab = "advanced";
+    getConnectionMock.mockResolvedValue(
+      connection({
+        name: "Plugin: Agent Identities",
+        config: {
+          type: "paperclip_plugin",
+          pluginKey: "ambitresearch.paperclip-agent-identities",
+        },
+        transportConfig: {
+          type: "paperclip_plugin",
+          pluginKey: "ambitresearch.paperclip-agent-identities",
+        },
+        healthStatus: "error",
+        healthMessage: "Remote MCP connection requires config.url",
+        lastError: "Remote MCP connection requires config.url",
+      }),
+    );
+
+    await renderAppDetail();
+
+    expect(container.textContent).toContain("Managed by a Paperclip plugin");
+    expect(container.textContent).toContain("It does not need a remote MCP URL or key.");
+    expect(container.textContent).toContain("Managed by Paperclip plugin");
+    expect(container.textContent).toContain("Paperclip plugin");
+    expect(container.querySelector('a[href="/company/settings/instance/plugins"]')).toBeTruthy();
+    expect(container.textContent).not.toContain("This app needs reconnecting");
+    expect(container.textContent).not.toContain("Remote MCP connection requires config.url");
+    expect(container.textContent).not.toContain("Replace key");
+    expect(container.textContent).not.toContain("Danger zone");
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+  });
+
   it("reviews quarantined actions as one toggle list and saves allowed and blocked choices together", async () => {
     mockParams.tab = "review";
     listCatalogMock.mockResolvedValue({

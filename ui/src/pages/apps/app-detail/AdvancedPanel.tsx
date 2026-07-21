@@ -7,6 +7,7 @@ import { toolsApi } from "@/api/tools";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/context/ToastContext";
+import { Link } from "@/lib/router";
 import { redactUrlSecrets } from "@/lib/redact-url-secrets";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import type { AppDetailSectionProps } from "./types";
@@ -23,12 +24,31 @@ export function AdvancedPanel({
   onRemove: () => void;
   onReplaced: () => void;
 }) {
+  const pluginManaged = isPaperclipPluginConnection(connection);
   return (
     <div className="space-y-6">
-      <KeySection connection={connection} galleryEntry={galleryEntry} onReplaced={onReplaced} />
+      {pluginManaged ? (
+        <PluginManagementSection />
+      ) : (
+        <KeySection connection={connection} galleryEntry={galleryEntry} onReplaced={onReplaced} />
+      )}
       <TechnicalDetails connection={connection} />
-      <DangerZone appName={appName} removing={removing} onRemove={onRemove} />
+      {!pluginManaged && <DangerZone appName={appName} removing={removing} onRemove={onRemove} />}
     </div>
+  );
+}
+
+function PluginManagementSection() {
+  return (
+    <section className="rounded-xl border border-border bg-card px-5 py-4">
+      <h2 className="text-sm font-bold text-foreground">Managed by a Paperclip plugin</h2>
+      <p className="mt-1 text-sm text-muted-foreground">
+        This app uses tools registered by an installed plugin. It does not need a remote MCP URL or key.
+      </p>
+      <Button asChild size="sm" variant="outline" className="mt-3">
+        <Link to="/company/settings/instance/plugins">Open Plugin Manager</Link>
+      </Button>
+    </section>
   );
 }
 
@@ -248,7 +268,7 @@ function TechnicalDetails({ connection }: { connection: ToolConnection }) {
         <dt className="text-muted-foreground">Address</dt>
         <dd className="break-all font-mono text-foreground">{connectionAddress(connection)}</dd>
         <dt className="text-muted-foreground">Connection type</dt>
-        <dd className="text-foreground">{connectionTransportLabel(connection.transport)}</dd>
+        <dd className="text-foreground">{connectionTransportLabel(connection.transport, connection)}</dd>
       </dl>
     </section>
   );
@@ -297,6 +317,7 @@ export function DangerZone({
 }
 
 export function connectionAddress(connection: ToolConnection): string {
+  if (isPaperclipPluginConnection(connection)) return "Managed by Paperclip plugin";
   const config = connection.config ?? connection.transportConfig ?? {};
   const value = config.url ?? config.endpoint ?? config.remoteUrl;
   if (typeof value === "string" && value.trim().length > 0) return redactUrlSecrets(value);
@@ -304,8 +325,17 @@ export function connectionAddress(connection: ToolConnection): string {
   return "Not set";
 }
 
-export function connectionTransportLabel(transport: ToolConnection["transport"]): string {
+export function connectionTransportLabel(
+  transport: ToolConnection["transport"],
+  connection?: ToolConnection,
+): string {
+  if (connection && isPaperclipPluginConnection(connection)) return "Paperclip plugin";
   if (transport === "mcp_remote") return "Remote HTTP";
   if (transport === "local_stdio") return "Local command";
   return "Unknown";
+}
+
+export function isPaperclipPluginConnection(connection: ToolConnection): boolean {
+  return connection.config?.type === "paperclip_plugin"
+    || connection.transportConfig?.type === "paperclip_plugin";
 }
