@@ -6,6 +6,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   approvals,
@@ -32,6 +33,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { publishLiveEvent } from "../services/live-events.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -43,6 +45,7 @@ function createEventBusStub() {
       return {
         emit: async () => {},
         subscribe: () => {},
+        clear: () => {},
       };
     },
   } as any;
@@ -105,6 +108,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     // instance here drains the runs the per-test host services dispatched.
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     await db.delete(costEvents);
+    await db.delete(agentTaskSessions);
     await deleteHeartbeatRunsWithDependents();
     await db.delete(agentWakeupRequests);
     await db.delete(issueRelations);
@@ -635,6 +639,60 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       assigneeAgentId: agentId,
       checkoutRunId: runId,
     });
+  });
+
+  it("includes company scope in plugin session event notifications", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    const services = buildHostServices(
+      db,
+      "plugin-record-id",
+      "paperclip.slack",
+      createEventBusStub(),
+      (method, params) => notifications.push({ method, params }),
+    );
+    const taskKey = "plugin:paperclip.slack:session:slack-thread-2";
+    const session = await services.agentSessions.create({ companyId, agentId, taskKey });
+    const queuedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "automation",
+      contextSnapshot: { taskKey },
+    });
+
+    const result = await services.agentSessions.sendMessage({
+      companyId,
+      sessionId: session.sessionId,
+      prompt: "Reply to the Slack message: hello",
+      reason: "slack_event",
+    });
+
+    publishLiveEvent({
+      companyId,
+      type: "heartbeat.run.log",
+      payload: { runId: result.runId, seq: 1, stream: "stdout", chunk: "Hi" },
+    });
+    publishLiveEvent({
+      companyId,
+      type: "heartbeat.run.status",
+      payload: { runId: result.runId, status: "succeeded" },
+    });
+
+    expect(notifications).toHaveLength(2);
+    expect(notifications).toEqual([
+      expect.objectContaining({
+        method: "agents.sessions.event",
+        params: expect.objectContaining({ companyId, eventType: "chunk" }),
+      }),
+      expect.objectContaining({
+        method: "agents.sessions.event",
+        params: expect.objectContaining({ companyId, eventType: "done" }),
+      }),
+    ]);
+    services.dispose();
   });
 
   it("refuses plugin wakeups for issues with unresolved blockers", async () => {
