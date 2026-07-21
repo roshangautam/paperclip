@@ -38,7 +38,18 @@ export function validateInstanceConfig(
   // hold a Paperclip secret UUID rather than a raw value. The format is a UI
   // hint only — UUID validation happens in the secrets handler at resolve time.
   ajv.addFormat("secret-ref", { validate: () => true });
-  const validate = ajv.compile(schema);
+  let validate;
+  try {
+    validate = ajv.compile(schema);
+  } catch (error) {
+    return {
+      valid: false,
+      errors: [{
+        field: "/",
+        message: error instanceof Error ? error.message : "schema compilation failed",
+      }],
+    };
+  }
   const valid = validate(configJson);
 
   if (valid) {

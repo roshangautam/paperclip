@@ -65,6 +65,7 @@ import {
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
+import { createPluginConfigSecretRefPatcher } from "./plugin-config-secret-refs.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -700,6 +701,11 @@ export function buildHostServices(
   const stateStore = pluginStateStore(db);
   const pluginDb = pluginDatabaseService(db);
   const secretsHandler = createPluginSecretsHandler({ db, pluginId });
+  const patchPluginConfigSecretRefs = createPluginConfigSecretRefPatcher({
+    db,
+    pluginId,
+    pluginKey,
+  });
   const companies = companyService(db);
   const agents = agentService(db);
   const managedAgents = pluginManagedAgentService(db, {
@@ -1414,6 +1420,16 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const configRow = await registry.getConfig(pluginId, companyId);
         return configRow?.configJson ?? {};
+      },
+      async patchSecretRefs(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return patchPluginConfigSecretRefs({
+          companyId,
+          path: params.path,
+          value: params.value,
+          schema: options.manifest?.instanceConfigSchema,
+        });
       },
     },
 

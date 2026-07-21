@@ -5,9 +5,14 @@ import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { EnvSecretRefBinding } from "@paperclipai/shared";
 
 import { definePlugin } from "../src/define-plugin.js";
+import {
+  createHostClientHandlers,
+  type HostServices,
+} from "../src/host-client-factory.js";
 import {
   createNotification,
   createRequest,
@@ -1020,6 +1025,273 @@ describe("worker setup-token pseudo-terminal dispatch", () => {
     } finally {
       worker.stop();
       hostReadline.close();
+    }
+  });
+});
+
+describe("worker secret resolution RPC", () => {
+  it("serializes object refs and injects company scope only in the host", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    const nestedCalls: Array<{ method: string; params: unknown }> = [];
+    let nextRequestId = 1;
+
+    const secretRef: EnvSecretRefBinding = {
+      type: "secret_ref",
+      secretId: "11111111-1111-4111-8111-111111111111",
+    };
+    const configPatch = vi.fn(async () => ({
+      credentials: { apiKey: secretRef },
+    }));
+    const secretsResolve = vi.fn(async () => "resolved-secret");
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.secret-rpc-test",
+      capabilities: ["secrets.bind-ref", "secrets.read-ref"],
+      services: {
+        config: {
+          get: vi.fn(async () => ({})),
+          patchSecretRefs: configPatch,
+        },
+        secrets: {
+          resolve: secretsResolve,
+        },
+      } as unknown as HostServices,
+    });
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.data.register("resolve-secret", async (params) => {
+          if (params.missingInput === true) {
+            return ctx.config.patchSecretRefs(undefined as never);
+          }
+          if (params.missingPath === true) {
+            return ctx.config.patchSecretRefs({ value: null } as never);
+          }
+          if (params.sparse === true) {
+            const sparse = new Array<EnvSecretRefBinding>(2);
+            sparse[1] = params.secretRef as EnvSecretRefBinding;
+            return ctx.config.patchSecretRefs({
+              path: ["credentials", "items"],
+              value: sparse,
+            });
+          }
+          if (params.invalidNumbers === true) {
+            return ctx.config.patchSecretRefs({
+              path: ["credentials", "items"],
+              value: [undefined, Number.NaN, Number.POSITIVE_INFINITY] as never,
+            });
+          }
+          if (params.prototypePatch !== undefined) {
+            return ctx.config.patchSecretRefs({
+              path: ["credentials"],
+              value: params.prototypePatch as never,
+            });
+          }
+          const config = await ctx.config.patchSecretRefs({
+            path: ["credentials"],
+            value: { apiKey: params.secretRef as EnvSecretRefBinding },
+          });
+          const secret = await ctx.secrets.resolve(params.secretRef as EnvSecretRefBinding, {
+            configPath: String(params.configPath),
+          });
+          return { config, secret };
+        });
+      },
+    });
+    const worker = startWorkerRpcHost({
+      plugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+
+    function callWorker(method: string, params: unknown, invocation?: PluginInvocationContext) {
+      const id = `host-${nextRequestId++}`;
+      const request = {
+        ...createRequest(method, params, id),
+        ...(invocation ? { paperclipInvocation: invocation } : {}),
+      };
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new Error(response.error.message));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(request));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (isJsonRpcResponse(message)) {
+        pending.get(String(message.id))?.(message);
+        pending.delete(String(message.id));
+        return;
+      }
+      if (
+        !isJsonRpcRequest(message)
+        || (
+          message.method !== "config.patchSecretRefs"
+          && message.method !== "secrets.resolve"
+        )
+      ) {
+        return;
+      }
+
+      nestedCalls.push({ method: message.method, params: message.params });
+      const invocationId =
+        (message as { paperclipInvocationId?: string }).paperclipInvocationId ?? "";
+      const context = invocationId === "secret-invocation"
+        ? { invocationScope: { companyId: "company-a" } }
+        : { invalidInvocationScope: true };
+      const hostCall = message.method === "config.patchSecretRefs"
+        ? handlers["config.patchSecretRefs"](message.params as never, context)
+        : handlers["secrets.resolve"](message.params as never, context);
+      void hostCall
+        .then((result) => {
+          hostToWorker.write(serializeMessage(createSuccessResponse(message.id, result)));
+        })
+        .catch((error: unknown) => {
+          hostToWorker.write(serializeMessage(createErrorResponse(
+            message.id,
+            PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+            error instanceof Error ? error.message : String(error),
+          )));
+        });
+    });
+
+    try {
+      await callWorker("initialize", {
+        manifest: {
+          id: "paperclip.secret-rpc-test",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Secret RPC test",
+          description: "Secret RPC test",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: ["secrets.bind-ref", "secrets.read-ref"],
+          entrypoints: { worker: "dist/worker.js" },
+        },
+        config: {},
+        instanceInfo: { instanceId: "test", hostVersion: "0.0.0" },
+        apiVersion: 1,
+      });
+
+      await expect(callWorker(
+        "getData",
+        {
+          key: "resolve-secret",
+          companyId: "company-a",
+          params: {
+            secretRef,
+            configPath: "credentials.apiKey",
+          },
+        },
+        { id: "secret-invocation", scope: { companyId: "company-a" } },
+      )).resolves.toEqual({
+        config: { credentials: { apiKey: secretRef } },
+        secret: "resolved-secret",
+      });
+
+      expect(nestedCalls).toEqual([
+        {
+          method: "config.patchSecretRefs",
+          params: {
+            path: ["credentials"],
+            value: { apiKey: secretRef },
+          },
+        },
+        {
+          method: "secrets.resolve",
+          params: {
+            secretRef,
+            configPath: "credentials.apiKey",
+          },
+        },
+      ]);
+      expect(configPatch).toHaveBeenCalledWith({
+        companyId: "company-a",
+        path: ["credentials"],
+        value: { apiKey: secretRef },
+      }, {
+        invocationScope: { companyId: "company-a" },
+      });
+      expect(secretsResolve).toHaveBeenCalledWith({
+        companyId: "company-a",
+        secretRef,
+        configPath: "credentials.apiKey",
+      }, {
+        invocationScope: { companyId: "company-a" },
+      });
+
+      await expect(callWorker(
+        "getData",
+        {
+          key: "resolve-secret",
+          companyId: "company-a",
+          params: {
+            sparse: true,
+            secretRef,
+          },
+        },
+        { id: "secret-invocation", scope: { companyId: "company-a" } },
+      )).rejects.toThrow(/sparse entries/i);
+      expect(nestedCalls).toHaveLength(2);
+      expect(configPatch).toHaveBeenCalledTimes(1);
+
+      await expect(callWorker(
+        "getData",
+        {
+          key: "resolve-secret",
+          companyId: "company-a",
+          params: {
+            invalidNumbers: true,
+          },
+        },
+        { id: "secret-invocation", scope: { companyId: "company-a" } },
+      )).rejects.toThrow(/only secret_ref objects/i);
+      expect(nestedCalls).toHaveLength(2);
+      expect(configPatch).toHaveBeenCalledTimes(1);
+
+      for (const params of [{ missingInput: true }, { missingPath: true }]) {
+        await expect(callWorker(
+          "getData",
+          {
+            key: "resolve-secret",
+            companyId: "company-a",
+            params,
+          },
+          { id: "secret-invocation", scope: { companyId: "company-a" } },
+        )).rejects.toThrow(/requires an object with path and value fields/i);
+      }
+      expect(nestedCalls).toHaveLength(2);
+      expect(configPatch).toHaveBeenCalledTimes(1);
+
+      for (const key of ["__proto__", "constructor", "prototype"]) {
+        const prototypePatch = JSON.parse(
+          `{"${key}":{"type":"secret_ref","secretId":"${secretRef.secretId}"}}`,
+        ) as Record<string, unknown>;
+        await expect(callWorker(
+          "getData",
+          {
+            key: "resolve-secret",
+            companyId: "company-a",
+            params: { prototypePatch },
+          },
+          { id: "secret-invocation", scope: { companyId: "company-a" } },
+        )).rejects.toThrow(/safe object keys/i);
+      }
+      expect(nestedCalls).toHaveLength(2);
+      expect(configPatch).toHaveBeenCalledTimes(1);
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
     }
   });
 });

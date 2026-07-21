@@ -127,6 +127,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "jobs.cancel": ["jobs.schedule"],
   "webhooks.receive": ["webhooks.receive"],
   "http.request": ["http.outbound"],
+  "config.patchSecretRefs": ["secrets.bind-ref"],
   "secrets.resolve": ["secrets.read-ref"],
 
   // Agent tools

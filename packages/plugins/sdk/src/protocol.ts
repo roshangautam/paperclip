@@ -74,6 +74,7 @@ import type {
   PluginAuthorizationDecisionResult,
   PluginAuthorizationPolicyRecord,
   PluginAuthorizationPolicySummary,
+  PluginSecretRefPatchValue,
 } from "./types.js";
 import type {
   PluginHealthDiagnostics,
@@ -1261,6 +1262,10 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
 export interface WorkerToHostMethods {
   // Config
   "config.get": [params: { companyId?: string }, result: Record<string, unknown>];
+  "config.patchSecretRefs": [
+    params: { path: string[]; value: PluginSecretRefPatchValue },
+    result: Record<string, unknown>,
+  ];
 
   // Trusted local folders
   "localFolders.declarations": [

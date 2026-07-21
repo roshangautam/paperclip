@@ -261,6 +261,10 @@ export function claudeOAuthClaimRejectedError(): HttpError {
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type SecretBindingDb = Pick<Db | DbTransaction, "select" | "delete" | "insert">;
 
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, "\\$&");
+}
+
 function isUniqueConstraintViolation(error: unknown, constraintName: string) {
   const seen = new Set<unknown>();
   let current = error;
@@ -1364,7 +1368,10 @@ export function secretService(db: Db) {
       }
       const versionRow = await getSecretVersion(secret.id, resolvedVersion);
       if (!versionRow) throw new HttpError(404, "Secret version not found", { code: "version_missing" });
-      if (versionRow.status === "disabled" || versionRow.status === "destroyed" || versionRow.revokedAt) {
+      if (
+        (versionRow.status !== "current" && versionRow.status !== "previous")
+        || versionRow.revokedAt
+      ) {
         throw unprocessable("Secret version is not active", { code: "version_inactive" });
       }
       const provider = getSecretProvider(providerId);
@@ -3476,7 +3483,7 @@ export function secretService(db: Db) {
               eq(userSecretDeclarations.companyId, companyId),
               eq(userSecretDeclarations.targetType, target.targetType),
               eq(userSecretDeclarations.targetId, target.targetId),
-              like(userSecretDeclarations.configPath, `${pathPrefix}.%`),
+              like(userSecretDeclarations.configPath, `${escapeLikePattern(pathPrefix)}.%`),
             ));
         }
         if (normalizedRefs.length === 0) return;
@@ -4492,44 +4499,45 @@ export function secretService(db: Db) {
         projectionClass?: SecretProjectionClass;
         projectionAllowlistKey?: string | null;
       }>,
-      options?: { replaceAll?: boolean },
+      options?: { replaceAll?: boolean; transaction?: SecretBindingDb },
     ) => {
-      const normalizedRefs: Array<{
-        secretId: string;
-        configPath: string;
-        versionSelector: SecretVersionSelector;
-        required: boolean;
-        label: string | null;
-        projectionClass: SecretProjectionClass;
-        projectionAllowlistKey: string | null;
-      }> = [];
-      for (const ref of refs) {
-        await assertSecretInCompany(companyId, ref.secretId);
-        assertSecretBindingConfigPath({ targetType: target.targetType, configPath: ref.configPath });
-        const projectionClass = ref.projectionClass ?? "unclassified";
-        const projectionAllowlistKey = ref.projectionAllowlistKey ?? null;
-        assertClass3StaticLeaseAllowed({
-          targetType: target.targetType,
-          configPath: ref.configPath,
-          projectionClass,
-          projectionAllowlistKey,
-        });
-        normalizedRefs.push({
-          secretId: ref.secretId,
-          configPath: ref.configPath,
-          versionSelector: ref.versionSelector ?? "latest",
-          required: ref.required ?? true,
-          label: ref.label ?? null,
-          projectionClass,
-          projectionAllowlistKey,
-        });
-      }
+      const syncBindings = async (targetDb: SecretBindingDb) => {
+        const normalizedRefs: Array<{
+          secretId: string;
+          configPath: string;
+          versionSelector: SecretVersionSelector;
+          required: boolean;
+          label: string | null;
+          projectionClass: SecretProjectionClass;
+          projectionAllowlistKey: string | null;
+        }> = [];
+        for (const ref of refs) {
+          await assertSecretInCompany(companyId, ref.secretId, targetDb);
+          assertSecretBindingConfigPath({ targetType: target.targetType, configPath: ref.configPath });
+          const projectionClass = ref.projectionClass ?? "unclassified";
+          const projectionAllowlistKey = ref.projectionAllowlistKey ?? null;
+          assertClass3StaticLeaseAllowed({
+            targetType: target.targetType,
+            configPath: ref.configPath,
+            projectionClass,
+            projectionAllowlistKey,
+          });
+          normalizedRefs.push({
+            secretId: ref.secretId,
+            configPath: ref.configPath,
+            versionSelector: ref.versionSelector ?? "latest",
+            required: ref.required ?? true,
+            label: ref.label ?? null,
+            projectionClass,
+            projectionAllowlistKey,
+          });
+        }
 
-      const pathPrefixes = [...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0]))];
-
-      await db.transaction(async (tx) => {
+        const pathPrefixes = [
+          ...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0])),
+        ];
         if (options?.replaceAll) {
-          await tx
+          await targetDb
             .delete(companySecretBindings)
             .where(
               and(
@@ -4540,7 +4548,7 @@ export function secretService(db: Db) {
             );
         } else if (pathPrefixes.length > 0) {
           for (const pathPrefix of pathPrefixes) {
-            await tx
+            await targetDb
               .delete(companySecretBindings)
               .where(
                 and(
@@ -4549,13 +4557,16 @@ export function secretService(db: Db) {
                   eq(companySecretBindings.targetId, target.targetId),
                   or(
                     eq(companySecretBindings.configPath, pathPrefix),
-                    like(companySecretBindings.configPath, `${pathPrefix}.%`),
+                    like(
+                      companySecretBindings.configPath,
+                      `${escapeLikePattern(pathPrefix)}.%`,
+                    ),
                   ),
                 ),
               );
           }
         } else {
-          await tx
+          await targetDb
             .delete(companySecretBindings)
             .where(
               and(
@@ -4565,23 +4576,29 @@ export function secretService(db: Db) {
               ),
             );
         }
-        if (normalizedRefs.length === 0) return;
-        await tx.insert(companySecretBindings).values(
-          normalizedRefs.map((ref) => ({
-            companyId,
-            secretId: ref.secretId,
-            targetType: target.targetType,
-            targetId: target.targetId,
-            configPath: ref.configPath,
-            versionSelector: String(ref.versionSelector),
-            required: ref.required,
-            label: ref.label,
-            projectionClass: ref.projectionClass,
-            projectionAllowlistKey: ref.projectionAllowlistKey,
-          })),
-        );
-      });
-      return normalizedRefs;
+        if (normalizedRefs.length > 0) {
+          await targetDb.insert(companySecretBindings).values(
+            normalizedRefs.map((ref) => ({
+              companyId,
+              secretId: ref.secretId,
+              targetType: target.targetType,
+              targetId: target.targetId,
+              configPath: ref.configPath,
+              versionSelector: String(ref.versionSelector),
+              required: ref.required,
+              label: ref.label,
+              projectionClass: ref.projectionClass,
+              projectionAllowlistKey: ref.projectionAllowlistKey,
+            })),
+          );
+        }
+        return normalizedRefs;
+      };
+
+      if (options?.transaction) {
+        return syncBindings(options.transaction);
+      }
+      return db.transaction(syncBindings);
     },
 
     /**
@@ -4819,7 +4836,7 @@ export function secretService(db: Db) {
               eq(companySecretBindings.companyId, companyId),
               eq(companySecretBindings.targetType, target.targetType),
               eq(companySecretBindings.targetId, target.targetId),
-              like(companySecretBindings.configPath, `${pathPrefix}.%`),
+              like(companySecretBindings.configPath, `${escapeLikePattern(pathPrefix)}.%`),
             ),
           );
         if (refs.length === 0) return;
@@ -4846,7 +4863,7 @@ export function secretService(db: Db) {
               eq(userSecretDeclarations.companyId, companyId),
               eq(userSecretDeclarations.targetType, target.targetType),
               eq(userSecretDeclarations.targetId, target.targetId),
-              like(userSecretDeclarations.configPath, `${pathPrefix}.%`),
+              like(userSecretDeclarations.configPath, `${escapeLikePattern(pathPrefix)}.%`),
             ),
           );
         if (userRefs.length === 0) return;
