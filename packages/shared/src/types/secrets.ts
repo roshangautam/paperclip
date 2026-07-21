@@ -284,7 +284,7 @@ export interface SecretAccessEvent {
   userSecretDefinitionId: string | null;
   secretScope: SecretScope;
   version: number | null;
-  provider: SecretProvider;
+  provider: SecretProvider | "unknown";
   responsibleUserId: string | null;
   credentialOwnerUserId: string | null;
   credentialSubjectType: string | null;

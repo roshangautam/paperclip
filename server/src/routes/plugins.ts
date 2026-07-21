@@ -2327,12 +2327,14 @@ export function pluginRoutes(
     try {
       const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
       await validatePluginSecretRefsForCompany(companyId, secretRefs);
-      await secretService(db).syncSecretRefsForTarget(
-        companyId,
-        { targetType: "plugin", targetId: plugin.id },
-        secretRefs,
-        { replaceAll: true },
-      );
+      if (secretRefs.length > 0) {
+        await secretService(db).syncSecretRefsForTarget(
+          companyId,
+          { targetType: "plugin", targetId: plugin.id },
+          secretRefs,
+          { replaceAll: false },
+        );
+      }
 
       const result = await registry.upsertConfig(plugin.id, companyId, {
         companyId,
