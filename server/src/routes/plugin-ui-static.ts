@@ -164,6 +164,49 @@ export function resolvePluginUiDir(
   return uiDir;
 }
 
+export function resolvePluginUiCompanyId(input: {
+  queryValue: unknown;
+  referer: string | undefined;
+  pluginSelector: string;
+  allowRefererFallback: boolean;
+}): string {
+  if (
+    Array.isArray(input.queryValue) ||
+    (input.queryValue !== undefined && typeof input.queryValue !== "string")
+  ) {
+    throw badRequest('"companyId" must be a string when provided');
+  }
+
+  if (typeof input.queryValue === "string") {
+    const companyId = input.queryValue.trim();
+    if (!companyId) {
+      throw badRequest('"companyId" must be a non-empty string when provided');
+    }
+    return companyId;
+  }
+
+  if (!input.allowRefererFallback || !input.referer) return "";
+
+  try {
+    const refererUrl = new URL(input.referer);
+    const match = refererUrl.pathname.match(/^\/_plugins\/([^/]+)\/ui(?:\/|$)/);
+    if (!match) return "";
+
+    let refererPluginSelector: string;
+    try {
+      refererPluginSelector = decodeURIComponent(match[1]);
+    } catch {
+      return "";
+    }
+    if (refererPluginSelector !== input.pluginSelector) return "";
+
+    const companyValues = refererUrl.searchParams.getAll("companyId");
+    return companyValues.length === 1 ? companyValues[0].trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 /**
  * Compute an ETag from file stat (size + mtime).
  * This is a lightweight approach that avoids reading the file content.
@@ -279,20 +322,20 @@ export function pluginUiStaticRoutes(db: Db, options: PluginUiStaticRouteOptions
       return;
     }
 
-    const rawCompanyId = req.query.companyId;
-    if (
-      Array.isArray(rawCompanyId) ||
-      (rawCompanyId !== undefined && typeof rawCompanyId !== "string")
-    ) {
-      throw badRequest('"companyId" must be a string when provided');
-    }
-    const companyId = typeof rawCompanyId === "string" ? rawCompanyId.trim() : "";
+    const companyId = resolvePluginUiCompanyId({
+      queryValue: req.query.companyId,
+      referer: req.get("referer"),
+      pluginSelector: pluginId,
+      allowRefererFallback: process.env.NODE_ENV !== "production",
+    });
     if (companyId) {
       assertCompanyAccess(req, companyId);
     }
 
     // Step 2b: Check for devUiUrl in company-scoped plugin config — proxy to
-    // local dev server when a plugin author has configured hot-reload.
+    // local dev server when a plugin author has configured hot-reload. In
+    // development, relative module/style requests inherit company scope from
+    // the same-plugin Referer when they do not repeat the query parameter.
     // See PLUGIN_SPEC.md §27.2 — Local Development Workflow
     try {
       const configRow = companyId ? await registry.getConfig(plugin.id, companyId) : null;

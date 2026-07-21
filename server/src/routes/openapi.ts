@@ -5884,7 +5884,7 @@ registry.registerPath({
   summary: "Get company-scoped plugin config",
   request: {
     params: z.object({ pluginId: z.string() }),
-    query: z.object({ companyId: z.string() }),
+    query: z.object({ companyId: z.string().uuid() }),
   },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
@@ -5896,7 +5896,7 @@ registry.registerPath({
   summary: "Set company-scoped plugin config",
   request: {
     params: z.object({ pluginId: z.string() }),
-    body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),
+    body: jsonBody(z.object({ companyId: z.string().uuid(), configJson: z.record(z.unknown()) })),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
@@ -5908,7 +5908,7 @@ registry.registerPath({
   summary: "Test company-scoped plugin config",
   request: {
     params: z.object({ pluginId: z.string() }),
-    body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),
+    body: jsonBody(z.object({ companyId: z.string().uuid(), configJson: z.record(z.unknown()) })),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
