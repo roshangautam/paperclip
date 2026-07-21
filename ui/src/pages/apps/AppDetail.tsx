@@ -40,6 +40,7 @@ import {
   DangerZone,
   connectionAddress,
   connectionTransportLabel,
+  isPaperclipPluginConnection,
 } from "./app-detail/AdvancedPanel";
 import type { AccessDraft } from "./app-detail/types";
 
@@ -346,7 +347,9 @@ export function AppDetail() {
   }
 
   const status = statusFor(connection);
-  const needsReconnect = status.tone === "attention" && connection.healthStatus !== "unknown";
+  const needsReconnect = status.tone === "attention"
+    && connection.healthStatus !== "unknown"
+    && !isPaperclipPluginConnection(connection);
   const quarantined = catalog.filter((e) => e.status === "quarantined");
   const active = catalog.filter((e) => e.status !== "quarantined" && e.status !== "removed");
   const readOnly = active.filter((e) => e.isReadOnly);

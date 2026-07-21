@@ -104,7 +104,12 @@ import type {
   UpdateToolProfileWithEntries,
   UnbindToolProfileBinding,
 } from "@paperclipai/shared";
-import { CLASS3_STATIC_LEASE_ALLOWLIST, getToolAppGalleryEntry, isToolConnectionAttentionHealth } from "@paperclipai/shared";
+import {
+  CLASS3_STATIC_LEASE_ALLOWLIST,
+  getToolAppGalleryEntry,
+  isToolConnectionAttentionHealth,
+  pluginManifestV1Schema,
+} from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
@@ -1232,7 +1237,11 @@ function sanitizeHttpFailure(error: unknown): { status: ToolConnectionHealthStat
         code: "secret_missing",
       };
     }
-    return { status: "error", message: error.message, code: "paperclip_error" };
+    return {
+      status: "error",
+      message: error.message,
+      code: typeof code === "string" && code.trim().length > 0 ? code : "paperclip_error",
+    };
   }
   if (error instanceof Error) {
     return { status: "error", message: error.message.slice(0, 240), code: "runtime_error" };
@@ -2778,7 +2787,77 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     }));
   }
 
+  async function pluginBacking(connection: typeof toolConnections.$inferSelect) {
+    const [application] = await db
+      .select()
+      .from(toolApplications)
+      .where(and(
+        eq(toolApplications.id, connection.applicationId),
+        eq(toolApplications.companyId, connection.companyId),
+      ))
+      .limit(1);
+    if (!application) throw notFound("Tool application not found");
+    if (application.type !== "paperclip_plugin") return null;
+    if (!application.pluginId) {
+      throw unprocessable("This app is no longer linked to its Paperclip plugin.", {
+        code: "plugin_link_missing",
+      });
+    }
+
+    const [plugin] = await db
+      .select()
+      .from(plugins)
+      .where(eq(plugins.id, application.pluginId))
+      .limit(1);
+    if (!plugin) {
+      throw unprocessable("The Paperclip plugin for this app is no longer installed.", {
+        code: "plugin_not_installed",
+      });
+    }
+    if (plugin.status !== "ready") {
+      throw unprocessable(`Plugin ${plugin.pluginKey} is not ready (status: ${plugin.status}).`, {
+        code: "plugin_not_ready",
+        pluginKey: plugin.pluginKey,
+        pluginStatus: plugin.status,
+      });
+    }
+    if (plugin.lastError?.trim()) {
+      throw unprocessable(`Plugin ${plugin.pluginKey} reported an error: ${plugin.lastError.trim()}`, {
+        code: "plugin_error",
+        pluginKey: plugin.pluginKey,
+      });
+    }
+
+    const parsed = pluginManifestV1Schema.safeParse(plugin.manifestJson);
+    if (!parsed.success) {
+      throw unprocessable(`Plugin ${plugin.pluginKey} has an invalid manifest.`, {
+        code: "plugin_manifest_invalid",
+        pluginKey: plugin.pluginKey,
+      });
+    }
+    if (parsed.data.id !== plugin.pluginKey) {
+      throw unprocessable(`Plugin manifest ID does not match ${plugin.pluginKey}.`, {
+        code: "plugin_manifest_id_mismatch",
+        pluginKey: plugin.pluginKey,
+        manifestId: parsed.data.id,
+      });
+    }
+
+    return {
+      plugin,
+      tools: (parsed.data.tools ?? []).map((tool): McpToolDescriptor => ({
+        name: tool.name,
+        title: tool.displayName,
+        description: tool.description,
+        inputSchema: tool.parametersSchema,
+        annotations: {},
+      })),
+    };
+  }
+
   async function discoverTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
+    const backing = await pluginBacking(connection);
+    if (backing) return backing.tools;
     if (connection.transport === "remote_http") return remoteTools(connection);
     await resolveCredentialHeaders(connection);
     return localTools(connection);
@@ -2814,15 +2893,21 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   async function checkConnectionHealth(connectionId: string, actor?: ActorInfo): Promise<ToolConnectionHealthCheckResult> {
     const connection = await getConnectionRow(connectionId);
     try {
-      if (connection.transport === "remote_http") {
+      const backing = await pluginBacking(connection);
+      if (backing) {
+        // The plugin worker owns execution. Its validated manifest is the catalog source;
+        // the synthetic connection is not a remote MCP endpoint.
+      } else if (connection.transport === "remote_http") {
         await remoteTools(connection);
       } else {
         await resolveCredentialHeaders(connection);
         await stdioTemplateId(connection.companyId, connection.config);
       }
-      const updated = await updateConnectionHealth(connection, "ok", connection.transport === "local_stdio"
-        ? "Approved stdio template is ready."
-        : "Remote MCP server responded to tools/list.");
+      const updated = await updateConnectionHealth(connection, "ok", backing
+        ? `Paperclip plugin ${backing.plugin.pluginKey} is ready and its tools are registered.`
+        : connection.transport === "local_stdio"
+          ? "Approved stdio template is ready."
+          : "Remote MCP server responded to tools/list.");
       const runtimeSlot = await ensureRuntimeSlot(updated);
       await audit({
         companyId: connection.companyId,
@@ -5475,7 +5560,18 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     updateConnection: async (connectionId: string, input: UpdateToolConnection): Promise<ToolConnection> => {
       const existing = await getConnectionRow(connectionId);
       const config = normalizeGoogleSheetsConnectionConfig(input.config ?? input.transportConfig ?? existing.config);
-      if (existing.transport === "remote_http") await assertRemoteEndpointAllowed(config);
+      const [application] = await db
+        .select({ type: toolApplications.type })
+        .from(toolApplications)
+        .where(and(
+          eq(toolApplications.id, existing.applicationId),
+          eq(toolApplications.companyId, existing.companyId),
+        ))
+        .limit(1);
+      if (!application) throw notFound("Tool application not found");
+      if (existing.transport === "remote_http" && application.type !== "paperclip_plugin") {
+        await assertRemoteEndpointAllowed(config);
+      }
       if (existing.transport === "local_stdio") await stdioTemplateId(existing.companyId, config);
       assertLocalStdioCanBeEnabled(existing.transport, input.enabled ?? existing.enabled);
       await assertGoogleSheetsSpreadsheetOwnership(existing.companyId, config, { excludeConnectionId: existing.id });
