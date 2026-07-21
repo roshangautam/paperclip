@@ -648,6 +648,48 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     services.dispose();
   });
 
+  it("preserves plugin session prompts in heartbeat run context", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const services = buildHostServices(
+      db,
+      "plugin-record-id",
+      "paperclip.slack",
+      createEventBusStub(),
+    );
+    const taskKey = "plugin:paperclip.slack:session:slack-thread-1";
+    const session = await services.agentSessions.create({ companyId, agentId, taskKey });
+    const queuedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "automation",
+      contextSnapshot: { taskKey },
+    });
+    const prompt = "Reply to the Slack message: hey";
+
+    const result = await services.agentSessions.sendMessage({
+      companyId,
+      sessionId: session.sessionId,
+      prompt,
+      reason: "slack_event",
+    });
+    expect(result.runId).toBe(queuedRunId);
+
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, result.runId));
+    expect(run?.contextSnapshot).toMatchObject({
+      taskKey,
+      wakeSource: "automation",
+      wakeTriggerDetail: "system",
+      invocationPrompt: prompt,
+      invocationPromptTruncated: false,
+    });
+  });
+
   it("refuses plugin wakeups for issues with unresolved blockers", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const blockerIssueId = randomUUID();

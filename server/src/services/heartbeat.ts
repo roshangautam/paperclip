@@ -315,6 +315,9 @@ const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
+export const MAX_INVOCATION_PROMPT_CHARS = 32_000;
+const COALESCED_INVOCATION_PROMPT_SEPARATOR = "\n\n---\n\n[paperclip coalesced invocation]\n\n";
+const TRUNCATED_INVOCATION_PROMPT_MARKER = "\n\n[paperclip truncated coalesced invocation prompt]\n\n";
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -2032,6 +2035,25 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+}
+
+export function createInvocationPromptWakeContext(prompt: unknown): Record<string, unknown> {
+  if (typeof prompt !== "string") return {};
+  const normalized = prompt.trim();
+  if (!normalized) return {};
+  const truncated = normalized.length > MAX_INVOCATION_PROMPT_CHARS;
+  return {
+    invocationPrompt: truncated ? normalized.slice(0, MAX_INVOCATION_PROMPT_CHARS) : normalized,
+    invocationPromptTruncated: truncated,
+  };
+}
+
+function truncateInvocationPrompt(prompt: string, maxChars: number) {
+  if (prompt.length <= maxChars) return prompt;
+  const retainedChars = maxChars - TRUNCATED_INVOCATION_PROMPT_MARKER.length;
+  const headChars = Math.ceil(retainedChars / 2);
+  const tailChars = retainedChars - headChars;
+  return `${prompt.slice(0, headChars)}${TRUNCATED_INVOCATION_PROMPT_MARKER}${prompt.slice(-tailChars)}`;
 }
 
 type UsageTotals = {
@@ -4348,6 +4370,40 @@ export function mergeCoalescedContextSnapshot(
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
+  const existingInvocationPrompt = readNonEmptyString(existing.invocationPrompt);
+  const incomingInvocationPrompt = readNonEmptyString(incoming.invocationPrompt);
+  if (existingInvocationPrompt && incomingInvocationPrompt) {
+    const availablePromptChars =
+      MAX_INVOCATION_PROMPT_CHARS - COALESCED_INVOCATION_PROMPT_SEPARATOR.length;
+    const halfAvailablePromptChars = Math.floor(availablePromptChars / 2);
+    let existingPromptBudget: number;
+    let incomingPromptBudget: number;
+    if (existingInvocationPrompt.length <= halfAvailablePromptChars) {
+      existingPromptBudget = existingInvocationPrompt.length;
+      incomingPromptBudget = availablePromptChars - existingPromptBudget;
+    } else if (incomingInvocationPrompt.length <= halfAvailablePromptChars) {
+      incomingPromptBudget = incomingInvocationPrompt.length;
+      existingPromptBudget = availablePromptChars - incomingPromptBudget;
+    } else {
+      existingPromptBudget = halfAvailablePromptChars;
+      incomingPromptBudget = availablePromptChars - existingPromptBudget;
+    }
+    const retainedExistingPrompt = truncateInvocationPrompt(
+      existingInvocationPrompt,
+      existingPromptBudget,
+    );
+    const retainedIncomingPrompt = truncateInvocationPrompt(
+      incomingInvocationPrompt,
+      incomingPromptBudget,
+    );
+    merged.invocationPrompt =
+      `${retainedExistingPrompt}${COALESCED_INVOCATION_PROMPT_SEPARATOR}${retainedIncomingPrompt}`;
+    merged.invocationPromptTruncated =
+      retainedExistingPrompt.length < existingInvocationPrompt.length ||
+      retainedIncomingPrompt.length < incomingInvocationPrompt.length ||
+      existing.invocationPromptTruncated === true ||
+      incoming.invocationPromptTruncated === true;
+  }
   const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];
@@ -4391,6 +4447,7 @@ export async function buildPaperclipWakePayload(input: {
     | null;
   exposeLowTrustRaw?: boolean;
 }) {
+  const invocationPrompt = readNonEmptyString(input.contextSnapshot.invocationPrompt);
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
   const annotationCommentId = readNonEmptyString(input.contextSnapshot.annotationCommentId);
@@ -4412,7 +4469,7 @@ export async function buildPaperclipWakePayload(input: {
           .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null);
-  if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
+  if (!invocationPrompt && commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
 
   const commentRows =
     commentIds.length === 0
@@ -4610,6 +4667,10 @@ export async function buildPaperclipWakePayload(input: {
           routingFallbackReason: readNonEmptyString(recoveryEvidence.routingFallbackReason),
         }
       : null,
+    invocationPrompt,
+    invocationPromptTruncated: invocationPrompt
+      ? input.contextSnapshot.invocationPromptTruncated === true
+      : false,
     issue: issueSummary
       ? {
           id: issueSummary.id,

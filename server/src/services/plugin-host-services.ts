@@ -36,7 +36,7 @@ import { issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
-import { heartbeatService } from "./heartbeat.js";
+import { createInvocationPromptWakeContext, heartbeatService } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
@@ -2150,11 +2150,13 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
+        const invocationPromptContext = createInvocationPromptWakeContext(params.prompt);
         const run = await heartbeat.wakeup(params.agentId, {
           source: "automation",
           triggerDetail: "system",
           reason: params.reason ?? null,
-          payload: { prompt: params.prompt },
+          payload: { prompt: invocationPromptContext.invocationPrompt ?? null },
+          contextSnapshot: invocationPromptContext,
           requestedByActorType: "system",
           requestedByActorId: pluginId,
         });
@@ -2626,15 +2628,17 @@ export function buildHostServices(
           .then((rows) => rows[0] ?? null);
         if (!session) throw new Error(`Session not found: ${params.sessionId}`);
 
+        const invocationPromptContext = createInvocationPromptWakeContext(params.prompt);
         const run = await heartbeat.wakeup(session.agentId, {
           source: "automation",
           triggerDetail: "system",
           reason: params.reason ?? null,
-          payload: { prompt: params.prompt },
+          payload: { prompt: invocationPromptContext.invocationPrompt ?? null },
           contextSnapshot: {
             taskKey: session.taskKey,
             wakeSource: "automation",
             wakeTriggerDetail: "system",
+            ...invocationPromptContext,
           },
           requestedByActorType: "system",
           requestedByActorId: pluginId,
