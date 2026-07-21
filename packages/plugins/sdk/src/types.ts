@@ -1525,6 +1525,8 @@ export interface AgentSession {
  * Delivered via JSON-RPC notifications from host to worker.
  */
 export interface AgentSessionEvent {
+  /** Company scope attached by the host so callback-initiated host calls stay authorized. */
+  companyId?: string;
   sessionId: string;
   runId: string;
   seq: number;
