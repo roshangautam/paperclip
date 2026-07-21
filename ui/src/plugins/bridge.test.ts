@@ -6,7 +6,7 @@ import { createRoot } from "react-dom/client";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   FileTree as SdkFileTree,
   ManagedRoutinesList as SdkManagedRoutinesList,
@@ -23,7 +23,10 @@ import {
   type PluginBridgeContextValue,
 } from "./bridge";
 import { initPluginBridge } from "./bridge-init";
-import { _createReactShimSourceForTests } from "./slots";
+import {
+  _createReactShimSourceForTests,
+  _createJsxRuntimeShimSourceForTests,
+} from "./slots";
 
 function clickEvent(
   overrides: Partial<ReactMouseEvent<HTMLAnchorElement>> = {},
@@ -43,6 +46,7 @@ function clickEvent(
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   delete globalThis.__paperclipPluginBridge__;
 });
 
@@ -331,5 +335,59 @@ describe("plugin React shim", () => {
     expect(source).toContain("export const useId = R.useId;");
     expect(source).toContain("export const useSyncExternalStore = R.useSyncExternalStore;");
     expect(source).toContain("export const startTransition = R.startTransition;");
+  });
+
+  it("preserves jsx-runtime static child validation and explicit keys", async () => {
+    globalThis.__paperclipPluginBridge__ = {
+      react: React,
+      reactDom: ReactDOM,
+      sdkUi: {},
+    };
+    const source = _createJsxRuntimeShimSourceForTests();
+    const runtimeUrl = `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`;
+    const runtime = await import(/* @vite-ignore */ runtimeUrl) as {
+      jsx: typeof React.createElement;
+      jsxs: typeof React.createElement;
+    };
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const children = [
+      runtime.jsx("span", { children: "one" }),
+      runtime.jsx("span", { children: "two" }),
+    ];
+
+    renderToStaticMarkup(runtime.jsxs("div", { children }));
+
+    expect(
+      consoleError.mock.calls.some((call) =>
+        call.some((value) => String(value).includes('Each child in a list should have a unique "key" prop')),
+      ),
+    ).toBe(false);
+    expect(runtime.jsx("span", {}, "identity-row").key).toBe("identity-row");
+  });
+
+  it("keeps jsx-runtime warnings for unkeyed dynamic child arrays", async () => {
+    globalThis.__paperclipPluginBridge__ = {
+      react: React,
+      reactDom: ReactDOM,
+      sdkUi: {},
+    };
+    const source = _createJsxRuntimeShimSourceForTests();
+    const runtimeUrl = `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}#dynamic`;
+    const runtime = await import(/* @vite-ignore */ runtimeUrl) as {
+      jsx: typeof React.createElement;
+    };
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const children = [
+      runtime.jsx("span", { children: "one" }),
+      runtime.jsx("span", { children: "two" }),
+    ];
+
+    renderToStaticMarkup(runtime.jsx("div", { children }));
+
+    expect(
+      consoleError.mock.calls.some((call) =>
+        call.some((value) => String(value).includes('Each child in a list should have a unique "key" prop')),
+      ),
+    ).toBe(true);
   });
 });
