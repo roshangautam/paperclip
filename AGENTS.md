@@ -177,6 +177,20 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 
 For `roshangautam/paperclip`, create fork-development PRs with `--base truenas/local`. The `master` branch mirrors `paperclipai/paperclip:master` and is reserved for upstream synchronization; do not merge fork-only changes into it. Configure Paperclip execution workspaces for this repository with `baseRef: "origin/truenas/local"` rather than relying on the runtime's `origin/master` fallback.
 
+#### Upstream Release Synchronization
+
+When advancing `truenas/local` to an upstream release, rebuild the fork history on the exact upstream release tag, then replay every fork-only commit on top of that tag. Inventory the old branch first and account for every commit; do not replay commits that are already ancestors of the new tag. Do not merge an upstream tag or `master` into `truenas/local`, and do not squash-merge an integration branch that contains an upstream merge: the resulting tree may be correct while the upstream tag is still absent from the branch's ancestry.
+
+Before promotion, verify that the release tag is an ancestor of the candidate and compare the candidate's content with the reviewed integration result:
+
+```sh
+git merge-base --is-ancestor <upstream-tag> <candidate>
+git range-diff <old-upstream-base>..<old-truenas-local> <upstream-tag>..<candidate>
+git diff --exit-code <reviewed-integration-result> <candidate>
+```
+
+Promoting this rebuilt history to the long-lived `truenas/local` branch is a controlled history rewrite. It requires explicit repository-owner approval, a fresh check of the remote branch head, and an exact `--force-with-lease` bound to that head. A normal PR merge cannot perform this ancestry replacement. This exception applies only to upstream release synchronization; ordinary fork changes must continue to use PRs targeting `truenas/local`.
+
 ## 11. Definition of Done
 
 A change is done when all are true:
