@@ -1,10 +1,29 @@
 import { describe, expect, it } from "vitest";
 import {
   buildPaperclipTaskMarkdown,
+  createInvocationPromptWakeContext,
+  MAX_INVOCATION_PROMPT_CHARS,
   mergeCoalescedContextSnapshot,
   summarizeHeartbeatRunContextSnapshot,
   summarizeHeartbeatRunListResultJson,
 } from "../services/heartbeat.js";
+
+describe("createInvocationPromptWakeContext", () => {
+  it("normalizes and bounds prompts before they are persisted", () => {
+    expect(createInvocationPromptWakeContext("  Reply to the plugin  ")).toEqual({
+      invocationPrompt: "Reply to the plugin",
+      invocationPromptTruncated: false,
+    });
+    expect(createInvocationPromptWakeContext(" \n ")).toEqual({});
+
+    const bounded = createInvocationPromptWakeContext(
+      `start-${"x".repeat(MAX_INVOCATION_PROMPT_CHARS)}-end`,
+    );
+    expect(bounded.invocationPrompt).toHaveLength(MAX_INVOCATION_PROMPT_CHARS);
+    expect(bounded.invocationPrompt).toMatch(/^start-/);
+    expect(bounded.invocationPromptTruncated).toBe(true);
+  });
+});
 
 describe("buildPaperclipTaskMarkdown", () => {
   it("adds planning directives for assignment and comment task context", () => {
@@ -219,6 +238,43 @@ describe("mergeCoalescedContextSnapshot", () => {
       selectedOptionIds: ["file-b"],
       selectedOptions: [{ id: "file-b", label: "b.txt", description: "Generated build output" }],
     });
+  });
+
+  it("preserves both invocation prompts when coalescing wakes", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        invocationPrompt: "First plugin request",
+        invocationPromptTruncated: false,
+      },
+      {
+        invocationPrompt: "Second plugin request",
+        invocationPromptTruncated: false,
+      },
+    );
+
+    expect(merged.invocationPrompt).toContain("First plugin request");
+    expect(merged.invocationPrompt).toContain("[paperclip coalesced invocation]");
+    expect(merged.invocationPrompt).toContain("Second plugin request");
+    expect(merged.invocationPromptTruncated).toBe(false);
+  });
+
+  it("retains both ends and marks truncation when coalesced invocation prompts exceed the limit", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        invocationPrompt: `first-${"a".repeat(MAX_INVOCATION_PROMPT_CHARS)}`,
+        invocationPromptTruncated: false,
+      },
+      {
+        invocationPrompt: `second-${"b".repeat(MAX_INVOCATION_PROMPT_CHARS)}`,
+        invocationPromptTruncated: false,
+      },
+    );
+
+    expect(merged.invocationPrompt).toHaveLength(MAX_INVOCATION_PROMPT_CHARS);
+    expect(merged.invocationPrompt).toContain("first-");
+    expect(merged.invocationPrompt).toContain("[paperclip truncated coalesced invocation prompt]");
+    expect(merged.invocationPrompt).toContain("second-");
+    expect(merged.invocationPromptTruncated).toBe(true);
   });
 });
 

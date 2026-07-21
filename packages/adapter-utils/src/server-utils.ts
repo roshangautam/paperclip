@@ -673,6 +673,8 @@ type PaperclipWakeRecovery = {
 type PaperclipWakePayload = {
   reason: string | null;
   recovery: PaperclipWakeRecovery | null;
+  invocationPrompt: string | null;
+  invocationPromptTruncated: boolean;
   issue: PaperclipWakeIssue | null;
   checkedOutByHarness: boolean;
   // Experimental: write user-interaction content in ASD-STE100 Simplified
@@ -1314,6 +1316,7 @@ function markdownFencedText(value: string): string {
 
 export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayload | null {
   const payload = parseObject(value);
+  const invocationPrompt = asString(payload.invocationPrompt, "").trim() || null;
   const comments = Array.isArray(payload.comments)
     ? payload.comments
         .map((entry) => normalizePaperclipWakeComment(entry))
@@ -1357,13 +1360,17 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
   const checkboxSelection = normalizePaperclipWakeCheckboxSelection(payload.checkboxSelection);
   const executionWorkspace = normalizePaperclipWakeExecutionWorkspace(payload.executionWorkspace);
   const agentMessage = normalizePaperclipWakeAgentMessage(payload.agentMessage);
-  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !documentReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !agentMessage && !recovery && !normalizePaperclipWakeIssue(payload.issue)) {
+  if (!invocationPrompt && comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !documentReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !agentMessage && !recovery && !normalizePaperclipWakeIssue(payload.issue)) {
     return null;
   }
 
   return {
     reason: asString(payload.reason, "").trim() || null,
     recovery,
+    invocationPrompt,
+    invocationPromptTruncated: invocationPrompt
+      ? asBoolean(payload.invocationPromptTruncated, false)
+      : false,
     issue: normalizePaperclipWakeIssue(payload.issue),
     checkedOutByHarness: asBoolean(payload.checkedOutByHarness, false),
     simplifiedEnglishInteractions: asBoolean(payload.simplifiedEnglishInteractions, false),
@@ -1478,6 +1485,49 @@ export function renderPaperclipWakePrompt(
 ): string {
   const normalized = normalizePaperclipWakePayload(value);
   if (!normalized) return "";
+  const isStandaloneInvocation = Boolean(
+    normalized.invocationPrompt &&
+      !normalized.recovery &&
+      !normalized.issue &&
+      !normalized.checkedOutByHarness &&
+      !normalized.dependencyBlockedInteraction &&
+      !normalized.treeHoldInteraction &&
+      !normalized.activeTreeHold &&
+      normalized.unresolvedBlockerIssueIds.length === 0 &&
+      normalized.unresolvedBlockerSummaries.length === 0 &&
+      normalized.commentIds.length === 0 &&
+      normalized.comments.length === 0 &&
+      normalized.annotationDeltas.length === 0 &&
+      normalized.childIssueSummaries.length === 0 &&
+      !normalized.childIssueSummaryTruncated &&
+      !normalized.executionStage &&
+      !normalized.continuationSummary &&
+      !normalized.planReviewContext &&
+      !normalized.livenessContinuation &&
+      !normalized.taskWatchdog &&
+      !normalized.interactionKind &&
+      !normalized.interactionStatus &&
+      !normalized.checkboxSelection &&
+      !normalized.executionWorkspace &&
+      normalized.requestedCount === 0 &&
+      normalized.includedCount === 0 &&
+      normalized.missingCount === 0 &&
+      !normalized.truncated &&
+      !normalized.fallbackFetchNeeded,
+  );
+  if (isStandaloneInvocation) {
+    return [
+      "## Paperclip Plugin Invocation",
+      "",
+      "A Paperclip plugin invoked you with this request. Treat it as the primary task for this heartbeat.",
+      normalized.reason ? `Reason: ${normalized.reason}` : null,
+      "",
+      normalized.invocationPrompt,
+      normalized.invocationPromptTruncated
+        ? "\n[invocation prompt truncated by Paperclip]"
+        : null,
+    ].filter((line): line is string => typeof line === "string").join("\n");
+  }
   const resumedSession = options.resumedSession === true;
   // The heartbeat prompt template already carries the execution contract on
   // fresh sessions; only resume deltas (which replace the template) and
@@ -1604,6 +1654,17 @@ export function renderPaperclipWakePrompt(
         ...executionContractLines,
         ...wakeSummaryLines,
       ];
+
+  if (normalized.invocationPrompt) {
+    lines.push(
+      "",
+      "Plugin invocation request:",
+      normalized.invocationPrompt,
+    );
+    if (normalized.invocationPromptTruncated) {
+      lines.push("[invocation prompt truncated by Paperclip]");
+    }
+  }
 
   if (normalized.issue?.status) {
     lines.push(`- issue status: ${normalized.issue.status}`);
