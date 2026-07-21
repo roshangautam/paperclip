@@ -73,6 +73,95 @@ describe("createTestHarness action context", () => {
   });
 });
 
+describe("createTestHarness config secret refs", () => {
+  it("requires the binding capability and patches nested config", async () => {
+    const secretRef = {
+      type: "secret_ref" as const,
+      secretId: "11111111-1111-4111-8111-111111111111",
+    };
+    const denied = createTestHarness({ manifest });
+    await expect(
+      denied.ctx.config.patchSecretRefs({
+        path: ["credentials"],
+        value: { token: secretRef },
+      }),
+    ).rejects.toThrow(/secrets\.bind-ref/);
+
+    const harness = createTestHarness({
+      manifest,
+      capabilities: ["secrets.bind-ref"],
+      config: { endpoint: "https://example.test" },
+    });
+    await expect(
+      harness.ctx.config.patchSecretRefs({
+        path: ["credentials"],
+        value: { token: secretRef },
+      }),
+    ).resolves.toEqual({
+      endpoint: "https://example.test",
+      credentials: { token: secretRef },
+    });
+  });
+
+  it("rejects prototype paths without mutating global objects", async () => {
+    const harness = createTestHarness({
+      manifest,
+      capabilities: ["secrets.bind-ref"],
+    });
+    const secretRef = {
+      type: "secret_ref" as const,
+      secretId: "11111111-1111-4111-8111-111111111111",
+    };
+
+    await expect(
+      harness.ctx.config.patchSecretRefs({
+        path: ["__proto__", "polluted"],
+        value: secretRef,
+      }),
+    ).rejects.toThrow(/non-empty path/i);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("supports array paths and refuses to remove ordinary config values", async () => {
+    const existingRef = {
+      type: "secret_ref" as const,
+      secretId: "11111111-1111-4111-8111-111111111111",
+    };
+    const replacementRef = {
+      type: "secret_ref" as const,
+      secretId: "22222222-2222-4222-8222-222222222222",
+    };
+    const harness = createTestHarness({
+      manifest,
+      capabilities: ["secrets.bind-ref"],
+      config: {
+        endpoint: "https://example.test",
+        items: [{ token: existingRef }],
+      },
+    });
+
+    await expect(
+      harness.ctx.config.patchSecretRefs({
+        path: ["items", "0", "token"],
+        value: replacementRef,
+      }),
+    ).resolves.toEqual({
+      endpoint: "https://example.test",
+      items: [{ token: replacementRef }],
+    });
+    await expect(
+      harness.ctx.config.patchSecretRefs({
+        path: ["endpoint"],
+        value: null,
+      }),
+    ).rejects.toThrow(/no bound secret refs/i);
+    await expect(harness.ctx.config.get()).resolves.toEqual({
+      endpoint: "https://example.test",
+      items: [{ token: replacementRef }],
+    });
+  });
+});
+
 describe("createTestHarness managed routines", () => {
   it("preserves declared activity gate settings", async () => {
     const harness = createTestHarness({

@@ -49,6 +49,290 @@ describe("extractSecretRefBindingsFromConfig", () => {
       { type: "object", properties: { token: { format: "secret-ref" } } },
     )).toThrow(/must use.*secret_ref/i);
   });
+  it("resolves anchors, percent-encoded pointers, and pattern properties", () => {
+    const secretId = "77777777-7777-4777-8777-777777777777";
+    const schema = {
+      type: "object",
+      $defs: {
+        secretRef: {
+          $id: "#secret",
+          format: "secret-ref",
+        },
+      },
+      properties: {
+        token: { $ref: "#secret" },
+      },
+      patternProperties: {
+        "^dynamic_": { $ref: "#%2F$defs%2FsecretRef" },
+      },
+    };
+
+    expect(() => extractSecretRefBindingsFromConfig(
+      { token: "sk-live-super-secret" },
+      schema,
+    )).toThrow(/secret value.*must use.*secret_ref/i);
+    expect(() => extractSecretRefBindingsFromConfig(
+      { dynamic_api: "sk-live-super-secret" },
+      schema,
+    )).toThrow(/secret value.*must use.*secret_ref/i);
+    expect(extractSecretRefBindingsFromConfig(
+      {
+        token: { type: "secret_ref", secretId },
+        dynamic_api: { type: "secret_ref", secretId },
+      },
+      schema,
+      { requireSchemaDeclaredRefs: true },
+    )).toEqual([
+      expect.objectContaining({ configPath: "token", secretId }),
+      expect.objectContaining({ configPath: "dynamic_api", secretId }),
+    ]);
+    expect(() => extractSecretRefBindingsFromConfig(
+      { undeclared: { type: "secret_ref", secretId } },
+      schema,
+      { requireSchemaDeclaredRefs: true },
+    )).toThrow(/must be declared with format "secret-ref"/i);
+  });
+
+  it("fails closed on unsupported secret-bearing schema extensions", () => {
+    expect(() => extractSecretRefBindingsFromConfig(
+      { token: "sk-live-super-secret" },
+      {
+        type: "object",
+        customSecretField: {
+          format: "secret-ref",
+        },
+      },
+    )).toThrow(/unsupported secret-ref keyword/i);
+  });
+
+  it("does not resolve schema refs through annotation values", () => {
+    const secretId = "77777777-7777-4777-8777-777777777777";
+    expect(() => extractSecretRefBindingsFromConfig(
+      {
+        token: { type: "secret_ref", secretId },
+      },
+      {
+        type: "object",
+        default: {
+          $id: "#token",
+          format: "secret-ref",
+        },
+        definitions: {
+          ordinaryToken: {
+            $id: "#token",
+            type: "string",
+          },
+        },
+        properties: {
+          token: { $ref: "#token" },
+        },
+      },
+      { requireSchemaDeclaredRefs: true },
+    )).toThrow(/must be declared with format "secret-ref"/i);
+  });
+
+  it.each(["if", "then", "else", "not"] as const)(
+    "does not treat an ordinary local ref under %s as a secret declaration",
+    (keyword) => {
+      expect(extractSecretRefBindingsFromConfig(
+        {},
+        {
+          type: "object",
+          $defs: {
+            ordinary: { type: "string" },
+          },
+          [keyword]: { $ref: "#/$defs/ordinary" },
+        },
+      )).toEqual([]);
+    },
+  );
+
+  it.each(["anyOf", "oneOf"] as const)(
+    "does not treat an ordinary local ref under %s as a secret declaration",
+    (keyword) => {
+      expect(extractSecretRefBindingsFromConfig(
+        {},
+        {
+          type: "object",
+          $defs: {
+            ordinary: { type: "string" },
+          },
+          [keyword]: [
+            { $ref: "#/$defs/ordinary" },
+            { type: "object" },
+          ],
+        },
+      )).toEqual([]);
+    },
+  );
+
+  it.each(["__proto__", "constructor", "prototype"])(
+    "rejects local schema pointers containing prototype key %s",
+    (prototypeKey) => {
+      const definitions = {
+        [prototypeKey]: {
+          secret: { format: "secret-ref" },
+        },
+      };
+
+      expect(() => extractSecretRefBindingsFromConfig(
+        {
+          token: {
+            type: "secret_ref",
+            secretId: "77777777-7777-4777-8777-777777777777",
+          },
+        },
+        {
+          type: "object",
+          $defs: definitions,
+          properties: {
+            token: { $ref: `#/$defs/${prototypeKey}/secret` },
+          },
+        },
+        { requireSchemaDeclaredRefs: true },
+      )).toThrow(/unsupported plugin config schema reference/i);
+    },
+  );
+
+  it("does not resolve local schema pointers through inherited properties", () => {
+    const definitions = Object.create({
+      inherited: { format: "secret-ref" },
+    }) as Record<string, unknown>;
+
+    expect(() => extractSecretRefBindingsFromConfig(
+      {
+        token: {
+          type: "secret_ref",
+          secretId: "77777777-7777-4777-8777-777777777777",
+        },
+      },
+      {
+        type: "object",
+        $defs: definitions,
+        properties: {
+          token: { $ref: "#/$defs/inherited" },
+        },
+      },
+      { requireSchemaDeclaredRefs: true },
+    )).toThrow(/unsupported plugin config schema reference/i);
+  });
+
+  it("rejects secret refs declared through ambiguous contains semantics", () => {
+    expect(() => extractSecretRefBindingsFromConfig(
+      {
+        values: [
+          "public",
+          {
+            type: "secret_ref",
+            secretId: "77777777-7777-4777-8777-777777777777",
+          },
+        ],
+      },
+      {
+        type: "object",
+        properties: {
+          values: {
+            type: "array",
+            contains: { format: "secret-ref" },
+          },
+        },
+      },
+    )).toThrow(/conditional keyword "contains"/i);
+  });
+
+  it("rejects secret refs declared in only one discriminated union branch", () => {
+    expect(() => extractSecretRefBindingsFromConfig(
+      {
+        mode: "plain",
+        token: {
+          type: "secret_ref",
+          secretId: "77777777-7777-4777-8777-777777777777",
+        },
+      },
+      {
+        type: "object",
+        oneOf: [
+          {
+            properties: {
+              mode: { const: "plain" },
+              token: { type: "string" },
+            },
+          },
+          {
+            properties: {
+              mode: { const: "secret" },
+              token: { type: "string", format: "secret-ref" },
+            },
+          },
+        ],
+      },
+      { requireSchemaDeclaredRefs: true },
+    )).toThrow(/ambiguously declare secret refs through "oneOf"/i);
+  });
+
+  it("rejects nested schema resource scopes instead of resolving against the wrong root", () => {
+    expect(() => extractSecretRefBindingsFromConfig(
+      {
+        nested: {
+          token: {
+            type: "secret_ref",
+            secretId: "77777777-7777-4777-8777-777777777777",
+          },
+        },
+      },
+      {
+        type: "object",
+        $defs: {
+          secret: { type: "string", format: "secret-ref" },
+        },
+        properties: {
+          nested: {
+            $id: "nested.json",
+            type: "object",
+            $defs: {
+              secret: { type: "string" },
+            },
+            properties: {
+              token: { $ref: "#/$defs/secret" },
+            },
+          },
+        },
+      },
+      { requireSchemaDeclaredRefs: true },
+    )).toThrow(/nested \$id resource scopes are not supported/i);
+  });
+
+  it("rejects pointers that cross nested schema resource scopes", () => {
+    expect(() => extractSecretRefBindingsFromConfig(
+      {
+        token: {
+          type: "secret_ref",
+          secretId: "77777777-7777-4777-8777-777777777777",
+        },
+      },
+      {
+        type: "object",
+        $defs: {
+          secret: { type: "string", format: "secret-ref" },
+          nested: {
+            $id: "nested.json",
+            type: "object",
+            $defs: {
+              secret: { type: "string" },
+            },
+            properties: {
+              token: { $ref: "#/$defs/secret" },
+            },
+          },
+        },
+        properties: {
+          token: { $ref: "#/$defs/nested/properties/token" },
+        },
+      },
+      { requireSchemaDeclaredRefs: true },
+    )).toThrow(/unsupported plugin config schema reference/i);
+  });
+
 });
 
 describe("createPluginSecretsHandler fail-closed guards", () => {

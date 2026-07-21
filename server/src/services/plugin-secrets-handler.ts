@@ -12,11 +12,7 @@ import {
 } from "@paperclipai/db";
 import type { EnvSecretRefBinding, SecretProjectionClass, SecretVersionSelector } from "@paperclipai/shared";
 import { envBindingSecretRefSchema } from "@paperclipai/shared";
-import {
-  collectSecretRefPaths,
-  isUuidSecretRef,
-  readConfigValueAtPath,
-} from "./json-schema-secret-refs.js";
+import { isUuidSecretRef } from "./json-schema-secret-refs.js";
 import { secretService } from "./secrets.js";
 import { HttpError, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -24,6 +20,7 @@ import { logger } from "../middleware/logger.js";
 // ---------------------------------------------------------------------------
 // Error helpers
 // ---------------------------------------------------------------------------
+export const MAX_PLUGIN_CONFIG_PATH_BYTES = 2_048;
 
 function invalidSecretRef(secretRef: unknown): Error {
   const rendered = typeof secretRef === "string" ? secretRef : JSON.stringify(secretRef);
@@ -45,6 +42,494 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const SCHEMA_ARRAY_APPLICATORS = ["allOf", "anyOf", "oneOf"] as const;
+const SCHEMA_SINGLE_APPLICATORS = ["not", "if", "then", "else"] as const;
+const SCHEMA_MAP_APPLICATORS = [
+  "properties",
+  "patternProperties",
+] as const;
+const SCHEMA_VALUE_APPLICATORS = [
+  "additionalProperties",
+  "additionalItems",
+] as const;
+const UNSUPPORTED_AJV_SCHEMA_KEYWORDS = [
+  "$dynamicRef",
+  "dependentSchemas",
+  "prefixItems",
+  "unevaluatedItems",
+  "unevaluatedProperties",
+] as const;
+const AMBIGUOUS_SECRET_SCHEMA_KEYWORDS = [
+  "contains",
+  "if",
+  "then",
+  "else",
+  "not",
+] as const;
+const NON_APPLICATOR_SCHEMA_KEYWORDS = new Set([
+  "$schema",
+  "$id",
+  "$anchor",
+  "$dynamicAnchor",
+  "$ref",
+  "$dynamicRef",
+  "$defs",
+  "definitions",
+  "$comment",
+  "type",
+  "enum",
+  "const",
+  "multipleOf",
+  "maximum",
+  "exclusiveMaximum",
+  "minimum",
+  "exclusiveMinimum",
+  "maxLength",
+  "minLength",
+  "pattern",
+  "format",
+  "contentEncoding",
+  "contentMediaType",
+  "contentSchema",
+  "maxItems",
+  "minItems",
+  "uniqueItems",
+  "maxContains",
+  "minContains",
+  "maxProperties",
+  "minProperties",
+  "required",
+  "dependentRequired",
+  "propertyNames",
+  "title",
+  "description",
+  "default",
+  "deprecated",
+  "readOnly",
+  "writeOnly",
+  "examples",
+]);
+const SUPPORTED_SCHEMA_KEYWORDS = new Set([
+  ...SCHEMA_ARRAY_APPLICATORS,
+  ...SCHEMA_SINGLE_APPLICATORS,
+  ...SCHEMA_MAP_APPLICATORS,
+  ...SCHEMA_VALUE_APPLICATORS,
+  "dependencies",
+  "contains",
+  "items",
+]);
+const SCHEMA_REF_PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function containsSecretRefFormat(
+  value: unknown,
+  rootSchema: unknown,
+  seenNodes: Set<unknown> = new Set(),
+  seenRefs: ReadonlySet<string> = new Set(),
+): boolean {
+  if (isPlainRecord(value)) {
+    if (seenNodes.has(value)) return false;
+    seenNodes.add(value);
+    if (value.format === "secret-ref" || typeof value.$dynamicRef === "string") return true;
+
+    if (typeof value.$ref === "string" && !seenRefs.has(value.$ref)) {
+      const resolved = resolveLocalSchemaRef(rootSchema, value.$ref);
+      if (!resolved) return true;
+      const nextSeenRefs = new Set(seenRefs);
+      nextSeenRefs.add(value.$ref);
+      if (containsSecretRefFormat(resolved, rootSchema, seenNodes, nextSeenRefs)) return true;
+    }
+
+    return Object.values(value).some((child) =>
+      containsSecretRefFormat(child, rootSchema, seenNodes, seenRefs));
+  }
+  if (Array.isArray(value)) {
+    if (seenNodes.has(value)) return false;
+    seenNodes.add(value);
+    return value.some((child) =>
+      containsSecretRefFormat(child, rootSchema, seenNodes, seenRefs));
+  }
+  return false;
+}
+
+function assertNoUnsupportedSecretRefConstructs(
+  schema: Record<string, unknown>,
+  rootSchema: unknown,
+): void {
+  if (
+    schema !== rootSchema
+    && typeof schema.$id === "string"
+    && !schema.$id.startsWith("#")
+  ) {
+    throw unprocessable(
+      "Plugin config schema nested $id resource scopes are not supported",
+    );
+  }
+  for (const keyword of UNSUPPORTED_AJV_SCHEMA_KEYWORDS) {
+    if (schema[keyword] !== undefined) {
+      throw unprocessable(
+        `Plugin config schema keyword "${keyword}" is not supported by the config validator`,
+      );
+    }
+  }
+  for (const keyword of AMBIGUOUS_SECRET_SCHEMA_KEYWORDS) {
+    if (containsSecretRefFormat(schema[keyword], rootSchema)) {
+      throw unprocessable(
+        `Plugin config schema cannot declare secret refs through conditional keyword "${keyword}"`,
+      );
+    }
+  }
+  for (const keyword of ["anyOf", "oneOf"] as const) {
+    const branches = schema[keyword];
+    if (Array.isArray(branches) && containsSecretRefFormat(branches, rootSchema)) {
+      const secretBranches = branches.filter((branch) =>
+        containsSecretRefFormat(branch, rootSchema));
+      const onlyOneSecretWithEmptyAlternatives = secretBranches.length === 1
+        && branches.every((branch) => {
+        if (containsSecretRefFormat(branch, rootSchema)) return branch === secretBranches[0];
+        if (!isPlainRecord(branch)) return false;
+        if (branch.type === "null" || branch.const === null || branch.const === "") return true;
+        return Array.isArray(branch.enum)
+          && branch.enum.every((value) => value === null || value === "");
+      });
+      if (!onlyOneSecretWithEmptyAlternatives) {
+        throw unprocessable(
+          `Plugin config schema cannot ambiguously declare secret refs through "${keyword}"`,
+        );
+      }
+    }
+  }
+
+  for (const [keyword, value] of Object.entries(schema)) {
+    if (
+      SUPPORTED_SCHEMA_KEYWORDS.has(keyword)
+      || NON_APPLICATOR_SCHEMA_KEYWORDS.has(keyword)
+    ) {
+      continue;
+    }
+    if (containsSecretRefFormat(value, rootSchema)) {
+      throw unprocessable(
+        `Plugin config schema uses unsupported secret-ref keyword "${keyword}"`,
+      );
+    }
+  }
+}
+
+function findSchemaNode(
+  rootSchema: unknown,
+  predicate: (schema: Record<string, unknown>) => boolean,
+  seen: Set<unknown> = new Set(),
+): unknown | null {
+  if (isPlainRecord(rootSchema)) {
+    if (seen.has(rootSchema)) return null;
+    seen.add(rootSchema);
+    if (predicate(rootSchema)) return rootSchema;
+    const children: unknown[] = [];
+    for (const keyword of SCHEMA_ARRAY_APPLICATORS) {
+      const schemas = rootSchema[keyword];
+      if (Array.isArray(schemas)) children.push(...schemas);
+    }
+    for (const keyword of SCHEMA_SINGLE_APPLICATORS) {
+      if (rootSchema[keyword] !== undefined) children.push(rootSchema[keyword]);
+    }
+    for (const keyword of SCHEMA_MAP_APPLICATORS) {
+      const schemas = rootSchema[keyword];
+      if (isPlainRecord(schemas)) children.push(...Object.values(schemas));
+    }
+    for (const keyword of ["$defs", "definitions"] as const) {
+      const definitions = rootSchema[keyword];
+      if (isPlainRecord(definitions)) children.push(...Object.values(definitions));
+    }
+    if (isPlainRecord(rootSchema.dependencies)) {
+      children.push(
+        ...Object.values(rootSchema.dependencies).filter((dependency) =>
+          !Array.isArray(dependency)),
+      );
+    }
+    if (Array.isArray(rootSchema.items)) children.push(...rootSchema.items);
+    else if (rootSchema.items !== undefined) children.push(rootSchema.items);
+    for (const keyword of [...SCHEMA_VALUE_APPLICATORS, "contains"] as const) {
+      if (rootSchema[keyword] !== undefined) children.push(rootSchema[keyword]);
+    }
+    for (const child of children) {
+      const found = findSchemaNode(child, predicate, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (Array.isArray(rootSchema)) {
+    if (seen.has(rootSchema)) return null;
+    seen.add(rootSchema);
+    for (const child of rootSchema) {
+      const found = findSchemaNode(child, predicate, seen);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function resolveLocalSchemaRef(rootSchema: unknown, ref: string): unknown | null {
+  let decodedRef: string;
+  try {
+    decodedRef = decodeURIComponent(ref);
+  } catch {
+    return null;
+  }
+
+  if (decodedRef === "#") return rootSchema;
+  if (decodedRef.startsWith("#/")) {
+    let current = rootSchema;
+    for (const encodedSegment of decodedRef.slice(2).split("/")) {
+      if (!isPlainRecord(current)) return null;
+      const segment = encodedSegment.replaceAll("~1", "/").replaceAll("~0", "~");
+      if (
+        SCHEMA_REF_PROTOTYPE_KEYS.has(segment)
+        || !Object.prototype.hasOwnProperty.call(current, segment)
+      ) {
+        return null;
+      }
+      current = current[segment];
+      if (
+        isPlainRecord(current)
+        && current !== rootSchema
+        && typeof current.$id === "string"
+        && !current.$id.startsWith("#")
+      ) {
+        return null;
+      }
+    }
+    return current ?? null;
+  }
+
+  if (decodedRef.startsWith("#")) {
+    const anchor = decodedRef.slice(1);
+    return findSchemaNode(rootSchema, (schema) =>
+      schema.$anchor === anchor
+      || schema.$dynamicAnchor === anchor
+      || schema.$id === decodedRef);
+  }
+
+  return null;
+}
+
+function schemaDeclaresSecretRefs(
+  schema: unknown,
+  rootSchema: unknown = schema,
+  seenRefs: ReadonlySet<string> = new Set(),
+): boolean {
+  if (!isPlainRecord(schema)) return false;
+  assertNoUnsupportedSecretRefConstructs(schema, rootSchema);
+  if (schema.format === "secret-ref") return true;
+
+  for (const refKeyword of ["$ref"] as const) {
+    const ref = schema[refKeyword];
+    if (typeof ref !== "string") continue;
+    if (seenRefs.has(ref)) continue;
+    const resolved = resolveLocalSchemaRef(rootSchema, ref);
+    if (!resolved) return true;
+    const nextSeenRefs = new Set(seenRefs);
+    nextSeenRefs.add(ref);
+    if (schemaDeclaresSecretRefs(resolved, rootSchema, nextSeenRefs)) return true;
+  }
+
+  for (const keyword of SCHEMA_ARRAY_APPLICATORS) {
+    const branches = schema[keyword];
+    if (
+      Array.isArray(branches)
+      && branches.some((branch) => schemaDeclaresSecretRefs(branch, rootSchema, seenRefs))
+    ) {
+      return true;
+    }
+  }
+
+  for (const keyword of SCHEMA_SINGLE_APPLICATORS) {
+    if (schemaDeclaresSecretRefs(schema[keyword], rootSchema, seenRefs)) return true;
+  }
+
+  for (const keyword of SCHEMA_MAP_APPLICATORS) {
+    const schemas = schema[keyword];
+    if (
+      isPlainRecord(schemas)
+      && Object.values(schemas).some((child) =>
+        schemaDeclaresSecretRefs(child, rootSchema, seenRefs))
+    ) {
+      return true;
+    }
+  }
+
+  if (isPlainRecord(schema.dependencies)) {
+    for (const dependency of Object.values(schema.dependencies)) {
+      if (
+        !Array.isArray(dependency)
+        && schemaDeclaresSecretRefs(dependency, rootSchema, seenRefs)
+      ) {
+        return true;
+      }
+    }
+  }
+
+  const itemSchemas = Array.isArray(schema.items) ? schema.items : [schema.items];
+  if (itemSchemas.some((item) => schemaDeclaresSecretRefs(item, rootSchema, seenRefs))) return true;
+
+  return SCHEMA_VALUE_APPLICATORS.some((keyword) =>
+    schemaDeclaresSecretRefs(schema[keyword], rootSchema, seenRefs));
+}
+
+function visitSchemaSecretValues(
+  value: unknown,
+  schema: unknown,
+  path: string,
+  visit: (value: unknown, path: string) => void,
+  rootSchema: unknown = schema,
+  seenRefs: ReadonlySet<string> = new Set(),
+): void {
+  if (!isPlainRecord(schema)) return;
+  assertNoUnsupportedSecretRefConstructs(schema, rootSchema);
+
+  for (const refKeyword of ["$ref"] as const) {
+    const ref = schema[refKeyword];
+    if (typeof ref !== "string") continue;
+    const refAtPath = `${ref}\u0000${path}`;
+    if (seenRefs.has(refAtPath)) continue;
+    const resolved = resolveLocalSchemaRef(rootSchema, ref);
+    if (!resolved) {
+      throw unprocessable(`Unsupported plugin config schema reference "${ref}"`);
+    }
+    const nextSeenRefs = new Set(seenRefs);
+    nextSeenRefs.add(refAtPath);
+    visitSchemaSecretValues(value, resolved, path, visit, rootSchema, nextSeenRefs);
+  }
+
+  for (const keyword of SCHEMA_ARRAY_APPLICATORS) {
+    const branches = schema[keyword];
+    if (!Array.isArray(branches)) continue;
+    for (const branch of branches) {
+      visitSchemaSecretValues(value, branch, path, visit, rootSchema, seenRefs);
+    }
+  }
+  for (const keyword of SCHEMA_SINGLE_APPLICATORS) {
+    const childSchema = schema[keyword];
+    if (childSchema !== undefined) {
+      visitSchemaSecretValues(value, childSchema, path, visit, rootSchema, seenRefs);
+    }
+  }
+
+  if (schema.format === "secret-ref") {
+    visit(value, path || "$");
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    const tupleItems = Array.isArray(schema.items) ? schema.items : [];
+    const sharedItems = isPlainRecord(schema.items) ? schema.items : null;
+    const visitedIndexes = new Set<number>();
+    value.forEach((item, index) => {
+      const itemSchema = tupleItems[index] ?? sharedItems;
+      if (itemSchema) {
+        visitedIndexes.add(index);
+        visitSchemaSecretValues(
+          item,
+          itemSchema,
+          path ? `${path}.${index}` : String(index),
+          visit,
+          rootSchema,
+          seenRefs,
+        );
+      }
+    });
+    const remainingItemsSchema = schema.additionalItems;
+    if (remainingItemsSchema !== undefined) {
+      value.forEach((item, index) => {
+        if (visitedIndexes.has(index)) return;
+        visitSchemaSecretValues(
+          item,
+          remainingItemsSchema,
+          path ? `${path}.${index}` : String(index),
+          visit,
+          rootSchema,
+          seenRefs,
+        );
+      });
+    }
+    return;
+  }
+
+  if (!isPlainRecord(value)) return;
+  const properties = isPlainRecord(schema.properties) ? schema.properties : {};
+  const visitedKeys = new Set<string>();
+  for (const [key, propertySchema] of Object.entries(properties)) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    visitedKeys.add(key);
+    visitSchemaSecretValues(
+      value[key],
+      propertySchema,
+      path ? `${path}.${key}` : key,
+      visit,
+      rootSchema,
+      seenRefs,
+    );
+  }
+
+  const patternProperties = isPlainRecord(schema.patternProperties)
+    ? schema.patternProperties
+    : {};
+  for (const [pattern, propertySchema] of Object.entries(patternProperties)) {
+    let matcher: RegExp;
+    try {
+      matcher = new RegExp(pattern);
+    } catch {
+      throw unprocessable(`Invalid patternProperties expression "${pattern}"`);
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (!matcher.test(key)) continue;
+      visitedKeys.add(key);
+      visitSchemaSecretValues(
+        child,
+        propertySchema,
+        path ? `${path}.${key}` : key,
+        visit,
+        rootSchema,
+        seenRefs,
+      );
+    }
+  }
+
+  for (const keyword of ["additionalProperties"] as const) {
+    const additionalSchema = schema[keyword];
+    if (!isPlainRecord(additionalSchema)) continue;
+    for (const [key, child] of Object.entries(value)) {
+      if (visitedKeys.has(key)) continue;
+      visitSchemaSecretValues(
+        child,
+        additionalSchema,
+        path ? `${path}.${key}` : key,
+        visit,
+        rootSchema,
+        seenRefs,
+      );
+    }
+  }
+
+  for (const keyword of ["dependencies"] as const) {
+    const dependentSchemas = isPlainRecord(schema[keyword]) ? schema[keyword] : {};
+    for (const [key, dependentSchema] of Object.entries(dependentSchemas)) {
+      if (
+        !Object.prototype.hasOwnProperty.call(value, key)
+        || Array.isArray(dependentSchema)
+      ) {
+        continue;
+      }
+      visitSchemaSecretValues(
+        value,
+        dependentSchema,
+        path,
+        visit,
+        rootSchema,
+        seenRefs,
+      );
+    }
+  }
+}
+
 function parseSecretRefBinding(value: unknown): EnvSecretRefBinding | null {
   const parsed = envBindingSecretRefSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
@@ -53,18 +538,35 @@ function parseSecretRefBinding(value: unknown): EnvSecretRefBinding | null {
 function assertSecretRefBinding(
   value: unknown,
   path: string,
-  rejectLegacyUuid = false,
+  options: {
+    rejectLegacyUuid?: boolean;
+    rejectRawSecretValue?: boolean;
+  } = {},
 ): EnvSecretRefBinding | null {
-  if (rejectLegacyUuid && typeof value === "string" && isUuidSecretRef(value)) {
+  const isEmptyValue = value === undefined
+    || value === null
+    || (typeof value === "string" && value.trim().length === 0);
+  if (isEmptyValue) return null;
+
+  if (
+    options.rejectLegacyUuid
+    && typeof value === "string"
+    && isUuidSecretRef(value.trim())
+  ) {
     throw unprocessable(
       `Plugin secret ref at ${path} must use { type: "secret_ref", secretId, version? }`,
     );
   }
-  if (!isPlainRecord(value) || value.type !== "secret_ref") return null;
-  const parsed = parseSecretRefBinding(value);
-  if (!parsed) {
-    throw unprocessable(`Invalid secret_ref binding at ${path}`);
+  if (!isPlainRecord(value) || value.type !== "secret_ref") {
+    if (options.rejectRawSecretValue) {
+      throw unprocessable(
+        `Plugin secret value at ${path} must use { type: "secret_ref", secretId, version? }`,
+      );
+    }
+    return null;
   }
+  const parsed = parseSecretRefBinding(value);
+  if (!parsed) throw unprocessable(`Invalid secret_ref binding at ${path}`);
   return parsed;
 }
 
@@ -82,12 +584,17 @@ export interface PluginConfigSecretRefBinding {
 // Validation
 // ---------------------------------------------------------------------------
 
-/** Extract shared object-shaped secret refs from plugin config. */
+export interface ExtractSecretRefBindingsOptions {
+  requireSchemaDeclaredRefs?: boolean;
+}
+
+/** Extract object-shaped secret refs while rejecting legacy UUID values. */
 export function extractSecretRefBindingsFromConfig(
   configJson: unknown,
   schema?: Record<string, unknown> | null,
+  options: ExtractSecretRefBindingsOptions = {},
 ): PluginConfigSecretRefBinding[] {
-  if (configJson == null || typeof configJson !== "object") return [];
+  if (!isPlainRecord(configJson)) return [];
 
   const refsByPath = new Map<string, PluginConfigSecretRefBinding>();
   const addRef = (binding: EnvSecretRefBinding, configPath: string) => {
@@ -102,17 +609,37 @@ export function extractSecretRefBindingsFromConfig(
     });
   };
 
-  const secretPaths = collectSecretRefPaths(schema);
-  for (const dotPath of secretPaths) {
-    const current = readConfigValueAtPath(configJson as Record<string, unknown>, dotPath);
-    const binding = assertSecretRefBinding(current, dotPath, true);
-    if (binding) addRef(binding, dotPath);
-  }
+  schemaDeclaresSecretRefs(schema);
+  const requireDeclaredRefPaths = Boolean(
+    options.requireSchemaDeclaredRefs
+    && isPlainRecord(schema)
+    && Object.keys(schema).length > 0,
+  );
+  const schemaDeclaredRefPaths = new Set<string>();
+  visitSchemaSecretValues(configJson, schema, "", (current, configPath) => {
+    const binding = assertSecretRefBinding(current, configPath, {
+      rejectLegacyUuid: true,
+      rejectRawSecretValue: true,
+    });
+    if (binding) {
+      schemaDeclaredRefPaths.add(configPath);
+      addRef(binding, configPath);
+    }
+  });
 
   function walk(value: unknown, path: string): void {
     const binding = assertSecretRefBinding(value, path || "$");
     if (binding) {
-      addRef(binding, path || "$");
+      const configPath = path || "$";
+      if (
+        requireDeclaredRefPaths
+        && !schemaDeclaredRefPaths.has(configPath)
+      ) {
+        throw unprocessable(
+          `Plugin secret ref at ${configPath} must be declared with format "secret-ref" in the plugin config schema`,
+        );
+      }
+      addRef(binding, configPath);
       return;
     }
     if (Array.isArray(value)) {
