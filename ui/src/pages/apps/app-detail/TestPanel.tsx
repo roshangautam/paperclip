@@ -146,7 +146,10 @@ export function TestPanel({
     queryFn: () => projectsApi.list(selectedCompanyId!),
     enabled: requiresProject && !!selectedCompanyId,
   });
-  const projects = projectsQuery.data ?? [];
+  const projects = useMemo(
+    () => (projectsQuery.data ?? []).filter((project) => !project.archivedAt),
+    [projectsQuery.data],
+  );
   const [projectId, setProjectId] = useState<string | null>(null);
 
   useEffect(() => {

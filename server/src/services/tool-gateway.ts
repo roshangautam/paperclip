@@ -4091,6 +4091,37 @@ export function createToolGatewayService(
     }
   }
 
+  /**
+   * Claim and execute a parked Test-tab invocation exactly once. Approval and
+   * execution are separate durable writes, so a server restart can leave an
+   * approved request whose invocation is still awaiting approval. Retrying the
+   * approval resumes that invocation, while the conditional status transition
+   * prevents concurrent retries from dispatching the tool more than once.
+   */
+  async function resumeApprovedTestInvocation(
+    invocation: typeof toolInvocations.$inferSelect,
+    parameters: unknown,
+    actionRequestId: string,
+  ): Promise<void> {
+    if (!isTestOriginInvocation(invocation)) return;
+    const now = new Date();
+    const [claimed] = await db
+      .update(toolInvocations)
+      .set({
+        status: "executing",
+        approvalState: "approved",
+        startedAt: invocation.startedAt ?? now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(toolInvocations.id, invocation.id),
+        eq(toolInvocations.status, "awaiting_approval"),
+      ))
+      .returning();
+    if (!claimed) return;
+    await runApprovedTestInvocation(claimed, parameters, actionRequestId);
+  }
+
   async function waitForActionRequestExecution(actionRequestId: string) {
     for (let attempt = 0; attempt < 500; attempt += 1) {
       const [row] = await db
@@ -5343,6 +5374,15 @@ export function createToolGatewayService(
       }
       if (actionRequest.status === "approved") {
         await reflectToolActionInteractionLifecycle({ actionRequestId: actionRequest.id, status: "approved" });
+        if (isTestOriginInvocation(invocation) && signedPayload.executionOnApprove === true) {
+          await resumeApprovedTestInvocation(invocation, signedPayload.arguments, actionRequest.id);
+          const [settled] = await db
+            .select()
+            .from(toolActionRequests)
+            .where(eq(toolActionRequests.id, actionRequest.id))
+            .limit(1);
+          return actionRequestResolution(settled ?? actionRequest);
+        }
         if (!isTestOriginInvocation(invocation) && signedPayload.executionOnApprove === true) {
           try {
             await executeApprovedAgentInvocation({ actionRequest, invocation });
@@ -5382,7 +5422,7 @@ export function createToolGatewayService(
       // call, so approving it is what runs it. Execute against the signed
       // arguments and record the result on the invocation for the live panel.
       if (isTestOriginInvocation(invocation)) {
-        await runApprovedTestInvocation(
+        await resumeApprovedTestInvocation(
           { ...invocation, approvalState: "approved" },
           signedPayload.arguments,
           updated.id,

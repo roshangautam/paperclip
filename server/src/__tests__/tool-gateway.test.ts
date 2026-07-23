@@ -4274,6 +4274,102 @@ rl.on("line", (line) => {
     expect(calls).toHaveLength(2);
   });
 
+  it("resumes an approved plugin Test call that is still awaiting execution exactly once", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const [project] = await db.insert(projects).values({
+      companyId: company.id,
+      name: `Retry plugin Test project ${randomUUID()}`,
+    }).returning();
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "identity_lookup_retry",
+      toolDisplayName: "Identity lookup retry",
+      riskLevel: "write",
+    });
+    const calls: Array<{ tool: string; parameters: unknown; runContext: unknown }> = [];
+    const dispatcher = createPluginDispatcher(pluginTool, async (tool, parameters, runContext) => {
+      calls.push({ tool, parameters, runContext });
+      return {
+        pluginId: pluginTool.plugin.id,
+        toolName: pluginTool.catalogEntry.toolName,
+        result: { content: "resumed plugin test", data: { ok: true } },
+      };
+    });
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review retried plugin Test calls",
+      policyType: "require_approval",
+      selectors: { connectionId: pluginTool.connection.id },
+      description: "Plugin Test calls need review.",
+      priority: 10,
+    });
+
+    const askFirst = await gateway.executeTestCall({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      userId: "board-user",
+      toolName: pluginTool.namespacedToolName,
+      projectId: project!.id,
+      parameters: { id: "resumed" },
+    });
+    if (askFirst.decision !== "ask_first") throw new Error("Expected ask-first plugin Test call");
+
+    const approvedAt = new Date();
+    await db
+      .update(toolActionRequests)
+      .set({
+        status: "approved",
+        decidedByUserId: "board-user",
+        resolvedByUserId: "board-user",
+        decidedAt: approvedAt,
+        resolvedAt: approvedAt,
+        updatedAt: approvedAt,
+      })
+      .where(eq(toolActionRequests.id, askFirst.actionRequestId));
+    await db
+      .update(toolInvocations)
+      .set({ approvalState: "approved", updatedAt: approvedAt })
+      .where(eq(toolInvocations.id, askFirst.invocationId));
+
+    await Promise.all([
+      gateway.approveActionRequest({
+        companyId: company.id,
+        actionRequestId: askFirst.actionRequestId,
+        actor: { userId: "board-user" },
+      }),
+      gateway.approveActionRequest({
+        companyId: company.id,
+        actionRequestId: askFirst.actionRequestId,
+        actor: { userId: "board-user" },
+      }),
+    ]);
+
+    const [invocation] = await db
+      .select()
+      .from(toolInvocations)
+      .where(eq(toolInvocations.id, askFirst.invocationId));
+    expect(invocation).toMatchObject({
+      status: "succeeded",
+      approvalState: "approved",
+      providerType: "paperclip_plugin",
+      projectId: project!.id,
+    });
+    expect(calls).toEqual([{
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "resumed" },
+      runContext: {
+        agentId: agent.id,
+        companyId: company.id,
+        runId: null,
+        projectId: project!.id,
+      },
+    }]);
+  });
+
   it("requires a company project before executing a plugin Test call", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

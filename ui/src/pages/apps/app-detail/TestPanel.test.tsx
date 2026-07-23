@@ -309,6 +309,39 @@ describe("TestPanel", () => {
     });
   });
 
+  it("excludes archived projects from plugin tests", async () => {
+    listProjectsMock.mockResolvedValue([
+      {
+        id: "project-archived",
+        name: "Archived project",
+        archivedAt: new Date("2026-06-01T00:00:00.000Z"),
+      },
+      { id: "project-active", name: "Active project", archivedAt: null },
+    ]);
+    await act(async () => renderPanel([readEntry], [], true));
+    await flushReact();
+
+    expect(listTestAgentsMock).toHaveBeenCalledWith("conn-1", "project-active");
+    expect(container.textContent).toContain("Active project");
+    expect(container.textContent).not.toContain("Archived project");
+
+    const projectTrigger = container.querySelector<HTMLElement>(
+      'button[aria-label="Choose a project for this test"]',
+    );
+    expect(projectTrigger).toBeTruthy();
+    projectTrigger!.hasPointerCapture = () => false;
+    await act(async () => {
+      projectTrigger!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+      projectTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const projectOptions = [...document.body.querySelectorAll<HTMLElement>('[role="option"]')]
+      .map((option) => option.textContent);
+    expect(projectOptions).toContain("Active project");
+    expect(projectOptions).not.toContain("Archived project");
+  });
+
   it("does not attribute an in-flight result to a newly selected project", async () => {
     listProjectsMock.mockResolvedValue([
       { id: "project-1", name: "Plugin Lab" },
