@@ -423,26 +423,29 @@ export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Exp
     .delete(instanceUserRoles)
     .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")));
 
-  const insertedCompanies = await db
-    .insert(companies)
-    .values({
-      id: companyId,
-      name: companyName,
-      description: `Provisioned by Paperclip Cloud for stack ${stackId}.`,
-      status: "active",
-      issuePrefix: issuePrefixForCloudStack(stackId),
-      updatedAt: now,
-    })
-    .onConflictDoNothing({
-      target: companies.id,
-    })
-    .returning({ id: companies.id });
-  // Reconciliation takes a per-company advisory lock, so keep it on the
-  // provisioning path instead of serializing every authenticated request.
-  // Startup and plugin lifecycle reconciliation repair existing companies.
-  if (insertedCompanies.length > 0) {
-    await toolAccessService(db).reconcilePluginApplications(companyId);
-  }
+  await db.transaction(async (tx) => {
+    const insertedCompanies = await tx
+      .insert(companies)
+      .values({
+        id: companyId,
+        name: companyName,
+        description: `Provisioned by Paperclip Cloud for stack ${stackId}.`,
+        status: "active",
+        issuePrefix: issuePrefixForCloudStack(stackId),
+        updatedAt: now,
+      })
+      .onConflictDoNothing({
+        target: companies.id,
+      })
+      .returning({ id: companies.id });
+    // Keep first-time reconciliation on the provisioning path without running
+    // it for every authenticated request. Coupling both writes transactionally
+    // means a reconciliation failure rolls back the company insert, so repeat
+    // authentication retries the complete provisioning step.
+    if (insertedCompanies.length > 0) {
+      await toolAccessService(tx as unknown as Db).reconcilePluginApplications(companyId);
+    }
+  });
 
   const membershipRole = stackRole === "owner" || stackRole === "admin" ? "owner" : stackRole;
   const membership = await db
