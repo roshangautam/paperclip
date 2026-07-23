@@ -230,7 +230,19 @@ export function TestPanel({
   const visibleQuarantined = quarantinedActions.filter(matches);
   const visibleCount = visibleRead.length + visibleWrite.length + visibleQuarantined.length;
 
-  if ((requiresProject && projectsQuery.isLoading) || testAgentsQuery.isLoading) {
+  // When a project is required and projects have resolved but `projectId` is
+  // still null, the default-selection effect hasn't run yet and
+  // `testAgentsQuery` is disabled (so neither query reports loading). Treat
+  // that intermediate window as loading so we don't briefly render the
+  // "No agents to test as" empty state before agents are fetched.
+  const awaitingProjectDefault =
+    requiresProject && projectId === null && projects.length > 0;
+
+  if (
+    (requiresProject && projectsQuery.isLoading) ||
+    awaitingProjectDefault ||
+    testAgentsQuery.isLoading
+  ) {
     return (
       <div className="space-y-4">
         <Skeleton className="h-20 w-full" />

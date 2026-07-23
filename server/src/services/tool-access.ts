@@ -2472,8 +2472,22 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     if (companyRows.length === 0) return;
 
     for (const company of companyRows) {
-      await db.transaction(async (tx) => {
-        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:plugin-app-reconciliation:${company.id}`}, 0))`);
+      // May be invoked with either a top-level Db or a Drizzle transaction
+      // client (e.g. from resolveCloudTenantActor, which passes `tx as Db`).
+      // Transaction clients don't expose `.transaction`, so fall back to
+      // running the reconciliation directly on the existing transaction rather
+      // than attempting to open a nested one, which would throw at runtime.
+      if (typeof db.transaction === "function") {
+        await db.transaction((tx) => reconcileCompanyPluginApplications(tx, company.id));
+      } else {
+        await reconcileCompanyPluginApplications(db as unknown as DbTransaction, company.id);
+      }
+    }
+  }
+
+  async function reconcileCompanyPluginApplications(tx: DbTransaction, companyId: string): Promise<void> {
+    const company = { id: companyId };
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:plugin-app-reconciliation:${company.id}`}, 0))`);
         const reconciledAt = now();
         const pluginRows = await tx.select().from(plugins).orderBy(plugins.pluginKey);
         const managedPlugins = pluginRows.flatMap((plugin) => {
@@ -3031,8 +3045,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             metadata: { source: "plugin_reconciliation", pluginKey: plugin.pluginKey },
           });
         }
-      });
-    }
   }
 
   async function listConnectionInstalls(connectionId: string, companyId?: string): Promise<ToolConnectionInstall[]> {
