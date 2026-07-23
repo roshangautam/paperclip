@@ -243,18 +243,18 @@ export interface PluginJobContext {
 // ---------------------------------------------------------------------------
 
 /**
- * Run context passed to a plugin tool handler when an agent invokes the tool.
+ * Execution context passed to a plugin tool handler.
  *
  * @see PLUGIN_SPEC.md §13.10 — `executeTool`
  */
 export interface ToolRunContext {
   /** UUID of the agent invoking the tool. */
   agentId: string;
-  /** UUID of the current agent run. */
-  runId: string;
-  /** UUID of the company the run belongs to. */
+  /** UUID of the current heartbeat run, or `null` for a board Test-tab invocation. */
+  runId: string | null;
+  /** UUID of the company that owns the execution scope. */
   companyId: string;
-  /** UUID of the project the run belongs to. */
+  /** UUID of the project that owns the execution scope. */
   projectId: string;
 }
 

@@ -417,9 +417,9 @@ Tool names are automatically namespaced by plugin ID at runtime (e.g. `linear:se
 
 ### 11.2 Tool Execution
 
-When an agent invokes a plugin tool during a run, the host routes the call to the plugin worker via a `executeTool` RPC method:
+When an agent or operator invokes a plugin tool, the host routes the call to the plugin worker via an `executeTool` RPC method:
 
-- `executeTool(input)` — receives tool name, parsed parameters, and run context (agent ID, run ID, company ID, project ID)
+- `executeTool(input)` — receives tool name, parsed parameters, and execution context (agent ID, nullable run ID, company ID, project ID). `runId` is the heartbeat run UUID for agent execution and `null` for an operator invocation from an app's Test tab; a tool-invocation UUID must not be substituted for a missing heartbeat run.
 
 The worker executes the tool logic and returns a typed result. The host enforces capability gates — a plugin must declare `agent.tools.register` to contribute tools, and individual tools may require additional capabilities (e.g. `http.outbound` for tools that call external APIs).
 

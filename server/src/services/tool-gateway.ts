@@ -57,7 +57,7 @@ import { secretService } from "./secrets.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
-import { descriptorHash } from "./tool-access.js";
+import { classifyRisk, descriptorHash } from "./tool-access.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
   createToolRuntimeSupervisor,
@@ -212,7 +212,7 @@ interface ExecutePluginToolInput {
   actor: { type: "agent" | "board"; agentId?: string | null; companyId?: string | null; userId?: string | null; runId?: string | null };
   tool: string;
   parameters: unknown;
-  runContext: ToolRunContext;
+  runContext: ToolRunContext & { runId: string };
 }
 
 type HeaderPolicyConfig = {
@@ -464,14 +464,7 @@ function summarizeResult(result: unknown): Record<string, unknown> {
 }
 
 function inferToolRisk(toolName: string): ToolGatewayDescriptor["risk"] {
-  const lower = toolName.toLowerCase();
-  if (/\b(delete|destroy|remove|drop|truncate|wipe|purge)\b|(^|[:._-])(delete|destroy|remove|drop|truncate|wipe|purge)([:._-]|$)/.test(lower)) {
-    return "destructive";
-  }
-  if (/\b(create|update|write|edit|patch|post|send|publish|merge|commit|apply)\b|(^|[:._-])(create|update|write|edit|patch|post|send|publish|merge|commit|apply)([:._-]|$)/.test(lower)) {
-    return "write";
-  }
-  return "read";
+  return classifyRisk({ name: toolName });
 }
 
 function riskFromCatalogEntry(entry: Pick<typeof toolCatalogEntries.$inferSelect, "riskLevel" | "isReadOnly" | "isWrite" | "isDestructive">): ToolGatewayDescriptor["risk"] {
@@ -3826,7 +3819,7 @@ export function createToolGatewayService(
                     pluginToolDispatcher.executeTool(args.tool.name, args.parameters, {
                       agentId: args.agentId,
                       companyId: args.companyId,
-                      runId: args.invocationId,
+                      runId: null,
                       projectId: args.session.projectId!,
                     }),
                     executionTimeoutMs,

@@ -4186,7 +4186,7 @@ rl.on("line", (line) => {
       runContext: {
         agentId: agent.id,
         companyId: company.id,
-        runId: allowed.invocationId,
+        runId: null,
         projectId: project.id,
       },
     });
@@ -4233,7 +4233,7 @@ rl.on("line", (line) => {
       tool: pluginTool.namespacedToolName,
       parameters: { id: "approved" },
       runContext: {
-        runId: askFirst.invocationId,
+        runId: null,
         projectId: project.id,
       },
     });

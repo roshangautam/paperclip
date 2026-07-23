@@ -6693,7 +6693,14 @@ describe("classifyRisk", () => {
     expect(risk("delete_widget")).toBe("destructive");
     expect(risk("github:delete_repo")).toBe("destructive");
     expect(risk("notion:remove_page")).toBe("destructive");
+    expect(risk("database:drop_table")).toBe("destructive");
+    expect(risk("cache:purge_entries")).toBe("destructive");
     expect(risk("cms:unpublish_post")).toBe("destructive");
+  });
+
+  it("classifies patch and merge operations as write", () => {
+    expect(risk("github:patch_issue")).toBe("write");
+    expect(risk("github:merge_pull_request")).toBe("write");
   });
 
   it("classifies read verbs and noise as read", () => {

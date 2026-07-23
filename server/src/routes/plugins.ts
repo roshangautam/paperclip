@@ -461,6 +461,8 @@ interface PluginToolExecuteRequest {
   runContext: ToolRunContext;
 }
 
+type HeartbeatToolRunContext = ToolRunContext & { runId: string };
+
 /**
  * Create Express router for plugin management API.
  *
@@ -786,7 +788,7 @@ export function pluginRoutes(
     return companyId === undefined ? base : { ...base, companyId };
   }
 
-  async function validateToolRunContextScope(runContext: ToolRunContext): Promise<string | null> {
+  async function validateToolRunContextScope(runContext: HeartbeatToolRunContext): Promise<string | null> {
     const [agent] = await db
       .select({ companyId: agents.companyId })
       .from(agents)
@@ -1026,8 +1028,13 @@ export function pluginRoutes(
       return;
     }
 
-    assertCompanyAccess(req, runContext.companyId);
-    const scopeError = await validateToolRunContextScope(runContext);
+    const heartbeatRunContext: HeartbeatToolRunContext = {
+      ...runContext,
+      runId: runContext.runId,
+    };
+
+    assertCompanyAccess(req, heartbeatRunContext.companyId);
+    const scopeError = await validateToolRunContextScope(heartbeatRunContext);
     if (scopeError) {
       res.status(403).json({ error: scopeError });
       return;
@@ -1044,7 +1051,7 @@ export function pluginRoutes(
           },
           tool,
           parameters: parameters ?? {},
-          runContext,
+          runContext: heartbeatRunContext,
         });
         res.json(result);
       } catch (err) {

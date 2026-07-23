@@ -1181,19 +1181,19 @@ function normalizeToolDescriptor(tool: unknown): McpToolDescriptor | null {
 // A leading-anchor regex (/^(create|...)/) misses every namespaced/camelCase
 // form and silently classifies writes as read-only. We normalise camelCase to
 // snake_case first so "postMessage" -> "post_message", then match the verb when
-// it is delimiter- or word-bounded. This mirrors the gateway classifier in
-// tool-gateway.ts (inferToolRisk) so the two stay consistent.
+// it is delimiter- or word-bounded. The gateway delegates to this classifier so
+// catalog and runtime risk decisions cannot drift apart.
 function verbMatches(toolName: string, verbs: string): boolean {
   const normalized = toolName.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
   return new RegExp(`\\b(${verbs})\\b|(^|[:._-])(${verbs})([:._-]|$)`).test(normalized);
 }
 
-export function classifyRisk(tool: McpToolDescriptor): ToolRiskLevel {
+export function classifyRisk(tool: McpToolDescriptor): Extract<ToolRiskLevel, "read" | "write" | "destructive"> {
   const annotations = tool.annotations ?? {};
   if (annotations.destructiveHint === true || annotations.destructive === true) return "destructive";
   if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
-  if (verbMatches(tool.name, "delete|remove|destroy|unpublish")) return "destructive";
-  if (verbMatches(tool.name, "create|update|write|set|send|publish|post|mutate|mark|archive")) return "write";
+  if (verbMatches(tool.name, "delete|destroy|remove|drop|truncate|wipe|purge|unpublish")) return "destructive";
+  if (verbMatches(tool.name, "create|update|write|edit|patch|post|send|publish|merge|commit|apply|set|mutate|mark|archive")) return "write";
   return "read";
 }
 

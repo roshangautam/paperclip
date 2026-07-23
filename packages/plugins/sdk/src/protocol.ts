@@ -438,7 +438,7 @@ export interface ExecuteToolParams {
   toolName: string;
   /** Parsed parameters matching the tool's declared schema. */
   parameters: unknown;
-  /** Agent run context. */
+  /** Tool execution context. `runId` is null for board Test-tab invocations. */
   runContext: ToolRunContext;
 }
 
