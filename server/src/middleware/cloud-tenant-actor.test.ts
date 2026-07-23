@@ -6,8 +6,9 @@ import { resolveCloudTenantActor } from "./auth.js";
 
 // Minimal fake Drizzle Db: records every table passed to .insert() / .delete() and
 // supports the chained call shapes used by resolveCloudTenantActor (values /
-// onConflictDo* / returning().then() / delete().where()). The chain is awaitable so
-// directly-awaited statements resolve.
+// onConflictDo* / returning().then() / delete().where()) plus the empty plugin
+// lookup used when a cloud tenant creates a company. The mutation chain is
+// awaitable so directly-awaited statements resolve.
 function createFakeDb(membershipRow = { companyId: "company-x", membershipRole: "owner", status: "active" }) {
   const insertedTables: unknown[] = [];
   const deletedTables: unknown[] = [];
@@ -18,7 +19,11 @@ function createFakeDb(membershipRow = { companyId: "company-x", membershipRole: 
   chain.where = () => chain;
   chain.returning = async () => [membershipRow];
   chain.then = (resolve: (v: unknown) => unknown) => Promise.resolve(undefined).then(resolve);
+  const selectChain: Record<string, unknown> = {};
+  selectChain.from = () => selectChain;
+  selectChain.orderBy = async () => [];
   const db = {
+    select: () => selectChain,
     insert: (table: unknown) => {
       insertedTables.push(table);
       return chain;

@@ -51,11 +51,13 @@ import type {
   UpdateToolMcpGateway,
 } from "@paperclipai/shared";
 import type { AgentToolDescriptor, PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
+import { parsePluginToolName } from "./plugin-tool-registry.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
+import { descriptorHash } from "./tool-access.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
   createToolRuntimeSupervisor,
@@ -201,6 +203,7 @@ interface ExecuteTestCallInput {
   agentId: string;
   userId: string;
   toolName: string;
+  projectId?: string | null;
   parameters?: unknown;
   timeoutMs?: number;
 }
@@ -839,11 +842,37 @@ export function createToolGatewayService(
     }));
   }
 
-  function allTools(): ToolGatewayDescriptor[] {
-    return [...BUILTIN_TOOLS, ...pluginTools()];
+  function pluginToolDescriptorHash(tool: ToolGatewayDescriptor): string {
+    const bareName = parsePluginToolName(tool.name)?.toolName ?? tool.name;
+    return descriptorHash({
+      name: bareName,
+      title: tool.displayName,
+      description: tool.description,
+      inputSchema: tool.parametersSchema,
+      annotations: {},
+    });
+  }
+
+  function pluginToolResultOrThrow(
+    execution: Awaited<ReturnType<PluginToolDispatcher["executeTool"]>>,
+  ) {
+    if (execution.result.error) {
+      throw new ToolGatewayHttpError(502, execution.result.error, "plugin_tool_error", {
+        pluginId: execution.pluginId,
+        toolName: execution.toolName,
+      });
+    }
+    return execution.result;
   }
 
   async function connectedMcpToolsForCompany(companyId: string): Promise<ToolGatewayDescriptor[]> {
+    const registeredPluginTools = pluginTools();
+    const registeredPluginToolByCatalogKey = new Map(
+      registeredPluginTools.map((tool) => {
+        const bareName = parsePluginToolName(tool.name)?.toolName ?? tool.name;
+        return [`${tool.pluginId}:${bareName}`, tool] as const;
+      }),
+    );
     const rows = await db
       .select({
         catalogEntry: toolCatalogEntries,
@@ -864,16 +893,27 @@ export function createToolGatewayService(
         eq(toolConnections.enabled, true),
         inArray(toolConnections.healthStatus, ["ok", "healthy"]),
         eq(toolApplications.companyId, companyId),
-        inArray(toolApplications.type, ["mcp_http", "mcp_stdio"]),
+        inArray(toolApplications.type, ["mcp_http", "mcp_stdio", "paperclip_plugin"]),
         eq(toolApplications.status, "active"),
       ))
       .orderBy(toolConnections.name, toolCatalogEntries.name);
 
-    const eligibleRows = rows.filter(({ connection, application }) =>
+    const eligibleRows = rows.filter(({ catalogEntry, connection, application }) =>
       (connection.transport === "remote_http" && application.type === "mcp_http")
       || (connection.transport === "local_stdio" && application.type === "mcp_stdio")
+      || (
+        application.type === "paperclip_plugin"
+        && Boolean(application.pluginId)
+        && (() => {
+          const registered = registeredPluginToolByCatalogKey.get(`${application.pluginId}:${catalogEntry.toolName}`);
+          return Boolean(registered && pluginToolDescriptorHash(registered) === catalogEntry.versionHash);
+        })()
+      )
     );
     const baseNames = eligibleRows.map(({ catalogEntry, connection, application }) => {
+      if (application.type === "paperclip_plugin" && application.pluginId) {
+        return registeredPluginToolByCatalogKey.get(`${application.pluginId}:${catalogEntry.toolName}`)!.name;
+      }
       const applicationKey = application.applicationKey ?? null;
       const connectionNamespace = `${slugSegment(applicationKey ?? connection.name ?? application.name, "mcp")}-${shortStableId(connection.id)}`;
       const toolSlug = slugSegment(catalogEntry.toolName, "tool");
@@ -886,7 +926,7 @@ export function createToolGatewayService(
 
     return eligibleRows.map(({ catalogEntry, connection, application }, index) => {
       const baseName = baseNames[index]!;
-      const gatewayToolName = baseNameCounts.get(baseName)! > 1
+      const gatewayToolName = application.type !== "paperclip_plugin" && baseNameCounts.get(baseName)! > 1
         ? `${baseName}-${shortStableId(catalogEntry.id)}`
         : baseName;
       const applicationKey = application.applicationKey ?? null;
@@ -916,6 +956,21 @@ export function createToolGatewayService(
         },
         onDemandTools,
       };
+      if (application.type === "paperclip_plugin" && application.pluginId) {
+        const registeredTool = registeredPluginToolByCatalogKey.get(`${application.pluginId}:${catalogEntry.toolName}`)!;
+        return {
+          ...registeredTool,
+          providerType: "paperclip_plugin" as const,
+          risk,
+          applicationId: application.id,
+          applicationKey,
+          applicationDisplayName: application.name,
+          connectionId: connection.id,
+          catalogEntryId: catalogEntry.id,
+          upstreamToolName: catalogEntry.toolName,
+          providerMetadata,
+        };
+      }
       return {
         name: gatewayToolName,
         displayName: catalogEntry.title ?? catalogEntry.toolName,
@@ -932,6 +987,15 @@ export function createToolGatewayService(
         upstreamToolName: catalogEntry.toolName,
         providerMetadata,
       };
+    });
+  }
+
+  function mergeStaticAndConnectedTools(connectedTools: ToolGatewayDescriptor[]): ToolGatewayDescriptor[] {
+    const seen = new Set<string>();
+    return [...BUILTIN_TOOLS, ...connectedTools].filter((tool) => {
+      if (seen.has(tool.name)) return false;
+      seen.add(tool.name);
+      return true;
     });
   }
 
@@ -1817,19 +1881,11 @@ export function createToolGatewayService(
     return 403;
   }
 
-  function findStaticTool(toolName: string): ToolGatewayDescriptor {
-    const tool = allTools().find((candidate) => candidate.name === toolName);
-    if (!tool) {
-      throw new ToolGatewayHttpError(404, `Tool "${toolName}" not found`, "tool_not_found", { tool: toolName });
-    }
-    return tool;
-  }
-
   async function findToolForSession(session: ToolGatewaySession, toolName: string): Promise<ToolGatewayDescriptor> {
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
-    const tool = [...allTools(), ...connectedTools, ...virtualTools]
+    const tool = [...mergeStaticAndConnectedTools(connectedTools), ...virtualTools]
       .filter((candidate) => session.agentId || (candidate.providerType !== "paperclip_self" && candidate.providerType !== "paperclip_plugin"))
       .find((candidate) => candidate.name === toolName);
     if (!tool) {
@@ -1902,7 +1958,7 @@ export function createToolGatewayService(
     }
     const allConnectedTools = await connectedMcpToolsForCompany(session.companyId);
     const onDemandTargets = allConnectedTools.filter(isOnDemandRemoteTool);
-    const tools = [...allTools(), ...allConnectedTools.filter((tool) => !isOnDemandRemoteTool(tool))].filter(
+    const tools = mergeStaticAndConnectedTools(allConnectedTools.filter((tool) => !isOnDemandRemoteTool(tool))).filter(
       (tool) => session.agentId || (tool.providerType !== "paperclip_self" && tool.providerType !== "paperclip_plugin"),
     );
     const decisions = await Promise.all(tools.map(async (tool) => {
@@ -3764,7 +3820,19 @@ export function createToolGatewayService(
           ? await executeRemoteHttpTool(args.session, args.tool, args.parameters, executionTimeoutMs, args.invocationId)
           : args.tool.providerType === "mcp_local_stdio"
             ? await executeLocalStdioTool(args.session, args.tool, args.parameters, executionTimeoutMs)
-            : null;
+            : args.tool.providerType === "paperclip_plugin" && pluginToolDispatcher
+              ? {
+                  result: pluginToolResultOrThrow(await runWithTimeout(
+                    pluginToolDispatcher.executeTool(args.tool.name, args.parameters, {
+                      agentId: args.agentId,
+                      companyId: args.companyId,
+                      runId: args.invocationId,
+                      projectId: args.session.projectId!,
+                    }),
+                    executionTimeoutMs,
+                  )),
+                }
+              : null;
       if (!connectedMcpExecution) {
         throw new ToolGatewayHttpError(404, `Tool "${args.tool.name}" not found`, "tool_not_found", {
           tool: args.tool.name,
@@ -3914,6 +3982,39 @@ export function createToolGatewayService(
   ): Promise<void> {
     const agentId = invocation.agentId;
     if (!invocation.connectionId || !agentId) return;
+    if (invocation.providerType === "paperclip_plugin") {
+      const [project] = invocation.projectId
+        ? await db
+          .select({ id: projects.id })
+          .from(projects)
+          .where(and(
+            eq(projects.id, invocation.projectId),
+            eq(projects.companyId, invocation.companyId),
+          ))
+          .limit(1)
+        : [];
+      if (!project) {
+        const errorCode = "test_project_not_found";
+        const errorMessage = "The project selected for this plugin Test call no longer exists in this company";
+        await db
+          .update(toolInvocations)
+          .set({
+            status: "failed",
+            errorCode,
+            errorMessage,
+            completedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(toolInvocations.id, invocation.id));
+        await reflectToolActionInteractionLifecycle({
+          actionRequestId,
+          status: "failed",
+          errorCode,
+          errorMessage,
+        });
+        return;
+      }
+    }
     const userId = invocation.actorId ?? "board";
     const session: ToolGatewaySession = {
       id: "test-call",
@@ -3922,7 +4023,7 @@ export function createToolGatewayService(
       agentId,
       runId: null,
       issueId: null,
-      projectId: null,
+      projectId: invocation.projectId,
       actorType: "user",
       actorId: userId,
       createdAt: new Date(),
@@ -4442,6 +4543,32 @@ export function createToolGatewayService(
     };
   }
 
+  async function resolveTestProject(input: {
+    companyId: string;
+    projectId?: string | null;
+    requiresProject: boolean;
+  }): Promise<string | null> {
+    const project = input.projectId
+      ? await db
+        .select({ id: projects.id })
+        .from(projects)
+        .where(and(eq(projects.id, input.projectId), eq(projects.companyId, input.companyId)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null)
+      : null;
+    if (input.projectId && !project) {
+      throw new ToolGatewayHttpError(404, "Test project not found in this company", "test_project_not_found");
+    }
+    if (input.requiresProject && !project) {
+      throw new ToolGatewayHttpError(
+        422,
+        "Plugin tests require an explicit project",
+        "plugin_test_project_required",
+      );
+    }
+    return project?.id ?? null;
+  }
+
   return {
     async recordRuntimeMcpDeliveryDiagnostic(input: {
       companyId: string;
@@ -4821,7 +4948,10 @@ export function createToolGatewayService(
 
     async listPluginToolsForAgent(input: { companyId: string; agentId: string }): Promise<AgentToolDescriptor[]> {
       await assertAgentInCompany(input.companyId, input.agentId);
-      const decisions = await Promise.all(pluginTools().map(async (tool) => {
+      const connectedPluginTools = (await connectedMcpToolsForCompany(input.companyId))
+        .filter((tool) => tool.providerType === "paperclip_plugin")
+        .filter((tool, index, tools) => tools.findIndex((candidate) => candidate.name === tool.name) === index);
+      const decisions = await Promise.all(connectedPluginTools.map(async (tool) => {
         const decision = await policyService.decide(policyInputForAgentTool({
           companyId: input.companyId,
           agentId: input.agentId,
@@ -4837,14 +4967,25 @@ export function createToolGatewayService(
         });
     },
 
-    async summarizeConnectionAccessForAgent(input: { companyId: string; connectionId: string; agentId: string }) {
+    async summarizeConnectionAccessForAgent(input: {
+      companyId: string;
+      connectionId: string;
+      agentId: string;
+      projectId?: string | null;
+    }) {
       await assertAgentInCompany(input.companyId, input.agentId);
       const tools = await connectedMcpToolsForConnection(input.companyId, input.connectionId);
+      const projectId = await resolveTestProject({
+        companyId: input.companyId,
+        projectId: input.projectId,
+        requiresProject: tools.some((tool) => tool.providerType === "paperclip_plugin"),
+      });
       const decisions = await Promise.all(tools.map(async (tool) => {
         const decision = await policyService.decide(policyInputForAgentTool({
           companyId: input.companyId,
           agentId: input.agentId,
           tool,
+          projectId,
         }));
         const testDecision =
           decision.decision === "require_approval"
@@ -4885,19 +5026,6 @@ export function createToolGatewayService(
 
     async executeTestCall(input: ExecuteTestCallInput) {
       await assertAgentInCompany(input.companyId, input.agentId);
-      const session: ToolGatewaySession = {
-        id: "test-call",
-        token: "test-call",
-        companyId: input.companyId,
-        agentId: input.agentId,
-        runId: null,
-        issueId: null,
-        projectId: null,
-        actorType: "user",
-        actorId: input.userId,
-        createdAt: new Date(),
-        expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
-      };
       const tool = (await connectedMcpToolsForConnection(input.companyId, input.connectionId))
         .find((candidate) =>
           candidate.name === input.toolName
@@ -4909,6 +5037,24 @@ export function createToolGatewayService(
           tool: input.toolName,
         });
       }
+      const projectId = await resolveTestProject({
+        companyId: input.companyId,
+        projectId: input.projectId,
+        requiresProject: tool.providerType === "paperclip_plugin",
+      });
+      const session: ToolGatewaySession = {
+        id: "test-call",
+        token: "test-call",
+        companyId: input.companyId,
+        agentId: input.agentId,
+        runId: null,
+        issueId: null,
+        projectId,
+        actorType: "user",
+        actorId: input.userId,
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
+      };
 
       const requestedParameters = input.parameters ?? {};
       const argumentValidation = validateToolContent({
@@ -4924,6 +5070,7 @@ export function createToolGatewayService(
         actorId: input.userId,
         tool,
         parameters: requestedParameters,
+        projectId: session.projectId,
         idempotencyKey: `test-call:${randomUUID()}`,
         consumeRateLimit: true,
       });
@@ -5743,7 +5890,7 @@ export function createToolGatewayService(
           connectedMcpExecution
             ? connectedMcpExecution.result
             : tool.providerType === "paperclip_plugin"
-            ? await runWithTimeout(
+            ? pluginToolResultOrThrow(await runWithTimeout(
                 pluginToolDispatcher!.executeTool(
                   tool.name,
                   effectiveParameters,
@@ -5755,7 +5902,7 @@ export function createToolGatewayService(
                   },
                 ),
                 executionTimeoutMs,
-              )
+              ))
             : await runWithTimeout(executeBuiltinTool(session, tool, effectiveParameters), executionTimeoutMs);
 
         const resultValidation = validateToolContent({
@@ -5951,9 +6098,11 @@ export function createToolGatewayService(
         expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
       };
 
-      const tool = findStaticTool(input.tool);
+      const tool = (await connectedMcpToolsForCompany(input.runContext.companyId)).find(
+        (candidate) => candidate.providerType === "paperclip_plugin" && candidate.name === input.tool,
+      );
 
-      if (tool.providerType !== "paperclip_plugin") {
+      if (!tool) {
         throw new ToolGatewayHttpError(404, `Tool "${input.tool}" is not a plugin tool`, "tool_not_found");
       }
 
@@ -6050,6 +6199,7 @@ export function createToolGatewayService(
       const startedAt = Date.now();
       try {
         const result = await pluginToolDispatcher.executeTool(input.tool, requestedParameters, input.runContext);
+        pluginToolResultOrThrow(result);
         const resultValidation = validateToolContent({
           value: result,
           direction: "result",

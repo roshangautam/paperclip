@@ -890,6 +890,7 @@ export interface ToolInvocation {
   actorId: string | null;
   agentId: string | null;
   issueId: string | null;
+  projectId: string | null;
   runId: string | null;
   applicationId: string | null;
   connectionId: string | null;

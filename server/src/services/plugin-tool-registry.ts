@@ -38,6 +38,25 @@ import { logger } from "../middleware/logger.js";
  */
 export const TOOL_NAMESPACE_SEPARATOR = ":";
 
+/**
+ * Split a namespaced plugin tool identifier at the plugin/tool boundary.
+ *
+ * Tool names may themselves contain colons (for example `admin:sync`), so
+ * only the first separator belongs to the namespace prefix.
+ */
+export function parsePluginToolName(
+  namespacedName: string,
+): { pluginId: string; toolName: string } | null {
+  const sepIndex = namespacedName.indexOf(TOOL_NAMESPACE_SEPARATOR);
+  if (sepIndex <= 0 || sepIndex >= namespacedName.length - 1) {
+    return null;
+  }
+  return {
+    pluginId: namespacedName.slice(0, sepIndex),
+    toolName: namespacedName.slice(sepIndex + 1),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -246,17 +265,6 @@ export function createPluginToolRegistry(
     return `${pluginId}${TOOL_NAMESPACE_SEPARATOR}${toolName}`;
   }
 
-  function parseName(namespacedName: string): { pluginId: string; toolName: string } | null {
-    const sepIndex = namespacedName.lastIndexOf(TOOL_NAMESPACE_SEPARATOR);
-    if (sepIndex <= 0 || sepIndex >= namespacedName.length - 1) {
-      return null;
-    }
-    return {
-      pluginId: namespacedName.slice(0, sepIndex),
-      toolName: namespacedName.slice(sepIndex + 1),
-    };
-  }
-
   function addTool(pluginId: string, decl: PluginToolDeclaration, pluginDbId: string): void {
     const namespacedName = buildName(pluginId, decl.name);
 
@@ -374,7 +382,7 @@ export function createPluginToolRegistry(
     },
 
     parseNamespacedName(namespacedName: string): { pluginId: string; toolName: string } | null {
-      return parseName(namespacedName);
+      return parsePluginToolName(namespacedName);
     },
 
     buildNamespacedName(pluginId: string, toolName: string): string {
@@ -387,7 +395,7 @@ export function createPluginToolRegistry(
       runContext: ToolRunContext,
     ): Promise<ToolExecutionResult> {
       // 1. Resolve the namespaced name
-      const parsed = parseName(namespacedName);
+      const parsed = parsePluginToolName(namespacedName);
       if (!parsed) {
         throw new Error(
           `Invalid tool name "${namespacedName}". Expected format: "<pluginId>${TOOL_NAMESPACE_SEPARATOR}<toolName>"`,

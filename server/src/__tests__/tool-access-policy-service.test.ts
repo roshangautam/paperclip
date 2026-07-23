@@ -118,14 +118,20 @@ async function createApprovedToolAction(input: {
   connectionId: string;
   catalogEntryId: string;
   issueId?: string | null;
+  projectId?: string | null;
+  actorType?: "agent" | "user";
   argumentsValue: Record<string, unknown>;
   status?: "approved" | "executed";
 }) {
   const svc = toolAccessPolicyService(input.db);
   const decisionInput = {
     companyId: input.companyId,
-    actor: { actorType: "agent" as const, actorId: input.agentId, agentId: input.agentId },
-    runContext: { issueId: input.issueId ?? null },
+    actor: {
+      actorType: input.actorType ?? "agent",
+      actorId: input.actorType === "user" ? "board-user" : input.agentId,
+      agentId: input.agentId,
+    },
+    runContext: { issueId: input.issueId ?? null, projectId: input.projectId ?? null },
     request: {
       connectionId: input.connectionId,
       catalogEntryId: input.catalogEntryId,
@@ -1303,6 +1309,83 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(trustConfig.trustRule?.lastHitAt).toEqual(expect.any(String));
     expect(trustEvents.some((event) => event.eventType === "trust_rule_created")).toBe(true);
     expect(trustEvents.some((event) => event.eventType === "trust_rule_used")).toBe(true);
+  });
+
+  it("keeps Test-origin approval counting and trust promotion scoped to the invocation project", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const [projectA, projectB] = await db.insert(projects).values([
+      { companyId: company.id, name: `Project A ${randomUUID()}` },
+      { companyId: company.id, name: `Project B ${randomUUID()}` },
+    ]).returning();
+    const { connection, catalogEntry } = await createTool(db, company.id);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review project-scoped Test calls",
+      policyType: "require_approval",
+      selectors: { toolName: "send_email" },
+    });
+    const argumentsValue = { to: "ops@example.com", body: "same Test payload" };
+    const firstProjectA = await createApprovedToolAction({
+      db,
+      companyId: company.id,
+      agentId: agent.id,
+      connectionId: connection.id,
+      catalogEntryId: catalogEntry.id,
+      projectId: projectA!.id,
+      actorType: "user",
+      argumentsValue,
+      status: "executed",
+    });
+    await createApprovedToolAction({
+      db,
+      companyId: company.id,
+      agentId: agent.id,
+      connectionId: connection.id,
+      catalogEntryId: catalogEntry.id,
+      projectId: projectB!.id,
+      actorType: "user",
+      argumentsValue,
+      status: "executed",
+    });
+
+    await expect(toolAccessPolicyService(db).createTrustRuleFromActionRequest({
+      companyId: company.id,
+      actionRequestId: firstProjectA.actionRequest.id,
+      body: { approvalThreshold: 2, scope: { includeProject: true } },
+    })).rejects.toThrow(/final rule scope; found 1/);
+
+    await createApprovedToolAction({
+      db,
+      companyId: company.id,
+      agentId: agent.id,
+      connectionId: connection.id,
+      catalogEntryId: catalogEntry.id,
+      projectId: projectA!.id,
+      actorType: "user",
+      argumentsValue,
+      status: "executed",
+    });
+    const trustRule = await toolAccessPolicyService(db).createTrustRuleFromActionRequest({
+      companyId: company.id,
+      actionRequestId: firstProjectA.actionRequest.id,
+      body: { approvalThreshold: 2, scope: { includeProject: true } },
+    });
+
+    expect(trustRule.selectors).toMatchObject({ projectId: projectA!.id });
+    await expect(toolAccessPolicyService(db).decide(firstProjectA.decisionInput)).resolves.toMatchObject({
+      allowed: true,
+      decision: "allow",
+      reasonCode: "allow_trust_rule",
+      matchedPolicyIds: [trustRule.id],
+    });
+    await expect(toolAccessPolicyService(db).decide({
+      ...firstProjectA.decisionInput,
+      runContext: { issueId: null, projectId: projectB!.id },
+    })).resolves.toMatchObject({
+      allowed: false,
+      decision: "require_approval",
+    });
   });
 
   it("does not count approved actions outside the final trust-rule agent scope", async () => {

@@ -60,6 +60,15 @@ Plain prose version of the same graph:
 
 If you remember one thing: **profile says *can this agent see the tool*; policy says *is this exact call allowed right now***.
 
+Plugin-provided tools use this same model. Paperclip represents a plugin manifest
+with tools as a managed application, connection, and catalog; the application
+label comes from the manifest `displayName`, while the stable plugin key remains
+the internal identity. Registered plugin tools are joined to their catalog rows,
+so connection/profile selectors, allow/ask-first/off summaries, the Apps **Test**
+tab, approval handling, invocations, and audit events work the same way as other
+connected tools. Plugin tools still execute through the plugin worker dispatcher,
+not through the connection's placeholder HTTP transport.
+
 ## Canonical integration model
 
 This runbook covers the MCP gateway slice of the broader Apps v2 integration

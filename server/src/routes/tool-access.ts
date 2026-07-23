@@ -44,6 +44,8 @@ import { badRequest, forbidden, notFound, unprocessable } from "../errors.js";
 import { accessService, googleSheetsRobotEmailFromEnv, logActivity, toolAccessPolicyService, toolAccessService } from "../services/index.js";
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
 
+const toolConnectionTestAgentsQuerySchema = toolConnectionTestCallSchema.pick({ projectId: true });
+
 /** Allowlist (e.g. Google Sheets allowed spreadsheet ids) lives in connection config. */
 function allowlistIds(config: Record<string, unknown> | null | undefined): string[] {
   const raw = config?.allowedSpreadsheetIds;
@@ -560,6 +562,7 @@ export function toolAccessRoutes(
     }
     const connection = await svc.getConnection(req.params.connectionId as string);
     await assertBoardAnyToolPermission(req, connection.companyId, ["tools:use", "tools:manage_connections"]);
+    const query = toolConnectionTestAgentsQuerySchema.parse(req.query);
     const rows = await db
       .select({
         id: agents.id,
@@ -570,23 +573,28 @@ export function toolAccessRoutes(
       })
       .from(agents)
       .where(eq(agents.companyId, connection.companyId));
-    const candidates = [];
-    for (const agent of rows) {
-      try {
-        await assertCanTestAsAgent(req, connection.companyId, agent.id);
-      } catch {
-        continue;
+    try {
+      const candidates = [];
+      for (const agent of rows) {
+        try {
+          await assertCanTestAsAgent(req, connection.companyId, agent.id);
+        } catch {
+          continue;
+        }
+        candidates.push({
+          ...agent,
+          effectiveAccess: await options.toolGateway.summarizeConnectionAccessForAgent({
+            companyId: connection.companyId,
+            connectionId: connection.id,
+            agentId: agent.id,
+            projectId: query.projectId ?? null,
+          }),
+        });
       }
-      candidates.push({
-        ...agent,
-        effectiveAccess: await options.toolGateway.summarizeConnectionAccessForAgent({
-          companyId: connection.companyId,
-          connectionId: connection.id,
-          agentId: agent.id,
-        }),
-      });
+      res.json({ agents: candidates });
+    } catch (error) {
+      if (!sendToolGatewayError(res, error)) throw error;
     }
-    res.json({ agents: candidates });
   });
 
   router.post("/tool-connections/:connectionId/test-calls", validate(toolConnectionTestCallSchema), async (req, res) => {
@@ -605,6 +613,7 @@ export function toolAccessRoutes(
         agentId: req.body.agentId,
         userId: req.actor.userId ?? "board",
         toolName: req.body.toolName,
+        projectId: req.body.projectId ?? null,
         parameters: req.body.parameters ?? {},
       });
       res.json(result);

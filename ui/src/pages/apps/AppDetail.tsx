@@ -433,7 +433,13 @@ export function AppDetail() {
         />
       )}
       {activeTab === "test" && (
-        <TestPanel connectionId={connectionId} appName={appName} active={active} quarantined={quarantined} />
+        <TestPanel
+          connectionId={connectionId}
+          appName={appName}
+          active={active}
+          quarantined={quarantined}
+          requiresProject={isPaperclipPluginConnection(connection)}
+        />
       )}
       {activeTab === "activity" && (
         <ActivityPanel

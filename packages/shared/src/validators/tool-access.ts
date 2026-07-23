@@ -621,6 +621,7 @@ export type CreateToolActionRequest = z.infer<typeof createToolActionRequestSche
 export const toolConnectionTestCallSchema = z.object({
   agentId: z.string().uuid(),
   toolName: z.string().trim().min(1).max(240),
+  projectId: z.string().uuid().optional().nullable(),
   parameters: z.unknown().optional(),
 });
 

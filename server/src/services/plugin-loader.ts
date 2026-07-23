@@ -49,6 +49,7 @@ import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
+import { toolAccessService } from "./tool-access.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,6 +58,7 @@ export const BUNDLED_LOCAL_PLUGIN_ROOT = path.join(REPO_ROOT, "packages", "plugi
 export const STANDALONE_BUNDLED_PLUGIN_ROOT = path.join(BUNDLED_LOCAL_PLUGIN_ROOT, "sandbox-providers");
 export const LOCAL_PLUGIN_AUTOBUILD_TIMEOUT_MS = 120_000;
 const STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE = "@paperclipai/plugin-sdk";
+const APP_RECONCILIATION_RETRY_DELAYS_MS = [250, 1_000, 5_000] as const;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1083,6 +1085,47 @@ export function pluginLoader(
   const log = logger.child({ service: "plugin-loader" });
   const hostVersion = runtimeServices?.instanceInfo.hostVersion;
 
+  async function reconcilePluginApplicationsAfterStartup(): Promise<void> {
+    try {
+      await toolAccessService(db).reconcilePluginApplications();
+    } catch (err) {
+      log.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        "plugin-loader: failed to reconcile plugin-backed Apps after startup; retrying in background",
+      );
+      schedulePluginApplicationReconciliationRetry(0);
+    }
+  }
+
+  function schedulePluginApplicationReconciliationRetry(attemptIndex: number): void {
+    const delayMs = APP_RECONCILIATION_RETRY_DELAYS_MS[attemptIndex];
+    if (delayMs === undefined) return;
+    const timer = setTimeout(() => {
+      void toolAccessService(db).reconcilePluginApplications().then(() => {
+        log.info(
+          { retryAttempt: attemptIndex + 1 },
+          "plugin-loader: reconciled plugin-backed Apps after startup retry",
+        );
+      }).catch((err) => {
+        const retryAttempt = attemptIndex + 1;
+        const hasAnotherRetry = retryAttempt < APP_RECONCILIATION_RETRY_DELAYS_MS.length;
+        log[hasAnotherRetry ? "warn" : "error"](
+          {
+            retryAttempt,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          hasAnotherRetry
+            ? "plugin-loader: plugin-backed App reconciliation retry failed"
+            : "plugin-loader: exhausted plugin-backed App reconciliation retries",
+        );
+        if (hasAnotherRetry) {
+          schedulePluginApplicationReconciliationRetry(retryAttempt);
+        }
+      });
+    }, delayMs);
+    timer.unref?.();
+  }
+
   async function assertPageRoutePathsAvailable(manifest: PaperclipPluginManifestV1): Promise<void> {
     const requestedRoutePaths = getDeclaredPageRoutePaths(manifest);
     if (requestedRoutePaths.length === 0) return;
@@ -1881,6 +1924,7 @@ export function pluginLoader(
 
       if (readyPlugins.length === 0) {
         log.info("plugin-loader: no ready plugins to load");
+        await reconcilePluginApplicationsAfterStartup();
         return { total: 0, succeeded: 0, failed: 0, results: [] };
       }
 
@@ -1906,6 +1950,8 @@ export function pluginLoader(
 
       const succeeded = loadResults.filter((r) => r.success).length;
       const failed = loadResults.filter((r) => !r.success).length;
+
+      await reconcilePluginApplicationsAfterStartup();
 
       log.info(
         {

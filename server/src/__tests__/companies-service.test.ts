@@ -15,8 +15,10 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   principalPermissionGrants,
+  plugins,
   routines,
   routineTriggers,
+  toolApplications,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -59,6 +61,7 @@ describeEmbeddedPostgres("companyService", () => {
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(companies);
+    await db.delete(plugins);
   });
 
   afterAll(async () => {
@@ -126,6 +129,48 @@ describeEmbeddedPostgres("companyService", () => {
     await reconcileBuiltInAgentsOnStartup(db);
     const afterReconcileRows = await db.select().from(agents).where(eq(agents.companyId, created.id));
     expect(afterReconcileRows.filter((row) => readBuiltInAgentMarker(row.metadata)?.key === "reflection-coach")).toHaveLength(1);
+  });
+
+  it("reconciles managed plugin Apps through the shared company creation path", async () => {
+    const pluginKey = `ambitresearch.agent-identities-${randomUUID()}`;
+    const [plugin] = await db.insert(plugins).values({
+      pluginKey,
+      packageName: "@ambitresearch/paperclip-agent-identities",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      status: "ready",
+      manifestJson: {
+        id: pluginKey,
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Agent Identities",
+        description: "Manage agent identity profiles.",
+        author: "Ambit Research",
+        categories: ["automation"],
+        capabilities: ["agent.tools.register"],
+        entrypoints: { worker: "./dist/worker.js" },
+        tools: [{
+          name: "get-agent-identity",
+          displayName: "Get agent identity",
+          description: "Return an agent's configured identity.",
+          parametersSchema: { type: "object", properties: {} },
+        }],
+      },
+    }).returning();
+
+    const created = await companyService(db).create({ name: "Imported Company" });
+
+    const [application] = await db.select().from(toolApplications).where(and(
+      eq(toolApplications.companyId, created.id),
+      eq(toolApplications.applicationKey, `paperclip_plugin:${pluginKey}`),
+    ));
+    expect(application).toMatchObject({
+      name: "Agent Identities",
+      type: "paperclip_plugin",
+      status: "active",
+      pluginId: plugin!.id,
+    });
   });
 
   it("archives companies by pausing runnable agents and cancelling active runs", async () => {
