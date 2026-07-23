@@ -423,7 +423,7 @@ export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Exp
     .delete(instanceUserRoles)
     .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")));
 
-  await db
+  const insertedCompanies = await db
     .insert(companies)
     .values({
       id: companyId,
@@ -435,11 +435,14 @@ export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Exp
     })
     .onConflictDoNothing({
       target: companies.id,
-    });
-  // Reconcile on every provisioning attempt, not only the insert that first
-  // created the company. If a prior reconciliation failed after the insert
-  // committed, the next trusted-header request must be able to repair it.
-  await toolAccessService(db).reconcilePluginApplications(companyId);
+    })
+    .returning({ id: companies.id });
+  // Reconciliation takes a per-company advisory lock, so keep it on the
+  // provisioning path instead of serializing every authenticated request.
+  // Startup and plugin lifecycle reconciliation repair existing companies.
+  if (insertedCompanies.length > 0) {
+    await toolAccessService(db).reconcilePluginApplications(companyId);
+  }
 
   const membershipRole = stackRole === "owner" || stackRole === "admin" ? "owner" : stackRole;
   const membership = await db

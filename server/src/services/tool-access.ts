@@ -2622,7 +2622,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         }
 
         const applicationsByPluginId = new Map<string, typeof toolApplications.$inferSelect>();
-        const legacyBackfillPluginIds = new Set<string>();
         const usedApplicationKeys = new Set(
           applicationRows.flatMap((application) => application.applicationKey ? [application.applicationKey] : []),
         );
@@ -2631,7 +2630,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           const applicationKey = existing?.applicationKey
             ?? allocateManagedPluginApplicationKey(plugin, usedApplicationKeys);
           const desiredName = desiredApplicationNames.get(plugin.id)!;
-          if (asRecord(existing?.metadata).source === "plugin_backfill") legacyBackfillPluginIds.add(plugin.id);
           const lifecycleState = pluginLifecycleResourceState(
             existing?.metadata,
             lifecycle.lifecycleStatus,
@@ -2855,7 +2853,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             const unsafeChange = riskLevel !== "read" && (!existing || changedDescriptor);
             const preserveDisabled = existing?.status === "disabled";
             const preserveQuarantined = existing?.status === "quarantined";
-            const migrationUpgrade = legacyHash || legacyBackfillPluginIds.has(plugin.id);
+            const migrationUpgrade = legacyHash;
             const shouldQuarantine = unsafeChange && !migrationUpgrade && !preserveDisabled && !preserveQuarantined;
             const status = preserveDisabled
               ? "disabled"

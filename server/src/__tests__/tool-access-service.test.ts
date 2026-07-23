@@ -1040,6 +1040,101 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(unchangedProfile.updatedAt).toEqual(repairedProfile.updatedAt);
   });
 
+  it("only exempts catalog rows created by the legacy plugin backfill from quarantine", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const pluginKey = `ambitresearch.agent-identities-${randomUUID()}`;
+    const [plugin] = await db.insert(plugins).values({
+      pluginKey,
+      packageName: "@ambitresearch/paperclip-agent-identities",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      status: "ready",
+      manifestJson: {
+        id: pluginKey,
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Agent Identities",
+        description: "Manage agent identity profiles.",
+        author: "Ambit Research",
+        categories: ["automation"],
+        capabilities: ["agent.tools.register"],
+        entrypoints: { worker: "./dist/worker.js" },
+        tools: [
+          {
+            name: "update_identity",
+            displayName: "Update identity",
+            description: "Update an existing agent identity.",
+            parametersSchema: { type: "object" },
+          },
+          {
+            name: "delete_identity",
+            displayName: "Delete identity",
+            description: "Delete an agent identity.",
+            parametersSchema: { type: "object" },
+          },
+        ],
+      },
+    }).returning();
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: `paperclip_plugin:${pluginKey}`,
+      name: pluginKey,
+      type: "paperclip_plugin",
+      status: "active",
+      pluginId: plugin!.id,
+      metadata: { source: "plugin_backfill", pluginKey },
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: `Plugin: ${pluginKey}`,
+      transport: "remote_http",
+      status: "active",
+      enabled: true,
+      config: { pluginKey, type: "paperclip_plugin" },
+      transportConfig: { pluginKey, type: "paperclip_plugin" },
+      healthStatus: "ok",
+    }).returning();
+    await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      connectionId: connection!.id,
+      entryKind: "tool",
+      name: "update_identity",
+      toolName: "update_identity",
+      title: "Update identity",
+      description: "Legacy backfilled tool.",
+      inputSchema: {},
+      annotations: {},
+      riskLevel: "write",
+      isReadOnly: false,
+      isWrite: true,
+      isDestructive: false,
+      status: "active",
+      versionHash: "0123456789abcdef0123456789abcdef",
+      schemaHash: "fedcba9876543210fedcba9876543210",
+    });
+
+    await service.reconcilePluginApplications(company.id);
+
+    const catalog = await db.select().from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, connection!.id));
+    expect(catalog).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        toolName: "update_identity",
+        status: "active",
+        quarantineReason: null,
+      }),
+      expect.objectContaining({
+        toolName: "delete_identity",
+        status: "quarantined",
+        quarantineReason: "pending_review",
+      }),
+    ]));
+  });
+
   it("preserves an unmarked canonical-key App and creates plugin-managed state under an alternate key", async () => {
     const company = await createCompany(db);
     const plugin = await createManagedToolPlugin(db);
