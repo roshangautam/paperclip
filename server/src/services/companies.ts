@@ -271,7 +271,7 @@ export function companyService(db: Db) {
       const created = await createCompanyWithUniquePrefix(data);
       await environmentsSvc.ensureLocalEnvironment(created.id);
       await builtInAgents.autoProvisionBundledAgents(created.id);
-      await toolAccessService(db).reconcilePluginApplications();
+      await toolAccessService(db).reconcilePluginApplications(created.id);
       const row = await getCompanyQuery(db)
         .where(eq(companies.id, created.id))
         .then((rows) => rows[0] ?? null);

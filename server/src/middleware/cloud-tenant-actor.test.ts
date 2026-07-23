@@ -21,6 +21,7 @@ function createFakeDb(membershipRow = { companyId: "company-x", membershipRole: 
   chain.then = (resolve: (v: unknown) => unknown) => Promise.resolve(undefined).then(resolve);
   const selectChain: Record<string, unknown> = {};
   selectChain.from = () => selectChain;
+  selectChain.where = async () => [];
   selectChain.orderBy = async () => [];
   const db = {
     select: () => selectChain,

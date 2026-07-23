@@ -2465,8 +2465,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     };
   }
 
-  async function reconcilePluginApplications(): Promise<void> {
-    const companyRows = await db.select({ id: companies.id }).from(companies).orderBy(companies.id);
+  async function reconcilePluginApplications(companyId?: string): Promise<void> {
+    const companyRows = companyId
+      ? await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId))
+      : await db.select({ id: companies.id }).from(companies).orderBy(companies.id);
     if (companyRows.length === 0) return;
 
     for (const company of companyRows) {
@@ -6012,6 +6014,21 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     updateApplication: async (applicationId: string, input: UpdateToolApplication): Promise<ToolApplication> => {
       const [existing] = await db.select().from(toolApplications).where(eq(toolApplications.id, applicationId));
       if (!existing) throw notFound("Tool application not found");
+      if (isDurablyManagedPluginApplication(existing)) {
+        const existingMetadata = asRecord(existing.metadata);
+        const requestedMetadata = input.metadata === undefined ? existingMetadata : asRecord(input.metadata);
+        const changesManagedIdentity =
+          (input.applicationKey !== undefined && input.applicationKey !== existing.applicationKey)
+          || (input.type !== undefined && input.type !== existing.type)
+          || (input.pluginId !== undefined && input.pluginId !== existing.pluginId)
+          || requestedMetadata.source !== existingMetadata.source
+          || requestedMetadata.pluginKey !== existingMetadata.pluginKey;
+        if (changesManagedIdentity) {
+          throw badRequest(
+            "Managed plugin App identity fields (applicationKey, type, pluginId, metadata.source, and metadata.pluginKey) cannot be changed",
+          );
+        }
+      }
       await assertOptionalPlugin(input.pluginId);
       await assertOptionalAgent(existing.companyId, input.ownerAgentId, "Tool application owner agent");
       if (input.name && input.name !== existing.name) {

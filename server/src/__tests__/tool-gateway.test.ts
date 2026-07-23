@@ -4050,6 +4050,80 @@ rl.on("line", (line) => {
     ]);
   });
 
+  it("executes an agent-origin plugin call after ask-first approval", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { issue, run, project } = await createIssueAndRun(db, company.id, agent.id);
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "update_identity",
+      toolDisplayName: "Update identity",
+      riskLevel: "write",
+    });
+    const calls: Array<{ tool: string; parameters: unknown; runContext: unknown }> = [];
+    const dispatcher = createPluginDispatcher(pluginTool, async (tool, parameters, runContext) => {
+      calls.push({ tool, parameters, runContext });
+      return {
+        pluginId: pluginTool.plugin.id,
+        toolName: pluginTool.catalogEntry.toolName,
+        result: { content: "identity updated", data: { ok: true } },
+      };
+    });
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review plugin writes",
+      policyType: "require_approval",
+      selectors: { connectionId: pluginTool.connection.id },
+      description: "Plugin writes require review.",
+    });
+
+    await gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "approved" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id },
+    }).then(
+      () => {
+        throw new Error("Expected plugin tool call to request approval");
+      },
+      (error) => expectGatewayError(error, 409, "approval_required"),
+    );
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    expect(actionRequest).toMatchObject({
+      companyId: company.id,
+      issueId: issue.id,
+      status: "pending",
+    });
+    await gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest!.id,
+      actor: { userId: "board-user" },
+    });
+
+    const [invocation] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, actionRequest!.invocationId));
+    expect(invocation).toMatchObject({
+      status: "succeeded",
+      approvalState: "approved",
+      providerType: "paperclip_plugin",
+      runId: run.id,
+      projectId: project.id,
+    });
+    expect(calls).toEqual([{
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "approved" },
+      runContext: {
+        agentId: agent.id,
+        companyId: company.id,
+        runId: run.id,
+        projectId: project.id,
+      },
+    }]);
+  });
+
   it("executes allowed and approved plugin calls from the Test tab", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

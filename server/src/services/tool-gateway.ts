@@ -4234,7 +4234,7 @@ export function createToolGatewayService(
       agentId: invocation.agentId,
       runId: invocation.runId,
       issueId: invocation.issueId,
-      projectId: issue?.projectId ?? null,
+      projectId: invocation.projectId ?? issue?.projectId ?? null,
       gatewayId: invocation.gatewayId,
       gatewayPublicId: invocation.gatewayPublicId,
       gatewayTokenId: invocation.gatewayTokenId,
@@ -4291,13 +4291,31 @@ export function createToolGatewayService(
 
     try {
       const executionTimeoutMs = timeoutMs(APPROVED_EXECUTION_TIMEOUT_MS);
-      const result = tool.providerType === "mcp_remote_http"
-        ? (await executeRemoteHttpTool(session, tool, parameters, executionTimeoutMs, invocation.id)).result
-        : tool.providerType === "mcp_local_stdio"
-          ? (await executeLocalStdioTool(session, tool, parameters, executionTimeoutMs)).result
-          : tool.providerType !== "paperclip_plugin"
-            ? await runWithTimeout(executeBuiltinTool(session, tool, parameters), executionTimeoutMs)
-            : (() => { throw new ToolGatewayHttpError(409, "Plugin actions cannot execute outside their originating run", "approved_execution_unsupported"); })();
+      let result: unknown;
+      if (tool.providerType === "mcp_remote_http") {
+        result = (await executeRemoteHttpTool(session, tool, parameters, executionTimeoutMs, invocation.id)).result;
+      } else if (tool.providerType === "mcp_local_stdio") {
+        result = (await executeLocalStdioTool(session, tool, parameters, executionTimeoutMs)).result;
+      } else if (tool.providerType === "paperclip_plugin") {
+        if (!pluginToolDispatcher || !session.runId || !session.projectId) {
+          throw new ToolGatewayHttpError(
+            409,
+            "Approved plugin action is missing its originating run or project context",
+            "approved_execution_context_missing",
+          );
+        }
+        result = pluginToolResultOrThrow(await runWithTimeout(
+          pluginToolDispatcher.executeTool(tool.name, parameters, {
+            agentId: invocation.agentId,
+            companyId: invocation.companyId,
+            runId: session.runId,
+            projectId: session.projectId,
+          }),
+          executionTimeoutMs,
+        ));
+      } else {
+        result = await runWithTimeout(executeBuiltinTool(session, tool, parameters), executionTimeoutMs);
+      }
       const resultValidation = validateToolContent({
         value: result,
         direction: "result",

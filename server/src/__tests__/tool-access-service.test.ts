@@ -1115,6 +1115,34 @@ describeEmbeddedPostgres("tool access service", () => {
     })).rejects.toThrow("reserved for managed plugin Apps");
   });
 
+  it("rejects identity changes that would detach and duplicate a managed plugin App", async () => {
+    const company = await createCompany(db);
+    const plugin = await createManagedToolPlugin(db);
+    const service = toolAccessService(db);
+    await service.reconcilePluginApplications();
+
+    const [application] = await db.select().from(toolApplications).where(and(
+      eq(toolApplications.companyId, company.id),
+      eq(toolApplications.pluginId, plugin.id),
+    ));
+    expect(application).toBeDefined();
+
+    await expect(service.updateApplication(application!.id, {
+      pluginId: null,
+    })).rejects.toThrow("Managed plugin App identity fields");
+    await expect(service.updateApplication(application!.id, {
+      metadata: { source: "operator" },
+    })).rejects.toThrow("Managed plugin App identity fields");
+
+    await service.reconcilePluginApplications();
+    const managedApplications = await db.select().from(toolApplications).where(and(
+      eq(toolApplications.companyId, company.id),
+      eq(toolApplications.pluginId, plugin.id),
+    ));
+    expect(managedApplications).toHaveLength(1);
+    expect(managedApplications[0]!.id).toBe(application!.id);
+  });
+
   it("serializes concurrent plugin application reconciliation", async () => {
     const company = await createCompany(db);
     const plugin = await createManagedToolPlugin(db);
