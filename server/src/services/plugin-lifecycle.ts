@@ -771,6 +771,7 @@ export function pluginLifecycleManager(
           manifestJson: newManifest,
         } as PluginRecord);
         await activateReadyPlugin(pluginId);
+        await reconcileAfterTransition(pluginId, result.pluginKey, "ready");
 
         emitDomain("plugin.loaded", {
           pluginId,

@@ -133,4 +133,41 @@ describe("plugin lifecycle App reconciliation", () => {
       vi.useRealTimers();
     }
   });
+
+  it("reconciles managed Apps after a successful plugin upgrade", async () => {
+    const oldManifest = {
+      id: "example.plugin",
+      version: "1.0.0",
+      capabilities: [],
+    };
+    const newManifest = {
+      ...oldManifest,
+      version: "1.1.0",
+      tools: [{
+        name: "new_tool",
+        displayName: "New tool",
+        description: "A tool added by the upgrade",
+        parametersSchema: { type: "object", properties: {} },
+      }],
+    };
+    currentPlugin = {
+      ...basePlugin,
+      manifestJson: oldManifest,
+    } as PluginRecord;
+    const upgradePlugin = vi.fn().mockResolvedValue({
+      oldManifest,
+      newManifest,
+      discovered: {
+        version: "1.1.0",
+      },
+    });
+    const manager = lifecycle({
+      upgradePlugin: upgradePlugin as PluginLoader["upgradePlugin"],
+    });
+
+    await expect(manager.upgrade("plugin-1", "1.1.0")).resolves.toMatchObject({ status: "ready" });
+
+    expect(upgradePlugin).toHaveBeenCalledWith("plugin-1", { version: "1.1.0" });
+    expect(reconcilePluginApplications).toHaveBeenCalledTimes(1);
+  });
 });
