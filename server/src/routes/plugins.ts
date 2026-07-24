@@ -1028,6 +1028,21 @@ export function pluginRoutes(
       return;
     }
 
+    const uuidFields: ReadonlyArray<[string, string]> = [
+      ["agentId", runContext.agentId],
+      ["runId", runContext.runId],
+      ["companyId", runContext.companyId],
+      ["projectId", runContext.projectId],
+    ];
+    for (const [field, value] of uuidFields) {
+      if (!UUID_REGEX.test(value)) {
+        res.status(400).json({
+          error: `"runContext.${field}" must be a valid UUID`,
+        });
+        return;
+      }
+    }
+
     const heartbeatRunContext: HeartbeatToolRunContext = {
       ...runContext,
       runId: runContext.runId,
