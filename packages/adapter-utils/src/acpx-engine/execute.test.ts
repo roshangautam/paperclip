@@ -14,6 +14,7 @@ import {
   parseGeminiVersionParts,
   rewriteGeminiAcpFlagForVersion,
   summarizeAcpxTurnUsage,
+  type RuntimeCacheEntry,
 } from "./execute.js";
 import { runChildProcess } from "../server-utils.js";
 
@@ -724,6 +725,219 @@ describe("shared ACPX engine runtime behavior", () => {
     // A new heartbeat with the same config env keeps the fingerprint stable, so
     // per-wake PAPERCLIP_* churn does not needlessly reset the session.
     expect(fp(sameEnvNewWake)).toBe(fp(first));
+  });
+
+  it("keeps the session fingerprint stable when Paperclip rotates run scratch env", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const baseConfig = { agentCommand: "node ./fake-acp.js", stateDir };
+    const withScratchEnv = (scratchDir: string) => ({
+      ...baseConfig,
+      env: {
+        OPENROUTER_API_KEY: "stable-value",
+        PAPERCLIP_RUN_SCRATCH_DIR: scratchDir,
+        PAPERCLIP_TASK_SCRATCH_DIR: scratchDir,
+        PAPERCLIP_SCRATCH_DIR: scratchDir,
+        PAPERCLIP_TMPDIR: scratchDir,
+        TMPDIR: scratchDir,
+        TEMP: scratchDir,
+        TMP: scratchDir,
+      },
+    });
+    const withScratchContext = (scratchDir: string, wakeReason: string) => ({
+      taskId: "issue-1",
+      wakeReason,
+      paperclipScratch: {
+        type: "heartbeat_run",
+        dir: scratchDir,
+        tempKeysApplied: ["TMPDIR", "TEMP", "TMP"],
+      },
+    });
+
+    const first = await runExecutor(withScratchEnv("/tmp/paperclip-run-one"), {
+      context: withScratchContext("/tmp/paperclip-run-one", "issue_assigned"),
+    });
+    const second = await runExecutor(withScratchEnv("/tmp/paperclip-run-two"), {
+      context: {
+        ...withScratchContext("/tmp/paperclip-run-two", "comment"),
+        wakeCommentId: "c-9",
+      },
+    });
+
+    const fp = (result: { result: { sessionParams?: unknown } }) =>
+      (result.result.sessionParams as { configFingerprint?: string } | undefined)?.configFingerprint;
+
+    expect(fp(first)).toBeDefined();
+    expect(fp(second)).toBe(fp(first));
+
+    const wrapperDir = path.join(stateDir, "wrappers");
+    const wrapperEnvFiles = (await fs.readdir(wrapperDir)).filter((name) => name.endsWith(".env"));
+    const wrapperEnvs = await Promise.all(
+      wrapperEnvFiles.map((name) => fs.readFile(path.join(wrapperDir, name), "utf8")),
+    );
+    expect(
+      wrapperEnvs.some(
+        (env) =>
+          env.includes("PAPERCLIP_RUN_SCRATCH_DIR='/tmp/paperclip-run-one'") &&
+          env.includes("TMPDIR='/tmp/paperclip-run-one'"),
+      ),
+    ).toBe(true);
+    expect(
+      wrapperEnvs.some(
+        (env) =>
+          env.includes("PAPERCLIP_RUN_SCRATCH_DIR='/tmp/paperclip-run-two'") &&
+          env.includes("TMPDIR='/tmp/paperclip-run-two'"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps operator-configured scratch paths in the session fingerprint without injection provenance", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const withScratchEnv = (scratchDir: string) => ({
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+      env: {
+        PAPERCLIP_RUN_SCRATCH_DIR: scratchDir,
+        PAPERCLIP_TASK_SCRATCH_DIR: scratchDir,
+        PAPERCLIP_SCRATCH_DIR: scratchDir,
+        PAPERCLIP_TMPDIR: scratchDir,
+        TMPDIR: scratchDir,
+        TEMP: scratchDir,
+        TMP: scratchDir,
+      },
+    });
+    const options = {
+      context: { taskId: "issue-1" },
+      executionTarget: { kind: "remote", transport: "ssh", cwd: "/repo" },
+    };
+
+    const first = await runExecutor(withScratchEnv("/custom/scratch-one"), options);
+    const second = await runExecutor(withScratchEnv("/custom/scratch-two"), options);
+
+    expect(first.result.sessionParams?.configFingerprint).toBeTypeOf("string");
+    expect(first.result.sessionParams?.configFingerprint).not.toBe(
+      second.result.sessionParams?.configFingerprint,
+    );
+  });
+
+  it("restarts a warm process when injected run scratch rotates while resuming its disk session", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const warmHandles = new Map<string, RuntimeCacheEntry>();
+    const ensureSessionInputs: Array<Record<string, unknown>> = [];
+    const closeReasons: string[] = [];
+    let runtimeCount = 0;
+    const execute = createAcpxEngineExecutor({
+      warmHandles,
+      createRuntime: () => {
+        runtimeCount += 1;
+        return {
+          ensureSession: async (input: Record<string, unknown>) => {
+            ensureSessionInputs.push(input);
+            return {
+              backendSessionId: "backend-session",
+              agentSessionId: "agent-session",
+              runtimeSessionName: "runtime-session",
+            };
+          },
+          startTurn: () => ({
+            events: (async function* () {
+              yield { type: "done", stopReason: "end_turn" };
+            })(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close: async (input: { reason: string }) => {
+            closeReasons.push(input.reason);
+          },
+        } as never;
+      },
+    });
+    const call = async (runId: string, scratchDir: string, sessionParams?: unknown) =>
+      execute({
+        runId,
+        agent: { id: "agent-1", companyId: "company-1" },
+        runtime: { sessionParams },
+        config: {
+          agent: "custom",
+          agentCommand: "node ./fake-acp.js",
+          stateDir,
+          mode: "persistent",
+          warmHandleIdleMs: 60_000,
+          env: {
+            PAPERCLIP_RUN_SCRATCH_DIR: scratchDir,
+            PAPERCLIP_TASK_SCRATCH_DIR: scratchDir,
+            PAPERCLIP_SCRATCH_DIR: scratchDir,
+            PAPERCLIP_TMPDIR: scratchDir,
+            TMPDIR: scratchDir,
+            TEMP: scratchDir,
+            TMP: scratchDir,
+          },
+        },
+        context: {
+          taskId: "issue-1",
+          paperclipScratch: {
+            type: "heartbeat_run",
+            dir: scratchDir,
+            tempKeysApplied: ["TMPDIR", "TEMP", "TMP"],
+          },
+        },
+        onLog: async () => {},
+        onMeta: async () => {},
+      } as never);
+
+    const first = await call("run-1", "/tmp/paperclip-run-one");
+    const second = await call("run-2", "/tmp/paperclip-run-two", first.sessionParams);
+
+    expect(first.sessionParams?.configFingerprint).toBe(second.sessionParams?.configFingerprint);
+    expect(runtimeCount).toBe(2);
+    expect(ensureSessionInputs[1]?.resumeSessionId).toBe("backend-session");
+    expect(closeReasons).toContain("paperclip run scratch changed");
+    expect(warmHandles).toHaveLength(1);
+
+    for (const entry of warmHandles.values()) {
+      if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer);
+    }
+    warmHandles.clear();
+  });
+
+  it("keeps custom scratch and temp values in the session fingerprint", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const baseConfig = {
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+      env: {
+        PAPERCLIP_RUN_SCRATCH_DIR: "/tmp/paperclip-run-one",
+        PAPERCLIP_SCRATCH_DIR: "/custom/scratch-one",
+        TMPDIR: "/custom/tmp-one",
+      },
+    };
+    const context = { taskId: "issue-1", wakeReason: "issue_assigned" };
+
+    const first = await runExecutor(baseConfig, { context });
+    const changedCustomScratch = await runExecutor(
+      {
+        ...baseConfig,
+        env: { ...baseConfig.env, PAPERCLIP_SCRATCH_DIR: "/custom/scratch-two" },
+      },
+      { context },
+    );
+    const changedCustomTmp = await runExecutor(
+      {
+        ...baseConfig,
+        env: { ...baseConfig.env, TMPDIR: "/custom/tmp-two" },
+      },
+      { context },
+    );
+
+    const fp = (result: { result: { sessionParams?: unknown } }) =>
+      (result.result.sessionParams as { configFingerprint?: string } | undefined)?.configFingerprint;
+
+    expect(fp(first)).toBeDefined();
+    expect(fp(changedCustomScratch)).not.toBe(fp(first));
+    expect(fp(changedCustomTmp)).not.toBe(fp(first));
   });
 
   it("busts the session fingerprint when a stable configured PAPERCLIP_* value rotates", async () => {

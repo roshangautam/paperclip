@@ -78,13 +78,20 @@ import {
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
 const WRAPPER_CLEANUP_RETENTION_MS = 15 * 60 * 1000;
 const PAPERCLIP_MANAGED_CODEX_SKILLS_MANIFEST = ".paperclip-managed-skills.json";
+const PAPERCLIP_RUN_SCRATCH_ENV_KEYS = new Set([
+  "PAPERCLIP_RUN_SCRATCH_DIR",
+  "PAPERCLIP_TASK_SCRATCH_DIR",
+  "PAPERCLIP_SCRATCH_DIR",
+  "PAPERCLIP_TMPDIR",
+]);
+const TEMP_ENV_KEYS = new Set(["TMPDIR", "TEMP", "TMP"]);
 
 type AcpxRuntimeFactory = (options: AcpRuntimeOptions) => AcpRuntime;
 
 export interface RuntimeCacheEntry {
   runtime: AcpRuntime;
   handle: AcpRuntimeHandle;
-  fingerprint: string;
+  warmHandleFingerprint: string;
   lastUsedAt: number;
   cleanupTimer?: NodeJS.Timeout;
 }
@@ -137,6 +144,7 @@ interface AcpxPreparedRuntime {
   timeoutResolution: AdapterExecutionTargetTimeoutResolution;
   sessionKey: string;
   fingerprint: string;
+  warmHandleFingerprint: string;
   agentCommand: string | null;
   agentRegistry: AcpAgentRegistry;
   processSessionBridge: AdapterExecutionTargetProcessSessionBridgeHandle | null;
@@ -174,6 +182,35 @@ function stableJson(value: unknown): string {
 
 function shortHash(value: unknown): string {
   return createHash("sha256").update(stableJson(value)).digest("hex").slice(0, 16);
+}
+
+interface PaperclipRunScratchContext {
+  dir: string;
+  tempKeysApplied: Set<string>;
+}
+
+function readPaperclipRunScratchContext(context: Record<string, unknown>): PaperclipRunScratchContext | null {
+  const scratch = parseObject(context.paperclipScratch);
+  if (asString(scratch.type, "") !== "heartbeat_run") return null;
+  const dir = asString(scratch.dir, "").trim();
+  if (!dir) return null;
+  const tempKeysApplied = new Set(
+    Array.isArray(scratch.tempKeysApplied)
+      ? scratch.tempKeysApplied.filter(
+          (key): key is string => typeof key === "string" && TEMP_ENV_KEYS.has(key),
+        )
+      : [],
+  );
+  return { dir, tempKeysApplied };
+}
+
+function isEphemeralRunScratchEnvEntry(
+  key: string,
+  value: string,
+  runScratch: PaperclipRunScratchContext | null,
+): boolean {
+  if (!runScratch || value !== runScratch.dir) return false;
+  return PAPERCLIP_RUN_SCRATCH_ENV_KEYS.has(key) || runScratch.tempKeysApplied.has(key);
 }
 
 function defaultPaperclipInstanceDir(): string {
@@ -1044,6 +1081,7 @@ async function buildRuntime(input: {
   await fs.mkdir(stateDir, { recursive: true });
 
   const envConfig = parseObject(config.env);
+  const runScratch = readPaperclipRunScratchContext(context);
   const hasExplicitApiKey =
     typeof envConfig.PAPERCLIP_API_KEY === "string" && envConfig.PAPERCLIP_API_KEY.trim().length > 0;
   const env: Record<string, string> = { ...buildPaperclipEnv(agent), PAPERCLIP_RUN_ID: runId };
@@ -1089,14 +1127,9 @@ async function buildRuntime(input: {
     executionTargetIsRemote,
   });
   // Resolved adapter env (plain + server-resolved secret_ref values) that we
-  // forward to the spawned agent process. Captured so a stable hash of it can be
-  // folded into the session fingerprint below — a change here must invalidate a
-  // warm/resumable session so the next launch picks up the latest env. Only
-  // user/adapter-configured env flows through this loop; per-wake PAPERCLIP_*
-  // runtime vars (PAPERCLIP_RUN_ID, wake/approval ids, ...) were assigned to
-  // `env` above and are never present in shapedEnvConfig, so they inherently
-  // stay out of the hash and don't reset the session every heartbeat.
-  const resolvedAdapterEnv: Record<string, string> = {};
+  // forward to the spawned agent process. Durable values are also captured so a
+  // stable hash of them can be folded into the session fingerprint below.
+  const durableAdapterEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries(shapedEnvConfig)) {
     if (typeof value !== "string") continue;
     // Runtime PAPERCLIP_* always wins over config: skip a PAPERCLIP_* key that
@@ -1105,7 +1138,15 @@ async function buildRuntime(input: {
     // stable per-run config, so it applies and feeds the fingerprint hash below.
     if (isPaperclipRuntimeEnvKey(key) && key in env) continue;
     env[key] = value;
-    resolvedAdapterEnv[key] = value;
+    // The heartbeat service injects a fresh run scratch directory into
+    // config.env so every adapter receives it. It is invocation state, not
+    // durable adapter configuration, and must not prevent ACPX from resuming
+    // the task's disk-backed session. Preserve custom temp directories in the
+    // fingerprint by excluding TMPDIR/TEMP/TMP only when they point at the
+    // injected run scratch directory.
+    if (!isEphemeralRunScratchEnvEntry(key, value, runScratch)) {
+      durableAdapterEnv[key] = value;
+    }
   }
   if (!hasExplicitApiKey && authToken) env.PAPERCLIP_API_KEY = authToken;
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
@@ -1270,7 +1311,7 @@ async function buildRuntime(input: {
   const overrideCommand = processSessionBridge?.agentCommand ?? wrapperPath;
   const overrides = overrideCommand ? { [acpxAgent]: overrideCommand } : undefined;
   const agentRegistry = createAgentRegistry({ overrides });
-  const fingerprint = shortHash({
+  const fingerprintInput = {
     acpxAgent,
     agentCommand: agentCommand ?? acpxAgent,
     cwd: path.resolve(cwd),
@@ -1292,14 +1333,24 @@ async function buildRuntime(input: {
       : null,
     mcpServers: mcpIdentity,
     secretManifestHash: shortHash(secretManifest),
-    // Fold the resolved adapter env (all applied user-configured values —
+    // Fold the durable resolved adapter env (all applied user-configured values —
     // plain, secret_ref, and stable PAPERCLIP_* config such as an explicit
     // PAPERCLIP_API_KEY) into the fingerprint so a change to any forwarded value
     // invalidates a warm handle / resumable session and forces a fresh launch
     // that sources the latest env. secretManifestHash alone misses plain-value
     // edits and same-version secret rotations. Per-wake runtime vars never enter
-    // resolvedAdapterEnv, so they don't churn the fingerprint every heartbeat.
-    adapterEnvHash: shortHash(resolvedAdapterEnv),
+    // durableAdapterEnv, so they don't churn the fingerprint every heartbeat.
+    adapterEnvHash: shortHash(durableAdapterEnv),
+  };
+  const fingerprint = shortHash(fingerprintInput);
+  // Disk-backed session compatibility intentionally ignores Paperclip's
+  // per-run scratch directory, but a live ACP process cannot: its environment
+  // was fixed when the wrapper launched. Rotate the warm handle while retaining
+  // the durable session identity so the replacement process resumes from disk
+  // with the current run's scratch paths.
+  const warmHandleFingerprint = shortHash({
+    fingerprint,
+    runScratchDir: runScratch?.dir ?? null,
   });
   const taskKey = asString(input.ctx.runtime.taskKey, "") || wakeTaskId || workspaceId || "default";
   const sessionKey = `paperclip:${agent.companyId}:${agent.id}:${taskKey}:${fingerprint}`;
@@ -1328,6 +1379,7 @@ async function buildRuntime(input: {
     timeoutResolution,
     sessionKey,
     fingerprint,
+    warmHandleFingerprint,
     agentCommand,
     agentRegistry,
     processSessionBridge,
@@ -1960,7 +2012,19 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     const previousParams = parseObject(ctx.runtime.sessionParams);
     const canResume = isCompatibleSession(previousParams, prepared);
     const resumeSessionId = canResume ? asString(previousParams.acpSessionId, "") || undefined : undefined;
-    const cached = canResume ? warmHandles.get(prepared.sessionKey) : undefined;
+    const warmCandidate = canResume ? warmHandles.get(prepared.sessionKey) : undefined;
+    const cached =
+      warmCandidate?.warmHandleFingerprint === prepared.warmHandleFingerprint
+        ? warmCandidate
+        : undefined;
+    if (warmCandidate && !cached) {
+      await closeWarmHandle({
+        handles: warmHandles,
+        key: prepared.sessionKey,
+        entry: warmCandidate,
+        reason: "paperclip run scratch changed",
+      });
+    }
     const runtimeOptions: AcpRuntimeOptions = {
       cwd: prepared.cwd,
       sessionStore: createRuntimeStore({ stateDir: prepared.stateDir }),
@@ -2218,7 +2282,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           const entry: RuntimeCacheEntry = {
             runtime,
             handle: sessionHandle,
-            fingerprint: prepared.fingerprint,
+            warmHandleFingerprint: prepared.warmHandleFingerprint,
             lastUsedAt: now(),
           };
           warmHandles.set(prepared.sessionKey, entry);

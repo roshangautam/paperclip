@@ -1,7 +1,7 @@
 # Agent Runtime Guide
 
 Status: User-facing guide
-Last updated: 2026-03-26
+Last updated: 2026-07-23
 Audience: Operators setting up and running agents in Paperclip
 
 ## 1. What this system does
@@ -83,11 +83,29 @@ Templates support variables like `{{agent.id}}`, `{{agent.name}}`, and run conte
 
 ## 4. Session resume behavior
 
-Paperclip stores session IDs for resumable adapters.
+Paperclip stores resumable session metadata per `(agent, taskKey, adapterType)`.
+The task key comes from the wake context's `taskKey`, `taskId`, or `issueId`, so
+one agent can maintain separate conversations for separate tasks.
 
-- Next heartbeat reuses the saved session automatically.
-- This gives continuity across heartbeats.
-- You can reset a session if context gets stale or confused.
+Built-in local ACP adapters are self-contained. In persistent mode, ACPX writes
+its session records to Paperclip-managed, company- and agent-scoped storage on
+disk, while the underlying coding harness keeps its native conversation state.
+No external memory service is required. The default warm-process lifetime is
+zero, which closes the ACP process after each run without deleting its persisted
+session.
+
+- A later heartbeat with the same task key and durable runtime configuration
+  reuses the saved session automatically.
+- A different task key keeps separate session state.
+- Changes to durable runtime identity, such as the working directory, model,
+  agent command, MCP configuration, skills, secrets, or configured environment,
+  start a fresh session so stale runtime state is not reused.
+- Per-run Paperclip scratch paths and their generated `TMPDIR`, `TEMP`, and
+  `TMP` aliases are still forwarded to the agent, but do not invalidate the
+  session when they rotate between heartbeats.
+- If restore fails, the adapter can retry with a fresh session and persist the
+  replacement.
+- You can reset all sessions for an agent or reset one task session by task key.
 
 Use session reset when:
 
