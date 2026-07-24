@@ -73,8 +73,18 @@ Templates support variables like `{{agent.id}}`, `{{agent.name}}`, and run conte
 Paperclip stores resumable session state per `(agent, taskKey, adapterType)`.
 `taskKey` is derived from wakeup context (`taskKey`, `taskId`, or `issueId`).
 
-- A heartbeat for the same task key reuses the previous session for that task.
+- Local ACP adapters persist session records in Paperclip-managed,
+  company- and agent-scoped storage on disk. The underlying coding harness owns
+  its native conversation state; no external memory service is required.
+- A heartbeat for the same task key and durable runtime configuration reuses the
+  previous session for that task, even when the ACP process is closed between
+  runs.
 - Different task keys for the same agent keep separate session state.
+- Durable runtime changes (including cwd, model, agent command, MCP setup,
+  skills, secrets, and configured env) invalidate the saved session identity.
+- Rotating Paperclip run-scratch paths and their generated `TMPDIR`, `TEMP`, and
+  `TMP` aliases remain available to the child process without invalidating the
+  saved session identity.
 - If restore fails, adapters should retry once with a fresh session and continue.
 - You can reset all sessions for an agent or reset one task session by task key.
 
