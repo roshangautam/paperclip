@@ -74,9 +74,9 @@ const plugin = definePlugin({
         properties: { a: { type: "number" }, b: { type: "number" } },
         required: ["a", "b"]
       }
-    }, async (params) => {
+    }, async (params, runContext) => {
       const { a, b } = params as { a: number; b: number };
-      return { content: `Result: ${a + b}`, data: { result: a + b } };
+      return { content: `Result: ${a + b}`, data: { result: a + b, runId: runContext.runId } };
     });
   },
 });
@@ -86,6 +86,8 @@ runWorker(plugin, import.meta.url);
 ```
 
 **Note:** `runWorker(plugin, import.meta.url)` must be called so that when the host runs your worker (e.g. `node dist/worker.js`), the RPC host starts and the process stays alive. When the file is imported (e.g. for tests), the main-module check prevents the host from starting.
+
+Plugin tool handlers receive a `ToolRunContext`. Its `runId` is the heartbeat run UUID during agent execution and `null` when an operator invokes the tool from an app's Test tab.
 
 ### Worker lifecycle and context
 

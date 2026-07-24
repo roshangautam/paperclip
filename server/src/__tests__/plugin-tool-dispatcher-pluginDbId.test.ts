@@ -158,6 +158,39 @@ describe("dispatcher.registerPluginTools — activation path", () => {
       dispatcher.registerPluginTools(PLUGIN_KEY, MANIFEST, ""),
     ).toThrow(/pluginDbId is required/);
   });
+
+  it("discovers and executes tool names that contain namespace separators", async () => {
+    const workerManager = createUuidKeyedWorkerManager();
+    const dispatcher = createPluginToolDispatcher({ workerManager });
+    const manifest = {
+      ...MANIFEST,
+      tools: [{
+        name: "admin:sync",
+        displayName: "Admin sync",
+        description: "Synchronize administrative state",
+        parametersSchema: { type: "object", properties: {} },
+      }],
+    } as PaperclipPluginManifestV1;
+
+    dispatcher.registerPluginTools(PLUGIN_KEY, manifest, PLUGIN_DB_ID);
+
+    expect(dispatcher.listToolsForAgent()).toEqual([
+      expect.objectContaining({ name: `${PLUGIN_KEY}:admin:sync` }),
+    ]);
+    await expect(dispatcher.executeTool(
+      `${PLUGIN_KEY}:admin:sync`,
+      { force: true },
+      { agentId: "a", runId: "r", companyId: "c", projectId: "p" },
+    )).resolves.toMatchObject({
+      pluginId: PLUGIN_KEY,
+      toolName: "admin:sync",
+    });
+    expect(workerManager.call).toHaveBeenCalledWith(
+      PLUGIN_DB_ID,
+      "executeTool",
+      expect.objectContaining({ toolName: "admin:sync", parameters: { force: true } }),
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

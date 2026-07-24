@@ -6,29 +6,79 @@ import { resolveCloudTenantActor } from "./auth.js";
 
 // Minimal fake Drizzle Db: records every table passed to .insert() / .delete() and
 // supports the chained call shapes used by resolveCloudTenantActor (values /
-// onConflictDo* / returning().then() / delete().where()). The chain is awaitable so
-// directly-awaited statements resolve.
-function createFakeDb(membershipRow = { companyId: "company-x", membershipRole: "owner", status: "active" }) {
+// onConflictDo* / returning().then() / delete().where()) plus the empty plugin
+// lookup used when a cloud tenant creates a company. The mutation chain is
+// awaitable so directly-awaited statements resolve.
+function createFakeDb(
+  membershipRow = { companyId: "company-x", membershipRole: "owner", status: "active" },
+  options: { companyInserted?: boolean; reconciliationFailures?: number } = {},
+) {
   const insertedTables: unknown[] = [];
   const deletedTables: unknown[] = [];
-  const chain: Record<string, unknown> = {};
-  chain.values = () => chain;
-  chain.onConflictDoUpdate = () => chain;
-  chain.onConflictDoNothing = () => chain;
-  chain.where = () => chain;
-  chain.returning = async () => [membershipRow];
-  chain.then = (resolve: (v: unknown) => unknown) => Promise.resolve(undefined).then(resolve);
+  const selectedTables: unknown[] = [];
+  let companyExists = options.companyInserted === false;
+  let companyInsertionCount = 0;
+  let reconciliationFailures = options.reconciliationFailures ?? 0;
+  const mutationChain = (table?: unknown) => {
+    const chain: Record<string, unknown> = {};
+    chain.values = () => chain;
+    chain.onConflictDoUpdate = () => chain;
+    chain.onConflictDoNothing = () => chain;
+    chain.where = () => chain;
+    chain.returning = async () => {
+      if (table !== companies) return [membershipRow];
+      if (companyExists) return [];
+      companyExists = true;
+      companyInsertionCount += 1;
+      return [{ id: "company-x" }];
+    };
+    chain.then = (resolve: (v: unknown) => unknown) => Promise.resolve(undefined).then(resolve);
+    return chain;
+  };
   const db = {
+    select: () => {
+      const selectChain: Record<string, unknown> = {};
+      let selectedTable: unknown;
+      selectChain.from = (table: unknown) => {
+        selectedTable = table;
+        selectedTables.push(table);
+        return selectChain;
+      };
+      selectChain.where = async () => {
+        if (selectedTable === companies && reconciliationFailures > 0) {
+          reconciliationFailures -= 1;
+          throw new Error("managed App reconciliation failed");
+        }
+        return [];
+      };
+      selectChain.orderBy = async () => [];
+      return selectChain;
+    },
     insert: (table: unknown) => {
       insertedTables.push(table);
-      return chain;
+      return mutationChain(table);
     },
     delete: (table: unknown) => {
       deletedTables.push(table);
-      return chain;
+      return mutationChain(table);
+    },
+    transaction: async (callback: (tx: Db) => Promise<unknown>) => {
+      const companyExistsBefore = companyExists;
+      try {
+        return await callback(db as unknown as Db);
+      } catch (error) {
+        companyExists = companyExistsBefore;
+        throw error;
+      }
     },
   } as unknown as Db;
-  return { db, insertedTables, deletedTables };
+  return {
+    db,
+    insertedTables,
+    deletedTables,
+    selectedTables,
+    getCompanyInsertionCount: () => companyInsertionCount,
+  };
 }
 
 function fakeReq(headers: Record<string, string>): Request {
@@ -84,6 +134,32 @@ describe("resolveCloudTenantActor (shared-pool hardening)", () => {
     expect(insertedTables).toContain(authUsers);
     expect(insertedTables).toContain(companies);
     expect(insertedTables).toContain(companyMemberships);
+  });
+
+  it("reconciles plugin applications when provisioning a new company", async () => {
+    const { db, selectedTables } = createFakeDb();
+    await resolveCloudTenantActor(db, fakeReq(VALID_HEADERS));
+    expect(selectedTables).toContain(companies);
+  });
+
+  it("does not reconcile plugin applications on repeat authentication", async () => {
+    const { db, selectedTables } = createFakeDb(undefined, { companyInserted: false });
+    await resolveCloudTenantActor(db, fakeReq(VALID_HEADERS));
+    expect(selectedTables).not.toContain(companies);
+  });
+
+  it("retries complete company provisioning after reconciliation fails", async () => {
+    const { db, selectedTables, getCompanyInsertionCount } = createFakeDb(undefined, {
+      reconciliationFailures: 1,
+    });
+
+    await expect(resolveCloudTenantActor(db, fakeReq(VALID_HEADERS)))
+      .rejects.toThrow("managed App reconciliation failed");
+    await expect(resolveCloudTenantActor(db, fakeReq(VALID_HEADERS)))
+      .resolves.toMatchObject({ source: "cloud_tenant" });
+
+    expect(getCompanyInsertionCount()).toBe(2);
+    expect(selectedTables.filter((table) => table === companies)).toHaveLength(2);
   });
 
   it("returns null when the server token is unset", async () => {

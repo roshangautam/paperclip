@@ -21,12 +21,20 @@ import type {
   ToolConnectionTestDecision,
 } from "@paperclipai/shared";
 import { Link } from "@/lib/router";
+import { projectsApi } from "@/api/projects";
 import { toolsApi } from "@/api/tools";
 import { queryKeys } from "@/lib/queryKeys";
 import { useCompany } from "@/context/CompanyContext";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Collapsible,
   CollapsibleContent,
@@ -121,6 +129,7 @@ export function TestPanel({
   appName,
   active,
   quarantined = [],
+  requiresProject = false,
 }: {
   connectionId: string;
   appName: string;
@@ -128,11 +137,36 @@ export function TestPanel({
   active: ToolCatalogEntry[];
   /** New, not-yet-reviewed actions — shown as Off so they're reachable to test. */
   quarantined?: ToolCatalogEntry[];
+  /** Paperclip plugin tools need a project to evaluate and execute in. */
+  requiresProject?: boolean;
 }) {
+  const { selectedCompanyId } = useCompany();
+  const projectsQuery = useQuery({
+    queryKey: queryKeys.projects.list(selectedCompanyId ?? "__none__"),
+    queryFn: () => projectsApi.list(selectedCompanyId!),
+    enabled: requiresProject && !!selectedCompanyId,
+  });
+  const projects = useMemo(
+    () => (projectsQuery.data ?? []).filter((project) => !project.archivedAt),
+    [projectsQuery.data],
+  );
+  const [projectId, setProjectId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!requiresProject) {
+      setProjectId(null);
+      return;
+    }
+    if (projectId && projects.some((project) => project.id === projectId)) return;
+    setProjectId(projects[0]?.id ?? null);
+  }, [projectId, projects, requiresProject]);
+
   const testAgentsQuery = useQuery({
-    queryKey: queryKeys.tools.testAgents(connectionId),
-    queryFn: () => toolsApi.listTestAgents(connectionId),
-    enabled: !!connectionId,
+    queryKey: queryKeys.tools.testAgents(connectionId, projectId),
+    queryFn: () => requiresProject
+      ? toolsApi.listTestAgents(connectionId, projectId)
+      : toolsApi.listTestAgents(connectionId),
+    enabled: !!connectionId && (!requiresProject || !!projectId),
   });
 
   const agents = useMemo(
@@ -196,7 +230,19 @@ export function TestPanel({
   const visibleQuarantined = quarantinedActions.filter(matches);
   const visibleCount = visibleRead.length + visibleWrite.length + visibleQuarantined.length;
 
-  if (testAgentsQuery.isLoading) {
+  // When a project is required and projects have resolved but `projectId` is
+  // still null, the default-selection effect hasn't run yet and
+  // `testAgentsQuery` is disabled (so neither query reports loading). Treat
+  // that intermediate window as loading so we don't briefly render the
+  // "No agents to test as" empty state before agents are fetched.
+  const awaitingProjectDefault =
+    requiresProject && projectId === null && projects.length > 0;
+
+  if (
+    (requiresProject && projectsQuery.isLoading) ||
+    awaitingProjectDefault ||
+    testAgentsQuery.isLoading
+  ) {
     return (
       <div className="space-y-4">
         <Skeleton className="h-20 w-full" />
@@ -206,8 +252,32 @@ export function TestPanel({
     );
   }
 
+  if (requiresProject && projectsQuery.isError) {
+    return (
+      <QueryErrorState
+        title="Couldn't load projects"
+        message="Projects are required to test this app. Check your connection and try again."
+        onRetry={() => void projectsQuery.refetch()}
+      />
+    );
+  }
+
+  if (testAgentsQuery.isError) {
+    return (
+      <QueryErrorState
+        title="Couldn't load test agents"
+        message={`Paperclip couldn't load the agents available to test ${appName}. Try again.`}
+        onRetry={() => void testAgentsQuery.refetch()}
+      />
+    );
+  }
+
   if (active.length === 0 && quarantinedActions.length === 0) {
     return <EmptyState connectionId={connectionId} appName={appName} />;
+  }
+
+  if (requiresProject && projects.length === 0) {
+    return <NoProjectsState appName={appName} />;
   }
 
   if (agents.length === 0) {
@@ -231,10 +301,31 @@ export function TestPanel({
     allAgents: agents,
     onSelectAgent: setAgentId,
     onInteract: () => setHasInteracted(true),
+    projectId,
   };
 
   return (
     <div className="space-y-5">
+      {requiresProject && projectId && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card p-4">
+          <div>
+            <p className="text-sm font-medium text-foreground">Test project</p>
+            <p className="text-xs text-muted-foreground">
+              Access and plugin execution are evaluated in this project.
+            </p>
+          </div>
+          <Select value={projectId} onValueChange={setProjectId}>
+            <SelectTrigger className="w-full sm:w-64" aria-label="Choose a project for this test">
+              <SelectValue placeholder="Select a project" />
+            </SelectTrigger>
+            <SelectContent>
+              {projects.map((project) => (
+                <SelectItem key={project.id} value={project.id}>{project.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
       {selectedAgent && (
         <TestAsHeader
           appName={appName}
@@ -301,6 +392,39 @@ export function TestPanel({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function QueryErrorState({
+  title,
+  message,
+  onRetry,
+}: {
+  title: string;
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-card p-6 text-center">
+      <AlertTriangle className="mx-auto h-5 w-5 text-destructive" aria-hidden="true" />
+      <p className="mt-2 text-sm font-medium text-foreground">{title}</p>
+      <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">{message}</p>
+      <Button className="mt-4" variant="outline" onClick={onRetry}>Try again</Button>
+    </div>
+  );
+}
+
+function NoProjectsState({ appName }: { appName: string }) {
+  return (
+    <div className="rounded-lg border border-border bg-card p-8 text-center">
+      <p className="text-base font-bold text-foreground">Create a project to test {appName}</p>
+      <p className="mx-auto mt-1.5 max-w-md text-sm text-muted-foreground">
+        Plugin actions run with project-scoped access. Create a project, then come back here to test them.
+      </p>
+      <Button asChild className="mt-4" variant="outline">
+        <Link to="/projects">Go to Projects</Link>
+      </Button>
     </div>
   );
 }
@@ -523,6 +647,7 @@ function FilterChip({ label, active, onClick }: { label: string; active: boolean
 type RowSharedProps = {
   connectionId: string;
   appName: string;
+  projectId: string | null;
   allAgents: ToolConnectionTestAgent[];
   onSelectAgent: (agentId: string) => void;
   onInteract: () => void;
@@ -571,15 +696,17 @@ function ActionRow({
   decision: ToolConnectionTestDecision;
   agent: ToolConnectionTestAgent;
 } & RowSharedProps) {
-  const [open, setOpen] = useState(() => Boolean(loadStoredAskFirstOutcome(shared.connectionId, entry, agent)));
+  const [open, setOpen] = useState(() => Boolean(
+    loadStoredAskFirstOutcome(shared.connectionId, shared.projectId, entry, agent),
+  ));
   const title = entry.title ?? entry.toolName;
   const sub = actionSubLine(entry);
 
   useEffect(() => {
-    if (loadStoredAskFirstOutcome(shared.connectionId, entry, agent)) {
+    if (loadStoredAskFirstOutcome(shared.connectionId, shared.projectId, entry, agent)) {
       setOpen(true);
     }
-  }, [shared.connectionId, entry, agent]);
+  }, [shared.connectionId, shared.projectId, entry, agent]);
 
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
@@ -618,14 +745,24 @@ type RunOutcome = {
   ranAt: Date;
 };
 
-function testOutcomeStorageKey(connectionId: string, entry: ToolCatalogEntry, agentId: string): string {
-  return `paperclip:test-call:${connectionId}:${agentId}:${entry.id}:${entry.toolName}`;
+function testOutcomeStorageKey(
+  connectionId: string,
+  projectId: string | null,
+  entry: ToolCatalogEntry,
+  agentId: string,
+): string {
+  return `paperclip:test-call:${connectionId}:${projectId ?? "none"}:${agentId}:${entry.id}:${entry.toolName}`;
 }
 
-function loadStoredAskFirstOutcome(connectionId: string, entry: ToolCatalogEntry, agent: ToolConnectionTestAgent): RunOutcome | null {
+function loadStoredAskFirstOutcome(
+  connectionId: string,
+  projectId: string | null,
+  entry: ToolCatalogEntry,
+  agent: ToolConnectionTestAgent,
+): RunOutcome | null {
   if (typeof window === "undefined") return null;
   try {
-    const raw = window.sessionStorage.getItem(testOutcomeStorageKey(connectionId, entry, agent.id));
+    const raw = window.sessionStorage.getItem(testOutcomeStorageKey(connectionId, projectId, entry, agent.id));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as {
       result?: ToolConnectionTestCallResult;
@@ -647,9 +784,15 @@ function loadStoredAskFirstOutcome(connectionId: string, entry: ToolCatalogEntry
   }
 }
 
-function storeAskFirstOutcome(connectionId: string, entry: ToolCatalogEntry, agentId: string, outcome: RunOutcome | null) {
+function storeAskFirstOutcome(
+  connectionId: string,
+  projectId: string | null,
+  entry: ToolCatalogEntry,
+  agentId: string,
+  outcome: RunOutcome | null,
+) {
   if (typeof window === "undefined") return;
-  const key = testOutcomeStorageKey(connectionId, entry, agentId);
+  const key = testOutcomeStorageKey(connectionId, projectId, entry, agentId);
   try {
     if (!outcome || outcome.result.decision !== "ask_first") {
       window.sessionStorage.removeItem(key);
@@ -688,6 +831,7 @@ function ActionTester({
   allAgents,
   onSelectAgent,
   onInteract,
+  projectId,
 }: {
   entry: ToolCatalogEntry;
   decision: ToolConnectionTestDecision;
@@ -700,7 +844,7 @@ function ActionTester({
   const [values, setValues] = useState<Record<string, unknown>>(() => getDefaultValues(rawSchema));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [outcome, setOutcome] = useState<RunOutcome | null>(() =>
-    loadStoredAskFirstOutcome(connectionId, entry, agent)
+    loadStoredAskFirstOutcome(connectionId, projectId, entry, agent)
   );
 
   // Running card state — keep the spinner visible ≥200ms (anti-flicker).
@@ -708,6 +852,8 @@ function ActionTester({
   const [elapsedMs, setElapsedMs] = useState(0);
   const startedAtRef = useRef(0);
   const cancelledRef = useRef(false);
+  const activeScopeRef = useRef({ connectionId, projectId, entryId: entry.id, agentId: agent.id });
+  activeScopeRef.current = { connectionId, projectId, entryId: entry.id, agentId: agent.id };
 
   const isOff = decision === "off";
 
@@ -718,24 +864,40 @@ function ActionTester({
   }, [running]);
 
   const run = useMutation({
-    mutationFn: async () => {
-      const result = await toolsApi.runTestCall(connectionId, {
-        agentId: agent.id,
-        toolName: entry.toolName,
-        parameters: values,
+    mutationFn: async (input: {
+      connectionId: string;
+      projectId: string | null;
+      entryId: string;
+      agentId: string;
+      agentName: string;
+      toolName: string;
+      parameters: Record<string, unknown>;
+    }) => {
+      const result = await toolsApi.runTestCall(input.connectionId, {
+        agentId: input.agentId,
+        toolName: input.toolName,
+        ...(input.projectId ? { projectId: input.projectId } : {}),
+        parameters: input.parameters,
       });
       return result;
     },
-    onSuccess: (result) => {
-      if (cancelledRef.current) return;
+    onSuccess: (result, input) => {
+      const isCurrentScope = () => {
+        const active = activeScopeRef.current;
+        return active.connectionId === input.connectionId
+          && active.projectId === input.projectId
+          && active.entryId === input.entryId
+          && active.agentId === input.agentId;
+      };
+      if (cancelledRef.current || !isCurrentScope()) return;
       const durationMs = Date.now() - startedAtRef.current;
       const finish = () => {
-        if (cancelledRef.current) return;
-        const nextOutcome = { result, agentName: agent.name, durationMs, ranAt: new Date() };
+        if (cancelledRef.current || !isCurrentScope()) return;
+        const nextOutcome = { result, agentName: input.agentName, durationMs, ranAt: new Date() };
         setRunning(false);
         setOutcome(nextOutcome);
-        storeAskFirstOutcome(connectionId, entry, agent.id, nextOutcome);
-        queryClient.invalidateQueries({ queryKey: queryKeys.tools.connectionActivity(connectionId) });
+        storeAskFirstOutcome(input.connectionId, input.projectId, entry, input.agentId, nextOutcome);
+        queryClient.invalidateQueries({ queryKey: queryKeys.tools.connectionActivity(input.connectionId) });
         if (selectedCompanyId) {
           queryClient.invalidateQueries({ queryKey: queryKeys.tools.actionRequests(selectedCompanyId, "pending") });
           queryClient.invalidateQueries({ queryKey: queryKeys.apps.attention(selectedCompanyId) });
@@ -745,13 +907,27 @@ function ActionTester({
       if (remaining > 0) window.setTimeout(finish, remaining);
       else finish();
     },
-    onError: () => {
-      if (cancelledRef.current) return;
+    onError: (_error, input) => {
+      const active = activeScopeRef.current;
+      if (cancelledRef.current
+        || active.connectionId !== input.connectionId
+        || active.projectId !== input.projectId
+        || active.entryId !== input.entryId
+        || active.agentId !== input.agentId) return;
       setRunning(false);
     },
   });
+  const resetRun = run.reset;
+
+  useEffect(() => {
+    cancelledRef.current = true;
+    setRunning(false);
+    resetRun();
+    setOutcome(loadStoredAskFirstOutcome(connectionId, projectId, entry, agent));
+  }, [connectionId, projectId, entry, agent, resetRun]);
 
   const onRun = () => {
+    resetRun();
     const validationErrors = validateJsonSchemaForm(rawSchema, values);
     setErrors(validationErrors);
     if (Object.keys(validationErrors).length > 0) return;
@@ -761,14 +937,23 @@ function ActionTester({
     setElapsedMs(0);
     setOutcome(null);
     setRunning(true);
-    run.mutate();
+    run.mutate({
+      connectionId,
+      projectId,
+      entryId: entry.id,
+      agentId: agent.id,
+      agentName: agent.name,
+      toolName: entry.toolName,
+      parameters: values,
+    });
   };
 
   const onReset = () => {
     cancelledRef.current = true;
     setRunning(false);
+    resetRun();
     setOutcome(null);
-    storeAskFirstOutcome(connectionId, entry, agent.id, null);
+    storeAskFirstOutcome(connectionId, projectId, entry, agent.id, null);
     setErrors({});
     setValues(getDefaultValues(rawSchema));
   };

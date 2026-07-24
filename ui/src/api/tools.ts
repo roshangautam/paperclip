@@ -305,13 +305,18 @@ export const toolsApi = {
     api.get<ToolConnectionActivityResponse>(
       `/tool-connections/${connectionId}/activity?limit=${limit}`,
     ),
-  listTestAgents: (connectionId: string) =>
+  listTestAgents: (connectionId: string, projectId?: string | null) =>
     api.get<ToolConnectionTestAgentsResponse>(
-      `/tool-connections/${connectionId}/test-agents`,
+      `/tool-connections/${connectionId}/test-agents${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`,
     ),
   runTestCall: (
     connectionId: string,
-    input: { agentId: string; toolName: string; parameters?: Record<string, unknown> },
+    input: {
+      agentId: string;
+      toolName: string;
+      projectId?: string | null;
+      parameters?: Record<string, unknown>;
+    },
   ) =>
     api.post<ToolConnectionTestCallResult>(
       `/tool-connections/${connectionId}/test-calls`,

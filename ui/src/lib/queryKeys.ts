@@ -17,8 +17,8 @@ export const queryKeys = {
     catalog: (connectionId: string) => ["tools", "connection", connectionId, "catalog"] as const,
     connectionActivity: (connectionId: string) =>
       ["tools", "connection", connectionId, "activity"] as const,
-    testAgents: (connectionId: string) =>
-      ["tools", "connection", connectionId, "test-agents"] as const,
+    testAgents: (connectionId: string, projectId?: string | null) =>
+      ["tools", "connection", connectionId, "test-agents", projectId ?? null] as const,
     testCallStatus: (connectionId: string, actionRequestId: string) =>
       ["tools", "connection", connectionId, "test-calls", actionRequestId] as const,
     actionRequests: (companyId: string, status: string) =>

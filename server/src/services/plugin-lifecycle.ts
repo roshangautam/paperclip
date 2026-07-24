@@ -45,6 +45,7 @@ import type {
 import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginLoader, type PluginLoader } from "./plugin-loader.js";
 import type { PluginWorkerManager, WorkerStartOptions } from "./plugin-worker-manager.js";
+import { toolAccessService } from "./tool-access.js";
 import { badRequest, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 
@@ -84,6 +85,8 @@ const VALID_TRANSITIONS: Record<string, readonly PluginStatus[]> = {
   upgrade_pending: ["ready", "error", "uninstalled"],
   uninstalled: ["installed"], // reinstall
 };
+
+const APP_RECONCILIATION_RETRY_DELAYS_MS = [250, 1_000, 5_000] as const;
 
 /**
  * Check whether a transition from `from` → `to` is valid.
@@ -278,6 +281,9 @@ export interface PluginLifecycleManagerOptions {
    * caller is responsible for managing worker processes externally.
    */
   workerManager?: PluginWorkerManager;
+
+  /** Reconcile plugin-backed Apps after lifecycle transitions. */
+  reconcilePluginApplications?: () => Promise<void>;
 }
 
 /**
@@ -309,6 +315,7 @@ export function pluginLifecycleManager(
   // as well as the new options object form.
   let loaderArg: PluginLoader | undefined;
   let workerManager: PluginWorkerManager | undefined;
+  let reconcilePluginApplications: (() => Promise<void>) | undefined;
 
   if (options && typeof options === "object" && "discoverAll" in options) {
     // Legacy: second arg is a PluginLoader directly
@@ -317,10 +324,13 @@ export function pluginLifecycleManager(
     const opts = options as PluginLifecycleManagerOptions;
     loaderArg = opts.loader;
     workerManager = opts.workerManager;
+    reconcilePluginApplications = opts.reconcilePluginApplications;
   }
 
   const registry = pluginRegistryService(db);
   const pluginLoaderInstance = loaderArg ?? pluginLoader(db);
+  const reconcileManagedApplications = reconcilePluginApplications
+    ?? (() => toolAccessService(db).reconcilePluginApplications());
   const emitter = new EventEmitter();
   emitter.setMaxListeners(100); // plugins may have many listeners; 100 is a safe upper bound
 
@@ -376,6 +386,10 @@ export function pluginLifecycleManager(
       newStatus: to,
     });
 
+    if (to !== "ready") {
+      await reconcileAfterTransition(pluginId, result.pluginKey, to);
+    }
+
     return result;
   }
 
@@ -384,6 +398,64 @@ export function pluginLifecycleManager(
     payload: PluginLifecycleEvents[LifecycleEventName],
   ): void {
     emitter.emit(event, payload);
+  }
+
+  async function reconcileAfterTransition(
+    pluginId: string,
+    pluginKey: string,
+    status: PluginStatus,
+  ): Promise<void> {
+    try {
+      await reconcileManagedApplications();
+    } catch (err) {
+      log.error(
+        {
+          pluginId,
+          pluginKey,
+          status,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        "plugin lifecycle: failed to reconcile plugin-backed Apps after lifecycle transition; retrying in background",
+      );
+      scheduleReconciliationRetry(pluginId, pluginKey, status, 0);
+    }
+  }
+
+  function scheduleReconciliationRetry(
+    pluginId: string,
+    pluginKey: string,
+    status: PluginStatus,
+    attemptIndex: number,
+  ): void {
+    const delayMs = APP_RECONCILIATION_RETRY_DELAYS_MS[attemptIndex];
+    if (delayMs === undefined) return;
+    const timer = setTimeout(() => {
+      void reconcileManagedApplications().then(() => {
+        log.info(
+          { pluginId, pluginKey, status, retryAttempt: attemptIndex + 1 },
+          "plugin lifecycle: reconciled plugin-backed Apps on retry",
+        );
+      }).catch((err) => {
+        const retryAttempt = attemptIndex + 1;
+        const hasAnotherRetry = retryAttempt < APP_RECONCILIATION_RETRY_DELAYS_MS.length;
+        log[hasAnotherRetry ? "warn" : "error"](
+          {
+            pluginId,
+            pluginKey,
+            status,
+            retryAttempt,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          hasAnotherRetry
+            ? "plugin lifecycle: plugin-backed App reconciliation retry failed"
+            : "plugin lifecycle: exhausted plugin-backed App reconciliation retries",
+        );
+        if (hasAnotherRetry) {
+          scheduleReconciliationRetry(pluginId, pluginKey, status, retryAttempt);
+        }
+      });
+    }, delayMs);
+    timer.unref?.();
   }
 
   // -----------------------------------------------------------------------
@@ -466,6 +538,7 @@ export function pluginLifecycleManager(
     async load(pluginId: string): Promise<PluginRecord> {
       const result = await transition(pluginId, "ready");
       await activateReadyPlugin(pluginId);
+      await reconcileAfterTransition(pluginId, result.pluginKey, "ready");
 
       emitDomain("plugin.loaded", {
         pluginId,
@@ -501,6 +574,7 @@ export function pluginLifecycleManager(
 
       const result = await transition(pluginId, "ready", null, plugin);
       await activateReadyPlugin(pluginId);
+      await reconcileAfterTransition(pluginId, result.pluginKey, "ready");
       emitDomain("plugin.enabled", {
         pluginId,
         pluginKey: result.pluginKey,
@@ -552,6 +626,7 @@ export function pluginLifecycleManager(
             pluginKey: plugin.pluginKey,
             removeData: true,
           });
+          await reconcileAfterTransition(pluginId, plugin.pluginKey, "uninstalled");
           return deleted as PluginRecord | null;
         }
         throw badRequest(
@@ -583,6 +658,8 @@ export function pluginLifecycleManager(
         pluginKey: plugin.pluginKey,
         removeData,
       });
+
+      await reconcileAfterTransition(pluginId, plugin.pluginKey, "uninstalled");
 
       return result as PluginRecord | null;
     },
@@ -694,6 +771,7 @@ export function pluginLifecycleManager(
           manifestJson: newManifest,
         } as PluginRecord);
         await activateReadyPlugin(pluginId);
+        await reconcileAfterTransition(pluginId, result.pluginKey, "ready");
 
         emitDomain("plugin.loaded", {
           pluginId,

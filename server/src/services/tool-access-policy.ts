@@ -1396,6 +1396,7 @@ export function toolAccessPolicyService(db: Db) {
       actorId: ctx.actorId,
       agentId: ctx.agentId,
       issueId: ctx.issueId,
+      projectId: ctx.projectId,
       runId: ctx.heartbeatRunId,
       applicationId: ctx.applicationId,
       connectionId: ctx.connectionId,
@@ -1479,7 +1480,8 @@ export function toolAccessPolicyService(db: Db) {
         agentId: invocation.agentId,
         heartbeatRunId: invocation.runId,
         issueId: invocation.issueId,
-        projectId: invocation.issueId ? issueProjectById.get(invocation.issueId) ?? null : null,
+        projectId: invocation.projectId
+          ?? (invocation.issueId ? issueProjectById.get(invocation.issueId) ?? null : null),
         routineId: null,
         gatewayId: null,
         applicationId: invocation.applicationId,
@@ -1503,7 +1505,7 @@ export function toolAccessPolicyService(db: Db) {
 
   function trustRuleSelectors(input: {
     invocation: typeof toolInvocations.$inferSelect;
-    issueProjectId: string | null;
+    projectId: string | null;
     selectors?: ToolAccessSelector;
     scope?: CreateToolTrustRuleFromActionRequest["scope"];
   }): Record<string, unknown> {
@@ -1514,7 +1516,7 @@ export function toolAccessPolicyService(db: Db) {
       selectors[key] = value;
     };
     apply("agentId", input.invocation.agentId, scope.includeAgent ?? true);
-    apply("projectId", input.issueProjectId, scope.includeProject ?? true);
+    apply("projectId", input.projectId, scope.includeProject ?? true);
     apply("issueId", input.invocation.issueId, scope.includeIssue === true);
     apply("applicationId", input.invocation.applicationId, scope.includeApplication ?? true);
     apply("connectionId", input.invocation.connectionId, scope.includeConnection ?? true);
@@ -1535,11 +1537,11 @@ export function toolAccessPolicyService(db: Db) {
 
   function reviewedTrustRuleSelectorValues(input: {
     invocation: typeof toolInvocations.$inferSelect;
-    issueProjectId: string | null;
+    projectId: string | null;
   }): Record<string, string> {
     const reviewed: Record<string, string> = {};
     if (input.invocation.agentId) reviewed.agentId = input.invocation.agentId;
-    if (input.issueProjectId) reviewed.projectId = input.issueProjectId;
+    if (input.projectId) reviewed.projectId = input.projectId;
     if (input.invocation.applicationId) reviewed.applicationId = input.invocation.applicationId;
     if (input.invocation.connectionId) reviewed.connectionId = input.invocation.connectionId;
     if (input.invocation.toolName) reviewed.toolName = input.invocation.toolName;
@@ -1643,13 +1645,14 @@ export function toolAccessPolicyService(db: Db) {
         .where(and(eq(issues.id, invocation.issueId), eq(issues.companyId, input.companyId)))
         .limit(1)
       : [null];
+    const reviewedProjectId = invocation.projectId ?? issue?.projectId ?? null;
     const reviewedSelectors = reviewedTrustRuleSelectorValues({
       invocation,
-      issueProjectId: issue?.projectId ?? null,
+      projectId: reviewedProjectId,
     });
     const selectors = trustRuleSelectors({
       invocation,
-      issueProjectId: issue?.projectId ?? null,
+      projectId: reviewedProjectId,
       selectors: input.body.selectors,
       scope: input.body.scope,
     });

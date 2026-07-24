@@ -18,6 +18,7 @@ import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
+import { toolAccessService } from "../services/tool-access.js";
 import { forbidden, unprocessable } from "../errors.js";
 
 function hashToken(token: string) {
@@ -422,19 +423,29 @@ export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Exp
     .delete(instanceUserRoles)
     .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")));
 
-  await db
-    .insert(companies)
-    .values({
-      id: companyId,
-      name: companyName,
-      description: `Provisioned by Paperclip Cloud for stack ${stackId}.`,
-      status: "active",
-      issuePrefix: issuePrefixForCloudStack(stackId),
-      updatedAt: now,
-    })
-    .onConflictDoNothing({
-      target: companies.id,
-    });
+  await db.transaction(async (tx) => {
+    const insertedCompanies = await tx
+      .insert(companies)
+      .values({
+        id: companyId,
+        name: companyName,
+        description: `Provisioned by Paperclip Cloud for stack ${stackId}.`,
+        status: "active",
+        issuePrefix: issuePrefixForCloudStack(stackId),
+        updatedAt: now,
+      })
+      .onConflictDoNothing({
+        target: companies.id,
+      })
+      .returning({ id: companies.id });
+    // Keep first-time reconciliation on the provisioning path without running
+    // it for every authenticated request. Coupling both writes transactionally
+    // means a reconciliation failure rolls back the company insert, so repeat
+    // authentication retries the complete provisioning step.
+    if (insertedCompanies.length > 0) {
+      await toolAccessService(tx as unknown as Db).reconcilePluginApplications(companyId);
+    }
+  });
 
   const membershipRole = stackRole === "owner" || stackRole === "admin" ? "owner" : stackRole;
   const membership = await db

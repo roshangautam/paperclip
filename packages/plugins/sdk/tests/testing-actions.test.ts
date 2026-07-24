@@ -73,6 +73,21 @@ describe("createTestHarness action context", () => {
   });
 });
 
+describe("createTestHarness tool context", () => {
+  it("preserves an explicit null run id for Test-tab-style invocations", async () => {
+    const harness = createTestHarness({ manifest, capabilities: ["agent.tools.register"] });
+    harness.ctx.tools.register("inspect-run", {
+      displayName: "Inspect run",
+      description: "Returns the execution run id",
+      parametersSchema: { type: "object", properties: {} },
+    }, async (_params, runContext) => ({ data: { runId: runContext.runId } }));
+
+    await expect(harness.executeTool("inspect-run", {}, { runId: null })).resolves.toEqual({
+      data: { runId: null },
+    });
+  });
+});
+
 describe("createTestHarness config secret refs", () => {
   it("requires the binding capability and patches nested config", async () => {
     const secretRef = {

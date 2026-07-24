@@ -2631,7 +2631,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       if (!handler) throw new Error(`No tool handler registered for '${name}'`);
       const ctxToPass: ToolRunContext = {
         agentId: runCtx.agentId ?? "agent-test",
-        runId: runCtx.runId ?? randomUUID(),
+        runId: runCtx.runId === undefined ? randomUUID() : runCtx.runId,
         companyId: runCtx.companyId ?? "company-test",
         projectId: runCtx.projectId ?? "project-test",
       };

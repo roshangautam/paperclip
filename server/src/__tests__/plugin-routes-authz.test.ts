@@ -600,6 +600,38 @@ describe.sequential("plugin tool and bridge authz", () => {
     expect(executeTool).not.toHaveBeenCalled();
   });
 
+  it("rejects tool execution with a 400 when a runContext reference is not a valid UUID", async () => {
+    const executeTool = vi.fn();
+    const getTool = vi.fn();
+    const { app } = await createApp(boardActor(), {}, {
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool,
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: {},
+        runContext: {
+          agentId: agentA,
+          runId: "not-a-uuid",
+          companyId: companyA,
+          projectId: projectA,
+        },
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("runContext.runId");
+    expect(getTool).not.toHaveBeenCalled();
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
   it("rejects tool execution when any runContext reference is outside the company scope", async () => {
     const cases: Array<[string, Array<Array<Record<string, unknown>>>]> = [
       [

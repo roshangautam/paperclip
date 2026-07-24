@@ -18,6 +18,7 @@ import {
   issues,
   principalPermissionGrants,
   plugins,
+  projects,
   secretAccessEvents,
   toolAccessAuditEvents,
   toolActionRequests,
@@ -176,6 +177,50 @@ async function createAgent(db: ReturnType<typeof createDb>, companyId: string, s
     adapterConfig: {},
     runtimeConfig: {},
   }).returning().then((rows) => rows[0]!);
+}
+
+async function createManagedToolPlugin(
+  db: ReturnType<typeof createDb>,
+  input: {
+    status?: "installed" | "ready" | "disabled" | "error" | "upgrade_pending" | "uninstalled";
+    lastError?: string | null;
+    tools?: Array<{
+      name: string;
+      displayName: string;
+      description: string;
+      parametersSchema: Record<string, unknown>;
+    }>;
+  } = {},
+) {
+  const pluginKey = `ambitresearch.agent-identities-${randomUUID()}`;
+  const tools = input.tools ?? [{
+    name: "who_am_i",
+    displayName: "Who Am I",
+    description: "Return the active agent identity.",
+    parametersSchema: { type: "object" },
+  }];
+  const [plugin] = await db.insert(plugins).values({
+    pluginKey,
+    packageName: "@ambitresearch/paperclip-agent-identities",
+    version: "1.0.0",
+    apiVersion: 1,
+    categories: ["automation"],
+    status: input.status ?? "ready",
+    lastError: input.lastError ?? null,
+    manifestJson: {
+      id: pluginKey,
+      apiVersion: 1,
+      version: "1.0.0",
+      displayName: "Agent Identities",
+      description: "Manage agent identity profiles.",
+      author: "Ambit Research",
+      categories: ["automation"],
+      capabilities: ["agent.tools.register"],
+      entrypoints: { worker: "./dist/worker.js" },
+      tools,
+    },
+  }).returning();
+  return plugin!;
 }
 
 async function createIssueAndRun(db: ReturnType<typeof createDb>, companyId: string, agentId: string) {
@@ -452,6 +497,7 @@ describeEmbeddedPostgres("tool access service", () => {
     await db.delete(plugins);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
@@ -883,6 +929,564 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("repairs plugin-managed app names without seeding an existing empty profile or timestamp churn", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const pluginKey = `ambitresearch.agent-identities-${randomUUID()}`;
+    const staleName = `Plugin: ${pluginKey}`;
+    const staleAt = new Date("2026-01-01T00:00:00.000Z");
+    const [plugin] = await db.insert(plugins).values({
+      pluginKey,
+      packageName: "@ambitresearch/paperclip-agent-identities",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      status: "ready",
+      manifestJson: {
+        id: pluginKey,
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Agent Identities",
+        description: "Manage agent identity profiles.",
+        author: "Ambit Research",
+        categories: ["automation"],
+        capabilities: ["agent.tools.register"],
+        entrypoints: { worker: "./dist/worker.js" },
+        tools: [{
+          name: "who_am_i",
+          displayName: "Who Am I",
+          description: "Return the active agent identity.",
+          parametersSchema: { type: "object" },
+        }],
+      },
+    }).returning();
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: `paperclip_plugin:${pluginKey}`,
+      name: pluginKey,
+      type: "paperclip_plugin",
+      status: "active",
+      pluginId: plugin.id,
+      metadata: { source: "plugin_backfill", pluginKey },
+      updatedAt: staleAt,
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application.id,
+      name: staleName,
+      transport: "remote_http",
+      status: "active",
+      enabled: true,
+      config: { pluginKey, type: "paperclip_plugin" },
+      transportConfig: { pluginKey, type: "paperclip_plugin" },
+      healthStatus: "ok",
+      updatedAt: staleAt,
+    }).returning();
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `app:${connection.id}`,
+      name: staleName,
+      description: `Access profile for ${staleName}.`,
+      status: "active",
+      defaultAction: "deny",
+      updatedAt: staleAt,
+    }).returning();
+
+    await service.reconcilePluginApplications();
+
+    const applications = await service.listApplications(company.id);
+    const connections = await service.listConnections(company.id);
+    const profiles = await service.listProfiles(company.id);
+
+    expect(applications.find((item) => item.id === application.id)?.name).toBe("Agent Identities");
+    expect(connections.find((item) => item.id === connection.id)?.name).toBe("Plugin: Agent Identities");
+    expect(profiles.find((item) => item.id === profile.id)).toMatchObject({
+      name: "Plugin: Agent Identities",
+      description: "Access profile for Plugin: Agent Identities.",
+    });
+    const [catalogEntry] = await db.select().from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, connection.id));
+    const [profileEntry] = await db.select().from(toolProfileEntries)
+      .where(eq(toolProfileEntries.profileId, profile.id));
+    const [binding] = await db.select().from(toolProfileBindings)
+      .where(eq(toolProfileBindings.profileId, profile.id));
+    expect(catalogEntry).toMatchObject({
+      toolName: "who_am_i",
+      title: "Who Am I",
+      status: "active",
+      riskLevel: "read",
+      isReadOnly: true,
+    });
+    expect(profileEntry).toBeUndefined();
+    expect(binding).toBeUndefined();
+
+    const [repairedApplication] = await db.select().from(toolApplications)
+      .where(eq(toolApplications.id, application.id));
+    const [repairedConnection] = await db.select().from(toolConnections)
+      .where(eq(toolConnections.id, connection.id));
+    const [repairedProfile] = await db.select().from(toolProfiles)
+      .where(eq(toolProfiles.id, profile.id));
+
+    await service.reconcilePluginApplications();
+
+    const [unchangedApplication] = await db.select().from(toolApplications)
+      .where(eq(toolApplications.id, application.id));
+    const [unchangedConnection] = await db.select().from(toolConnections)
+      .where(eq(toolConnections.id, connection.id));
+    const [unchangedProfile] = await db.select().from(toolProfiles)
+      .where(eq(toolProfiles.id, profile.id));
+    expect(unchangedApplication.updatedAt).toEqual(repairedApplication.updatedAt);
+    expect(unchangedConnection.updatedAt).toEqual(repairedConnection.updatedAt);
+    expect(unchangedProfile.updatedAt).toEqual(repairedProfile.updatedAt);
+  });
+
+  it("only exempts catalog rows created by the legacy plugin backfill from quarantine", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const pluginKey = `ambitresearch.agent-identities-${randomUUID()}`;
+    const [plugin] = await db.insert(plugins).values({
+      pluginKey,
+      packageName: "@ambitresearch/paperclip-agent-identities",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      status: "ready",
+      manifestJson: {
+        id: pluginKey,
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Agent Identities",
+        description: "Manage agent identity profiles.",
+        author: "Ambit Research",
+        categories: ["automation"],
+        capabilities: ["agent.tools.register"],
+        entrypoints: { worker: "./dist/worker.js" },
+        tools: [
+          {
+            name: "update_identity",
+            displayName: "Update identity",
+            description: "Update an existing agent identity.",
+            parametersSchema: { type: "object" },
+          },
+          {
+            name: "delete_identity",
+            displayName: "Delete identity",
+            description: "Delete an agent identity.",
+            parametersSchema: { type: "object" },
+          },
+        ],
+      },
+    }).returning();
+    const [application] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: `paperclip_plugin:${pluginKey}`,
+      name: pluginKey,
+      type: "paperclip_plugin",
+      status: "active",
+      pluginId: plugin!.id,
+      metadata: { source: "plugin_backfill", pluginKey },
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      name: `Plugin: ${pluginKey}`,
+      transport: "remote_http",
+      status: "active",
+      enabled: true,
+      config: { pluginKey, type: "paperclip_plugin" },
+      transportConfig: { pluginKey, type: "paperclip_plugin" },
+      healthStatus: "ok",
+    }).returning();
+    await db.insert(toolCatalogEntries).values({
+      companyId: company.id,
+      applicationId: application!.id,
+      connectionId: connection!.id,
+      entryKind: "tool",
+      name: "update_identity",
+      toolName: "update_identity",
+      title: "Update identity",
+      description: "Legacy backfilled tool.",
+      inputSchema: {},
+      annotations: {},
+      riskLevel: "write",
+      isReadOnly: false,
+      isWrite: true,
+      isDestructive: false,
+      status: "active",
+      versionHash: "0123456789abcdef0123456789abcdef",
+      schemaHash: "fedcba9876543210fedcba9876543210",
+    });
+
+    await service.reconcilePluginApplications(company.id);
+
+    const catalog = await db.select().from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, connection!.id));
+    expect(catalog).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        toolName: "update_identity",
+        status: "active",
+        quarantineReason: null,
+      }),
+      expect.objectContaining({
+        toolName: "delete_identity",
+        status: "quarantined",
+        quarantineReason: "pending_review",
+      }),
+    ]));
+  });
+
+  it("preserves an unmarked canonical-key App and creates plugin-managed state under an alternate key", async () => {
+    const company = await createCompany(db);
+    const plugin = await createManagedToolPlugin(db);
+    const service = toolAccessService(db);
+    const canonicalKey = `paperclip_plugin:${plugin.pluginKey}`;
+    const [userApplication] = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: canonicalKey,
+      name: "Existing user App",
+      type: "mcp_http",
+      status: "active",
+      metadata: { source: "operator" },
+    }).returning();
+    const [userConnection] = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: userApplication!.id,
+      name: "Existing user connection",
+      transport: "remote_http",
+      status: "active",
+      enabled: true,
+      config: { url: "https://example.com/mcp" },
+      healthStatus: "unchecked",
+    }).returning();
+
+    await service.reconcilePluginApplications();
+
+    const [preservedApplication] = await db.select().from(toolApplications)
+      .where(eq(toolApplications.id, userApplication!.id));
+    const [preservedConnection] = await db.select().from(toolConnections)
+      .where(eq(toolConnections.id, userConnection!.id));
+    expect(preservedApplication).toMatchObject({
+      applicationKey: canonicalKey,
+      name: "Existing user App",
+      type: "mcp_http",
+      pluginId: null,
+      metadata: { source: "operator" },
+    });
+    expect(preservedConnection).toMatchObject({
+      applicationId: userApplication!.id,
+      name: "Existing user connection",
+      config: { url: "https://example.com/mcp" },
+    });
+
+    const [managedApplication] = await db.select().from(toolApplications)
+      .where(eq(toolApplications.pluginId, plugin.id));
+    expect(managedApplication).toMatchObject({
+      applicationKey: `${canonicalKey}:${plugin.id}`,
+      name: "Agent Identities",
+      type: "paperclip_plugin",
+      metadata: {
+        source: "plugin_reconciliation",
+        pluginKey: plugin.pluginKey,
+      },
+    });
+    const managedConnections = await db.select().from(toolConnections)
+      .where(eq(toolConnections.applicationId, managedApplication!.id));
+    expect(managedConnections).toHaveLength(1);
+    expect(managedConnections[0]!.id).not.toBe(userConnection!.id);
+  });
+
+  it("rejects user-created plugin-managed application types and keys", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    await expect(service.createApplication(company.id, {
+      name: "Reserved type",
+      type: "paperclip_plugin",
+    })).rejects.toThrow("reserved for managed plugin Apps");
+    await expect(service.createApplication(company.id, {
+      applicationKey: "paperclip_plugin:reserved-key",
+      name: "Reserved key",
+      type: "mcp_http",
+    })).rejects.toThrow("reserved for managed plugin Apps");
+  });
+
+  it("rejects identity changes that would detach and duplicate a managed plugin App", async () => {
+    const company = await createCompany(db);
+    const plugin = await createManagedToolPlugin(db);
+    const service = toolAccessService(db);
+    await service.reconcilePluginApplications();
+
+    const [application] = await db.select().from(toolApplications).where(and(
+      eq(toolApplications.companyId, company.id),
+      eq(toolApplications.pluginId, plugin.id),
+    ));
+    expect(application).toBeDefined();
+
+    await expect(service.updateApplication(application!.id, {
+      pluginId: null,
+    })).rejects.toThrow("Managed plugin App identity fields");
+    await expect(service.updateApplication(application!.id, {
+      metadata: { source: "operator" },
+    })).rejects.toThrow("Managed plugin App identity fields");
+
+    await service.reconcilePluginApplications();
+    const managedApplications = await db.select().from(toolApplications).where(and(
+      eq(toolApplications.companyId, company.id),
+      eq(toolApplications.pluginId, plugin.id),
+    ));
+    expect(managedApplications).toHaveLength(1);
+    expect(managedApplications[0]!.id).toBe(application!.id);
+  });
+
+  it("serializes concurrent plugin application reconciliation", async () => {
+    const company = await createCompany(db);
+    const plugin = await createManagedToolPlugin(db);
+    const service = toolAccessService(db);
+
+    await Promise.all([
+      service.reconcilePluginApplications(),
+      service.reconcilePluginApplications(),
+      service.reconcilePluginApplications(),
+    ]);
+
+    const applications = await db.select().from(toolApplications)
+      .where(and(
+        eq(toolApplications.companyId, company.id),
+        eq(toolApplications.applicationKey, `paperclip_plugin:${plugin.pluginKey}`),
+      ));
+    expect(applications).toHaveLength(1);
+    const connections = await db.select().from(toolConnections)
+      .where(eq(toolConnections.applicationId, applications[0]!.id));
+    expect(connections).toHaveLength(1);
+    const profiles = await db.select().from(toolProfiles)
+      .where(eq(toolProfiles.profileKey, `app:${connections[0]!.id}`));
+    expect(profiles).toHaveLength(1);
+    await expect(db.select().from(toolProfileEntries)
+      .where(eq(toolProfileEntries.profileId, profiles[0]!.id))).resolves.toHaveLength(1);
+    await expect(db.select().from(toolProfileBindings)
+      .where(eq(toolProfileBindings.profileId, profiles[0]!.id))).resolves.toHaveLength(1);
+  });
+
+  it("takes failed plugin Apps offline and restores their prior operator state", async () => {
+    const company = await createCompany(db);
+    const plugin = await createManagedToolPlugin(db);
+    const service = toolAccessService(db);
+    await service.reconcilePluginApplications();
+
+    const [application] = await db.select().from(toolApplications)
+      .where(eq(toolApplications.applicationKey, `paperclip_plugin:${plugin.pluginKey}`));
+    const [connection] = await db.select().from(toolConnections)
+      .where(eq(toolConnections.applicationId, application!.id));
+    const [profile] = await db.select().from(toolProfiles)
+      .where(eq(toolProfiles.profileKey, `app:${connection!.id}`));
+    await db.update(toolApplications).set({ status: "draft" })
+      .where(eq(toolApplications.id, application!.id));
+    await db.update(toolConnections).set({
+      status: "active",
+      enabled: false,
+      healthStatus: "unchecked",
+      healthMessage: "Operator paused this connection.",
+    }).where(eq(toolConnections.id, connection!.id));
+    await db.update(toolProfiles).set({ status: "draft" })
+      .where(eq(toolProfiles.id, profile!.id));
+
+    await db.update(plugins).set({ status: "error", lastError: "Worker exited" })
+      .where(eq(plugins.id, plugin.id));
+    await service.reconcilePluginApplications();
+
+    const [failedApplication] = await db.select().from(toolApplications)
+      .where(eq(toolApplications.id, application!.id));
+    const [failedConnection] = await db.select().from(toolConnections)
+      .where(eq(toolConnections.id, connection!.id));
+    const [failedProfile] = await db.select().from(toolProfiles)
+      .where(eq(toolProfiles.id, profile!.id));
+    expect(failedApplication).toMatchObject({ status: "disabled", archivedAt: null });
+    expect(failedConnection).toMatchObject({
+      status: "disabled",
+      enabled: false,
+      healthStatus: "error",
+      healthMessage: `Paperclip plugin ${plugin.pluginKey} reported an error: Worker exited`,
+    });
+    expect(failedProfile).toMatchObject({ status: "disabled" });
+
+    await db.update(plugins).set({ status: "ready", lastError: null })
+      .where(eq(plugins.id, plugin.id));
+    await service.reconcilePluginApplications();
+
+    const [recoveredApplication] = await db.select().from(toolApplications)
+      .where(eq(toolApplications.id, application!.id));
+    const [recoveredConnection] = await db.select().from(toolConnections)
+      .where(eq(toolConnections.id, connection!.id));
+    const [recoveredProfile] = await db.select().from(toolProfiles)
+      .where(eq(toolProfiles.id, profile!.id));
+    expect(recoveredApplication).toMatchObject({ status: "draft", archivedAt: null });
+    expect(recoveredConnection).toMatchObject({
+      status: "active",
+      enabled: false,
+      healthStatus: "unchecked",
+      healthMessage: "Operator paused this connection.",
+    });
+    expect(recoveredProfile).toMatchObject({ status: "draft" });
+    expect(recoveredApplication.metadata).not.toHaveProperty("pluginLifecycleRestore");
+    expect(recoveredConnection.config).not.toHaveProperty("pluginLifecycleRestore");
+    expect(recoveredProfile.metadata).not.toHaveProperty("pluginLifecycleRestore");
+  });
+
+  it("retires and restores plugin Apps when the final tool disappears or the plugin is deleted", async () => {
+    const company = await createCompany(db);
+    const plugin = await createManagedToolPlugin(db);
+    const service = toolAccessService(db);
+    await service.reconcilePluginApplications();
+
+    const originalManifest = plugin.manifestJson as Record<string, unknown>;
+    const [application] = await db.select().from(toolApplications)
+      .where(eq(toolApplications.applicationKey, `paperclip_plugin:${plugin.pluginKey}`));
+    const [connection] = await db.select().from(toolConnections)
+      .where(eq(toolConnections.applicationId, application!.id));
+    const [profile] = await db.select().from(toolProfiles)
+      .where(eq(toolProfiles.profileKey, `app:${connection!.id}`));
+
+    await db.update(plugins).set({ manifestJson: { ...originalManifest, tools: [] } })
+      .where(eq(plugins.id, plugin.id));
+    await service.reconcilePluginApplications();
+
+    await expect(db.select().from(toolApplications)
+      .where(eq(toolApplications.id, application!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "archived" })]);
+    await expect(db.select().from(toolConnections)
+      .where(eq(toolConnections.id, connection!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "archived", enabled: false })]);
+    await expect(db.select().from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, connection!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "removed" })]);
+    await expect(db.select().from(toolProfiles)
+      .where(eq(toolProfiles.id, profile!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "archived" })]);
+
+    await db.update(plugins).set({ manifestJson: originalManifest })
+      .where(eq(plugins.id, plugin.id));
+    await service.reconcilePluginApplications();
+    await expect(db.select().from(toolApplications)
+      .where(eq(toolApplications.id, application!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "active", archivedAt: null })]);
+    await expect(db.select().from(toolConnections)
+      .where(eq(toolConnections.id, connection!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "active", enabled: true })]);
+    await expect(db.select().from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, connection!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "active" })]);
+    await expect(db.select().from(toolProfiles)
+      .where(eq(toolProfiles.id, profile!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "active" })]);
+
+    await db.delete(plugins).where(eq(plugins.id, plugin.id));
+    await service.reconcilePluginApplications();
+    await expect(db.select().from(toolApplications)
+      .where(eq(toolApplications.id, application!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "archived", pluginId: null })]);
+    await expect(db.select().from(toolConnections)
+      .where(eq(toolConnections.id, connection!.id)))
+      .resolves.toEqual([expect.objectContaining({ status: "archived", enabled: false })]);
+  });
+
+  it("preserves operator-selected plugin tool access and agent bindings during reconciliation", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const service = toolAccessService(db);
+    const pluginKey = `ambitresearch.agent-identities-${randomUUID()}`;
+    await db.insert(plugins).values({
+      pluginKey,
+      packageName: "@ambitresearch/paperclip-agent-identities",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      status: "ready",
+      manifestJson: {
+        id: pluginKey,
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Agent Identities",
+        description: "Manage agent identity profiles.",
+        author: "Ambit Research",
+        categories: ["automation"],
+        capabilities: ["agent.tools.register"],
+        entrypoints: { worker: "./dist/worker.js" },
+        tools: [
+          {
+            name: "who_am_i",
+            displayName: "Who Am I",
+            description: "Return the active agent identity.",
+            parametersSchema: { type: "object" },
+          },
+          {
+            name: "get_identity",
+            displayName: "Get Identity",
+            description: "Return a configured agent identity.",
+            parametersSchema: { type: "object" },
+          },
+        ],
+      },
+    });
+
+    await service.reconcilePluginApplications();
+
+    const [connection] = (await service.listConnections(company.id))
+      .filter((item) => item.config.pluginKey === pluginKey);
+    const [profile] = (await service.listProfiles(company.id))
+      .filter((item) => item.profileKey === `app:${connection!.id}`);
+    expect(profile).toMatchObject({
+      entries: [{
+        selectorType: "connection",
+        effect: "include",
+        connectionId: connection!.id,
+      }],
+      bindings: [{
+        targetType: "company",
+        targetId: company.id,
+        priority: 100,
+      }],
+    });
+    const catalog = await db.select().from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, connection!.id))
+      .orderBy(toolCatalogEntries.toolName);
+    const selectedTool = catalog.find((entry) => entry.toolName === "who_am_i")!;
+
+    await service.updateProfile(profile!.id, {
+      entries: [{ selectorType: "catalog_entry", effect: "include", catalogEntryId: selectedTool.id }],
+    });
+    await service.unbindProfile(profile!.id, { targetType: "company", targetId: company.id });
+    await service.bindProfile(
+      profile!.id,
+      { targetType: "agent", targetId: agent!.id, priority: 25 },
+      { actorType: "user", actorId: "board" },
+    );
+
+    await service.reconcilePluginApplications();
+
+    const [reconciledProfile] = (await service.listProfiles(company.id))
+      .filter((item) => item.id === profile!.id);
+    expect(reconciledProfile).toMatchObject({
+      entries: [{
+        selectorType: "catalog_entry",
+        effect: "include",
+        catalogEntryId: selectedTool.id,
+      }],
+      bindings: [{
+        targetType: "agent",
+        targetId: agent!.id,
+        priority: 25,
+      }],
+    });
+
+    await service.updateProfile(profile!.id, { entries: [] });
+    await service.unbindProfile(profile!.id, { targetType: "agent", targetId: agent!.id });
+    await service.reconcilePluginApplications();
+
+    const [unassignedProfile] = (await service.listProfiles(company.id))
+      .filter((item) => item.id === profile!.id);
+    expect(unassignedProfile).toMatchObject({ entries: [], bindings: [] });
+  });
+
   it("sends the MCP Streamable HTTP Accept header and decodes an SSE catalog response", async () => {
     const company = await createCompany(db);
     const service = toolAccessService(db);
@@ -1223,6 +1827,47 @@ describeEmbeddedPostgres("tool access service", () => {
         offCount: 0,
       },
     });
+  });
+
+  it("rejects invalid project ids on Test access summaries", async () => {
+    const company = await createCompany(db);
+    const userId = `tool-tester-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, ["tools:use"]);
+    await createAgent(db, company.id);
+    const { connection } = await createRemoteToolFixture(db, company.id);
+    const app = createRouteApp(
+      db,
+      boardSessionActor(company.id, "operator", userId),
+      createToolGatewayService(db, { toolActionSigningSecret: "test-secret" }),
+    );
+
+    await request(app)
+      .get(`/api/tool-connections/${connection.id}/test-agents?projectId=not-a-uuid`)
+      .expect(400);
+  });
+
+  it("rejects Test summary projects that belong to another company", async () => {
+    const company = await createCompany(db);
+    const userId = `tool-tester-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, ["tools:use"]);
+    await createAgent(db, company.id);
+    const { connection } = await createRemoteToolFixture(db, company.id);
+    const otherCompany = await createCompany(db);
+    const [otherProject] = await db.insert(projects).values({
+      companyId: otherCompany.id,
+      name: `Other company project ${randomUUID()}`,
+    }).returning();
+    const app = createRouteApp(
+      db,
+      boardSessionActor(company.id, "operator", userId),
+      createToolGatewayService(db, { toolActionSigningSecret: "test-secret" }),
+    );
+
+    const response = await request(app)
+      .get(`/api/tool-connections/${connection.id}/test-agents?projectId=${otherProject!.id}`)
+      .expect(404);
+
+    expect(response.body).toMatchObject({ reasonCode: "test_project_not_found" });
   });
 
   it("surfaces a last-changed audit hint attributed to the agent that authored the governing policy", async () => {
@@ -6072,6 +6717,46 @@ describeEmbeddedPostgres("tool access service", () => {
       expect.objectContaining({ targetType: "agent", targetId: agent.id }),
     ]));
   });
+
+  it("preserves customized app-profile constraints when installs change", async () => {
+    const company = await createCompany(db);
+    const firstAgent = await createAgent(db, company.id);
+    const secondAgent = await createAgent(db, company.id);
+    const { connection } = await createRemoteToolFixture(db, company.id);
+    const service = toolAccessService(db);
+
+    await service.putConnectionInstalls(connection.id, {
+      installs: [{ targetType: "agent", targetId: firstAgent.id }],
+    });
+    const [profile] = await db.select().from(toolProfiles)
+      .where(eq(toolProfiles.profileKey, `app:${connection.id}`));
+    const [catalogEntry] = await db.select().from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, connection.id));
+    await service.updateProfile(profile!.id, {
+      entries: [{
+        selectorType: "catalog_entry",
+        effect: "include",
+        catalogEntryId: catalogEntry!.id,
+      }],
+    });
+
+    await service.putConnectionInstalls(connection.id, {
+      installs: [
+        { targetType: "agent", targetId: firstAgent.id },
+        { targetType: "agent", targetId: secondAgent.id },
+      ],
+    });
+
+    const [updatedProfile] = (await service.listProfiles(company.id))
+      .filter((item) => item.id === profile!.id);
+    expect(updatedProfile).toMatchObject({
+      entries: [{
+        selectorType: "catalog_entry",
+        effect: "include",
+        catalogEntryId: catalogEntry!.id,
+      }],
+    });
+  });
 });
 
 describe("classifyRisk", () => {
@@ -6103,7 +6788,14 @@ describe("classifyRisk", () => {
     expect(risk("delete_widget")).toBe("destructive");
     expect(risk("github:delete_repo")).toBe("destructive");
     expect(risk("notion:remove_page")).toBe("destructive");
+    expect(risk("database:drop_table")).toBe("destructive");
+    expect(risk("cache:purge_entries")).toBe("destructive");
     expect(risk("cms:unpublish_post")).toBe("destructive");
+  });
+
+  it("classifies patch and merge operations as write", () => {
+    expect(risk("github:patch_issue")).toBe("write");
+    expect(risk("github:merge_pull_request")).toBe("write");
   });
 
   it("classifies read verbs and noise as read", () => {

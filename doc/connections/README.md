@@ -79,6 +79,16 @@ pages, its own tables, workers, migrations, routines, or specialized ingestion.
 A plugin may bundle catalog entries, but it must not bypass the connection,
 profile, policy, credential, and audit model.
 
+When a plugin declares tools, Paperclip exposes it as a managed app using the
+manifest `displayName` for the app, connection, and generated profile labels;
+the manifest `id` remains the stable internal plugin key. Each registered tool
+must be joined to its active connection catalog entry. This lets the Apps
+**Test** tab and agent sessions evaluate profile/policy state and dispatch calls
+through the plugin worker while preserving the normal invocation and audit
+trail. The `paperclip_plugin` application type and `paperclip_plugin:` key
+namespace are reserved for these reconciled records; operator-created Apps are
+never adopted or overwritten solely because their key resembles a plugin key.
+
 Use a **skill** for agent instructions. Skills may use connections; they must
 not own durable tokens.
 

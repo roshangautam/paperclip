@@ -17,6 +17,7 @@ import {
   issueThreadInteractions,
   issues,
   principalPermissionGrants,
+  plugins,
   projects,
   toolAccessAuditEvents,
   toolActionRequests,
@@ -39,7 +40,7 @@ import {
 } from "@paperclipai/db";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
-import { toolAccessService } from "../services/tool-access.js";
+import { descriptorHash, toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 import { secretService } from "../services/secrets.js";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "../../../packages/kv-demo-mcp-server/src/http.js";
@@ -260,6 +261,130 @@ async function createRemoteMcpTool(
     quarantinedAt: input.quarantinedAt ?? null,
   }).returning();
   return { application, connection: connection!, catalogEntry: catalogEntry! };
+}
+
+async function createConnectedPluginTool(
+  db: Db,
+  companyId: string,
+  input: {
+    pluginKey?: string;
+    displayName?: string;
+    toolName?: string;
+    toolDisplayName?: string;
+    riskLevel?: "read" | "write" | "destructive";
+  } = {},
+) {
+  const pluginKey = input.pluginKey ?? `ambitresearch.test-plugin-${randomUUID()}`;
+  const displayName = input.displayName ?? "Test plugin";
+  const toolName = input.toolName ?? "read_status";
+  const toolDisplayName = input.toolDisplayName ?? "Read status";
+  const riskLevel = input.riskLevel ?? "read";
+  const [plugin] = await db.insert(plugins).values({
+    pluginKey,
+    packageName: `@ambitresearch/${pluginKey.split(".").at(-1)}`,
+    version: "1.0.0",
+    apiVersion: 1,
+    categories: ["automation"],
+    status: "ready",
+    manifestJson: {
+      id: pluginKey,
+      apiVersion: 1,
+      version: "1.0.0",
+      displayName,
+      description: `${displayName} test fixture.`,
+      author: "Ambit Research",
+      categories: ["automation"],
+      capabilities: ["agent.tools.register"],
+      entrypoints: { worker: "./dist/worker.js" },
+      tools: [{
+        name: toolName,
+        displayName: toolDisplayName,
+        description: `Call ${toolDisplayName}.`,
+        parametersSchema: { type: "object", properties: { id: { type: "string" } } },
+      }],
+    },
+  }).returning();
+  const [application] = await db.insert(toolApplications).values({
+    companyId,
+    applicationKey: `paperclip_plugin:${pluginKey}`,
+    name: displayName,
+    type: "paperclip_plugin",
+    status: "active",
+    pluginId: plugin.id,
+  }).returning();
+  const [connection] = await db.insert(toolConnections).values({
+    companyId,
+    applicationId: application.id,
+    name: `Plugin: ${displayName}`,
+    transport: "remote_http",
+    status: "active",
+    enabled: true,
+    healthStatus: "ok",
+    config: { pluginKey, type: "paperclip_plugin" },
+    transportConfig: { pluginKey, type: "paperclip_plugin" },
+  }).returning();
+  const [catalogEntry] = await db.insert(toolCatalogEntries).values({
+    companyId,
+    applicationId: application.id,
+    connectionId: connection.id,
+    entryKind: "tool",
+    name: toolName,
+    toolName,
+    title: toolDisplayName,
+    description: `Call ${toolDisplayName}.`,
+    inputSchema: { type: "object", properties: { id: { type: "string" } } },
+    annotations: {},
+    riskLevel,
+    isReadOnly: riskLevel === "read",
+    isWrite: riskLevel === "write",
+    isDestructive: riskLevel === "destructive",
+    status: "active",
+    versionHash: descriptorHash({
+      name: toolName,
+      title: toolDisplayName,
+      description: `Call ${toolDisplayName}.`,
+      inputSchema: { type: "object", properties: { id: { type: "string" } } },
+      annotations: {},
+    }),
+  }).returning();
+  return {
+    plugin,
+    application,
+    connection,
+    catalogEntry,
+    namespacedToolName: `${pluginKey}:${toolName}`,
+  };
+}
+
+type ConnectedPluginTool = Awaited<ReturnType<typeof createConnectedPluginTool>>;
+
+function createPluginDispatcher(
+  pluginTool: ConnectedPluginTool,
+  executeTool?: PluginToolDispatcher["executeTool"],
+): PluginToolDispatcher {
+  return {
+    initialize: async () => {},
+    teardown: () => {},
+    listToolsForAgent: () => [{
+      name: pluginTool.namespacedToolName,
+      displayName: pluginTool.catalogEntry.title!,
+      description: pluginTool.catalogEntry.description!,
+      parametersSchema: pluginTool.catalogEntry.inputSchema as Record<string, unknown>,
+      pluginId: pluginTool.plugin.id,
+    }],
+    getTool: () => null,
+    executeTool: executeTool ?? (async () => ({
+      pluginId: pluginTool.plugin.id,
+      toolName: pluginTool.catalogEntry.toolName,
+      result: { content: "plugin ok", data: { ok: true } },
+    })),
+    registerPluginTools: () => {},
+    unregisterPluginTools: () => {},
+    toolCount: () => 1,
+    getRegistry: () => {
+      throw new Error("not used");
+    },
+  };
 }
 
 async function createLocalStdioMcpTool(
@@ -503,6 +628,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     await db.delete(toolProfiles);
     await db.delete(toolConnections);
     await db.delete(toolApplications);
+    await db.delete(plugins);
     await db.delete(secretAccessEvents);
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
@@ -3827,24 +3953,30 @@ rl.on("line", (line) => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run, project } = await createIssueAndRun(db, company.id, agent.id);
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      pluginKey: `ambitresearch.demo-plugin-${randomUUID()}`,
+      displayName: "Demo plugin",
+      toolName: "read_status",
+      toolDisplayName: "Read status",
+    });
     const calls: unknown[] = [];
     const dispatcher: PluginToolDispatcher = {
       initialize: async () => {},
       teardown: () => {},
       listToolsForAgent: () => [
         {
-          name: "demo-plugin:read_status",
-          displayName: "Read status",
-          description: "Read status through a plugin tool.",
-          parametersSchema: { type: "object" },
-          pluginId: "demo-plugin",
+          name: pluginTool.namespacedToolName,
+          displayName: pluginTool.catalogEntry.title!,
+          description: pluginTool.catalogEntry.description!,
+          parametersSchema: pluginTool.catalogEntry.inputSchema as Record<string, unknown>,
+          pluginId: pluginTool.plugin.id,
         },
       ],
       getTool: () => null,
       executeTool: async (tool, parameters, runContext) => {
         calls.push({ tool, parameters, runContext });
         return {
-          pluginId: "demo-plugin",
+          pluginId: pluginTool.plugin.id,
           toolName: "read_status",
           result: { content: "plugin ok", data: { ok: true } },
         };
@@ -3861,7 +3993,7 @@ rl.on("line", (line) => {
     await expect(gateway.listPluginToolsForAgent({ companyId: company.id, agentId: agent.id })).resolves.toEqual([]);
     await gateway.executePluginTool({
       actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
-      tool: "demo-plugin:read_status",
+      tool: pluginTool.namespacedToolName,
       parameters: {},
       runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id },
     }).then(
@@ -3871,27 +4003,699 @@ rl.on("line", (line) => {
       (error) => expectGatewayError(error, 403, "deny_default"),
     );
 
-    await allowToolsForAgent(db, company.id, agent.id, ["demo-plugin:read_status"]);
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
 
     await expect(gateway.listPluginToolsForAgent({ companyId: company.id, agentId: agent.id })).resolves.toEqual([
-      expect.objectContaining({ name: "demo-plugin:read_status" }),
+      expect.objectContaining({
+        name: pluginTool.namespacedToolName,
+        pluginId: pluginTool.plugin.id,
+      }),
     ]);
+    await expect(gateway.summarizeConnectionAccessForAgent({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      projectId: project.id,
+    })).resolves.toMatchObject({
+      toolCount: 1,
+      allowedCount: 1,
+      askFirstCount: 0,
+      offCount: 0,
+    });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const visiblePluginTools = (await gateway.listToolsForSession(session.token))
+      .filter((tool) => tool.name === pluginTool.namespacedToolName);
+    expect(visiblePluginTools).toHaveLength(1);
+    expect(visiblePluginTools[0]).toMatchObject({
+      providerType: "paperclip_plugin",
+      applicationId: pluginTool.application.id,
+      connectionId: pluginTool.connection.id,
+      catalogEntryId: pluginTool.catalogEntry.id,
+    });
     await expect(gateway.executePluginTool({
       actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
-      tool: "demo-plugin:read_status",
+      tool: pluginTool.namespacedToolName,
       parameters: { id: "1" },
       runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id },
     })).resolves.toMatchObject({
-      pluginId: "demo-plugin",
+      pluginId: pluginTool.plugin.id,
       toolName: "read_status",
       result: { content: "plugin ok", data: { ok: true } },
     });
     expect(calls).toEqual([
       expect.objectContaining({
-        tool: "demo-plugin:read_status",
+        tool: pluginTool.namespacedToolName,
         parameters: { id: "1" },
       }),
     ]);
+  });
+
+  it("executes an agent-origin plugin call after ask-first approval", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { issue, run, project } = await createIssueAndRun(db, company.id, agent.id);
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "update_identity",
+      toolDisplayName: "Update identity",
+      riskLevel: "write",
+    });
+    const calls: Array<{ tool: string; parameters: unknown; runContext: unknown }> = [];
+    const dispatcher = createPluginDispatcher(pluginTool, async (tool, parameters, runContext) => {
+      calls.push({ tool, parameters, runContext });
+      return {
+        pluginId: pluginTool.plugin.id,
+        toolName: pluginTool.catalogEntry.toolName,
+        result: { content: "identity updated", data: { ok: true } },
+      };
+    });
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review plugin writes",
+      policyType: "require_approval",
+      selectors: { connectionId: pluginTool.connection.id },
+      description: "Plugin writes require review.",
+    });
+
+    await gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "approved" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id },
+    }).then(
+      () => {
+        throw new Error("Expected plugin tool call to request approval");
+      },
+      (error) => expectGatewayError(error, 409, "approval_required"),
+    );
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    expect(actionRequest).toMatchObject({
+      companyId: company.id,
+      issueId: issue.id,
+      status: "pending",
+    });
+    await gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest!.id,
+      actor: { userId: "board-user" },
+    });
+
+    const [invocation] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, actionRequest!.invocationId));
+    expect(invocation).toMatchObject({
+      status: "succeeded",
+      approvalState: "approved",
+      providerType: "paperclip_plugin",
+      runId: run.id,
+      projectId: project.id,
+    });
+    expect(calls).toEqual([{
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "approved" },
+      runContext: {
+        agentId: agent.id,
+        companyId: company.id,
+        runId: run.id,
+        projectId: project.id,
+      },
+    }]);
+  });
+
+  it("executes allowed and approved plugin calls from the Test tab", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const project = await db.insert(projects).values({
+      companyId: company.id,
+      name: `Plugin test project ${randomUUID()}`,
+    }).returning().then((rows) => rows[0]!);
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "identity_lookup",
+      toolDisplayName: "Identity lookup",
+      riskLevel: "write",
+    });
+    const calls: Array<{ tool: string; parameters: unknown; runContext: unknown }> = [];
+    const dispatcher: PluginToolDispatcher = {
+      initialize: async () => {},
+      teardown: () => {},
+      listToolsForAgent: () => [{
+        name: pluginTool.namespacedToolName,
+        displayName: pluginTool.catalogEntry.title!,
+        description: pluginTool.catalogEntry.description!,
+        parametersSchema: pluginTool.catalogEntry.inputSchema as Record<string, unknown>,
+        pluginId: pluginTool.plugin.id,
+      }],
+      getTool: () => null,
+      executeTool: async (tool, parameters, runContext) => {
+        calls.push({ tool, parameters, runContext });
+        return {
+          pluginId: pluginTool.plugin.id,
+          toolName: pluginTool.catalogEntry.toolName,
+          result: { content: "plugin test ok", data: { ok: true } },
+        };
+      },
+      registerPluginTools: () => {},
+      unregisterPluginTools: () => {},
+      toolCount: () => 1,
+      getRegistry: () => {
+        throw new Error("not used");
+      },
+    };
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+
+    const allowed = await gateway.executeTestCall({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      userId: "board-user",
+      toolName: pluginTool.catalogEntry.toolName,
+      projectId: project.id,
+      parameters: { id: "allowed" },
+    });
+    expect(allowed).toMatchObject({
+      decision: "allowed",
+      result: { content: "plugin test ok", data: { ok: true } },
+    });
+    expect(calls[0]).toMatchObject({
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "allowed" },
+      runContext: {
+        agentId: agent.id,
+        companyId: company.id,
+        runId: null,
+        projectId: project.id,
+      },
+    });
+
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review plugin test calls",
+      policyType: "require_approval",
+      selectors: { connectionId: pluginTool.connection.id },
+      description: "Plugin Test calls need review.",
+      priority: 10,
+    });
+    const askFirst = await gateway.executeTestCall({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      userId: "board-user",
+      toolName: pluginTool.namespacedToolName,
+      projectId: project.id,
+      parameters: { id: "approved" },
+    });
+    expect(askFirst).toMatchObject({
+      decision: "ask_first",
+      invocationId: expect.any(String),
+      actionRequestId: expect.any(String),
+    });
+    if (askFirst.decision !== "ask_first") throw new Error("Expected ask-first plugin Test call");
+    await gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: askFirst.actionRequestId,
+      actor: { userId: "board-user" },
+    });
+    const [approvedInvocation] = await db
+      .select()
+      .from(toolInvocations)
+      .where(eq(toolInvocations.id, askFirst.invocationId));
+    expect(approvedInvocation).toMatchObject({
+      status: "succeeded",
+      providerType: "paperclip_plugin",
+      connectionId: pluginTool.connection.id,
+      catalogEntryId: pluginTool.catalogEntry.id,
+    });
+    expect(calls[1]).toMatchObject({
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "approved" },
+      runContext: {
+        runId: null,
+        projectId: project.id,
+      },
+    });
+
+    const [deletedProject] = await db.insert(projects).values({
+      companyId: company.id,
+      name: `Deleted before approval ${randomUUID()}`,
+    }).returning();
+    const orphaned = await gateway.executeTestCall({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      userId: "board-user",
+      toolName: pluginTool.namespacedToolName,
+      projectId: deletedProject!.id,
+      parameters: { id: "must-not-run" },
+    });
+    if (orphaned.decision !== "ask_first") throw new Error("Expected ask-first plugin Test call");
+    await db.delete(projects).where(eq(projects.id, deletedProject!.id));
+
+    await gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: orphaned.actionRequestId,
+      actor: { userId: "board-user" },
+    });
+
+    const [orphanedInvocation] = await db
+      .select()
+      .from(toolInvocations)
+      .where(eq(toolInvocations.id, orphaned.invocationId));
+    expect(orphanedInvocation).toMatchObject({
+      status: "failed",
+      providerType: "paperclip_plugin",
+      projectId: null,
+      errorCode: "test_project_not_found",
+      errorMessage: "The project selected for this plugin Test call no longer exists in this company",
+    });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("resumes an approved plugin Test call that is still awaiting execution exactly once", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const [project] = await db.insert(projects).values({
+      companyId: company.id,
+      name: `Retry plugin Test project ${randomUUID()}`,
+    }).returning();
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "identity_lookup_retry",
+      toolDisplayName: "Identity lookup retry",
+      riskLevel: "write",
+    });
+    const calls: Array<{ tool: string; parameters: unknown; runContext: unknown }> = [];
+    const dispatcher = createPluginDispatcher(pluginTool, async (tool, parameters, runContext) => {
+      calls.push({ tool, parameters, runContext });
+      return {
+        pluginId: pluginTool.plugin.id,
+        toolName: pluginTool.catalogEntry.toolName,
+        result: { content: "resumed plugin test", data: { ok: true } },
+      };
+    });
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review retried plugin Test calls",
+      policyType: "require_approval",
+      selectors: { connectionId: pluginTool.connection.id },
+      description: "Plugin Test calls need review.",
+      priority: 10,
+    });
+
+    const askFirst = await gateway.executeTestCall({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      userId: "board-user",
+      toolName: pluginTool.namespacedToolName,
+      projectId: project!.id,
+      parameters: { id: "resumed" },
+    });
+    if (askFirst.decision !== "ask_first") throw new Error("Expected ask-first plugin Test call");
+
+    const approvedAt = new Date();
+    await db
+      .update(toolActionRequests)
+      .set({
+        status: "approved",
+        decidedByUserId: "board-user",
+        resolvedByUserId: "board-user",
+        decidedAt: approvedAt,
+        resolvedAt: approvedAt,
+        updatedAt: approvedAt,
+      })
+      .where(eq(toolActionRequests.id, askFirst.actionRequestId));
+    await db
+      .update(toolInvocations)
+      .set({ approvalState: "approved", updatedAt: approvedAt })
+      .where(eq(toolInvocations.id, askFirst.invocationId));
+
+    await Promise.all([
+      gateway.approveActionRequest({
+        companyId: company.id,
+        actionRequestId: askFirst.actionRequestId,
+        actor: { userId: "board-user" },
+      }),
+      gateway.approveActionRequest({
+        companyId: company.id,
+        actionRequestId: askFirst.actionRequestId,
+        actor: { userId: "board-user" },
+      }),
+    ]);
+
+    const [invocation] = await db
+      .select()
+      .from(toolInvocations)
+      .where(eq(toolInvocations.id, askFirst.invocationId));
+    expect(invocation).toMatchObject({
+      status: "succeeded",
+      approvalState: "approved",
+      providerType: "paperclip_plugin",
+      projectId: project!.id,
+    });
+    expect(calls).toEqual([{
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "resumed" },
+      runContext: {
+        agentId: agent.id,
+        companyId: company.id,
+        runId: null,
+        projectId: project!.id,
+      },
+    }]);
+  });
+
+  it("requires a company project before executing a plugin Test call", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "who_am_i",
+      toolDisplayName: "Who Am I",
+    });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+    const dispatcher = createPluginDispatcher(pluginTool);
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+
+    await gateway.executeTestCall({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      userId: "board-user",
+      toolName: pluginTool.catalogEntry.toolName,
+      parameters: {},
+    }).then(
+      () => {
+        throw new Error("Expected plugin Test call without a project to fail");
+      },
+      (error) => expectGatewayError(error, 422, "plugin_test_project_required"),
+    );
+
+    expect(await db.select().from(toolInvocations)).toHaveLength(0);
+  });
+
+  it("rejects a plugin Test project owned by another company", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const pluginTool = await createConnectedPluginTool(db, company.id);
+    const otherCompany = await createCompany(db);
+    const [otherProject] = await db.insert(projects).values({
+      companyId: otherCompany.id,
+      name: `Other company project ${randomUUID()}`,
+    }).returning();
+    const gateway = createTestToolGatewayService(db, {
+      pluginToolDispatcher: createPluginDispatcher(pluginTool),
+    });
+
+    await gateway.executeTestCall({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      userId: "board-user",
+      toolName: pluginTool.catalogEntry.toolName,
+      projectId: otherProject!.id,
+      parameters: {},
+    }).then(
+      () => {
+        throw new Error("Expected a cross-company Test project to fail");
+      },
+      (error) => expectGatewayError(error, 404, "test_project_not_found"),
+    );
+
+    expect(await db.select().from(toolInvocations)).toHaveLength(0);
+  });
+
+  it("uses the same selected project for plugin Test summaries and execution", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const [allowedProject, offProject] = await db.insert(projects).values([
+      { companyId: company.id, name: `Allowed project ${randomUUID()}` },
+      { companyId: company.id, name: `Off project ${randomUUID()}` },
+    ]).returning();
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      toolName: "identity_lookup",
+      toolDisplayName: "Identity lookup",
+    });
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company.id,
+      profileKey: `project-test-${randomUUID()}`,
+      name: "Project-scoped plugin Test access",
+      defaultAction: "deny",
+    }).returning();
+    await db.insert(toolProfileBindings).values({
+      companyId: company.id,
+      profileId: profile!.id,
+      targetType: "project",
+      targetId: allowedProject!.id,
+    });
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: profile!.id,
+      selectorType: "tool_name",
+      effect: "include",
+      toolName: pluginTool.namespacedToolName,
+    });
+    const gateway = createTestToolGatewayService(db, {
+      pluginToolDispatcher: createPluginDispatcher(pluginTool),
+    });
+
+    await expect(gateway.summarizeConnectionAccessForAgent({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      projectId: allowedProject!.id,
+    })).resolves.toMatchObject({ allowedCount: 1, offCount: 0 });
+    await expect(gateway.summarizeConnectionAccessForAgent({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      projectId: offProject!.id,
+    })).resolves.toMatchObject({ allowedCount: 0, offCount: 1 });
+
+    const allowed = await gateway.executeTestCall({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      userId: "board-user",
+      toolName: pluginTool.catalogEntry.toolName,
+      projectId: allowedProject!.id,
+      parameters: { id: "allowed" },
+    });
+    expect(allowed.decision).toBe("allowed");
+    const off = await gateway.executeTestCall({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      userId: "board-user",
+      toolName: pluginTool.catalogEntry.toolName,
+      projectId: offProject!.id,
+      parameters: { id: "off" },
+    });
+    expect(off.decision).toBe("off");
+
+    const invocations = await db.select().from(toolInvocations);
+    expect(invocations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: allowed.invocationId, projectId: allowedProject!.id }),
+      expect.objectContaining({ id: off.invocationId, projectId: offProject!.id }),
+    ]));
+  });
+
+  it("hides and rejects plugin tools when governed runtime state is stale or unavailable", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run, project } = await createIssueAndRun(db, company.id, agent.id);
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "who_am_i",
+      toolDisplayName: "Who Am I",
+    });
+    let dispatchCount = 0;
+    const dispatcher = createPluginDispatcher(pluginTool, async () => {
+      dispatchCount += 1;
+      return {
+        pluginId: pluginTool.plugin.id,
+        toolName: pluginTool.catalogEntry.toolName,
+        result: { content: "plugin ok" },
+      };
+    });
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+
+    await expect(gateway.listPluginToolsForAgent({ companyId: company.id, agentId: agent.id }))
+      .resolves.toHaveLength(1);
+
+    await db.update(toolCatalogEntries)
+      .set({ versionHash: randomUUID() })
+      .where(eq(toolCatalogEntries.id, pluginTool.catalogEntry.id));
+    await expect(gateway.listPluginToolsForAgent({ companyId: company.id, agentId: agent.id }))
+      .resolves.toEqual([]);
+    await gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: pluginTool.namespacedToolName,
+      parameters: {},
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id },
+    }).then(
+      () => {
+        throw new Error("Expected a stale plugin catalog descriptor to be rejected");
+      },
+      (error) => expectGatewayError(error, 404, "tool_not_found"),
+    );
+
+    await db.update(toolCatalogEntries)
+      .set({ versionHash: pluginTool.catalogEntry.versionHash })
+      .where(eq(toolCatalogEntries.id, pluginTool.catalogEntry.id));
+    await db.update(toolConnections)
+      .set({ status: "disabled" })
+      .where(eq(toolConnections.id, pluginTool.connection.id));
+    await expect(gateway.listPluginToolsForAgent({ companyId: company.id, agentId: agent.id }))
+      .resolves.toEqual([]);
+
+    await db.update(toolConnections)
+      .set({ status: "active", healthStatus: "failed" })
+      .where(eq(toolConnections.id, pluginTool.connection.id));
+    await expect(gateway.listPluginToolsForAgent({ companyId: company.id, agentId: agent.id }))
+      .resolves.toEqual([]);
+    expect(dispatchCount).toBe(0);
+  });
+
+  it("records plugin error envelopes as failed Test invocations", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const [project] = await db.insert(projects).values({
+      companyId: company.id,
+      name: `Plugin test project ${randomUUID()}`,
+    }).returning();
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "who_am_i",
+      toolDisplayName: "Who Am I",
+    });
+    const dispatcher = createPluginDispatcher(pluginTool, async () => ({
+      pluginId: pluginTool.plugin.id,
+      toolName: pluginTool.catalogEntry.toolName,
+      result: { error: "Identity is not configured" },
+    }));
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+
+    const failed = await gateway.executeTestCall({
+      companyId: company.id,
+      connectionId: pluginTool.connection.id,
+      agentId: agent.id,
+      userId: "board-user",
+      toolName: pluginTool.catalogEntry.toolName,
+      projectId: project!.id,
+      parameters: {},
+    });
+    expect(failed).toMatchObject({
+      decision: "allowed",
+      error: {
+        message: "Identity is not configured",
+        reasonCode: "plugin_tool_error",
+      },
+    });
+    const [invocation] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, failed.invocationId));
+    expect(invocation).toMatchObject({
+      status: "failed",
+      errorCode: "plugin_tool_error",
+      errorMessage: "Identity is not configured",
+    });
+  });
+
+  it("records plugin error envelopes as failed agent-run invocations", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "read_identity",
+      toolDisplayName: "Read identity",
+    });
+    const dispatcher = createPluginDispatcher(pluginTool, async () => ({
+      pluginId: pluginTool.plugin.id,
+      toolName: pluginTool.catalogEntry.toolName,
+      result: { error: "Identity is not configured" },
+    }));
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+    const session = await gateway.createSession({
+      companyId: company.id,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    await gateway.executeTool({
+      sessionToken: session.token,
+      tool: pluginTool.namespacedToolName,
+      parameters: {},
+    }).then(
+      () => {
+        throw new Error("Expected the plugin error envelope to fail the gateway call");
+      },
+      (error) => expectGatewayError(error, 502, "plugin_tool_error"),
+    );
+
+    const [invocation] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.toolName, pluginTool.namespacedToolName));
+    expect(invocation).toMatchObject({
+      status: "failed",
+      errorCode: "plugin_tool_error",
+      errorMessage: "Identity is not configured",
+    });
+  });
+
+  it("does not dispatch raw plugin tools without a governed catalog connection", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run, project } = await createIssueAndRun(db, company.id, agent.id);
+    const rawToolName = `ambitresearch.raw-${randomUUID()}:unsafe_call`;
+    let dispatchCount = 0;
+    const dispatcher: PluginToolDispatcher = {
+      initialize: async () => {},
+      teardown: () => {},
+      listToolsForAgent: () => [{
+        name: rawToolName,
+        displayName: "Unsafe call",
+        description: "A runtime-only plugin tool.",
+        parametersSchema: { type: "object" },
+        pluginId: randomUUID(),
+      }],
+      getTool: () => null,
+      executeTool: async () => {
+        dispatchCount += 1;
+        return {
+          pluginId: randomUUID(),
+          toolName: "unsafe_call",
+          result: { content: "should not execute" },
+        };
+      },
+      registerPluginTools: () => {},
+      unregisterPluginTools: () => {},
+      toolCount: () => 1,
+      getRegistry: () => {
+        throw new Error("not used");
+      },
+    };
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+
+    await gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: rawToolName,
+      parameters: {},
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id },
+    }).then(
+      () => {
+        throw new Error("Expected a runtime-only plugin tool to be rejected");
+      },
+      (error) => expectGatewayError(error, 404, "tool_not_found"),
+    );
+    expect(dispatchCount).toBe(0);
   });
 
   it("rejects caller-supplied issue context outside the run company", async () => {

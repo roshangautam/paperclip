@@ -214,6 +214,7 @@ describe("RunTranscriptView", () => {
       invocation: {
         id: invocationId,
         companyId: "company-1",
+        projectId: "project-1",
         idempotencyKey: null,
         actorType: "agent",
         actorId: "agent-1",

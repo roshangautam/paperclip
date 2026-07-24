@@ -9,6 +9,7 @@ import {
   authUsers,
   companySecretBindings,
   companySecrets,
+  companies,
   heartbeatRuns,
   issues,
   plugins,
@@ -781,6 +782,7 @@ function toToolInvocation(row: typeof toolInvocations.$inferSelect): ToolInvocat
     actorId: row.actorId,
     agentId: row.agentId,
     issueId: row.issueId,
+    projectId: row.projectId,
     runId: row.runId,
     applicationId: row.applicationId,
     connectionId: row.connectionId,
@@ -1179,23 +1181,23 @@ function normalizeToolDescriptor(tool: unknown): McpToolDescriptor | null {
 // A leading-anchor regex (/^(create|...)/) misses every namespaced/camelCase
 // form and silently classifies writes as read-only. We normalise camelCase to
 // snake_case first so "postMessage" -> "post_message", then match the verb when
-// it is delimiter- or word-bounded. This mirrors the gateway classifier in
-// tool-gateway.ts (inferToolRisk) so the two stay consistent.
+// it is delimiter- or word-bounded. The gateway delegates to this classifier so
+// catalog and runtime risk decisions cannot drift apart.
 function verbMatches(toolName: string, verbs: string): boolean {
   const normalized = toolName.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
   return new RegExp(`\\b(${verbs})\\b|(^|[:._-])(${verbs})([:._-]|$)`).test(normalized);
 }
 
-export function classifyRisk(tool: McpToolDescriptor): ToolRiskLevel {
+export function classifyRisk(tool: McpToolDescriptor): Extract<ToolRiskLevel, "read" | "write" | "destructive"> {
   const annotations = tool.annotations ?? {};
   if (annotations.destructiveHint === true || annotations.destructive === true) return "destructive";
   if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
-  if (verbMatches(tool.name, "delete|remove|destroy|unpublish")) return "destructive";
-  if (verbMatches(tool.name, "create|update|write|set|send|publish|post|mutate|mark|archive")) return "write";
+  if (verbMatches(tool.name, "delete|destroy|remove|drop|truncate|wipe|purge|unpublish")) return "destructive";
+  if (verbMatches(tool.name, "create|update|write|edit|patch|post|send|publish|merge|commit|apply|set|mutate|mark|archive")) return "write";
   return "read";
 }
 
-function descriptorHash(tool: McpToolDescriptor): string {
+export function descriptorHash(tool: McpToolDescriptor): string {
   return stableHash({
     name: tool.name,
     title: tool.title ?? null,
@@ -2306,8 +2308,16 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   async function appProfileForConnection(
     dbClient: Pick<Db, "select" | "insert">,
     connection: typeof toolConnections.$inferSelect,
+    options: {
+      name?: string;
+      description?: string;
+      status?: "draft" | "active" | "disabled" | "archived";
+      metadata?: Record<string, unknown>;
+    } = {},
   ) {
     const profileKey = `app:${connection.id}`;
+    const profileName = options.name ?? connection.name;
+    let profileCreated = false;
     let [profile] = await dbClient
       .select()
       .from(toolProfiles)
@@ -2317,24 +2327,18 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       [profile] = await dbClient.insert(toolProfiles).values({
         companyId: connection.companyId,
         profileKey,
-        name: connection.name,
-        description: `Access profile for ${connection.name}.`,
-        status: "active",
+        name: profileName,
+        description: options.description ?? `Access profile for ${profileName}.`,
+        status: options.status ?? "active",
         defaultAction: "deny",
-        metadata: { source: "tool_connection_install", connectionId: connection.id },
+        metadata: options.metadata ?? { source: "tool_connection_install", connectionId: connection.id },
       }).returning();
+      profileCreated = true;
     }
-    const [existingEntry] = await dbClient
-      .select({ id: toolProfileEntries.id })
-      .from(toolProfileEntries)
-      .where(and(
-        eq(toolProfileEntries.companyId, connection.companyId),
-        eq(toolProfileEntries.profileId, profile.id),
-        eq(toolProfileEntries.selectorType, "connection"),
-        eq(toolProfileEntries.connectionId, connection.id),
-      ))
-      .limit(1);
-    if (!existingEntry) {
+    // Seed broad connection access only when creating the managed profile.
+    // Existing profiles may intentionally contain narrower catalog/tool entries
+    // (or no entries at all), so install updates must not broaden operator state.
+    if (profileCreated) {
       await dbClient.insert(toolProfileEntries).values({
         companyId: connection.companyId,
         profileId: profile.id,
@@ -2345,6 +2349,702 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       });
     }
     return profile;
+  }
+
+  function allocateManagedName(
+    baseName: string,
+    suffix: string,
+    stableId: string,
+    usedNames: Set<string>,
+  ): string {
+    const candidates = [baseName, `${baseName} (${suffix})`, `${baseName} (${stableId})`];
+    for (const candidate of candidates) {
+      if (!usedNames.has(candidate)) {
+        usedNames.add(candidate);
+        return candidate;
+      }
+    }
+    let index = 2;
+    while (usedNames.has(`${baseName} (${stableId}-${index})`)) index += 1;
+    const candidate = `${baseName} (${stableId}-${index})`;
+    usedNames.add(candidate);
+    return candidate;
+  }
+
+  const managedPluginApplicationSources = new Set(["plugin_reconciliation", "plugin_backfill"]);
+
+  function isDurablyManagedPluginApplication(
+    application: typeof toolApplications.$inferSelect,
+  ): boolean {
+    const metadata = asRecord(application.metadata);
+    return application.type === "paperclip_plugin"
+      && managedPluginApplicationSources.has(String(metadata.source ?? ""))
+      && typeof metadata.pluginKey === "string";
+  }
+
+  function isManagedApplicationForPlugin(
+    application: typeof toolApplications.$inferSelect,
+    plugin: typeof plugins.$inferSelect,
+  ): boolean {
+    return isDurablyManagedPluginApplication(application)
+      && application.pluginId === plugin.id
+      && asRecord(application.metadata).pluginKey === plugin.pluginKey;
+  }
+
+  function allocateManagedPluginApplicationKey(
+    plugin: typeof plugins.$inferSelect,
+    usedKeys: Set<string>,
+  ): string {
+    const canonicalKey = `paperclip_plugin:${plugin.pluginKey}`;
+    const alternateKey = `${canonicalKey}:${plugin.id}`;
+    for (const candidate of [canonicalKey, alternateKey]) {
+      if (!usedKeys.has(candidate)) {
+        usedKeys.add(candidate);
+        return candidate;
+      }
+    }
+    let index = 2;
+    while (usedKeys.has(`${alternateKey}:${index}`)) index += 1;
+    const candidate = `${alternateKey}:${index}`;
+    usedKeys.add(candidate);
+    return candidate;
+  }
+
+  function pluginLifecycleProjection(plugin: typeof plugins.$inferSelect) {
+    const available = plugin.status === "ready" && !plugin.lastError?.trim();
+    const lifecycleStatus = plugin.status === "ready" && !available
+      ? "ready_error"
+      : plugin.status;
+    const healthMessage = available
+      ? `Paperclip plugin ${plugin.pluginKey} is ready and its tools are registered.`
+      : plugin.lastError?.trim()
+        ? `Paperclip plugin ${plugin.pluginKey} reported an error: ${plugin.lastError.trim()}`
+        : `Paperclip plugin ${plugin.pluginKey} is ${plugin.status}.`;
+    return {
+      available,
+      lifecycleStatus,
+      applicationStatus: available ? "active" as const : "disabled" as const,
+      connectionStatus: available ? "active" as const : "disabled" as const,
+      connectionEnabled: available,
+      healthStatus: available ? "ok" as const : plugin.status === "error" ? "error" as const : "unchecked" as const,
+      healthMessage,
+      profileStatus: available ? "active" as const : "disabled" as const,
+    };
+  }
+
+  function pluginLifecycleResourceState(
+    metadata: Record<string, unknown> | null | undefined,
+    lifecycleStatus: string,
+    currentState: Record<string, unknown>,
+  ) {
+    const existingMetadata = asRecord(metadata);
+    const previousLifecycleStatus = existingMetadata.pluginLifecycleStatus;
+    const existingRestoreState = asRecord(existingMetadata.pluginLifecycleRestore);
+    const restoring = lifecycleStatus === "ready"
+      && typeof previousLifecycleStatus === "string"
+      && previousLifecycleStatus !== "ready";
+    const nextMetadata: Record<string, unknown> = {
+      ...existingMetadata,
+      pluginLifecycleStatus: lifecycleStatus,
+    };
+
+    if (lifecycleStatus === "ready") {
+      delete nextMetadata.pluginLifecycleRestore;
+    } else if (
+      previousLifecycleStatus === undefined
+      || previousLifecycleStatus === "ready"
+      || Object.keys(existingRestoreState).length === 0
+    ) {
+      nextMetadata.pluginLifecycleRestore = currentState;
+    }
+
+    return {
+      metadata: nextMetadata,
+      restoring,
+      restoreState: existingRestoreState,
+    };
+  }
+
+  async function reconcilePluginApplications(companyId?: string): Promise<void> {
+    const companyRows = companyId
+      ? await db.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId))
+      : await db.select({ id: companies.id }).from(companies).orderBy(companies.id);
+    if (companyRows.length === 0) return;
+
+    for (const company of companyRows) {
+      // May be invoked with either a top-level Db or a Drizzle transaction
+      // client (e.g. from resolveCloudTenantActor, which passes `tx as Db`).
+      // Transaction clients don't expose `.transaction`, so fall back to
+      // running the reconciliation directly on the existing transaction rather
+      // than attempting to open a nested one, which would throw at runtime.
+      if (typeof db.transaction === "function") {
+        await db.transaction((tx) => reconcileCompanyPluginApplications(tx, company.id));
+      } else {
+        await reconcileCompanyPluginApplications(db as unknown as DbTransaction, company.id);
+      }
+    }
+  }
+
+  async function reconcileCompanyPluginApplications(tx: DbTransaction, companyId: string): Promise<void> {
+    const company = { id: companyId };
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:plugin-app-reconciliation:${company.id}`}, 0))`);
+        const reconciledAt = now();
+        const pluginRows = await tx.select().from(plugins).orderBy(plugins.pluginKey);
+        const managedPlugins = pluginRows.flatMap((plugin) => {
+          if (plugin.status === "uninstalled") return [];
+          const parsed = pluginManifestV1Schema.safeParse(plugin.manifestJson);
+          if (!parsed.success || !parsed.data.tools?.length) return [];
+          const tools = parsed.data.tools.map((tool) => normalizeToolDescriptor({
+            name: tool.name,
+            title: tool.displayName,
+            description: tool.description,
+            inputSchema: tool.parametersSchema,
+            annotations: {},
+          })).filter((tool): tool is McpToolDescriptor => Boolean(tool));
+          if (tools.length === 0) return [];
+          return [{ plugin, manifest: parsed.data, tools, lifecycle: pluginLifecycleProjection(plugin) }];
+        });
+        let applicationRows = await tx
+          .select()
+          .from(toolApplications)
+          .where(eq(toolApplications.companyId, company.id));
+        const activeManagedPluginsById = new Map(managedPlugins.map(({ plugin }) => [plugin.id, plugin]));
+        const retiredApplications = applicationRows.filter((application) => {
+          if (!isDurablyManagedPluginApplication(application)) return false;
+          if (!application.pluginId) return true;
+          const plugin = activeManagedPluginsById.get(application.pluginId);
+          return !plugin || asRecord(application.metadata).pluginKey !== plugin.pluginKey;
+        });
+        if (retiredApplications.length > 0) {
+          const retiredApplicationIds = retiredApplications.map((application) => application.id);
+          const retiredConnections = await tx
+            .select()
+            .from(toolConnections)
+            .where(and(
+              eq(toolConnections.companyId, company.id),
+              inArray(toolConnections.applicationId, retiredApplicationIds),
+            ));
+          const retiredConnectionIds = retiredConnections.map((connection) => connection.id);
+          for (const application of retiredApplications) {
+            const lifecycleState = pluginLifecycleResourceState(
+              application.metadata,
+              "retired",
+              { status: application.status },
+            );
+            await tx.update(toolApplications).set({
+              status: "archived",
+              archivedAt: application.archivedAt ?? reconciledAt,
+              metadata: lifecycleState.metadata,
+              updatedAt: reconciledAt,
+            }).where(eq(toolApplications.id, application.id));
+          }
+          for (const connection of retiredConnections) {
+            const lifecycleState = pluginLifecycleResourceState(
+              connection.config,
+              "retired",
+              {
+                status: connection.status,
+                enabled: connection.enabled,
+                healthStatus: connection.healthStatus,
+                healthMessage: connection.healthMessage,
+              },
+            );
+            await tx.update(toolConnections).set({
+              status: "archived",
+              enabled: false,
+              healthStatus: "unchecked",
+              healthMessage: "The backing Paperclip plugin is no longer installed or no longer declares tools.",
+              config: {
+                ...lifecycleState.metadata,
+              },
+              transportConfig: {
+                ...asRecord(connection.transportConfig),
+                pluginLifecycleStatus: "retired",
+              },
+              updatedAt: reconciledAt,
+            }).where(eq(toolConnections.id, connection.id));
+          }
+          if (retiredConnectionIds.length > 0) {
+            await tx.update(toolCatalogEntries).set({
+              status: "removed",
+              updatedAt: reconciledAt,
+            }).where(and(
+              eq(toolCatalogEntries.companyId, company.id),
+              inArray(toolCatalogEntries.connectionId, retiredConnectionIds),
+            ));
+            const retiredProfileKeys = retiredConnectionIds.map((connectionId) => `app:${connectionId}`);
+            const retiredProfiles = await tx.select().from(toolProfiles).where(and(
+              eq(toolProfiles.companyId, company.id),
+              inArray(toolProfiles.profileKey, retiredProfileKeys),
+            ));
+            for (const profile of retiredProfiles) {
+              const lifecycleState = pluginLifecycleResourceState(
+                profile.metadata,
+                "retired",
+                { status: profile.status },
+              );
+              await tx.update(toolProfiles).set({
+                status: "archived",
+                metadata: lifecycleState.metadata,
+                updatedAt: reconciledAt,
+              }).where(eq(toolProfiles.id, profile.id));
+            }
+          }
+          applicationRows = applicationRows.map((application) => {
+            if (!retiredApplicationIds.includes(application.id)) return application;
+            return {
+              ...application,
+              status: "archived" as const,
+              archivedAt: application.archivedAt ?? reconciledAt,
+              metadata: {
+                ...asRecord(application.metadata),
+                pluginLifecycleStatus: "retired",
+              },
+            };
+          });
+        }
+        const existingApplicationsByPluginId = new Map<string, typeof toolApplications.$inferSelect>();
+        for (const { plugin } of managedPlugins) {
+          const matches = applicationRows
+            .filter((application) => isManagedApplicationForPlugin(application, plugin))
+            .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id));
+          if (matches[0]) existingApplicationsByPluginId.set(plugin.id, matches[0]);
+        }
+        const managedApplicationIds = new Set(
+          Array.from(existingApplicationsByPluginId.values()).map((application) => application.id),
+        );
+        const usedApplicationNames = new Set(applicationRows
+          .filter((application) => !managedApplicationIds.has(application.id))
+          .map((application) => application.name));
+        const desiredApplicationNames = new Map<string, string>();
+        for (const { plugin, manifest } of managedPlugins) {
+          desiredApplicationNames.set(plugin.id, allocateManagedName(
+            manifest.displayName.trim(),
+            plugin.pluginKey,
+            plugin.id,
+            usedApplicationNames,
+          ));
+        }
+        for (const { plugin } of managedPlugins) {
+          const existing = existingApplicationsByPluginId.get(plugin.id);
+          const desiredName = desiredApplicationNames.get(plugin.id)!;
+          if (existing && existing.name !== desiredName) {
+            await tx.update(toolApplications)
+              .set({ name: `__paperclip_plugin_reconcile__:${existing.id}`, updatedAt: reconciledAt })
+              .where(eq(toolApplications.id, existing.id));
+          }
+        }
+
+        const applicationsByPluginId = new Map<string, typeof toolApplications.$inferSelect>();
+        const usedApplicationKeys = new Set(
+          applicationRows.flatMap((application) => application.applicationKey ? [application.applicationKey] : []),
+        );
+        for (const { plugin, manifest, lifecycle } of managedPlugins) {
+          const existing = existingApplicationsByPluginId.get(plugin.id);
+          const applicationKey = existing?.applicationKey
+            ?? allocateManagedPluginApplicationKey(plugin, usedApplicationKeys);
+          const desiredName = desiredApplicationNames.get(plugin.id)!;
+          const lifecycleState = pluginLifecycleResourceState(
+            existing?.metadata,
+            lifecycle.lifecycleStatus,
+            { status: existing?.status ?? "active" },
+          );
+          const desiredMetadata = {
+            ...lifecycleState.metadata,
+            source: "plugin_reconciliation",
+            pluginKey: plugin.pluginKey,
+          };
+          const desiredStatus = lifecycle.available
+            ? lifecycleState.restoring
+              ? lifecycleState.restoreState.status === "draft"
+                || lifecycleState.restoreState.status === "active"
+                || lifecycleState.restoreState.status === "disabled"
+                || lifecycleState.restoreState.status === "archived"
+                ? lifecycleState.restoreState.status
+                : "active" as const
+              : existing?.status ?? lifecycle.applicationStatus
+            : lifecycle.applicationStatus;
+          if (!existing) {
+            const [created] = await tx.insert(toolApplications).values({
+              companyId: company.id,
+              applicationKey,
+              name: desiredName,
+              description: manifest.description,
+              type: "paperclip_plugin",
+              status: desiredStatus,
+              pluginId: plugin.id,
+              metadata: desiredMetadata,
+            }).returning();
+            applicationsByPluginId.set(plugin.id, created!);
+            continue;
+          }
+          const changed = existing.name !== desiredName
+            || existing.description !== manifest.description
+            || existing.type !== "paperclip_plugin"
+            || existing.status !== desiredStatus
+            || existing.pluginId !== plugin.id
+            || existing.archivedAt !== null
+            || stableHash(existing.metadata) !== stableHash(desiredMetadata);
+          if (changed) {
+            const [updated] = await tx.update(toolApplications).set({
+              name: desiredName,
+              description: manifest.description,
+              type: "paperclip_plugin",
+              status: desiredStatus,
+              pluginId: plugin.id,
+              archivedAt: null,
+              metadata: desiredMetadata,
+              updatedAt: reconciledAt,
+            }).where(eq(toolApplications.id, existing.id)).returning();
+            applicationsByPluginId.set(plugin.id, updated!);
+          } else {
+            applicationsByPluginId.set(plugin.id, existing);
+          }
+        }
+
+        applicationRows = Array.from(applicationsByPluginId.values());
+        const allConnections = await tx
+          .select()
+          .from(toolConnections)
+          .where(eq(toolConnections.companyId, company.id));
+        const selectedConnectionsByApplicationId = new Map<string, typeof toolConnections.$inferSelect>();
+        for (const application of applicationRows) {
+          const matches = allConnections
+            .filter((connection) => connection.applicationId === application.id)
+            .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id));
+          if (matches[0]) selectedConnectionsByApplicationId.set(application.id, matches[0]);
+        }
+        const managedConnectionIds = new Set(Array.from(selectedConnectionsByApplicationId.values()).map((connection) => connection.id));
+        const usedConnectionNames = new Set(allConnections
+          .filter((connection) => !managedConnectionIds.has(connection.id))
+          .map((connection) => connection.name));
+        const desiredConnectionNames = new Map<string, string>();
+        for (const { plugin, manifest } of managedPlugins) {
+          desiredConnectionNames.set(plugin.id, allocateManagedName(
+            `Plugin: ${manifest.displayName.trim()}`,
+            plugin.pluginKey,
+            plugin.id,
+            usedConnectionNames,
+          ));
+        }
+        for (const { plugin } of managedPlugins) {
+          const application = applicationsByPluginId.get(plugin.id)!;
+          const existing = selectedConnectionsByApplicationId.get(application.id);
+          const desiredName = desiredConnectionNames.get(plugin.id)!;
+          if (existing && existing.name !== desiredName) {
+            await tx.update(toolConnections)
+              .set({ name: `__paperclip_plugin_reconcile__:${existing.id}`, updatedAt: reconciledAt })
+              .where(eq(toolConnections.id, existing.id));
+          }
+        }
+
+        const connectionsByPluginId = new Map<string, typeof toolConnections.$inferSelect>();
+        for (const { plugin, lifecycle } of managedPlugins) {
+          const application = applicationsByPluginId.get(plugin.id)!;
+          const existing = selectedConnectionsByApplicationId.get(application.id);
+          const desiredName = desiredConnectionNames.get(plugin.id)!;
+          const lifecycleState = pluginLifecycleResourceState(
+            existing?.config,
+            lifecycle.lifecycleStatus,
+            {
+              status: existing?.status ?? "active",
+              enabled: existing?.enabled ?? true,
+              healthStatus: existing?.healthStatus ?? "ok",
+              healthMessage: existing?.healthMessage
+                ?? `Paperclip plugin ${plugin.pluginKey} is ready and its tools are registered.`,
+            },
+          );
+          const desiredConfig = {
+            ...lifecycleState.metadata,
+            pluginKey: plugin.pluginKey,
+            type: "paperclip_plugin",
+          };
+          const desiredTransportConfig = {
+            ...asRecord(existing?.transportConfig),
+            pluginKey: plugin.pluginKey,
+            type: "paperclip_plugin",
+            pluginLifecycleStatus: lifecycle.lifecycleStatus,
+          };
+          const restoredStatus = lifecycleState.restoreState.status;
+          const desiredStatus = lifecycle.available
+            ? lifecycleState.restoring
+              ? restoredStatus === "draft"
+                || restoredStatus === "active"
+                || restoredStatus === "disabled"
+                || restoredStatus === "archived"
+                ? restoredStatus
+                : "active" as const
+              : existing?.status ?? lifecycle.connectionStatus
+            : lifecycle.connectionStatus;
+          const desiredEnabled = lifecycle.available
+            ? lifecycleState.restoring
+              ? typeof lifecycleState.restoreState.enabled === "boolean"
+                ? lifecycleState.restoreState.enabled
+                : true
+              : existing?.enabled ?? lifecycle.connectionEnabled
+            : lifecycle.connectionEnabled;
+          const restoredHealthStatus = lifecycleState.restoreState.healthStatus;
+          const desiredHealthStatus = lifecycle.available
+            ? lifecycleState.restoring
+              ? typeof restoredHealthStatus === "string"
+                && ["unknown", "healthy", "degraded", "failed", "unchecked", "ok", "error", "missing_secret"].includes(restoredHealthStatus)
+                ? restoredHealthStatus as ToolConnectionHealthStatus
+                : lifecycle.healthStatus
+              : existing?.healthStatus ?? lifecycle.healthStatus
+            : lifecycle.healthStatus;
+          const desiredHealthMessage = lifecycle.available
+            ? lifecycleState.restoring
+              ? typeof lifecycleState.restoreState.healthMessage === "string"
+                ? lifecycleState.restoreState.healthMessage
+                : lifecycle.healthMessage
+              : existing?.healthMessage ?? lifecycle.healthMessage
+            : lifecycle.healthMessage;
+          if (!existing) {
+            const [created] = await tx.insert(toolConnections).values({
+              companyId: company.id,
+              applicationId: application.id,
+              name: desiredName,
+              connectionKind: "managed",
+              transport: "remote_http",
+              status: desiredStatus,
+              enabled: desiredEnabled,
+              config: desiredConfig,
+              transportConfig: desiredTransportConfig,
+              healthStatus: desiredHealthStatus,
+              healthMessage: desiredHealthMessage,
+            }).returning();
+            connectionsByPluginId.set(plugin.id, created!);
+            continue;
+          }
+          const changed = existing.name !== desiredName
+            || existing.applicationId !== application.id
+            || existing.connectionKind !== "managed"
+            || existing.transport !== "remote_http"
+            || existing.status !== desiredStatus
+            || existing.enabled !== desiredEnabled
+            || existing.healthStatus !== desiredHealthStatus
+            || existing.healthMessage !== desiredHealthMessage
+            || stableHash(existing.config) !== stableHash(desiredConfig)
+            || stableHash(existing.transportConfig) !== stableHash(desiredTransportConfig);
+          if (changed) {
+            const [updated] = await tx.update(toolConnections).set({
+              applicationId: application.id,
+              name: desiredName,
+              connectionKind: "managed",
+              transport: "remote_http",
+              status: desiredStatus,
+              enabled: desiredEnabled,
+              config: desiredConfig,
+              transportConfig: desiredTransportConfig,
+              healthStatus: desiredHealthStatus,
+              healthMessage: desiredHealthMessage,
+              updatedAt: reconciledAt,
+            }).where(eq(toolConnections.id, existing.id)).returning();
+            connectionsByPluginId.set(plugin.id, updated!);
+          } else {
+            connectionsByPluginId.set(plugin.id, existing);
+          }
+        }
+
+        for (const { plugin, tools } of managedPlugins) {
+          const application = applicationsByPluginId.get(plugin.id)!;
+          const connection = connectionsByPluginId.get(plugin.id)!;
+          const existingEntries = await tx
+            .select()
+            .from(toolCatalogEntries)
+            .where(eq(toolCatalogEntries.connectionId, connection.id));
+          const existingByToolName = new Map(existingEntries.map((entry) => [entry.toolName, entry]));
+          const manifestToolNames = new Set(tools.map((tool) => tool.name));
+          for (const descriptor of tools) {
+            const existing = existingByToolName.get(descriptor.name);
+            const riskLevel = classifyRisk(descriptor);
+            const versionHash = descriptorHash(descriptor);
+            const schemaHash = stableHash(descriptor.inputSchema ?? {});
+            const legacyHash = Boolean(existing && /^[0-9a-f]{32}$/i.test(existing.versionHash));
+            const changedDescriptor = Boolean(existing && (
+              existing.versionHash !== versionHash || existing.schemaHash !== schemaHash
+            ));
+            const unsafeChange = riskLevel !== "read" && (!existing || changedDescriptor);
+            const preserveDisabled = existing?.status === "disabled";
+            const preserveQuarantined = existing?.status === "quarantined";
+            const migrationUpgrade = legacyHash;
+            const shouldQuarantine = unsafeChange && !migrationUpgrade && !preserveDisabled && !preserveQuarantined;
+            const status = preserveDisabled
+              ? "disabled"
+              : preserveQuarantined || shouldQuarantine
+                ? "quarantined"
+                : "active";
+            const quarantinedAt = preserveQuarantined
+              ? existing!.quarantinedAt
+              : shouldQuarantine
+                ? reconciledAt
+                : null;
+            const quarantineReason = preserveQuarantined
+              ? existing!.quarantineReason
+              : shouldQuarantine
+                ? "pending_review"
+                : null;
+            if (!existing) {
+              await tx.insert(toolCatalogEntries).values({
+                companyId: company.id,
+                applicationId: application.id,
+                connectionId: connection.id,
+                entryKind: "tool",
+                name: descriptor.name,
+                toolName: descriptor.name,
+                title: descriptor.title ?? null,
+                description: descriptor.description ?? null,
+                inputSchema: descriptor.inputSchema ?? {},
+                annotations: descriptor.annotations ?? {},
+                riskLevel,
+                isReadOnly: riskLevel === "read",
+                isWrite: riskLevel === "write",
+                isDestructive: riskLevel === "destructive",
+                status,
+                versionHash,
+                schemaHash,
+                quarantinedAt,
+                quarantineReason,
+              });
+              continue;
+            }
+            const entryChanged = existing.applicationId !== application.id
+              || existing.entryKind !== "tool"
+              || existing.name !== descriptor.name
+              || existing.title !== (descriptor.title ?? null)
+              || existing.description !== (descriptor.description ?? null)
+              || stableHash(existing.inputSchema) !== stableHash(descriptor.inputSchema ?? {})
+              || stableHash(existing.annotations) !== stableHash(descriptor.annotations ?? {})
+              || existing.riskLevel !== riskLevel
+              || existing.isReadOnly !== (riskLevel === "read")
+              || existing.isWrite !== (riskLevel === "write")
+              || existing.isDestructive !== (riskLevel === "destructive")
+              || existing.status !== status
+              || existing.versionHash !== versionHash
+              || existing.schemaHash !== schemaHash
+              || existing.quarantinedAt?.getTime() !== quarantinedAt?.getTime()
+              || existing.quarantineReason !== quarantineReason;
+            if (entryChanged) {
+              await tx.update(toolCatalogEntries).set({
+                applicationId: application.id,
+                entryKind: "tool",
+                name: descriptor.name,
+                title: descriptor.title ?? null,
+                description: descriptor.description ?? null,
+                inputSchema: descriptor.inputSchema ?? {},
+                annotations: descriptor.annotations ?? {},
+                riskLevel,
+                isReadOnly: riskLevel === "read",
+                isWrite: riskLevel === "write",
+                isDestructive: riskLevel === "destructive",
+                status,
+                versionHash,
+                schemaHash,
+                lastSeenAt: reconciledAt,
+                quarantinedAt,
+                quarantineReason,
+                updatedAt: reconciledAt,
+              }).where(eq(toolCatalogEntries.id, existing.id));
+            }
+          }
+          for (const existing of existingEntries) {
+            if (!manifestToolNames.has(existing.toolName) && existing.status !== "removed") {
+              await tx.update(toolCatalogEntries).set({ status: "removed", updatedAt: reconciledAt })
+                .where(eq(toolCatalogEntries.id, existing.id));
+            }
+          }
+        }
+
+        const allProfiles = await tx
+          .select()
+          .from(toolProfiles)
+          .where(eq(toolProfiles.companyId, company.id));
+        const managedProfileKeys = new Set(Array.from(connectionsByPluginId.values()).map((connection) => `app:${connection.id}`));
+        const profilesByKey = new Map(allProfiles
+          .filter((profile) => managedProfileKeys.has(profile.profileKey))
+          .map((profile) => [profile.profileKey, profile]));
+        const usedProfileNames = new Set(allProfiles
+          .filter((profile) => !managedProfileKeys.has(profile.profileKey))
+          .map((profile) => profile.name));
+        const desiredProfileNames = new Map<string, string>();
+        for (const { plugin } of managedPlugins) {
+          const connection = connectionsByPluginId.get(plugin.id)!;
+          desiredProfileNames.set(plugin.id, allocateManagedName(
+            connection.name,
+            plugin.pluginKey,
+            plugin.id,
+            usedProfileNames,
+          ));
+        }
+        for (const { plugin } of managedPlugins) {
+          const connection = connectionsByPluginId.get(plugin.id)!;
+          const existing = profilesByKey.get(`app:${connection.id}`);
+          const desiredName = desiredProfileNames.get(plugin.id)!;
+          if (existing && existing.name !== desiredName) {
+            await tx.update(toolProfiles)
+              .set({ name: `__paperclip_plugin_reconcile__:${existing.id}`, updatedAt: reconciledAt })
+              .where(eq(toolProfiles.id, existing.id));
+          }
+        }
+        for (const { plugin, lifecycle } of managedPlugins) {
+          const connection = connectionsByPluginId.get(plugin.id)!;
+          const desiredName = desiredProfileNames.get(plugin.id)!;
+          const desiredDescription = `Access profile for ${desiredName}.`;
+          const existingProfile = profilesByKey.get(`app:${connection.id}`);
+          const lifecycleState = pluginLifecycleResourceState(
+            existingProfile?.metadata,
+            lifecycle.lifecycleStatus,
+            { status: existingProfile?.status ?? "active" },
+          );
+          const desiredMetadata = {
+            ...lifecycleState.metadata,
+            source: "plugin_reconciliation",
+            connectionId: connection.id,
+            pluginKey: plugin.pluginKey,
+          };
+          const restoredStatus = lifecycleState.restoreState.status;
+          const desiredStatus = lifecycle.available
+            ? lifecycleState.restoring
+              ? restoredStatus === "draft"
+                || restoredStatus === "active"
+                || restoredStatus === "disabled"
+                || restoredStatus === "archived"
+                ? restoredStatus
+                : "active" as const
+              : existingProfile?.status ?? lifecycle.profileStatus
+            : lifecycle.profileStatus;
+          if (existingProfile) {
+            const profileChanged = existingProfile.name !== desiredName
+              || existingProfile.description !== desiredDescription
+              || existingProfile.status !== desiredStatus
+              || stableHash(existingProfile.metadata) !== stableHash(desiredMetadata);
+            if (profileChanged) {
+              await tx.update(toolProfiles).set({
+                name: desiredName,
+                description: desiredDescription,
+                status: desiredStatus,
+                metadata: desiredMetadata,
+                updatedAt: reconciledAt,
+              }).where(eq(toolProfiles.id, existingProfile.id));
+            }
+            continue;
+          }
+
+          const profile = await appProfileForConnection(tx, connection, {
+            name: desiredName,
+            description: desiredDescription,
+            status: desiredStatus,
+            metadata: desiredMetadata,
+          });
+          await tx.insert(toolProfileBindings).values({
+            companyId: company.id,
+            profileId: profile.id,
+            targetType: "company",
+            targetId: company.id,
+            priority: 100,
+            metadata: { source: "plugin_reconciliation", pluginKey: plugin.pluginKey },
+          });
+        }
   }
 
   async function listConnectionInstalls(connectionId: string, companyId?: string): Promise<ToolConnectionInstall[]> {
@@ -5095,6 +5795,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   }
 
   return {
+    reconcilePluginApplications,
+
     approvedStdioTemplates: async (companyId: string): Promise<ToolStdioCommandTemplate[]> => {
       const adminTemplates = await db
         .select()
@@ -5289,9 +5991,15 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     createApplication: async (companyId: string, input: CreateToolApplication): Promise<ToolApplication> => {
       await assertOptionalPlugin(input.pluginId);
       await assertOptionalAgent(companyId, input.ownerAgentId, "Tool application owner agent");
+      const applicationKey = input.applicationKey ?? normalizeKey(input.name);
+      if (input.type === "paperclip_plugin" || applicationKey.startsWith("paperclip_plugin:")) {
+        throw badRequest(
+          "The paperclip_plugin application type and paperclip_plugin: keys are reserved for managed plugin Apps",
+        );
+      }
       const [row] = await db.insert(toolApplications).values({
         companyId,
-        applicationKey: input.applicationKey ?? normalizeKey(input.name),
+        applicationKey,
         name: input.name,
         description: input.description ?? null,
         type: input.type,
@@ -5316,6 +6024,21 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     updateApplication: async (applicationId: string, input: UpdateToolApplication): Promise<ToolApplication> => {
       const [existing] = await db.select().from(toolApplications).where(eq(toolApplications.id, applicationId));
       if (!existing) throw notFound("Tool application not found");
+      if (isDurablyManagedPluginApplication(existing)) {
+        const existingMetadata = asRecord(existing.metadata);
+        const requestedMetadata = input.metadata === undefined ? existingMetadata : asRecord(input.metadata);
+        const changesManagedIdentity =
+          (input.applicationKey !== undefined && input.applicationKey !== existing.applicationKey)
+          || (input.type !== undefined && input.type !== existing.type)
+          || (input.pluginId !== undefined && input.pluginId !== existing.pluginId)
+          || requestedMetadata.source !== existingMetadata.source
+          || requestedMetadata.pluginKey !== existingMetadata.pluginKey;
+        if (changesManagedIdentity) {
+          throw badRequest(
+            "Managed plugin App identity fields (applicationKey, type, pluginId, metadata.source, and metadata.pluginKey) cannot be changed",
+          );
+        }
+      }
       await assertOptionalPlugin(input.pluginId);
       await assertOptionalAgent(existing.companyId, input.ownerAgentId, "Tool application owner agent");
       if (input.name && input.name !== existing.name) {

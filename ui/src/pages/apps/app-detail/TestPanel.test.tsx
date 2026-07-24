@@ -12,15 +12,23 @@ const listTestAgentsMock = vi.hoisted(() => vi.fn());
 const runTestCallMock = vi.hoisted(() => vi.fn());
 const getTestCallStatusMock = vi.hoisted(() => vi.fn());
 const declineActionRequestMock = vi.hoisted(() => vi.fn());
+const listProjectsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/api/tools", () => ({
   toolsApi: {
-    listTestAgents: (connectionId: string) => listTestAgentsMock(connectionId),
+    listTestAgents: (connectionId: string, projectId?: string | null) =>
+      listTestAgentsMock(connectionId, projectId),
     runTestCall: (connectionId: string, input: unknown) => runTestCallMock(connectionId, input),
     getTestCallStatus: (connectionId: string, actionRequestId: string) =>
       getTestCallStatusMock(connectionId, actionRequestId),
     declineActionRequest: (companyId: string, actionRequestId: string) =>
       declineActionRequestMock(companyId, actionRequestId),
+  },
+}));
+
+vi.mock("@/api/projects", () => ({
+  projectsApi: {
+    list: (companyId: string) => listProjectsMock(companyId),
   },
 }));
 
@@ -180,11 +188,18 @@ let root: any;
 function renderPanel(
   active: ToolCatalogEntry[] = [readEntry, writeAskEntry, offEntry],
   quarantined: ToolCatalogEntry[] = [],
+  requiresProject = false,
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   root.render(
     <QueryClientProvider client={client}>
-      <TestPanel connectionId="conn-1" appName="Google Sheets" active={active} quarantined={quarantined} />
+      <TestPanel
+        connectionId="conn-1"
+        appName="Google Sheets"
+        active={active}
+        quarantined={quarantined}
+        requiresProject={requiresProject}
+      />
     </QueryClientProvider>,
   );
 }
@@ -197,7 +212,9 @@ beforeEach(() => {
   runTestCallMock.mockReset();
   getTestCallStatusMock.mockReset();
   declineActionRequestMock.mockReset();
+  listProjectsMock.mockReset();
   listTestAgentsMock.mockResolvedValue({ agents: [agent()] });
+  listProjectsMock.mockResolvedValue([{ id: "project-1", name: "Plugin Lab" }]);
   // Default ask-first polls report the request still waiting on approval.
   getTestCallStatusMock.mockResolvedValue({
     actionRequestId: "req-1",
@@ -218,6 +235,34 @@ afterEach(() => {
 });
 
 describe("TestPanel", () => {
+  it("shows project loading failures and retries them", async () => {
+    listProjectsMock.mockRejectedValueOnce(new Error("projects unavailable"));
+    await act(async () => renderPanel([readEntry], [], true));
+    await flushReact();
+
+    expect(container.textContent).toContain("Couldn't load projects");
+    expect(container.textContent).not.toContain("Create a project");
+
+    await clickByText("Try again");
+
+    expect(listProjectsMock).toHaveBeenCalledTimes(2);
+    expect(container.textContent).toContain("Plugin Lab");
+  });
+
+  it("shows test-agent loading failures and retries them", async () => {
+    listTestAgentsMock.mockRejectedValueOnce(new Error("agents unavailable"));
+    await act(async () => renderPanel([readEntry]));
+    await flushReact();
+
+    expect(container.textContent).toContain("Couldn't load test agents");
+    expect(container.textContent).not.toContain("No agents to test as");
+
+    await clickByText("Try again");
+
+    expect(listTestAgentsMock).toHaveBeenCalledTimes(2);
+    expect(container.textContent).toContain("ClaudeCoder");
+  });
+
   it("renders the Test-as header and grouped actions with access badges", async () => {
     await act(async () => renderPanel());
     await flushReact();
@@ -231,6 +276,183 @@ describe("TestPanel", () => {
     expect(container.textContent).toContain("Allowed");
     expect(container.textContent).toContain("Ask first");
     expect(container.textContent).toContain("Off");
+  });
+
+  it("uses the selected project for plugin access summaries and test calls", async () => {
+    runTestCallMock.mockResolvedValue({
+      decision: "allowed",
+      invocationId: "inv-project",
+      result: [{ name: "Acme" }],
+    });
+    await act(async () => renderPanel([readEntry], [], true));
+    await flushReact();
+
+    expect(container.textContent).toContain("Test project");
+    expect(container.textContent).toContain("Plugin Lab");
+    expect(listProjectsMock).toHaveBeenCalledWith("company-1");
+    expect(listTestAgentsMock).toHaveBeenCalledWith("conn-1", "project-1");
+
+    const trigger = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Read a sheet"),
+    );
+    await act(async () => trigger!.click());
+    await flushReact();
+    await fillFormField("sheet-123");
+    await clickByText("Run");
+    await settle();
+
+    expect(runTestCallMock).toHaveBeenCalledWith("conn-1", {
+      agentId: "agent-claude",
+      toolName: "read_sheet",
+      projectId: "project-1",
+      parameters: { spreadsheetId: "sheet-123" },
+    });
+  });
+
+  it("excludes archived projects from plugin tests", async () => {
+    listProjectsMock.mockResolvedValue([
+      {
+        id: "project-archived",
+        name: "Archived project",
+        archivedAt: new Date("2026-06-01T00:00:00.000Z"),
+      },
+      { id: "project-active", name: "Active project", archivedAt: null },
+    ]);
+    await act(async () => renderPanel([readEntry], [], true));
+    await flushReact();
+
+    expect(listTestAgentsMock).toHaveBeenCalledWith("conn-1", "project-active");
+    expect(container.textContent).toContain("Active project");
+    expect(container.textContent).not.toContain("Archived project");
+
+    const projectTrigger = container.querySelector<HTMLElement>(
+      'button[aria-label="Choose a project for this test"]',
+    );
+    expect(projectTrigger).toBeTruthy();
+    projectTrigger!.hasPointerCapture = () => false;
+    await act(async () => {
+      projectTrigger!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+      projectTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const projectOptions = [...document.body.querySelectorAll<HTMLElement>('[role="option"]')]
+      .map((option) => option.textContent);
+    expect(projectOptions).toContain("Active project");
+    expect(projectOptions).not.toContain("Archived project");
+  });
+
+  it("does not attribute an in-flight result to a newly selected project", async () => {
+    listProjectsMock.mockResolvedValue([
+      { id: "project-1", name: "Plugin Lab" },
+      { id: "project-2", name: "Production" },
+    ]);
+    let resolveRun!: (result: unknown) => void;
+    runTestCallMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveRun = resolve;
+    }));
+    await act(async () => renderPanel([readEntry], [], true));
+    await flushReact();
+
+    const actionTrigger = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Read a sheet"),
+    );
+    await act(async () => actionTrigger!.click());
+    await flushReact();
+    await fillFormField("sheet-123");
+    await clickByText("Run");
+
+    const projectTrigger = container.querySelector<HTMLElement>(
+      'button[aria-label="Choose a project for this test"]',
+    );
+    expect(projectTrigger).toBeTruthy();
+    projectTrigger!.hasPointerCapture = () => false;
+    await act(async () => {
+      projectTrigger!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+      projectTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    const projectOption = [...document.body.querySelectorAll<HTMLElement>('[role="option"]')]
+      .find((option) => option.textContent?.includes("Production"));
+    expect(projectOption).toBeTruthy();
+    projectOption!.hasPointerCapture = () => false;
+    await act(async () => {
+      projectOption!.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0 }));
+      projectOption!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(listTestAgentsMock).toHaveBeenCalledWith("conn-1", "project-2");
+    expect(container.textContent).not.toContain("Running…");
+    await act(async () => {
+      resolveRun({
+        decision: "allowed",
+        invocationId: "inv-project-1",
+        result: [{ name: "Acme" }],
+      });
+    });
+    await settle();
+
+    expect(container.textContent).toContain("Production");
+    expect(container.textContent).not.toContain("Worked.");
+  });
+
+  it("does not show an in-flight error after switching projects", async () => {
+    listProjectsMock.mockResolvedValue([
+      { id: "project-1", name: "Plugin Lab" },
+      { id: "project-2", name: "Production" },
+    ]);
+    let rejectRun!: (error: Error) => void;
+    runTestCallMock.mockReturnValueOnce(new Promise((_resolve, reject) => {
+      rejectRun = reject;
+    }));
+    await act(async () => renderPanel([readEntry], [], true));
+    await flushReact();
+
+    const actionTrigger = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Read a sheet"),
+    );
+    await act(async () => actionTrigger!.click());
+    await flushReact();
+    await fillFormField("sheet-123");
+    await clickByText("Run");
+
+    const projectTrigger = container.querySelector<HTMLElement>(
+      'button[aria-label="Choose a project for this test"]',
+    );
+    expect(projectTrigger).toBeTruthy();
+    projectTrigger!.hasPointerCapture = () => false;
+    await act(async () => {
+      projectTrigger!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+      projectTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    const projectOption = [...document.body.querySelectorAll<HTMLElement>('[role="option"]')]
+      .find((option) => option.textContent?.includes("Production"));
+    expect(projectOption).toBeTruthy();
+    projectOption!.hasPointerCapture = () => false;
+    await act(async () => {
+      projectOption!.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0 }));
+      projectOption!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    await act(async () => rejectRun(new Error("Old project failed")));
+    await settle();
+
+    expect(container.textContent).toContain("Production");
+    expect(container.textContent).not.toContain("Couldn't reach");
+    expect(container.textContent).not.toContain("Old project failed");
+  });
+
+  it("shows a clear plugin Test state when the company has no projects", async () => {
+    listProjectsMock.mockResolvedValue([]);
+    await act(async () => renderPanel([readEntry], [], true));
+    await flushReact();
+
+    expect(container.textContent).toContain("Create a project to test Google Sheets");
+    expect(container.textContent).toContain("Go to Projects");
+    expect(listTestAgentsMock).not.toHaveBeenCalled();
   });
 
   it("shows the empty state when there are no actions", async () => {
