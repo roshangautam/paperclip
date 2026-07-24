@@ -3814,17 +3814,28 @@ export function createToolGatewayService(
           : args.tool.providerType === "mcp_local_stdio"
             ? await executeLocalStdioTool(args.session, args.tool, args.parameters, executionTimeoutMs)
             : args.tool.providerType === "paperclip_plugin" && pluginToolDispatcher
-              ? {
-                  result: pluginToolResultOrThrow(await runWithTimeout(
-                    pluginToolDispatcher.executeTool(args.tool.name, args.parameters, {
-                      agentId: args.agentId,
-                      companyId: args.companyId,
-                      runId: null,
-                      projectId: args.session.projectId!,
-                    }),
-                    executionTimeoutMs,
-                  )),
-                }
+              ? await (async (): Promise<RemoteHttpExecutionResult> => {
+                  const projectId = args.session.projectId;
+                  if (!projectId) {
+                    throw new ToolGatewayHttpError(
+                      400,
+                      `Plugin tool "${args.tool.name}" requires a project context`,
+                      "project_required",
+                      { tool: args.tool.name, invocationId: args.invocationId },
+                    );
+                  }
+                  return {
+                    result: pluginToolResultOrThrow(await runWithTimeout(
+                      pluginToolDispatcher.executeTool(args.tool.name, args.parameters, {
+                        agentId: args.agentId,
+                        companyId: args.companyId,
+                        runId: null,
+                        projectId,
+                      }),
+                      executionTimeoutMs,
+                    )),
+                  };
+                })()
               : null;
       if (!connectedMcpExecution) {
         throw new ToolGatewayHttpError(404, `Tool "${args.tool.name}" not found`, "tool_not_found", {
