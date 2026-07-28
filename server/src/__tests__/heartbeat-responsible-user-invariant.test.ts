@@ -14,6 +14,9 @@ import {
   heartbeatRuns,
   issueComments,
   issues,
+  routines,
+  routineRevisions,
+  routineRuns,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -105,6 +108,9 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     await deleteHeartbeatRunsAfterEvents(db);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
+    await db.delete(routineRuns);
+    await db.delete(routineRevisions);
+    await db.delete(routines);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companySkills);
@@ -177,6 +183,88 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
       const completed = await waitForRun(db, run!.id);
       expect(completed?.responsibleUserId).toBe(issueResponsibleUserId);
     }
+  });
+
+  it("uses a repaired routine-run owner ahead of the legacy pinned revision", async () => {
+    const { companyId, ownerUserId, agentId } = await seedCompany();
+    const legacyResponsibleUserId = "built-in-bundles";
+    const routineId = randomUUID();
+    const routineRevisionId = randomUUID();
+    const routineRunId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Repaired built-in routine",
+      assigneeAgentId: agentId,
+      responsibleUserId: ownerUserId,
+    });
+    await db.insert(routineRevisions).values({
+      id: routineRevisionId,
+      companyId,
+      routineId,
+      revisionNumber: 1,
+      title: "Legacy built-in routine revision",
+      responsibleUserId: legacyResponsibleUserId,
+      snapshot: {
+        version: 1,
+        routine: {
+          id: routineId,
+          companyId,
+          projectId: null,
+          goalId: null,
+          parentIssueId: null,
+          title: "Legacy built-in routine revision",
+          description: null,
+          assigneeAgentId: agentId,
+          priority: "medium",
+          status: "active",
+          concurrencyPolicy: "coalesce_if_active",
+          catchUpPolicy: "skip_missed",
+          originKind: "built_in_bundle",
+          originId: "recent-agent-reflection",
+          variables: [],
+          env: null,
+          responsibleUserId: legacyResponsibleUserId,
+        },
+        triggers: [],
+      },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Legacy routine execution",
+      status: "todo",
+      assigneeAgentId: agentId,
+      responsibleUserId: legacyResponsibleUserId,
+      originKind: "routine_execution",
+      originId: routineId,
+      originRunId: routineRunId,
+    });
+    await db.insert(routineRuns).values({
+      id: routineRunId,
+      companyId,
+      routineId,
+      source: "schedule",
+      status: "issue_created",
+      routineRevisionId,
+      responsibleUserId: ownerUserId,
+      linkedIssueId: issueId,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      requestedByActorType: "system",
+      contextSnapshot: { issueId, source: "routine.dispatch" },
+    });
+
+    expect(run).not.toBeNull();
+    const completed = await waitForRun(db, run!.id);
+    expect(completed?.responsibleUserId).toBe(ownerUserId);
+    expect(completed?.responsibleUserId).not.toBe(legacyResponsibleUserId);
   });
 
   it("uses the triggering user for manual UI/API runs", async () => {

@@ -6084,7 +6084,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return {
           routineId: issueContext.originId,
           env: snapshot.routine.env ?? null,
-          responsibleUserId: revision?.responsibleUserId ?? snapshot.routine.responsibleUserId ?? null,
+          responsibleUserId:
+            routineRun.responsibleUserId
+            ?? revision?.responsibleUserId
+            ?? snapshot.routine.responsibleUserId
+            ?? null,
         };
       }
     }

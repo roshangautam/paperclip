@@ -16,10 +16,13 @@ import {
   companySkillVersions,
   companySkills,
   createDb,
+  heartbeatRuns,
   issueThreadInteractions,
   issues,
   principalPermissionGrants,
   routines,
+  routineRevisions,
+  routineRuns,
   routineTriggers,
 } from "@paperclipai/db";
 import { readPaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
@@ -118,6 +121,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     await db.delete(routines);
     await db.delete(issueThreadInteractions);
     await db.delete(issues);
+    await db.delete(heartbeatRuns);
     await db.delete(builtInManagedResources);
     await db.delete(companySkillVersions);
     await db.delete(companySkills);
@@ -977,6 +981,259 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(grantKeys).not.toContain("tasks:assign");
     expect(grantKeys).not.toContain("agents:configure");
     expect(grantKeys).not.toContain("skills:create");
+  });
+
+  it("uses the company default and audits legacy ownership repair for approved built-ins on startup", async () => {
+    const companyId = await seedCompany({ requireApproval: true });
+    await reconcileBuiltInAgentsOnStartup(db);
+    const pending = await builtInAgentService(db).get(companyId, "reflection-coach");
+    const approval = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.companyId, companyId))
+      .then((rows) => rows.find(
+        (row) => (row.payload as { agentId?: string } | null)?.agentId === pending.agentId,
+      ));
+    await approvalService(db).approve(approval!.id, "board-user", "Approved Reflection Coach");
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    const [revision] = await db.select().from(routineRevisions).where(eq(routineRevisions.id, routine!.latestRevisionId!));
+    const [trigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.routineId, routine!.id));
+
+    expect(routine).toMatchObject({
+      assigneeAgentId: pending.agentId,
+      responsibleUserId: "responsible-user",
+      createdByUserId: null,
+    });
+
+    await db
+      .update(routines)
+      .set({
+        title: "Legacy stock reflection routine",
+        status: "active",
+        responsibleUserId: "built-in-bundles",
+        createdByUserId: "built-in-bundles",
+      })
+      .where(eq(routines.id, routine!.id));
+    await db
+      .update(routineTriggers)
+      .set({ enabled: true })
+      .where(eq(routineTriggers.id, trigger!.id));
+    await db
+      .update(routineRevisions)
+      .set({
+        responsibleUserId: "built-in-bundles",
+        snapshot: {
+          ...revision!.snapshot,
+          routine: { ...revision!.snapshot.routine, responsibleUserId: "built-in-bundles" },
+        },
+      })
+      .where(eq(routineRevisions.id, revision!.id));
+
+    const liveRoutineRunId = randomUUID();
+    const liveIssueId = randomUUID();
+    const liveHeartbeatRunId = randomUUID();
+    await db.insert(issues).values({
+      id: liveIssueId,
+      companyId,
+      title: "Legacy live reflection execution",
+      status: "todo",
+      assigneeAgentId: pending.agentId,
+      responsibleUserId: "built-in-bundles",
+      originKind: "routine_execution",
+      originId: routine!.id,
+      originRunId: liveRoutineRunId,
+      originFingerprint: "legacy-live-reflection",
+    });
+    await db.insert(routineRuns).values({
+      id: liveRoutineRunId,
+      companyId,
+      routineId: routine!.id,
+      triggerId: trigger!.id,
+      source: "schedule",
+      status: "issue_created",
+      routineRevisionId: revision!.id,
+      responsibleUserId: "built-in-bundles",
+      dispatchFingerprint: "legacy-live-reflection",
+      linkedIssueId: liveIssueId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: liveHeartbeatRunId,
+      companyId,
+      agentId: pending.agentId!,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      responsibleUserId: "built-in-bundles",
+      contextSnapshot: {
+        issueId: liveIssueId,
+        responsibleUserId: "built-in-bundles",
+        preserved: "context-value",
+      },
+    });
+
+    const historicalRoutineRunId = randomUUID();
+    const historicalIssueId = randomUUID();
+    const historicalHeartbeatRunId = randomUUID();
+    await db.insert(issues).values({
+      id: historicalIssueId,
+      companyId,
+      title: "Historical blocked reflection execution",
+      status: "blocked",
+      assigneeAgentId: pending.agentId,
+      responsibleUserId: "built-in-bundles",
+      originKind: "routine_execution",
+      originId: routine!.id,
+      originRunId: historicalRoutineRunId,
+      originFingerprint: "legacy-blocked-reflection",
+    });
+    await db.insert(routineRuns).values({
+      id: historicalRoutineRunId,
+      companyId,
+      routineId: routine!.id,
+      triggerId: trigger!.id,
+      source: "schedule",
+      status: "failed",
+      routineRevisionId: revision!.id,
+      responsibleUserId: "built-in-bundles",
+      dispatchFingerprint: "legacy-blocked-reflection",
+      linkedIssueId: historicalIssueId,
+      failureReason: "Execution issue moved to blocked",
+      completedAt: new Date(),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: historicalHeartbeatRunId,
+      companyId,
+      agentId: pending.agentId!,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      responsibleUserId: "built-in-bundles",
+      contextSnapshot: {
+        issueId: historicalIssueId,
+        responsibleUserId: "built-in-bundles",
+      },
+      error: "Responsible user is not authorized",
+      finishedAt: new Date(),
+    });
+
+    const legacyState = await builtInAgentService(db).get(companyId, "reflection-coach");
+    const legacyRoutineState = legacyState.resources.find((resource) => resource.resourceKind === "routine");
+    await db
+      .update(builtInManagedResources)
+      .set({ stockHash: legacyRoutineState!.currentHash! })
+      .where(and(
+        eq(builtInManagedResources.companyId, companyId),
+        eq(builtInManagedResources.resourceKind, "routine"),
+      ));
+    const updateAvailableState = await builtInAgentService(db).get(companyId, "reflection-coach");
+    expect(updateAvailableState.resources.find((resource) => resource.resourceKind === "routine")).toMatchObject({
+      stockStatus: "stock_update_available",
+      scheduleEnabled: true,
+    });
+
+    await Promise.all(
+      Array.from({ length: 20 }, () => reconcileBuiltInAgentsOnStartup(db)),
+    );
+
+    const [repaired] = await db.select().from(routines).where(eq(routines.id, routine!.id));
+    const [repairedRevision] = await db
+      .select()
+      .from(routineRevisions)
+      .where(eq(routineRevisions.id, repaired!.latestRevisionId!));
+    const [repairedTrigger] = await db
+      .select()
+      .from(routineTriggers)
+      .where(eq(routineTriggers.routineId, repaired!.id));
+    expect(repaired).toMatchObject({
+      title: "Legacy stock reflection routine",
+      status: "active",
+      responsibleUserId: "responsible-user",
+    });
+    expect(repairedTrigger).toMatchObject({ enabled: true });
+    expect(repaired!.latestRevisionNumber).toBeGreaterThan(routine!.latestRevisionNumber);
+    expect(repairedRevision).toMatchObject({
+      responsibleUserId: "responsible-user",
+      snapshot: { routine: { responsibleUserId: "responsible-user" } },
+    });
+    const [historicalRevision] = await db
+      .select()
+      .from(routineRevisions)
+      .where(eq(routineRevisions.id, revision!.id));
+    expect(historicalRevision).toMatchObject({
+      responsibleUserId: "built-in-bundles",
+      snapshot: { routine: { responsibleUserId: "built-in-bundles" } },
+    });
+    const [repairedLiveRoutineRun] = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.id, liveRoutineRunId));
+    const [repairedLiveIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, liveIssueId));
+    const [repairedLiveHeartbeatRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, liveHeartbeatRunId));
+    expect(repairedLiveRoutineRun).toMatchObject({
+      responsibleUserId: "responsible-user",
+      routineRevisionId: revision!.id,
+      dispatchFingerprint: "legacy-live-reflection",
+    });
+    expect(repairedLiveIssue).toMatchObject({ responsibleUserId: "responsible-user" });
+    expect(repairedLiveHeartbeatRun).toMatchObject({
+      responsibleUserId: "responsible-user",
+      contextSnapshot: {
+        issueId: liveIssueId,
+        responsibleUserId: "responsible-user",
+        preserved: "context-value",
+      },
+    });
+    const [preservedHistoricalRoutineRun] = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.id, historicalRoutineRunId));
+    const [preservedHistoricalIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, historicalIssueId));
+    const [preservedHistoricalHeartbeatRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, historicalHeartbeatRunId));
+    expect(preservedHistoricalRoutineRun?.responsibleUserId).toBe("built-in-bundles");
+    expect(preservedHistoricalIssue?.responsibleUserId).toBe("built-in-bundles");
+    expect(preservedHistoricalHeartbeatRun).toMatchObject({
+      responsibleUserId: "built-in-bundles",
+      contextSnapshot: { responsibleUserId: "built-in-bundles" },
+    });
+    const repairEvents = await db
+      .select()
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "built_in_agent.routine_ownership_repaired"),
+      ));
+    expect(repairEvents).toHaveLength(1);
+    const [repairEvent] = repairEvents;
+    expect(repairEvent).toMatchObject({
+      actorType: "system",
+      actorId: "built-in-bundles",
+      entityType: "routine",
+      entityId: routine!.id,
+      details: {
+        key: "reflection-coach",
+        routineKey: "recent-agent-reflection",
+        previousResponsibleUserId: "built-in-bundles",
+        responsibleUserId: "responsible-user",
+        repairedRecords: {
+          routineRuns: 1,
+          issues: 1,
+          heartbeatRuns: 1,
+          heartbeatRunContextSnapshots: 1,
+        },
+      },
+    });
   });
 
   it("materializes the Summarizer bundle paused on Claude Haiku with a disabled routine", async () => {

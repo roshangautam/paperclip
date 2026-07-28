@@ -1284,9 +1284,36 @@ export function builtInAgentService(db: Db) {
     return resumed as Agent;
   }
 
+  function routineOwnershipRepairOptions(definition: BuiltInAgentDefinition) {
+    return {
+      fallbackResponsibleUserId: "built-in-bundles",
+      repairResponsibleUserId: "built-in-bundles",
+      responsibleUserRepairActivity: {
+        actorId: "built-in-bundles",
+        action: "built_in_agent.routine_ownership_repaired",
+        details: {
+          key: definition.key,
+          routineKey: definition.bundle!.routine.routineKey,
+        },
+      },
+    };
+  }
+
+  async function repairRoutineOwnership(routine: Routine | null, definition: BuiltInAgentDefinition) {
+    if (!routine || routine.responsibleUserId !== "built-in-bundles") return routine;
+    const repaired = await routineSvc.update(
+      routine.id,
+      {},
+      { agentId: null, userId: null },
+      routineOwnershipRepairOptions(definition),
+    );
+    if (!repaired) throw notFound("Built-in routine not found");
+    return repaired;
+  }
+
   async function createOrResetRoutine(agent: Agent, definition: BuiltInAgentDefinition, existing: Routine | null, mode: "reconcile" | "reset") {
     const routine = definition.bundle!.routine;
-    const actor = { agentId: null, userId: "built-in-bundles" };
+    const actor = { agentId: null, userId: null };
     const nextRoutine = existing
       ? await routineSvc.update(existing.id, {
         title: routine.title,
@@ -1297,7 +1324,7 @@ export function builtInAgentService(db: Db) {
         concurrencyPolicy: routine.concurrencyPolicy,
         catchUpPolicy: routine.catchUpPolicy,
         variables: routine.variables,
-      }, actor)
+      }, actor, routineOwnershipRepairOptions(definition))
       : await routineSvc.create(agent.companyId, {
         title: routine.title,
         description: routine.description,
@@ -1307,7 +1334,7 @@ export function builtInAgentService(db: Db) {
         concurrencyPolicy: routine.concurrencyPolicy,
         catchUpPolicy: routine.catchUpPolicy,
         variables: routine.variables,
-      }, actor);
+      }, actor, { fallbackResponsibleUserId: "built-in-bundles" });
     if (!nextRoutine) throw notFound("Built-in routine not found");
     await db
       .update(routines)
@@ -1382,9 +1409,13 @@ export function builtInAgentService(db: Db) {
       mode === "reset"
       || currentState.stockStatus === "missing"
       || currentState.stockStatus === "stock_update_available";
-    const nextRoutine = shouldWrite
+    let nextRoutine = shouldWrite
       ? await createOrResetRoutine(agent, definition, routine, mode)
-      : routine!;
+      : routine;
+    if (!shouldWrite) {
+      nextRoutine = await repairRoutineOwnership(nextRoutine, definition);
+    }
+    if (!nextRoutine) throw notFound("Built-in routine not found");
     await upsertManagedResourceBinding({
       companyId: agent.companyId,
       bundleKey: definition.key,
@@ -1763,6 +1794,10 @@ export function builtInAgentService(db: Db) {
     });
     if (!updated) throw notFound("Built-in agent not found");
     await ensureBuiltInAgentDefaultGrants(updated as Agent, definition);
+    if (definition.bundle && updated.status !== "pending_approval") {
+      const { routine } = await getRoutineByBinding(companyId, definition);
+      await repairRoutineOwnership(routine, definition);
+    }
     return state(definition, updated as Agent);
   }
 
