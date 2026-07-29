@@ -112,6 +112,7 @@ async function handleRequest(request) {
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: JSON.stringify(observations) },
+          _meta: { origin: "assistant", kind: "model", untrusted: "drop-me" },
         },
       },
     });

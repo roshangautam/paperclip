@@ -1,8 +1,31 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
+
+const {
+  prepareAdapterExecutionTargetRuntime,
+  startAdapterExecutionTargetPaperclipBridge,
+  startAdapterExecutionTargetProcessSessionBridge,
+} = vi.hoisted(() => ({
+  prepareAdapterExecutionTargetRuntime: vi.fn(),
+  startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => null),
+  startAdapterExecutionTargetProcessSessionBridge: vi.fn(async () => null),
+}));
+
+vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>(
+    "@paperclipai/adapter-utils/execution-target",
+  );
+  return {
+    ...actual,
+    prepareAdapterExecutionTargetRuntime,
+    startAdapterExecutionTargetPaperclipBridge,
+    startAdapterExecutionTargetProcessSessionBridge,
+  };
+});
+
 import {
   buildGeminiAcpConfig,
   createGeminiAcpExecutor,
@@ -47,6 +70,7 @@ function setNodeVersion(version: string): void {
 }
 
 afterEach(async () => {
+  vi.clearAllMocks();
   setNodeVersion(originalNodeVersion);
   if (originalPath === undefined) delete process.env.PATH;
   else process.env.PATH = originalPath;
@@ -244,6 +268,23 @@ describe("gemini_local ACP lane", () => {
       engine: "acp",
       explicit: true,
     });
+    process.env.PATH = "";
+    await expect(
+      resolveGeminiExecutionEngineForRun({
+        config: { command: "gemini" },
+        executionTarget: null,
+      }),
+    ).resolves.toEqual({ engine: "acp", explicit: false });
+    await expect(
+      resolveGeminiExecutionEngineForRun({
+        config: { command: "/missing/gemini" },
+        executionTarget: null,
+      }),
+    ).resolves.toMatchObject({
+      engine: "cli",
+      explicit: false,
+      fallbackReason: expect.stringContaining("/missing/gemini --acp"),
+    });
 
     setNodeVersion("v19.9.0");
     await expect(
@@ -387,12 +428,95 @@ describe("gemini_local ACP lane", () => {
     expect(logs.some((entry) => entry.text.includes("\"type\":\"acpx.session\""))).toBe(true);
   });
 
+  it("uses the packaged Gemini CLI binary for local ACP runs", async () => {
+    const root = await makeTempRoot("paperclip-gemini-acp-packaged-");
+    const runtime = new FakeRuntime({});
+    const metas: AdapterInvocationMeta[] = [];
+    const execute = createGeminiAcpExecutor({
+      createRuntime: () => runtime as never,
+    });
+
+    await execute(buildContext(root, {
+      config: {
+        engine: "acp",
+        cwd: root,
+        stateDir: path.join(root, "state"),
+        promptTemplate: "Do the assigned work.",
+      },
+      onMeta: async (meta) => {
+        metas.push(meta);
+      },
+    }));
+
+    expect(metas[0]?.command).toContain(`${path.sep}node_modules${path.sep}.bin${path.sep}gemini --acp`);
+  });
+
+  it("uploads the packaged Gemini runtime for sandbox ACP runs and restores the workspace", async () => {
+    const root = await makeTempRoot("paperclip-gemini-acp-sandbox-");
+    const runtime = new FakeRuntime({});
+    const metas: AdapterInvocationMeta[] = [];
+    const restoreWorkspace = vi.fn(async () => {});
+    const target = {
+      kind: "remote" as const,
+      transport: "sandbox" as const,
+      providerKey: "fixture",
+      remoteCwd: "/sandbox/original",
+      runner: {
+        execute: async () => ({
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "",
+          stderr: "",
+          pid: null,
+          startedAt: new Date().toISOString(),
+        }),
+      },
+    };
+    prepareAdapterExecutionTargetRuntime.mockResolvedValueOnce({
+      target,
+      workspaceRemoteDir: "/sandbox/workspace",
+      runtimeRootDir: "/sandbox/runtime",
+      assetDirs: { "gemini-cli": "/sandbox/runtime/gemini-cli" },
+      restoreWorkspace,
+    });
+    const execute = createGeminiAcpExecutor({
+      createRuntime: () => runtime as never,
+    });
+
+    await execute(buildContext(root, {
+      config: {
+        engine: "acp",
+        cwd: root,
+        stateDir: path.join(root, "state"),
+        promptTemplate: "Do the assigned work.",
+      },
+      executionTarget: target,
+      onMeta: async (meta) => {
+        metas.push(meta);
+      },
+    }));
+
+    expect(prepareAdapterExecutionTargetRuntime).toHaveBeenCalledWith(expect.objectContaining({
+      adapterKey: "gemini",
+      workspaceLocalDir: root,
+      assets: [expect.objectContaining({
+        key: "gemini-cli",
+        localDir: expect.stringContaining(`${path.sep}@google${path.sep}gemini-cli`),
+        followSymlinks: true,
+      })],
+    }));
+    expect(startAdapterExecutionTargetProcessSessionBridge).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: "/sandbox/workspace",
+      args: ["-lc", "exec node '/sandbox/runtime/gemini-cli/bundle/gemini.js' --acp"],
+    }));
+    expect(metas[0]?.command).toBe("node '/sandbox/runtime/gemini-cli/bundle/gemini.js' --acp");
+    expect(restoreWorkspace).toHaveBeenCalledTimes(1);
+  });
+
   it("reports Gemini ACP environment readiness", async () => {
     const root = await makeTempRoot("paperclip-gemini-acp-env-");
-    const bin = path.join(root, "bin");
-    await fs.mkdir(bin, { recursive: true });
-    await fs.writeFile(path.join(bin, "gemini"), "#!/usr/bin/env sh\n", "utf8");
-    process.env.PATH = `${bin}${path.delimiter}${process.env.PATH ?? ""}`;
+    process.env.PATH = "";
     process.env.GEMINI_API_KEY = "test-key";
     setNodeVersion("v20.0.0");
 
@@ -402,6 +526,7 @@ describe("gemini_local ACP lane", () => {
       config: {
         engine: "acp",
         cwd: root,
+        command: "gemini",
       },
     });
 

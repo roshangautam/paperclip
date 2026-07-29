@@ -1,0 +1,75 @@
+diff --git a/dist/acp-agent.d.ts b/dist/acp-agent.d.ts
+index 68a796e32a2e4b03d5c13e6c2aa128cc327001d8..299721d4f42fffe273f4e98a8e2e55ae654cffc4 100644
+--- a/dist/acp-agent.d.ts
++++ b/dist/acp-agent.d.ts
+@@ -824,6 +824,7 @@ export declare function toAcpNotifications(content: string | ContentBlockParam[]
+     registerHooks?: boolean;
+     clientCapabilities?: ClientCapabilities;
+     parentToolUseId?: string | null;
++    modelOutput?: boolean;
+     cwd?: string;
+     taskState?: TaskState;
+     emittedToolCalls?: Set<string>;
+diff --git a/dist/acp-agent.js b/dist/acp-agent.js
+index d4e114cafe9645450ff82530cf1f6c838aeb63ae..c44e10c55366cbf58f39adc6985420436f3a49b6 100644
+--- a/dist/acp-agent.js
++++ b/dist/acp-agent.js
+@@ -2065,7 +2065,9 @@ export class ClaudeAcpAgent {
+                                     // prose can be injected into the feed.)
+                                     if (session.activeTurn?.isLocalOnlyCommand ||
+                                         (!deliveredAssistantText && (message.usage.output_tokens ?? 0) === 0)) {
+-                                        for (const notification of toAcpNotifications(message.result, "assistant", params.sessionId, session.toolUseCache, this.client, this.logger)) {
++                                        for (const notification of toAcpNotifications(message.result, "assistant", params.sessionId, session.toolUseCache, this.client, this.logger, {
++                                            modelOutput: session.activeTurn?.isLocalOnlyCommand !== true,
++                                        })) {
+                                             await sendUpdate(notification);
+                                         }
+                                     }
+@@ -2466,6 +2468,7 @@ export class ClaudeAcpAgent {
+                         for (const notification of toAcpNotifications(content, message.message.role, params.sessionId, session.toolUseCache, this.client, this.logger, {
+                             clientCapabilities: this.clientCapabilities,
+                             parentToolUseId: message.parent_tool_use_id,
++                            modelOutput: message.type === "assistant",
+                             cwd: session.cwd,
+                             taskState: session.taskState,
+                             emittedToolCalls: session.emittedToolCalls,
+@@ -3014,6 +3017,8 @@ export class ClaudeAcpAgent {
+             message.message.role, sessionId, toolUseCache, this.client, this.logger, {
+                 registerHooks: false,
+                 clientCapabilities: this.clientCapabilities,
++                parentToolUseId: message.parent_tool_use_id,
++                modelOutput: message.type === "assistant",
+                 cwd: this.sessions[sessionId]?.cwd,
+                 taskState: this.sessions[sessionId]?.taskState,
+                 messageId: replayMessageId,
+@@ -4992,6 +4997,9 @@ export function toAcpNotifications(content, role, sessionId, toolUseCache, clien
+                 text: content,
+             },
+         };
++        if (options?.modelOutput === true && role === "assistant" && !options?.parentToolUseId) {
++            update._meta = { origin: "assistant", kind: "model" };
++        }
+         applyMessageId(update, options?.messageId);
+         if (options?.parentToolUseId) {
+             update._meta = {
+@@ -5290,6 +5298,12 @@ export function toAcpNotifications(content, role, sessionId, toolUseCache, clien
+                 break;
+         }
+         if (update) {
++            if (options?.modelOutput === true &&
++                role === "assistant" &&
++                update.sessionUpdate === "agent_message_chunk" &&
++                !options?.parentToolUseId) {
++                update._meta = { ...update._meta, origin: "assistant", kind: "model" };
++            }
+             if (options?.parentToolUseId) {
+                 update._meta = {
+                     ...update._meta,
+@@ -5312,6 +5326,7 @@ export function streamEventToAcpNotifications(message, sessionId, toolUseCache,
+     const forwardedOptions = {
+         clientCapabilities: options?.clientCapabilities,
+         parentToolUseId: message.parent_tool_use_id,
++        modelOutput: true,
+         cwd: options?.cwd,
+         taskState: options?.taskState,
+         emittedToolCalls: options?.emittedToolCalls,

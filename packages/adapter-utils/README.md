@@ -9,6 +9,12 @@ For the adapter-author guide see
 [`docs/adapters/creating-an-adapter.md`](../../docs/adapters/creating-an-adapter.md)
 and the in-repo notes at [`packages/adapters/AUTHORING.md`](../adapters/AUTHORING.md).
 
+ACPX `text_delta` runtime events are emitted as `acpx.text_delta` transcript
+records. Model-authored top-level assistant output carries the exact
+`origin: "assistant"` and `kind: "model"` pair. ACPX and this package forward
+only those two provenance fields; absent, partial, unknown, and ID-only
+metadata remains untrusted so downstream consumers can fail closed.
+
 ## No-remote-git contract
 
 The local execution-workspace cwd is the only persistence boundary across

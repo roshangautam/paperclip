@@ -45,6 +45,9 @@
     "dist",
     "skills"
   ],
+  "bundledDependencies": [
+    "@agentclientprotocol/codex-acp"
+  ],
   "scripts": {
     "build": "tsc && cp src/server/codex-auth-merge-decision.cjs src/server/codex-auth-merge-extract.sh dist/server/",
     "clean": "rm -rf dist",
@@ -53,8 +56,14 @@
   },
   "dependencies": {
     "@agentclientprotocol/codex-acp": "^1.1.0",
+    "@agentclientprotocol/sdk": "^1.1.0",
+    "@openai/codex": "^0.142.5",
     "@paperclipai/adapter-utils": "workspace:*",
-    "picocolors": "^1.1.1"
+    "diff": "^9.0.0",
+    "open": "^11.0.0",
+    "picocolors": "^1.1.1",
+    "vscode-jsonrpc": "^9.0.1",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.19.21",

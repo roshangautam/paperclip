@@ -308,7 +308,7 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(prompt).not.toContain("$PAPERCLIP_API_BASE/api/issues/$PAPERCLIP_TASK_ID");
   });
 
-  it("emits ACP text deltas as stdout transcript records", async () => {
+  it("emits only exact model provenance on ACP text delta transcript records", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const logs: Array<{ stream: string; text: string }> = [];
@@ -323,9 +323,49 @@ describe("shared ACPX engine runtime behavior", () => {
           events: (async function* () {
             yield {
               type: "text_delta",
-              text: "streamed hello",
+              text: "missing provenance",
               stream: "output",
               tag: "agent_message_chunk",
+            };
+            yield {
+              type: "text_delta",
+              text: "ID-only provenance",
+              stream: "output",
+              tag: "agent_message_chunk",
+              messageId: "assistant-message-1",
+            };
+            yield {
+              type: "text_delta",
+              text: "partial provenance",
+              stream: "output",
+              tag: "agent_message_chunk",
+              origin: "assistant",
+            };
+            yield {
+              type: "text_delta",
+              text: "malformed provenance",
+              stream: "output",
+              tag: "agent_message_chunk",
+              origin: 42,
+              kind: "model",
+            };
+            yield {
+              type: "text_delta",
+              text: "unknown provenance",
+              stream: "output",
+              tag: "agent_message_chunk",
+              origin: "runtime",
+              kind: "diagnostic",
+            };
+            yield {
+              type: "text_delta",
+              text: "model output",
+              stream: "output",
+              tag: "agent_message_chunk",
+              origin: "assistant",
+              kind: "model",
+              messageId: "assistant-message-2",
+              _meta: { untrusted: "drop-me" },
             };
             yield { type: "done", stopReason: "end_turn" };
           })(),
@@ -352,15 +392,27 @@ describe("shared ACPX engine runtime behavior", () => {
     } as never);
 
     expect(result.exitCode).toBe(0);
-    expect(logs).toContainEqual({
-      stream: "stdout",
-      text: `${JSON.stringify({
-        type: "acpx.text_delta",
-        text: "streamed hello",
-        channel: "output",
-        tag: "agent_message_chunk",
-      })}\n`,
+    const textDeltas = logs
+      .filter((entry) => entry.stream === "stdout" && entry.text.includes('"type":"acpx.text_delta"'))
+      .map((entry) => JSON.parse(entry.text) as Record<string, unknown>);
+    const untrusted = (text: string) => ({
+      type: "acpx.text_delta",
+      text,
+      channel: "output",
+      tag: "agent_message_chunk",
     });
+    expect(textDeltas).toEqual([
+      untrusted("missing provenance"),
+      untrusted("ID-only provenance"),
+      untrusted("partial provenance"),
+      untrusted("malformed provenance"),
+      untrusted("unknown provenance"),
+      {
+        ...untrusted("model output"),
+        origin: "assistant",
+        kind: "model",
+      },
+    ]);
   });
 
   it("captures per-run usage, cost deltas, and billing identity from the ACP runtime", async () => {
@@ -1690,6 +1742,7 @@ describe("gemini ACP flag selection", () => {
 
     await runExecutor({
       agent: "gemini",
+      agentCommand: "gemini --acp",
       stateDir,
       env: { HOME: path.join(root, "home"), PATH: pathWithFakeBin(binDir) },
     });
@@ -1707,6 +1760,7 @@ describe("gemini ACP flag selection", () => {
 
     await runExecutor({
       agent: "gemini",
+      agentCommand: "gemini --acp",
       stateDir,
       env: { HOME: path.join(root, "home"), PATH: pathWithFakeBin(binDir) },
     });

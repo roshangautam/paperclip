@@ -1,0 +1,20 @@
+diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
+--- a/dist/runtime.d.ts
++++ b/dist/runtime.d.ts
+@@ -132,0 +133,2 @@
++  origin?: "assistant";
++  kind?: "model";
+diff --git a/dist/runtime.js b/dist/runtime.js
+--- a/dist/runtime.js
++++ b/dist/runtime.js
+@@ -111,0 +112,2 @@
++	const metaRaw = params.payload._meta;
++	const isModelOutput = isRecord(metaRaw) && metaRaw.origin === "assistant" && metaRaw.kind === "model";
+@@ -120 +122,2 @@
+-			tag: params.tag
++			tag: params.tag,
++			...isModelOutput ? { origin: "assistant", kind: "model" } : {}
+@@ -129 +132,2 @@
+-		tag: params.tag
++		tag: params.tag,
++		...isModelOutput ? { origin: "assistant", kind: "model" } : {}

@@ -115,7 +115,10 @@ test("publish_package_to_npm returns after a successful pnpm publish", () => {
   const result = runPublishHelper({ pnpmMode: "success" });
 
   assert.equal(result.status, 0);
-  assert.match(result.calls, /^pnpm publish --no-git-checks --tag canary --access public$/m);
+  assert.match(
+    result.calls,
+    /^pnpm --config\.node-linker=hoisted publish --no-git-checks --tag canary --access public$/m,
+  );
   assert.doesNotMatch(result.calls, /npm view/);
   assert.doesNotMatch(result.calls, /--provenance=false/);
 });
@@ -127,7 +130,7 @@ test("publish_package_to_npm retries duplicate tlog failures without provenance"
   assert.match(result.calls, /^npm view @paperclipai\/example@1\.2\.3 version$/m);
   assert.match(
     result.calls,
-    /^pnpm publish --no-git-checks --tag canary --access public --provenance=false$/m,
+    /^pnpm --config\.node-linker=hoisted publish --no-git-checks --tag canary --access public --provenance=false$/m,
   );
 });
 
