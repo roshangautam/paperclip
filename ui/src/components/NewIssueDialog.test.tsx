@@ -951,6 +951,16 @@ describe("NewIssueDialog", () => {
         metaKey: true,
       }));
     });
+    expect(modeChip()?.getAttribute("data-issue-work-mode-chip")).toBe("chat");
+
+    await act(async () => {
+      modeChip()?.dispatchEvent(new KeyboardEvent("keydown", {
+        bubbles: true,
+        code: "Period",
+        key: ".",
+        metaKey: true,
+      }));
+    });
     expect(modeChip()?.getAttribute("data-issue-work-mode-chip")).toBe("standard");
 
     act(() => root.unmount());
