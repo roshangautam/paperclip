@@ -742,6 +742,18 @@ describe("IssueChatThread", () => {
       }));
     });
 
+    expect(composer?.getAttribute("data-pending-work-mode")).toBe("chat");
+    expect(chip?.textContent).toContain("Chat mode");
+
+    act(() => {
+      composer?.dispatchEvent(new KeyboardEvent("keydown", {
+        bubbles: true,
+        code: "Period",
+        key: ".",
+        metaKey: true,
+      }));
+    });
+
     expect(composer?.getAttribute("data-pending-work-mode")).toBe("standard");
     expect(chip?.textContent).toContain("Agent mode");
 
