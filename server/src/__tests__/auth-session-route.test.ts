@@ -90,10 +90,17 @@ describe("actorMiddleware authenticated session profile", () => {
             return chain;
           },
           returning() {
+            const last = inserts.at(-1)?.values;
+            // The companies insert uses onConflictDoNothing().returning(): an
+            // already-provisioned company yields no row, which is the steady
+            // state this middleware test exercises. Returning [] keeps
+            // first-time plugin reconciliation (which needs a real database)
+            // out of scope here.
+            if (last && "issuePrefix" in last) return Promise.resolve([]);
             return Promise.resolve([{
-              companyId: inserts.at(-1)?.values.companyId,
-              membershipRole: inserts.at(-1)?.values.membershipRole,
-              status: inserts.at(-1)?.values.status,
+              companyId: last?.companyId,
+              membershipRole: last?.membershipRole,
+              status: last?.status,
             }]);
           },
         };
@@ -102,6 +109,7 @@ describe("actorMiddleware authenticated session profile", () => {
       delete: vi.fn(() => ({ where: () => Promise.resolve(undefined) })),
       select: vi.fn(() => createSelectChain([])),
     } as any;
+    db.transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(db));
     const app = express();
     app.use(
       actorMiddleware(db, {
@@ -336,7 +344,10 @@ describe("actorMiddleware authenticated session profile", () => {
         return insertChain;
       },
       onConflictDoNothing() {
-        return insertChain;
+        // Only the companies insert takes this branch. An already-provisioned
+        // company returns no row, so first-time plugin reconciliation (which
+        // needs a real database) stays out of this middleware-focused test.
+        return { ...insertChain, returning: () => Promise.resolve([]) };
       },
       returning() {
         return Promise.resolve([{ companyId: "company-1", membershipRole: "owner", status: "active" }]);
@@ -355,6 +366,7 @@ describe("actorMiddleware authenticated session profile", () => {
         }),
       })),
       insert: vi.fn(() => insertChain),
+      transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(db)),
       delete: vi.fn((table: unknown) => ({
         where: () => {
           if (table === instanceUserRoles) state.staleInstanceAdminRow = false;
