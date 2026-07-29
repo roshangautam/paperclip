@@ -1,5 +1,7 @@
 import pc from "picocolors";
 
+import { ACPX_PROVENANCE_ASSISTANT } from "./provenance.js";
+
 function parseJson(line: string): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(line);
@@ -77,6 +79,13 @@ export function printAcpxStreamEvent(raw: string, debug: boolean): void {
     if (!text) return;
     const channel = asString(parsed.channel) || asString(parsed.stream);
     const isThought = channel === "thought" || channel === "thinking";
+    // DRO-1183: a delta explicitly marked non-assistant is transport/adapter
+    // output, so render it as dim diagnostics rather than green agent prose.
+    const provenance = asString(parsed.provenance);
+    if (provenance && provenance !== ACPX_PROVENANCE_ASSISTANT) {
+      console.log(pc.gray(text));
+      return;
+    }
     if (isThought) console.log(pc.gray(text));
     else process.stdout.write(pc.green(text));
     return;

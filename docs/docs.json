@@ -104,6 +104,7 @@
               "adapters/http",
               "adapters/external-adapters",
               "adapters/adapter-ui-parser",
+              "adapters/acpx-event-provenance",
               "adapters/creating-an-adapter"
             ]
           }

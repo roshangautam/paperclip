@@ -359,8 +359,81 @@ describe("shared ACPX engine runtime behavior", () => {
         text: "streamed hello",
         channel: "output",
         tag: "agent_message_chunk",
+        provenance: "assistant",
       })}\n`,
     });
+  });
+
+  it("marks an untagged text delta preceding assistant prose as transport provenance", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const logs: Array<{ stream: string; text: string }> = [];
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            // Transport/adapter diagnostic surfaced by the runtime as a
+            // text_delta without an assistant session-update tag.
+            yield {
+              type: "text_delta",
+              text: "Model metadata not found, defaulting to fallback metadata",
+              stream: "output",
+            };
+            yield {
+              type: "text_delta",
+              text: "streamed hello",
+              stream: "output",
+              tag: "agent_message_chunk",
+            };
+            yield { type: "done", stopReason: "end_turn" };
+          })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-transport-delta-provenance",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
+      context: {},
+      onLog: async (stream: "stdout" | "stderr", text: string) => {
+        logs.push({ stream, text });
+      },
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(0);
+
+    const deltas = logs
+      .filter((entry) => entry.stream === "stdout")
+      .map((entry) => {
+        try {
+          return JSON.parse(entry.text) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((record): record is Record<string, unknown> => record?.type === "acpx.text_delta");
+
+    expect(deltas).toHaveLength(2);
+    expect(deltas[0]?.provenance).toBe("transport");
+    expect(deltas[1]?.provenance).toBe("assistant");
+
+    const assistantText = deltas
+      .filter((record) => record.provenance === "assistant")
+      .map((record) => record.text)
+      .join("");
+    expect(assistantText).toBe("streamed hello");
+    expect(assistantText).not.toContain("Model metadata not found");
   });
 
   it("captures per-run usage, cost deltas, and billing identity from the ACP runtime", async () => {

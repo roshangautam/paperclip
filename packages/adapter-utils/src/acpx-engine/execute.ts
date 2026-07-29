@@ -74,6 +74,12 @@ import {
   DEFAULT_ACP_ENGINE_TIMEOUT_SEC,
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "./constants.js";
+import {
+  ACPX_PROVENANCE_ERROR,
+  ACPX_PROVENANCE_TOOL,
+  ACPX_PROVENANCE_TRANSPORT,
+  textDeltaProvenance,
+} from "./provenance.js";
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
 const WRAPPER_CLEANUP_RETENTION_MS = 15 * 60 * 1000;
@@ -1583,6 +1589,7 @@ async function emitRuntimeEvent(ctx: AdapterExecutionContext, event: AcpRuntimeE
       text: event.text,
       channel: event.stream === "thought" ? "thought" : "output",
       tag: event.tag,
+      provenance: textDeltaProvenance(event.tag),
     });
     return;
   }
@@ -1596,6 +1603,7 @@ async function emitRuntimeEvent(ctx: AdapterExecutionContext, event: AcpRuntimeE
       status: event.status,
       text: event.text,
       tag: event.tag,
+      provenance: ACPX_PROVENANCE_TOOL,
       ...(toolInput !== undefined ? { input: toolInput } : {}),
     });
     return;
@@ -1607,6 +1615,7 @@ async function emitRuntimeEvent(ctx: AdapterExecutionContext, event: AcpRuntimeE
       tag: event.tag,
       used: event.used,
       size: event.size,
+      provenance: ACPX_PROVENANCE_TRANSPORT,
       ...(event.cost ? { cost: event.cost } : {}),
       ...(event.breakdown ? { breakdown: event.breakdown } : {}),
     });
@@ -1617,6 +1626,7 @@ async function emitRuntimeEvent(ctx: AdapterExecutionContext, event: AcpRuntimeE
       type: "acpx.result",
       summary: event.stopReason ?? "completed",
       stopReason: event.stopReason,
+      provenance: ACPX_PROVENANCE_TRANSPORT,
     });
     return;
   }
@@ -1626,6 +1636,7 @@ async function emitRuntimeEvent(ctx: AdapterExecutionContext, event: AcpRuntimeE
       message: event.message,
       code: event.code,
       retryable: event.retryable,
+      provenance: ACPX_PROVENANCE_ERROR,
     });
   }
 }
@@ -1884,6 +1895,7 @@ async function emitAcpxFailure(input: {
     type: "acpx.error",
     message,
     phase,
+    provenance: ACPX_PROVENANCE_ERROR,
     ...classified.errorMeta,
     ...(childStderrTail ? { childStderrTail } : {}),
   });
@@ -2172,6 +2184,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       model: prepared.requestedModel || null,
       thinkingEffort: prepared.requestedThinkingEffort || null,
       fastMode: prepared.fastMode,
+      provenance: ACPX_PROVENANCE_TRANSPORT,
     });
     if (ctx.onMeta) {
       await ctx.onMeta({
@@ -2321,6 +2334,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         summary: terminal.status,
         stopReason: terminalStopReason,
         message: errorMessage,
+        provenance:
+          terminal.status === "completed" ? ACPX_PROVENANCE_TRANSPORT : ACPX_PROVENANCE_ERROR,
       });
       await cleanupRemoteBridges(prepared);
       return {

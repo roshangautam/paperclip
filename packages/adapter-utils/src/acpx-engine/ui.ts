@@ -1,5 +1,7 @@
 import type { TranscriptEntry } from "@paperclipai/adapter-utils";
 
+import { ACPX_PROVENANCE_ASSISTANT } from "./provenance.js";
+
 function parseJson(line: string): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(line);
@@ -78,6 +80,15 @@ export function parseAcpxStdoutLine(line: string, ts: string): TranscriptEntry[]
     const text = asString(parsed.text);
     if (!text) return [];
     const channel = asString(parsed.channel) || asString(parsed.stream);
+    // DRO-1183: only explicitly assistant-authored deltas render as assistant
+    // prose. Records emitted before the provenance contract carry no
+    // `provenance` field at all; during the bounded transition window they keep
+    // the historical channel-based rendering so old run transcripts still read
+    // correctly.
+    const provenance = asString(parsed.provenance);
+    if (provenance && provenance !== ACPX_PROVENANCE_ASSISTANT) {
+      return [{ kind: "system", ts, text }];
+    }
     return [{
       kind: channel === "thought" || channel === "thinking" ? "thinking" : "assistant",
       ts,
