@@ -13,7 +13,7 @@ diff --git a/dist/runtime.js b/dist/runtime.js
 @@ -120 +122,2 @@
 -			tag: params.tag
 +			tag: params.tag,
-+			...isModelOutput ? { origin: "assistant", kind: "model" } : {}
++			...(isModelOutput ? { origin: "assistant", kind: "model" } : {})
 @@ -129 +132,2 @@
 -		tag: params.tag
 +		tag: params.tag,
