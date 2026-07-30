@@ -76,7 +76,12 @@ async function runAcpxFixtureSession(
     mode: "prompt",
     requestId: `request-${sessionName}`,
   })) {
-    if (event.type === "text_delta" && event.stream !== "thought") output += event.text;
+    if (event.type === "text_delta" && event.stream !== "thought") {
+      expect(event.origin).toBe("assistant");
+      expect(event.kind).toBe("model");
+      expect(event).not.toHaveProperty("untrusted");
+      output += event.text;
+    }
   }
 
   await runtime.close({
@@ -105,7 +110,7 @@ async function startUnauthorizedAnthropicFixture(): Promise<{
 }
 
 describe("same-machine MCP isolation", () => {
-  it("passes disjoint MCP server sets through acpx session/new and tools/list", async () => {
+  it("preserves exact ACP model provenance while passing disjoint MCP server sets", async () => {
     const root = await createMcpIsolationRoot("paperclip-acpx-mcp-isolation-");
     cleanupRoots.push(root);
 

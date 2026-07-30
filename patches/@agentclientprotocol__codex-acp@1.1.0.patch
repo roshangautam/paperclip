@@ -1,0 +1,57 @@
+diff --git a/dist/index.js b/dist/index.js
+index c0b36696c043489fcbbc9b07836a46d4394721fe..3b27dfc8566ed9919513523e8db21622016db715 100755
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -23233,7 +23233,10 @@ var CodexEventHandler = class {
+     };
+   }
+   async createTextEvent(event) {
+-    return createAgentTextMessageChunk(event.delta, event.itemId);
++    return {
++      ...createAgentTextMessageChunk(event.delta, event.itemId),
++      _meta: { origin: "assistant", kind: "model" }
++    };
+   }
+   async createConfigWarningEvent(event) {
+     const detailsText = event.details ? `
+@@ -23397,7 +23400,7 @@ var CodexEventHandler = class {
+     if (text.length === 0) {
+       return null;
+     }
+-    return createAgentTextMessageChunk(text);
++    return { ...createAgentTextMessageChunk(text), _meta: { origin: "assistant", kind: "model" } };
+   }
+   createContextCompactedEvent() {
+     return createAgentTextMessageChunk("*Context compacted to fit the model's context window.*\n\n");
+@@ -26411,7 +26414,8 @@ function createMessageUpdates(item) {
+   }
+   return contentBlocksFromResponseContent(item["content"]).map((content) => ({
+     sessionUpdate: "agent_message_chunk",
+-    content
++    content,
++    _meta: { origin: "assistant", kind: "model" }
+   }));
+ }
+ function createEventMsgUpdates(record2) {
+@@ -27978,7 +27982,8 @@ You have been logged out. Please try again.`);
+         return [{
+           sessionUpdate: "agent_message_chunk",
+           messageId: item.id,
+-          content: { type: "text", text: item.text }
++          content: { type: "text", text: item.text },
++          _meta: { origin: "assistant", kind: "model" }
+         }];
+       case "reasoning":
+         return this.createReasoningUpdates(item);
+@@ -28046,9 +28054,10 @@ var CodexThread = class {
+     return {
+       sessionUpdate: "agent_message_chunk",
+       content: {
+         type: "text",
+         text: `${entered ? "Entered" : "Exited"} review mode: ${item.review}`
+-      }
++      },
++      ...(!entered ? { _meta: { origin: "assistant", kind: "model" } } : {})
+     };
+   }
+   createContextCompactionUpdate() {

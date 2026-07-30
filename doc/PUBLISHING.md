@@ -64,6 +64,15 @@ The version rewrite step now uses [`scripts/release-package-map.mjs`](../scripts
 
 Those rewrites are temporary. The working tree is restored after publish or dry-run.
 
+## Bundled patched ACP runtimes
+
+The adapter utilities plus the Claude, Codex, and Gemini adapters bundle their
+patched `acpx`/ACP runtime dependency so provenance fixes survive installation
+from the published package. The release script passes
+`--config.node-linker=hoisted` to `pnpm publish`; pnpm's default isolated linker
+cannot pack `bundledDependencies`. Use the same flag when previewing one of
+these packages manually.
+
 ## `@paperclipai/ui` packaging
 
 The UI package publishes prebuilt static assets, not the source workspace.

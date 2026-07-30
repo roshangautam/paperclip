@@ -310,7 +310,7 @@ publish_package_to_npm() {
 
   publish_log="$(mktemp "${TMPDIR:-/tmp}/paperclip-npm-publish.XXXXXX")"
 
-  if (set -o pipefail; pnpm publish --no-git-checks --tag "$dist_tag" --access public 2>&1 | tee "$publish_log"); then
+  if (set -o pipefail; pnpm --config.node-linker=hoisted publish --no-git-checks --tag "$dist_tag" --access public 2>&1 | tee "$publish_log"); then
     rm -f "$publish_log"
     return 0
   fi
@@ -335,7 +335,7 @@ publish_package_to_npm() {
   fi
 
   release_warn "Retrying ${package_name}@${package_version} once with npm provenance disabled."
-  if pnpm publish --no-git-checks --tag "$dist_tag" --access public --provenance=false; then
+  if pnpm --config.node-linker=hoisted publish --no-git-checks --tag "$dist_tag" --access public --provenance=false; then
     rm -f "$publish_log"
     return 0
   fi

@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import type {
   AdapterEnvironmentCheck,
@@ -10,8 +11,11 @@ import type {
 } from "@paperclipai/adapter-utils";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
+  overrideAdapterExecutionTargetRemoteCwd,
+  prepareAdapterExecutionTargetRuntime,
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetCwd,
+  resolveAdapterExecutionTargetTimeoutSec,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   DEFAULT_ACP_ENGINE_MODE,
@@ -25,10 +29,12 @@ import {
   asString,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
+import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "../index.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const packageRootDir = path.resolve(moduleDir, "../..");
+const require = createRequire(import.meta.url);
 const MIN_ACP_NODE_VERSION = "20.0.0";
 
 export type GeminiExecutionEngine = "cli" | "acp";
@@ -86,9 +92,12 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
 }
 
 export function buildGeminiAcpConfig(config: Record<string, unknown>): Record<string, unknown> {
-  const configuredAgentCommand = firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
+  const configuredAgentCommand = configuredGeminiAcpCommand(config);
   const configuredGeminiCommand = firstNonEmptyString(config.command);
-  const agentCommand = configuredAgentCommand ?? (configuredGeminiCommand ? `${configuredGeminiCommand} --acp` : undefined);
+  const agentCommand = configuredAgentCommand ??
+    (configuredGeminiCommand && configuredGeminiCommand !== "gemini"
+      ? `${configuredGeminiCommand} --acp`
+      : undefined);
   const stateDir = firstNonEmptyString(config.stateDir, config.acpStateDir);
   const mode = firstNonEmptyString(config.mode, config.acpMode) ?? DEFAULT_ACP_ENGINE_MODE;
   const permissionMode =
@@ -126,6 +135,83 @@ function withGeminiAcpDefaults(options: GeminiAcpExecutorOptions): AcpxEngineExe
   };
 }
 
+function configuredGeminiAcpCommand(config: Record<string, unknown>): string | undefined {
+  return firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
+}
+
+function usesBundledGeminiAcpRuntime(config: Record<string, unknown>): boolean {
+  const cliCommand = firstNonEmptyString(config.command);
+  return !configuredGeminiAcpCommand(config) && (!cliCommand || cliCommand === "gemini");
+}
+
+function bundledGeminiCliDir(): string {
+  return path.dirname(require.resolve("@google/gemini-cli/package.json"));
+}
+
+function bundledGeminiCliEntry(): string {
+  return path.join(bundledGeminiCliDir(), "bundle", "gemini.js");
+}
+
+function geminiAcpLocalWorkspace(ctx: AdapterExecutionContext): string {
+  const workspace = parseObject(ctx.context.paperclipWorkspace);
+  const configuredCwd = asString(ctx.config.cwd, "");
+  const workspaceCwd = asString(workspace.cwd, "");
+  const useConfiguredCwd = asString(workspace.source, "") === "agent_home" && configuredCwd.length > 0;
+  return (useConfiguredCwd ? "" : workspaceCwd) || configuredCwd || process.cwd();
+}
+
+async function prepareBundledGeminiAcpRuntime(
+  ctx: AdapterExecutionContext,
+  config: Record<string, unknown>,
+): Promise<{
+  context: AdapterExecutionContext;
+  restoreWorkspace: (() => Promise<void>) | null;
+}> {
+  const target = readAdapterExecutionTarget({
+    executionTarget: ctx.executionTarget,
+    legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
+  });
+  if (!sandboxTargetHasProcessSessionBridge(target) || configuredGeminiAcpCommand(config)) {
+    return { context: { ...ctx, config }, restoreWorkspace: null };
+  }
+
+  await ctx.onLog("stdout", "[paperclip] Syncing workspace and bundled Gemini ACP runtime to sandbox.\n");
+  const prepared = await prepareAdapterExecutionTargetRuntime({
+    runId: ctx.runId,
+    target,
+    adapterKey: "gemini",
+    workspaceLocalDir: geminiAcpLocalWorkspace(ctx),
+    timeoutSec: resolveAdapterExecutionTargetTimeoutSec(target, asNumber(config.timeoutSec, 0)),
+    onProgress: (line) => ctx.onLog("stdout", line),
+    onRuntimeProgress: ctx.onRuntimeProgress,
+    assets: [{
+      key: "gemini-cli",
+      localDir: bundledGeminiCliDir(),
+      followSymlinks: true,
+    }],
+  });
+  const remoteGeminiEntry = path.posix.join(
+    prepared.assetDirs["gemini-cli"],
+    "bundle",
+    "gemini.js",
+  );
+  return {
+    context: {
+      ...ctx,
+      config: {
+        ...config,
+        agentCommand: `node ${shellQuote(remoteGeminiEntry)} --acp`,
+      },
+      executionTarget: overrideAdapterExecutionTargetRemoteCwd(
+        target,
+        prepared.workspaceRemoteDir,
+      ),
+    },
+    restoreWorkspace: () =>
+      prepared.restoreWorkspace((line) => ctx.onLog("stdout", line)),
+  };
+}
+
 export function createGeminiAcpExecutor(options: GeminiAcpExecutorOptions = {}): GeminiAcpExecutor {
   let executor: GeminiAcpExecutor | null = null;
   return async (ctx) => {
@@ -135,10 +221,12 @@ export function createGeminiAcpExecutor(options: GeminiAcpExecutorOptions = {}):
       currentExecutor = createAcpxEngineExecutor(withGeminiAcpDefaults(options));
       executor = currentExecutor;
     }
-    return currentExecutor({
-      ...ctx,
-      config: buildGeminiAcpConfig(ctx.config),
-    });
+    const prepared = await prepareBundledGeminiAcpRuntime(ctx, buildGeminiAcpConfig(ctx.config));
+    try {
+      return await currentExecutor(prepared.context);
+    } finally {
+      await prepared.restoreWorkspace?.();
+    }
   };
 }
 
@@ -216,7 +304,7 @@ async function commandIsResolvable(
 }
 
 function resolveGeminiAcpCommand(config: Record<string, unknown>): string {
-  const configured = firstNonEmptyString(config.agentCommand, config.acpAgentCommand);
+  const configured = configuredGeminiAcpCommand(config);
   if (configured) return configured;
   const geminiCommand = firstNonEmptyString(config.command) ?? "gemini";
   return `${geminiCommand} --acp`;
@@ -243,6 +331,15 @@ async function defaultGeminiAcpFallbackReason(
   }
   if (!nodeVersionMeetsGeminiAcpMinimum()) {
     return `Node ${process.version} does not satisfy Gemini ACP's Node >=${MIN_ACP_NODE_VERSION} prerequisite.`;
+  }
+  if (usesBundledGeminiAcpRuntime(input.config)) {
+    if (!(await pathExists(bundledGeminiCliEntry()))) {
+      return `Bundled Gemini ACP runtime is not available: ${bundledGeminiCliEntry()}.`;
+    }
+    if (target?.kind === "remote" && !(await commandIsResolvable("node", resolveConfigPath(input.config), input))) {
+      return "Gemini ACP requires Node on the remote execution target.";
+    }
+    return null;
   }
   const command = resolveGeminiAcpCommand(input.config);
   if (!(await commandIsResolvable(command, resolveConfigPath(input.config), input))) {
@@ -313,11 +410,14 @@ export async function testGeminiAcpEnvironment(
       : `Run Gemini ACP with Node >=${MIN_ACP_NODE_VERSION} or switch engine=cli.`,
   });
 
-  const command = resolveGeminiAcpCommand(config);
-  const commandResolvable = await commandIsResolvable(command, resolveConfigPath(config), {
-    config,
-    executionTarget: ctx.executionTarget,
-  });
+  const usesBundledRuntime = usesBundledGeminiAcpRuntime(config);
+  const command = usesBundledRuntime ? bundledGeminiCliEntry() : resolveGeminiAcpCommand(config);
+  const commandResolvable = usesBundledRuntime
+    ? await pathExists(command)
+    : await commandIsResolvable(command, resolveConfigPath(config), {
+        config,
+        executionTarget: ctx.executionTarget,
+      });
   checks.push({
     code: commandResolvable ? "gemini_acp_command_resolvable" : "gemini_acp_command_missing",
     level: commandResolvable ? "info" : "error",

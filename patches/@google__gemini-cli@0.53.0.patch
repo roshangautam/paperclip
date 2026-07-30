@@ -1,0 +1,14 @@
+diff --git a/bundle/gemini-7M47OEXS.js b/bundle/gemini-7M47OEXS.js
+index 293c7da164a573239600462859d8a89f26f979f4..b85f4982704bb97850861f0581c288d9426ff0c3 100644
+--- a/bundle/gemini-7M47OEXS.js
++++ b/bundle/gemini-7M47OEXS.js
+@@ -14038,7 +14038,8 @@ ${thought.description}`;
+               };
+               await this.sendUpdate({
+                 sessionUpdate: "agent_message_chunk",
+-                content
++                content,
++                _meta: { origin: "assistant", kind: "model" }
+               });
+               break;
+             }

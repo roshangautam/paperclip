@@ -254,16 +254,21 @@ async function resolveBuiltInAgentCommand(input: {
   executionTargetIsRemote: boolean;
 }): Promise<BuiltInAgentCommand | null> {
   const { agent, packageRootDir, executionTargetIsRemote } = input;
-  if (agent === "gemini") {
-    return { command: "gemini --acp", shellCommand: "gemini --acp" };
-  }
-  const binName = agent === "claude" ? "claude-agent-acp" : agent === "codex" ? "codex-acp" : null;
+  const binName =
+    agent === "gemini"
+      ? "gemini"
+      : agent === "claude"
+        ? "claude-agent-acp"
+        : agent === "codex"
+          ? "codex-acp"
+          : null;
   if (!binName) return null;
+  const args = agent === "gemini" ? " --acp" : "";
   if (executionTargetIsRemote) {
-    return { command: binName, shellCommand: binName };
+    return { command: `${binName}${args}`, shellCommand: `${binName}${args}` };
   }
   const resolved = (await findAncestorBin(packageRootDir, binName)) ?? binName;
-  return { command: resolved, shellCommand: shellQuote(resolved) };
+  return { command: `${resolved}${args}`, shellCommand: `${shellQuote(resolved)}${args}` };
 }
 
 const execFileAsync = promisify(execFile);
@@ -1578,11 +1583,13 @@ async function emitAcpxLog(ctx: AdapterExecutionContext, payload: Record<string,
 
 async function emitRuntimeEvent(ctx: AdapterExecutionContext, event: AcpRuntimeEvent) {
   if (event.type === "text_delta") {
+    const isModelOutput = event.origin === "assistant" && event.kind === "model";
     await emitAcpxLog(ctx, {
       type: "acpx.text_delta",
       text: event.text,
       channel: event.stream === "thought" ? "thought" : "output",
       tag: event.tag,
+      ...(isModelOutput ? { origin: event.origin, kind: event.kind } : {}),
     });
     return;
   }
