@@ -74,6 +74,17 @@ test("every real harness installs outside the runtime user's home", () => {
   }
 });
 
+test("the Pi image stays on the server runtime package version", () => {
+  assert.match(
+    read("Dockerfile.pi"),
+    /npm install -g --no-audit --no-fund @earendil-works\/pi-coding-agent@0\.74\.0 \\/,
+  );
+  assert.match(
+    read("../../server/src/adapters/registry.ts"),
+    /buildNpmRuntimeCommandSpec\(config, "pi", "@earendil-works\/pi-coding-agent@0\.74\.0"\)/,
+  );
+});
+
 test("bake keeps all existing runtime targets and chains them to base", () => {
   const bake = read("buildx-bake.hcl");
   const expected = ["base", "claude", "codex", "gemini", "opencode", "pi", "hermes"];
