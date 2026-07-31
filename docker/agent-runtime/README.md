@@ -1,9 +1,10 @@
 # Agent Runtime Image Family
 
 Paperclip's server image is the control plane. These images are separate,
-non-root execution environments for coding-agent harnesses. A sandbox provider
-starts the appropriate runtime image for a lease, mounts the workspace and
-runtime command, and removes the sandbox when the run finishes.
+non-root execution environments for coding-agent harnesses. They define only
+the image and shim contract. A consuming sandbox provider remains responsible
+for supplying the workspace and runtime-command spec and managing lifecycle;
+this change does not add that integration.
 
 The runtime images are not long-running agent services and do not need to be
 added to the Paperclip server image.
