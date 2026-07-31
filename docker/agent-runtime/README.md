@@ -2,9 +2,12 @@
 
 Paperclip's server image is the control plane. These images are separate,
 non-root execution environments for coding-agent harnesses. They define only
-the image and shim contract. A consuming sandbox provider remains responsible
-for supplying the workspace and runtime-command spec and managing lifecycle;
-this change does not add that integration.
+the image and optional shim contract. A consuming sandbox provider remains
+responsible for supplying the workspace and credentials, invoking a harness,
+and managing lifecycle; this change does not add that integration. Providers
+may execute harnesses directly. The shim only turns a runtime-command spec into
+a harness process; it does not mount workspaces, inject credentials, create
+sandboxes, or clean them up.
 
 The runtime images are not long-running agent services and do not need to be
 added to the Paperclip server image.
