@@ -22,7 +22,7 @@ added to the Paperclip server image.
 - **`agent-runtime-gemini`**: Adds `@google/gemini-cli` and its headless
   API-key authentication setting.
 - **`agent-runtime-claude`**: Adds `@anthropic-ai/claude-code` and the
-  `claude-code` command expected by the shim.
+  `claude-code` compatibility alias.
 - **`agent-runtime-hermes`**: Reserved placeholder. It does not install a
   Hermes runtime yet.
 

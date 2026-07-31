@@ -14,8 +14,8 @@ RUN export HOME=/root \
     && chown -R 0:0 "$CLAUDE_ROOT" \
     && chmod -R go-w "$CLAUDE_ROOT"
 
-# @anthropic-ai/claude-code installs as 'claude', but the shim expects
-# 'claude-code'. Resolve the installed binary and create a root-owned alias.
+# @anthropic-ai/claude-code installs as 'claude'; keep a root-owned
+# 'claude-code' compatibility alias for callers that use the package name.
 RUN CLAUDE_BIN="$(command -v claude)" \
     && ln -s "$CLAUDE_BIN" /usr/local/bin/claude-code
 
