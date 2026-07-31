@@ -14,7 +14,7 @@ added to the Paperclip server image.
 - **`agent-runtime-base`**: Ubuntu 22.04, Node 22, git, tini, ripgrep,
   UID/GID 1000, and `paperclip-agent-shim`.
 - **`agent-runtime-opencode`**: Adds `opencode-ai`.
-- **`agent-runtime-pi`**: Adds `@mariozechner/pi-coding-agent`.
+- **`agent-runtime-pi`**: Adds `@earendil-works/pi-coding-agent@0.74.0`.
 - **`agent-runtime-codex`**: Adds `@openai/codex`.
 - **`agent-runtime-gemini`**: Adds `@google/gemini-cli` and its headless
   API-key authentication setting.

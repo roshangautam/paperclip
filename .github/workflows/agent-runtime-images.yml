@@ -29,6 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Test runtime image contract
+        run: node --test docker/agent-runtime/runtime-images.test.mjs
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 

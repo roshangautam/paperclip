@@ -8,11 +8,18 @@ const realHarnesses = [
   ["codex", "@openai/codex", "codex"],
   ["gemini", "@google/gemini-cli", "gemini"],
   ["opencode", "opencode-ai", "opencode"],
-  ["pi", "@mariozechner/pi-coding-agent", "pi"],
+  ["pi", "@earendil-works/pi-coding-agent", "pi"],
 ];
 
 function read(name) {
   return readFileSync(new URL(name, runtimeDir), "utf8");
+}
+
+function targetBlock(bake, name) {
+  const start = bake.indexOf(`target "${name}" {`);
+  assert.notEqual(start, -1, `target ${name} is present`);
+  const end = bake.indexOf('\ntarget "', start + 1);
+  return bake.slice(start, end === -1 ? bake.length : end);
 }
 
 test("the base image defines a writable non-root runtime contract", () => {
@@ -20,7 +27,10 @@ test("the base image defines a writable non-root runtime contract", () => {
 
   assert.match(base, /groupadd -g 1000 paperclip/);
   assert.match(base, /useradd -u 1000 -g 1000 -d \/home\/paperclip/);
-  assert.match(base, /install -d -o 1000 -g 1000[\s\S]*\/workspace/);
+  assert.match(
+    base,
+    /&& install -d -o 1000 -g 1000 \\\n(?:\s+\/[^\n]+ \\\n)*\s+\/workspace$/m,
+  );
   assert.match(base, /^ENV HOME=\/home\/paperclip \\/m);
   assert.match(base, /NPM_CONFIG_CACHE=\/home\/paperclip\/\.cache\/npm/);
   assert.match(base, /XDG_CACHE_HOME=\/home\/paperclip\/\.cache/);
@@ -78,10 +88,11 @@ test("bake keeps all existing runtime targets and chains them to base", () => {
   assert.deepEqual(definedTargets, expected);
 
   for (const [name] of realHarnesses) {
+    const target = targetBlock(bake, name);
     assert.match(
-      bake,
+      target,
       new RegExp(
-        `target "${name}"[\\s\\S]*?"paperclipai/agent-runtime-base:\\$\\{VERSION\\}" = "target:base"`,
+        `"paperclipai/agent-runtime-base:\\$\\{VERSION\\}" = "target:base"`,
       ),
     );
   }
