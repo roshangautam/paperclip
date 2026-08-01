@@ -33,9 +33,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 1000 paperclip \
-    && useradd -u 1000 -g 1000 -d /home/paperclip -m -s /bin/bash paperclip
+    && useradd -u 1000 -g 1000 -d /home/paperclip -m -s /bin/bash paperclip \
+    && install -d -o 1000 -g 1000 \
+      /home/paperclip/.cache \
+      /home/paperclip/.cache/npm \
+      /home/paperclip/.config \
+      /home/paperclip/.local \
+      /home/paperclip/.local/share \
+      /home/paperclip/.local/state \
+      /workspace
 
-COPY --from=shim-build   /out/paperclip-agent-shim                          /usr/local/bin/paperclip-agent-shim
+COPY --from=shim-build --chown=0:0 --chmod=0755 /out/paperclip-agent-shim /usr/local/bin/paperclip-agent-shim
+
+ENV HOME=/home/paperclip \
+    NPM_CONFIG_CACHE=/home/paperclip/.cache/npm \
+    XDG_CACHE_HOME=/home/paperclip/.cache \
+    XDG_CONFIG_HOME=/home/paperclip/.config \
+    XDG_DATA_HOME=/home/paperclip/.local/share \
+    XDG_STATE_HOME=/home/paperclip/.local/state
 
 USER 1000:1000
 WORKDIR /workspace

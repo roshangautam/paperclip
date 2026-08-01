@@ -4,12 +4,22 @@ FROM paperclipai/agent-runtime-base:${BASE_TAG}
 
 USER root
 # pi is the multi-provider Pi coding-agent router. Verified npm package:
-# @mariozechner/pi-coding-agent (binary 'pi' → dist/cli.js). Same package
+# @earendil-works/pi-coding-agent (binary 'pi' -> dist/cli.js). Same package
 # is used by SANDBOX_INSTALL_COMMAND in pi-local/src/index.ts.
-RUN npm install -g @mariozechner/pi-coding-agent@latest \
-    && { chown -R 1000:1000 /usr/lib/node_modules || true; }
+RUN export HOME=/root \
+      NPM_CONFIG_CACHE=/root/.npm \
+      XDG_CACHE_HOME=/root/.cache \
+      XDG_CONFIG_HOME=/root/.config \
+      XDG_DATA_HOME=/root/.local/share \
+      XDG_STATE_HOME=/root/.local/state \
+    && npm install -g --no-audit --no-fund @earendil-works/pi-coding-agent@0.74.0 \
+    && PI_ROOT="$(npm root -g)/@earendil-works/pi-coding-agent" \
+    && chown -R 0:0 "$PI_ROOT" \
+    && chmod -R go-w "$PI_ROOT"
 
 USER 1000:1000
 
-# Verify the CLI is on PATH for the shim's exec.LookPath
-RUN command -v pi >/dev/null 2>&1 || (echo "pi not on PATH"; exit 1)
+RUN PI_ROOT="$(npm root -g)/@earendil-works/pi-coding-agent" \
+    && command -v pi >/dev/null 2>&1 \
+    && test "$(stat -c '%u:%g' "$PI_ROOT")" = "0:0" \
+    && test ! -w "$PI_ROOT"
