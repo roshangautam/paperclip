@@ -1,6 +1,13 @@
 name: Agent runtime images
 
 on:
+  pull_request:
+    branches: [master, truenas/local]
+    paths:
+      - "docker/agent-runtime/**"
+      - "server/src/adapters/registry.ts"
+      - "tools/agent-shim/**"
+      - ".github/workflows/agent-runtime-images.yml"
   push:
     branches: [master]
     paths:
@@ -16,16 +23,53 @@ on:
 
 permissions:
   contents: read
-  packages: write
-  id-token: write   # cosign keyless OIDC
 
 env:
   REGISTRY: ghcr.io/paperclipai
   VERSION: ${{ github.event.inputs.version || format('git-{0}', github.sha) }}
 
 jobs:
-  build-and-sign:
+  contract:
     runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test runtime image contract
+        run: node --test docker/agent-runtime/runtime-images.test.mjs
+
+  build-pr:
+    if: github.event_name == 'pull_request'
+    needs: contract
+    runs-on: ubuntu-22.04
+    env:
+      REGISTRY: localhost/paperclip
+      VERSION: pr-${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build all deployed harness images without pushing
+        run: |
+          docker buildx bake \
+            -f docker/agent-runtime/buildx-bake.hcl \
+            base opencode pi codex gemini claude \
+            --load
+
+      - name: Smoke the non-root base image
+        run: |
+          docker run --rm "${REGISTRY}/agent-runtime-base:${VERSION}" \
+            sh -lc 'test "$(id -u):$(id -g)" = 1000:1000 && touch "$HOME/.runtime-write-check"'
+
+  build-and-sign:
+    if: github.event_name != 'pull_request'
+    needs: contract
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # cosign keyless OIDC
     steps:
       - uses: actions/checkout@v7
 

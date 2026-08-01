@@ -3,10 +3,20 @@ ARG BASE_TAG=dev
 FROM paperclipai/agent-runtime-base:${BASE_TAG}
 
 USER root
-RUN npm install -g @openai/codex@latest \
-    && { chown -R 1000:1000 /usr/lib/node_modules || true; }
+RUN export HOME=/root \
+      NPM_CONFIG_CACHE=/root/.npm \
+      XDG_CACHE_HOME=/root/.cache \
+      XDG_CONFIG_HOME=/root/.config \
+      XDG_DATA_HOME=/root/.local/share \
+      XDG_STATE_HOME=/root/.local/state \
+    && npm install -g --no-audit --no-fund @openai/codex@latest \
+    && CODEX_ROOT="$(npm root -g)/@openai/codex" \
+    && chown -R 0:0 "$CODEX_ROOT" \
+    && chmod -R go-w "$CODEX_ROOT"
 
 USER 1000:1000
 
-# Verify the CLI is on PATH for the shim's exec.LookPath
-RUN command -v codex >/dev/null 2>&1 || (echo "codex not on PATH"; exit 1)
+RUN CODEX_ROOT="$(npm root -g)/@openai/codex" \
+    && command -v codex >/dev/null 2>&1 \
+    && test "$(stat -c '%u:%g' "$CODEX_ROOT")" = "0:0" \
+    && test ! -w "$CODEX_ROOT"

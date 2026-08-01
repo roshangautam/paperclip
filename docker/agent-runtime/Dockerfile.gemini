@@ -3,13 +3,23 @@ ARG BASE_TAG=dev
 FROM paperclipai/agent-runtime-base:${BASE_TAG}
 
 USER root
-RUN npm install -g @google/gemini-cli@latest \
-    && { chown -R 1000:1000 /usr/lib/node_modules || true; }
+RUN export HOME=/root \
+      NPM_CONFIG_CACHE=/root/.npm \
+      XDG_CACHE_HOME=/root/.cache \
+      XDG_CONFIG_HOME=/root/.config \
+      XDG_DATA_HOME=/root/.local/share \
+      XDG_STATE_HOME=/root/.local/state \
+    && npm install -g --no-audit --no-fund @google/gemini-cli@latest \
+    && GEMINI_ROOT="$(npm root -g)/@google/gemini-cli" \
+    && chown -R 0:0 "$GEMINI_ROOT" \
+    && chmod -R go-w "$GEMINI_ROOT"
 
 USER 1000:1000
 
-# Verify the CLI is on PATH for the shim's exec.LookPath
-RUN command -v gemini >/dev/null 2>&1 || (echo "gemini not on PATH"; exit 1)
+RUN GEMINI_ROOT="$(npm root -g)/@google/gemini-cli" \
+    && command -v gemini >/dev/null 2>&1 \
+    && test "$(stat -c '%u:%g' "$GEMINI_ROOT")" = "0:0" \
+    && test ! -w "$GEMINI_ROOT"
 
 # Pre-select the gemini-api-key auth mode: gemini-cli refuses headless runs with
 # "Invalid auth method selected." unless settings.json picks an auth type (the
