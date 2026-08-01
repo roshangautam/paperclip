@@ -1,85 +1,98 @@
 # Agent Runtime Image Family
 
-Container images for running coding-agent harnesses in sandboxed environments (for example the kubernetes sandbox provider, stage 1 of the k8s contribution). Images are named `agent-runtime-{harness}:{version}` and published to `ghcr.io/paperclipai/` by the `agent-runtime-images` workflow. The registry is overridable: every reference flows through the `REGISTRY` bake variable.
+Paperclip's server image is the control plane. These images are separate,
+non-root execution environments for coding-agent harnesses. They define only
+the image and optional shim contract. A consuming sandbox provider remains
+responsible for supplying the workspace and credentials, invoking a harness,
+and managing lifecycle; this change does not add that integration. Providers
+may execute harnesses directly. The shim only turns a runtime-command spec into
+a harness process; it does not mount workspaces, inject credentials, create
+sandboxes, or clean them up.
 
-## Image Lineup
+The runtime images are not long-running agent services and do not need to be
+added to the Paperclip server image.
 
-- **`agent-runtime-base`**: Foundation. Ubuntu 22.04 + Node 22 + git + tini + non-root user (uid 1000) + the agent shim.
-- **`agent-runtime-opencode`**: Extends base with `opencode-ai` globally installed.
-- **`agent-runtime-pi`**: Extends base with `@mariozechner/pi-coding-agent`.
-- **`agent-runtime-codex`**: Extends base with `@openai/codex`.
-- **`agent-runtime-gemini`**: Extends base with `@google/gemini-cli` plus headless auth-mode settings.
-- **`agent-runtime-claude`**: Extends base with `@anthropic-ai/claude-code` (symlinked as `claude-code`).
-- **`agent-runtime-hermes`**: Dockerfile included in the bake group, not in the default publish scope (stub until a CLI package exists).
+## Image lineup
 
-## Base Image Contents
+- **`agent-runtime-base`**: Ubuntu 22.04, Node 22, git, tini, ripgrep,
+  UID/GID 1000, and `paperclip-agent-shim`.
+- **`agent-runtime-opencode`**: Adds `opencode-ai`.
+- **`agent-runtime-pi`**: Adds `@earendil-works/pi-coding-agent@0.74.0`.
+- **`agent-runtime-codex`**: Adds `@openai/codex`.
+- **`agent-runtime-gemini`**: Adds `@google/gemini-cli` and its headless
+  API-key authentication setting.
+- **`agent-runtime-claude`**: Adds `@anthropic-ai/claude-code` and the
+  `claude-code` compatibility alias.
+- **`agent-runtime-hermes`**: Reserved placeholder. It does not install a
+  Hermes runtime yet.
 
-**OS & Runtime:**
-- Ubuntu 22.04
-- Node.js 22 (via NodeSource APT repo)
-- git
-- tini (PID-1 init, ensures signal propagation)
-- Non-root user `paperclip` (uid/gid 1000)
+## Runtime contract
 
-**Paperclip Binaries:**
-- `/usr/local/bin/paperclip-agent-shim`: Go binary compiled from `tools/agent-shim/`. Reads `/run/paperclip/runtime-command.json` and `syscall.Exec`s the harness CLI.
+All images inherit these defaults from `agent-runtime-base`:
 
-**Defaults:**
-- `USER`: 1000:1000 (paperclip, non-root)
-- `WORKDIR`: `/workspace` (mount workspace volumes here)
-- `ENTRYPOINT`: `/usr/bin/tini --` (PID-1 reaper, forwards signals)
-- `CMD`: `/usr/local/bin/paperclip-agent-shim`
+- `USER 1000:1000` (`paperclip`);
+- `WORKDIR /workspace`;
+- `ENTRYPOINT ["/usr/bin/tini", "--"]`;
+- `CMD ["/usr/local/bin/paperclip-agent-shim"]`;
+- writable home, npm cache, XDG cache/config/data/state, and workspace
+  directories owned by UID/GID 1000.
 
-## Building Locally
+Each real harness is installed globally as root during the image build. The
+build uses root-only home and cache paths, then leaves the installed package
+root-owned and non-writable by the runtime user. Harness state created while an
+agent runs therefore lands in `/home/paperclip`, while the shared executable
+cannot be modified by that agent.
 
-All targets build `linux/amd64` by default (see `buildx-bake.hcl`). Derived images chain off the `base` target through bake `contexts`, so the literal registry in each `FROM` line is overridden at build time and the whole family builds in one pass without pushing intermediates.
+The shim reads `/run/paperclip/runtime-command.json` (or a path passed with
+`-spec`) and replaces itself with the requested CLI using `syscall.Exec`:
 
-```bash
-docker buildx bake -f docker/agent-runtime/buildx-bake.hcl --load
-```
-
-### Custom tag or registry
-
-```bash
-REGISTRY=myregistry VERSION=mytag \
-  docker buildx bake -f docker/agent-runtime/buildx-bake.hcl --load
-```
-
-## Quickstart Smoke Test
-
-Build and verify the `agent-runtime-claude` image runs locally:
-
-```bash
-docker buildx bake -f docker/agent-runtime/buildx-bake.hcl base claude --load
-docker run --rm ghcr.io/paperclipai/agent-runtime-claude:dev claude-code --version
-```
-
-## Agent Container (paperclip-agent-shim)
-
-The main agent process runs as the shim (PID 1 under tini). The shim:
-
-1. Reads `/run/paperclip/runtime-command.json` (path overridable via `-spec`), a JSON file mounted by whatever schedules the run
-2. Parses `{ "command", "args" }`: the harness CLI and arguments
-3. Resolves the command on PATH and `syscall.Exec`s it, replacing itself
-4. SIGTERM from the kubelet propagates directly to the harness (no zombie processes)
-
-**runtime-command.json Contract:**
 ```json
 {
   "command": "claude-code",
-  "args": ["--token", "xyz", "--workspace", "/workspace"]
+  "args": ["--print", "Inspect the assigned workspace"]
 }
 ```
 
-The shim makes no assumptions about command structure; it is harness-agnostic. New harnesses swap the command/args; the base image stays the same.
+Provider credentials and deployment policy are supplied per lease; they are
+not baked into these images.
 
-## Security Model
+## Build locally
 
-- **Non-root execution**: user 1000:1000, no capability grants
-- **PSS Restricted compatible**: no privileged containers, no host mounts; works with a read-only root filesystem (writable `/workspace` + `/tmp` mounts)
-- **No secrets baked in**: API tokens and credentials come from per-run ephemeral Secrets mounted as env vars or files
-- **Image signing**: cosign keyless OIDC in the publish workflow
+All targets build for `linux/amd64`. Derived targets use Buildx named contexts,
+so a local build can chain them to the base target without first publishing the
+base image:
+
+```bash
+REGISTRY=localhost/paperclip VERSION=dev \
+  docker buildx bake -f docker/agent-runtime/buildx-bake.hcl --load
+```
+
+Build a smaller subset while iterating:
+
+```bash
+REGISTRY=localhost/paperclip VERSION=dev \
+  docker buildx bake -f docker/agent-runtime/buildx-bake.hcl \
+  base codex claude --load
+```
+
+## Verify locally
+
+```bash
+node --test docker/agent-runtime/runtime-images.test.mjs
+(cd tools/agent-shim && go test ./...)
+
+docker run --rm localhost/paperclip/agent-runtime-base:dev \
+  sh -lc 'test "$(id -u):$(id -g)" = 1000:1000 && touch "$HOME/.runtime-write-check"'
+docker run --rm localhost/paperclip/agent-runtime-codex:dev codex --version
+```
+
+TrueNAS image publication, compose wiring, sandbox-provider selection, and
+network policy belong to the deployment configuration that consumes these
+images. They are intentionally not encoded in this image family.
 
 ## Publishing
 
-`.github/workflows/agent-runtime-images.yml` builds and pushes the default scope (base, opencode, pi, codex, gemini, claude) on `workflow_dispatch` (with an explicit version tag) or on pushes to `master` touching these paths, then signs each digest with cosign keyless OIDC.
+The existing `.github/workflows/agent-runtime-images.yml` publishes the base
+and five real harness images to `ghcr.io/paperclipai` and signs their digests.
+Hermes remains outside the default publishing set until it has a supported
+runtime package.

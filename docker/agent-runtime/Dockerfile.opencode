@@ -4,10 +4,20 @@ FROM paperclipai/agent-runtime-base:${BASE_TAG}
 
 USER root
 # opencode-ai npm package; binary on PATH is `opencode`.
-RUN npm install -g opencode-ai@latest \
-    && { chown -R 1000:1000 /usr/lib/node_modules || true; }
+RUN export HOME=/root \
+      NPM_CONFIG_CACHE=/root/.npm \
+      XDG_CACHE_HOME=/root/.cache \
+      XDG_CONFIG_HOME=/root/.config \
+      XDG_DATA_HOME=/root/.local/share \
+      XDG_STATE_HOME=/root/.local/state \
+    && npm install -g --no-audit --no-fund opencode-ai@latest \
+    && OPENCODE_ROOT="$(npm root -g)/opencode-ai" \
+    && chown -R 0:0 "$OPENCODE_ROOT" \
+    && chmod -R go-w "$OPENCODE_ROOT"
 
 USER 1000:1000
 
-# Verify the CLI is on PATH for the shim's exec.LookPath
-RUN command -v opencode >/dev/null 2>&1 || (echo "opencode not on PATH"; exit 1)
+RUN OPENCODE_ROOT="$(npm root -g)/opencode-ai" \
+    && command -v opencode >/dev/null 2>&1 \
+    && test "$(stat -c '%u:%g' "$OPENCODE_ROOT")" = "0:0" \
+    && test ! -w "$OPENCODE_ROOT"
