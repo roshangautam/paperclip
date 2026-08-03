@@ -50,6 +50,7 @@ import {
 } from "./plugin-environment-driver.js";
 import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
+import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 
 export function buildEnvironmentLeaseContext(input: {
@@ -1936,7 +1937,31 @@ export function environmentRuntimeService(
               ? lease.metadata?.[PENDING_CLEANUP_RELEASE_STATUS_KEY] as "released" | "expired" | "failed"
               : "expired",
           });
-          if (retried && retried.status !== "pending_cleanup") cleaned += 1;
+          if (retried && retried.status !== "pending_cleanup") {
+            cleaned += 1;
+            try {
+              await logActivity(db, {
+                companyId: retried.companyId,
+                actorType: "system",
+                actorId: "environment_cleanup_retry",
+                runId: retried.heartbeatRunId,
+                issueId: retried.issueId,
+                action: "environment.lease_cleanup_completed",
+                entityType: "environment_lease",
+                entityId: retried.id,
+                details: {
+                  environmentId: retried.environmentId,
+                  provider: retried.provider,
+                  executionWorkspaceId: retried.executionWorkspaceId,
+                  previousStatus: "pending_cleanup",
+                  status: retried.status,
+                  cleanupStatus: retried.cleanupStatus,
+                },
+              });
+            } catch (error) {
+              logger.warn({ err: error, leaseId: retried.id }, "failed to log completed sandbox cleanup retry");
+            }
+          }
         } catch (error) {
           logger.warn(
             {

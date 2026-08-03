@@ -12,6 +12,7 @@ import {
 } from "@paperclipai/adapter-utils/ssh";
 import {
   agents,
+  activityLog,
   companies,
   companySecretVersions,
   companySecrets,
@@ -147,6 +148,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
     await db.delete(environmentLeases);
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(environments);
@@ -1889,6 +1891,23 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       status: "failed",
       cleanupStatus: "success",
     });
+    await expect(
+      db.select().from(activityLog).where(eq(activityLog.entityId, lease.id)),
+    ).resolves.toContainEqual(expect.objectContaining({
+      companyId: lease.companyId,
+      actorType: "system",
+      actorId: "environment_cleanup_retry",
+      action: "environment.lease_cleanup_completed",
+      entityType: "environment_lease",
+      entityId: lease.id,
+      details: expect.objectContaining({
+        environmentId: lease.environmentId,
+        provider: "fake-plugin",
+        previousStatus: "pending_cleanup",
+        status: "failed",
+        cleanupStatus: "success",
+      }),
+    }));
   });
 
   it("claims a pending sandbox cleanup once across overlapping retries", async () => {
