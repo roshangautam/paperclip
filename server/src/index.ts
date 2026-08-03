@@ -58,6 +58,7 @@ import {
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { environmentRuntimeService } from "./services/environment-runtime.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -844,6 +845,7 @@ export async function startServer(): Promise<StartedServer> {
 
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+    const environmentRuntime = environmentRuntimeService(db as any, { pluginWorkerManager });
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
@@ -909,6 +911,11 @@ export async function startServer(): Promise<StartedServer> {
               );
             }
           }
+        }
+
+        const sandboxCleanup = await environmentRuntime.retryPendingSandboxCleanups();
+        if (sandboxCleanup.attempted > 0) {
+          logger.info(sandboxCleanup, "startup pending sandbox cleanup retry complete");
         }
 
         const promotion = await heartbeat.promoteDueScheduledRetries();
@@ -1040,6 +1047,17 @@ export async function startServer(): Promise<StartedServer> {
 
         if (heartbeatSchedulerStopped) return;
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+          trackHeartbeatSchedulerWork(environmentRuntime
+            .retryPendingSandboxCleanups()
+            .then((result) => {
+              if (result.attempted > 0) {
+                logger.info(result, "periodic pending sandbox cleanup retry complete");
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic pending sandbox cleanup retry failed");
+            }));
+
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat

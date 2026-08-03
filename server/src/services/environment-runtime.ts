@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, lte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companySecrets, companySecretVersions, environmentLeases } from "@paperclipai/db";
 import type {
@@ -50,6 +50,7 @@ import {
 } from "./plugin-environment-driver.js";
 import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
+import { logger } from "../middleware/logger.js";
 
 export function buildEnvironmentLeaseContext(input: {
   persistedExecutionWorkspace: Pick<ExecutionWorkspace, "id" | "mode"> | null;
@@ -203,6 +204,8 @@ export interface EnvironmentRuntimeLeaseRecord {
 
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_TIMEOUT_MS = 5_000;
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS = 100;
+const SANDBOX_CLEANUP_RETRY_DELAY_MS = 5 * 60 * 1000;
+const PENDING_CLEANUP_RELEASE_STATUS_KEY = "pendingCleanupReleaseStatus";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -619,6 +622,41 @@ function createSandboxEnvironmentDriver(
   const pluginWorkerReadyTimeoutMs = options.pluginWorkerReadyTimeoutMs ?? DEFAULT_PLUGIN_SANDBOX_WORKER_READY_TIMEOUT_MS;
   const pluginWorkerReadyPollMs = options.pluginWorkerReadyPollMs ?? DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS;
   const environmentsSvc = environmentService(db);
+
+  async function finalizeSandboxRelease(input: {
+    release: EnvironmentDriverReleaseInput;
+    cleanupError: unknown | null;
+  }): Promise<EnvironmentLease | null> {
+    const releaseStatus =
+      input.release.lease.leasePolicy === "retain_on_failure" && input.release.status === "failed"
+        ? ("retained" as const)
+        : input.release.status;
+
+    if (input.cleanupError && input.release.lease.leasePolicy === "ephemeral") {
+      logger.warn(
+        {
+          err: input.cleanupError,
+          leaseId: input.release.lease.id,
+          environmentId: input.release.environment.id,
+          provider: input.release.lease.provider,
+        },
+        "sandbox lease cleanup failed; queued for retry",
+      );
+      return await environmentsSvc.releaseLease(input.release.lease.id, "pending_cleanup", {
+        failureReason: input.release.status === "failed" ? "adapter_or_run_failure" : undefined,
+        cleanupStatus: "failed",
+        metadata: {
+          ...(input.release.lease.metadata ?? {}),
+          [PENDING_CLEANUP_RELEASE_STATUS_KEY]: releaseStatus,
+        },
+      });
+    }
+
+    return await environmentsSvc.releaseLease(input.release.lease.id, releaseStatus, {
+      failureReason: input.release.status === "failed" ? "adapter_or_run_failure" : undefined,
+      cleanupStatus: input.cleanupError ? "failed" : "success",
+    });
+  }
 
   async function resolveSandboxProviderPlugin(input: { provider: string }) {
     const running = await resolvePluginSandboxProviderDriverByKey({
@@ -1119,33 +1157,29 @@ function createSandboxEnvironmentDriver(
         }
       }
 
-      const parsed = metadataConfig
-        ? await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, {
-            id: input.environment.id,
-            driver: "sandbox",
-            config: metadataConfig as unknown as Record<string, unknown>,
-          })
-        : await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, input.environment);
-      if (parsed.driver !== "sandbox") {
-        throw new Error(`Expected sandbox environment config for lease "${input.lease.id}".`);
-      }
-
-      let cleanupStatus: "success" | "failed" = "success";
+      let cleanupError: unknown | null = null;
       try {
+        const parsed = metadataConfig
+          ? await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, {
+              id: input.environment.id,
+              driver: "sandbox",
+              config: metadataConfig as unknown as Record<string, unknown>,
+            })
+          : await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, input.environment);
+        if (parsed.driver !== "sandbox") {
+          throw new Error(`Expected sandbox environment config for lease "${input.lease.id}".`);
+        }
         await releaseSandboxProviderLease({
           config: parsed.config,
           providerLeaseId: input.lease.providerLeaseId,
           status: input.status,
         });
-      } catch {
-        cleanupStatus = "failed";
+      } catch (error) {
+        cleanupError = error;
       }
-      const releaseStatus = input.lease.leasePolicy === "retain_on_failure" && input.status === "failed"
-        ? "retained" as const
-        : input.status;
-      return await environmentsSvc.releaseLease(input.lease.id, releaseStatus, {
-        failureReason: input.status === "failed" ? "adapter_or_run_failure" : undefined,
-        cleanupStatus,
+      return await finalizeSandboxRelease({
+        release: input,
+        cleanupError,
       });
     },
 
@@ -1251,7 +1285,7 @@ function createSandboxEnvironmentDriver(
     const pluginId = readString(metadata.pluginId);
     const providerKey = readString(metadata.provider);
 
-    let cleanupStatus: "success" | "failed" = "success";
+    let cleanupError: unknown | null = null;
     if (pluginId && providerKey && pluginWorkerManager?.isRunning(pluginId)) {
       try {
         const config = await resolvePluginSandboxRuntimeConfig({
@@ -1268,20 +1302,16 @@ function createSandboxEnvironmentDriver(
           providerLeaseId: input.lease.providerLeaseId,
           leaseMetadata: metadata,
         }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)));
-      } catch {
-        cleanupStatus = "failed";
+      } catch (error) {
+        cleanupError = error;
       }
     } else {
-      cleanupStatus = "failed";
+      cleanupError = new Error("Sandbox provider plugin worker is unavailable");
     }
 
-    const releaseStatus =
-      input.lease.leasePolicy === "retain_on_failure" && input.status === "failed"
-        ? ("retained" as const)
-        : input.status;
-    return await environmentsSvc.releaseLease(input.lease.id, releaseStatus, {
-      failureReason: input.status === "failed" ? "adapter_or_run_failure" : undefined,
-      cleanupStatus,
+    return await finalizeSandboxRelease({
+      release: input,
+      cleanupError,
     });
   }
 
@@ -1365,9 +1395,11 @@ function readString(value: unknown): string | null {
 const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "driver",
   "executionWorkspaceMode",
+  PENDING_CLEANUP_RELEASE_STATUS_KEY,
   "pluginId",
   "pluginKey",
   "providerMetadata",
+  "remoteCwd",
   "shellCommand",
   "sandboxProviderPlugin",
 ]);
@@ -1384,7 +1416,7 @@ function sanitizePluginSandboxConfigFromLeaseMetadata(
 }
 
 function sandboxConfigForLeaseMetadata(config: SandboxEnvironmentConfig): Record<string, unknown> {
-  return { ...config };
+  return sanitizePluginSandboxConfigFromLeaseMetadata(config as unknown as Record<string, unknown>);
 }
 
 function tryParseCurrentPluginConfig(environment: Environment): PluginEnvironmentConfig | null {
@@ -1801,6 +1833,76 @@ export function environmentRuntimeService(
       }
 
       return released;
+    },
+
+    async retryPendingSandboxCleanups() {
+      const updatedBefore = new Date(Date.now() - SANDBOX_CLEANUP_RETRY_DELAY_MS);
+      const leaseRows = await db
+        .select()
+        .from(environmentLeases)
+        .where(
+          and(
+            eq(environmentLeases.status, "pending_cleanup"),
+            eq(environmentLeases.leasePolicy, "ephemeral"),
+            lte(environmentLeases.updatedAt, updatedBefore),
+          ),
+        );
+
+      let attempted = 0;
+      let cleaned = 0;
+      for (const leaseRow of leaseRows) {
+        const claimedRow = await db
+          .update(environmentLeases)
+          .set({ updatedAt: new Date() })
+          .where(
+            and(
+              eq(environmentLeases.id, leaseRow.id),
+              eq(environmentLeases.status, "pending_cleanup"),
+              eq(environmentLeases.leasePolicy, "ephemeral"),
+              lte(environmentLeases.updatedAt, updatedBefore),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!claimedRow) continue;
+
+        const environment = await environmentsSvc.getById(claimedRow.environmentId);
+        if (!environment) continue;
+
+        const lease = toEnvironmentLeaseSnapshot(claimedRow);
+        const driver = getDriver(getLeaseDriverKey(lease, environment));
+        if (!driver) continue;
+
+        attempted += 1;
+        try {
+          const retried = await driver.releaseRunLease({
+            environment,
+            lease,
+            status: ["released", "expired", "failed"].includes(
+              String(lease.metadata?.[PENDING_CLEANUP_RELEASE_STATUS_KEY]),
+            )
+              ? lease.metadata?.[PENDING_CLEANUP_RELEASE_STATUS_KEY] as "released" | "expired" | "failed"
+              : "expired",
+          });
+          if (retried && retried.status !== "pending_cleanup") cleaned += 1;
+        } catch (error) {
+          logger.warn(
+            {
+              err: error,
+              leaseId: lease.id,
+              environmentId: environment.id,
+              provider: lease.provider,
+            },
+            "pending sandbox cleanup retry failed",
+          );
+        }
+      }
+
+      return {
+        attempted,
+        cleaned,
+        pending: attempted - cleaned,
+      };
     },
 
     async destroyReusableSandboxLeases(input: {

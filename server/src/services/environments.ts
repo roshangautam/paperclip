@@ -644,6 +644,7 @@ export function environmentService(db: Db) {
       options?: {
         failureReason?: string;
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
+        metadata?: Record<string, unknown> | null;
       },
     ) => {
       const now = new Date();
@@ -656,6 +657,7 @@ export function environmentService(db: Db) {
           updatedAt: now,
           ...(options?.failureReason !== undefined ? { failureReason: options.failureReason } : {}),
           ...(options?.cleanupStatus !== undefined ? { cleanupStatus: options.cleanupStatus } : {}),
+          ...(options?.metadata !== undefined ? { metadata: options.metadata } : {}),
         })
         .where(eq(environmentLeases.id, id))
         .returning()

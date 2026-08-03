@@ -1805,6 +1805,79 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
+  it("retries failed ephemeral plugin sandbox cleanup", async () => {
+    const pluginId = randomUUID();
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "sandbox",
+      name: "Retrying Plugin Sandbox",
+      config: {
+        provider: "fake-plugin",
+        image: "fake:test",
+        reuseLease: false,
+      },
+    });
+    const lease = await environmentService(db).acquireLease({
+      companyId,
+      environmentId: environment.id,
+      issueId: null,
+      heartbeatRunId: runId,
+      leasePolicy: "ephemeral",
+      provider: "fake-plugin",
+      providerLeaseId: "failed-plugin-lease",
+      metadata: {
+        driver: "sandbox",
+        provider: "fake-plugin",
+        pluginId,
+        sandboxProviderPlugin: true,
+        image: "fake:test",
+        reuseLease: false,
+      },
+    });
+    const failedRelease = environmentRuntimeService(db, {
+      pluginWorkerManager: {
+        isRunning: vi.fn(() => true),
+        call: vi.fn(async () => {
+          throw new Error("context canceled");
+        }),
+      } as unknown as PluginWorkerManager,
+    });
+
+    const pending = await failedRelease.releaseRunLeases(runId, "failed");
+
+    expect(pending[0]?.lease).toMatchObject({
+      id: lease.id,
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "adapter_or_run_failure",
+      metadata: expect.objectContaining({ pendingCleanupReleaseStatus: "failed" }),
+    });
+    await db
+      .update(environmentLeases)
+      .set({ updatedAt: new Date(0) })
+      .where(eq(environmentLeases.id, lease.id));
+
+    const recoveredWorkerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async () => undefined),
+    } as unknown as PluginWorkerManager;
+    const recoveredRuntime = environmentRuntimeService(db, {
+      pluginWorkerManager: recoveredWorkerManager,
+    });
+    const result = await recoveredRuntime.retryPendingSandboxCleanups();
+
+    expect(result).toEqual({ attempted: 1, cleaned: 1, pending: 0 });
+    expect(recoveredWorkerManager.call).toHaveBeenCalledWith(
+      pluginId,
+      "environmentReleaseLease",
+      expect.objectContaining({ providerLeaseId: "failed-plugin-lease" }),
+      undefined,
+    );
+    await expect(environmentService(db).getLeaseById(lease.id)).resolves.toMatchObject({
+      status: "failed",
+      cleanupStatus: "success",
+    });
+  });
+
   it("retries reusable plugin-backed sandbox destroy when the worker is unavailable", async () => {
     const { pluginId, companyId, executionWorkspaceId, reusableLease } =
       await seedReusablePluginSandboxLease();
