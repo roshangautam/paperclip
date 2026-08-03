@@ -651,6 +651,7 @@ export function environmentService(db: Db) {
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
         metadata?: Record<string, unknown> | null;
         expectedCleanupClaimId?: string;
+        expectedStatus?: EnvironmentLeaseStatus;
       },
     ) => {
       const now = new Date();
@@ -668,12 +669,15 @@ export function environmentService(db: Db) {
           cleanupClaimedAt: null,
         })
         .where(
-          options?.expectedCleanupClaimId
-            ? and(
-                eq(environmentLeases.id, id),
-                eq(environmentLeases.cleanupClaimId, options.expectedCleanupClaimId),
-              )
-            : eq(environmentLeases.id, id),
+          and(
+            eq(environmentLeases.id, id),
+            options?.expectedCleanupClaimId
+              ? eq(environmentLeases.cleanupClaimId, options.expectedCleanupClaimId)
+              : undefined,
+            options?.expectedStatus
+              ? eq(environmentLeases.status, options.expectedStatus)
+              : undefined,
+          ),
         )
         .returning()
         .then((rows) => rows[0] ?? null);

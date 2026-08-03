@@ -652,6 +652,7 @@ function createSandboxEnvironmentDriver(
         failureReason: input.release.status === "failed" ? "adapter_or_run_failure" : undefined,
         cleanupStatus: "failed",
         expectedCleanupClaimId: input.release.cleanupClaimId,
+        expectedStatus: input.release.cleanupClaimId ? "pending_cleanup" : "active",
         metadata: {
           ...(input.release.lease.metadata ?? {}),
           [PENDING_CLEANUP_RELEASE_STATUS_KEY]: releaseStatus,
@@ -663,6 +664,7 @@ function createSandboxEnvironmentDriver(
       failureReason: input.release.status === "failed" ? "adapter_or_run_failure" : undefined,
       cleanupStatus: input.cleanupError ? "failed" : "success",
       expectedCleanupClaimId: input.release.cleanupClaimId,
+      expectedStatus: input.release.cleanupClaimId ? "pending_cleanup" : "active",
     });
   }
 

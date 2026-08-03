@@ -397,7 +397,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     return { pluginId, companyId, agentId, environment, runId, executionWorkspaceId, reusableLease };
   }
 
-  async function seedPendingPluginSandboxCleanup(providerLeaseId: string) {
+  async function seedPluginSandboxLease(providerLeaseId: string) {
     const pluginId = randomUUID();
     const { companyId, environment, runId } = await seedEnvironment({
       driver: "sandbox",
@@ -425,6 +425,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         reuseLease: false,
       },
     });
+    return { pluginId, lease, runId };
+  }
+
+  async function seedPendingPluginSandboxCleanup(providerLeaseId: string) {
+    const seeded = await seedPluginSandboxLease(providerLeaseId);
     const failedRelease = environmentRuntimeService(db, {
       pluginWorkerManager: {
         isRunning: vi.fn(() => true),
@@ -433,13 +438,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }),
       } as unknown as PluginWorkerManager,
     });
-    const pending = await failedRelease.releaseRunLeases(runId, "failed");
+    const pending = await failedRelease.releaseRunLeases(seeded.runId, "failed");
     await db
       .update(environmentLeases)
       .set({ updatedAt: new Date(0) })
-      .where(eq(environmentLeases.id, lease.id));
+      .where(eq(environmentLeases.id, seeded.lease.id));
 
-    return { pluginId, lease, pending };
+    return { ...seeded, pending };
   }
 
   it("acquires and releases a local run lease through the runtime seam", async () => {
@@ -1914,6 +1919,34 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         cleanupStatus: "success",
       }),
     }));
+  });
+
+  it("does not let a late failed initial cleanup overwrite a successful release", async () => {
+    const { pluginId, lease, runId } = await seedPluginSandboxLease("overlapping-initial-release");
+    let failFirstCleanup!: (error: Error) => void;
+    const firstCleanupBlocked = new Promise<void>((_resolve, reject) => {
+      failFirstCleanup = reject;
+    });
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn()
+        .mockImplementationOnce(async () => await firstCleanupBlocked)
+        .mockResolvedValueOnce(undefined),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    const lateFailure = runtimeWithPlugin.releaseRunLeases(runId);
+    await vi.waitFor(() => expect(workerManager.call).toHaveBeenCalledTimes(1));
+    const successfulRelease = await runtimeWithPlugin.releaseRunLeases(runId);
+    failFirstCleanup(new Error("late provider failure"));
+    const failedRelease = await lateFailure;
+
+    expect(successfulRelease).toHaveLength(1);
+    expect(failedRelease).toHaveLength(0);
+    await expect(environmentService(db).getLeaseById(lease.id)).resolves.toMatchObject({
+      status: "released",
+      cleanupStatus: "success",
+    });
   });
 
   it("claims a pending sandbox cleanup once across overlapping retries", async () => {
