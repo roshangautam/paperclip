@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -43,6 +43,8 @@ const KUBERNETES_PROVIDER_KEY = "kubernetes";
 /** Metadata marker for the company's managed-by-config Kubernetes sandbox environment. */
 const KUBERNETES_MANAGED_MARKER = "managedKubernetesSandbox";
 const ACTIVE_CUSTOM_IMAGE_SETUP_STATUSES = ["starting", "waiting_for_user", "capturing"] as const;
+const DELETE_BLOCKING_LEASE_STATUSES = ["active", "pending_cleanup"] as const satisfies readonly EnvironmentLeaseStatus[];
+const DELETE_BLOCKING_REUSABLE_LEASE_STATUSES = ["released", "retained", "failed"] as const satisfies readonly EnvironmentLeaseStatus[];
 
 /**
  * Configuration accepted by `ensureKubernetesEnvironment`. Mirrors the keys of
@@ -476,7 +478,19 @@ export function environmentService(db: Db) {
             sql`not exists (
               select 1 from ${environmentLeases}
               where ${environmentLeases.environmentId} = ${environments.id}
-                and ${environmentLeases.status} in ('active', 'pending_cleanup')
+                and (
+                  ${environmentLeases.status} in (${sql.join(
+                    DELETE_BLOCKING_LEASE_STATUSES.map((status) => sql`${status}`),
+                    sql`, `,
+                  )})
+                  or (
+                    ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+                    and ${environmentLeases.status} in (${sql.join(
+                      DELETE_BLOCKING_REUSABLE_LEASE_STATUSES.map((status) => sql`${status}`),
+                      sql`, `,
+                    )})
+                  )
+                )
             )`,
           ),
         )
@@ -538,13 +552,26 @@ export function environmentService(db: Db) {
         db
           .select({
             activeCount: sql<number>`count(*) filter (where ${environmentLeases.status} = 'active')::int`,
+            reusableCount: sql<number>`count(*) filter (
+              where ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+                and ${environmentLeases.status} in (${sql.join(
+                  DELETE_BLOCKING_REUSABLE_LEASE_STATUSES.map((status) => sql`${status}`),
+                  sql`, `,
+                )})
+            )::int`,
             pendingCleanupCount: sql<number>`count(*) filter (where ${environmentLeases.status} = 'pending_cleanup')::int`,
           })
           .from(environmentLeases)
           .where(
             and(
               eq(environmentLeases.environmentId, id),
-              inArray(environmentLeases.status, ["active", "pending_cleanup"]),
+              or(
+                inArray(environmentLeases.status, [...DELETE_BLOCKING_LEASE_STATUSES]),
+                and(
+                  eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+                  inArray(environmentLeases.status, [...DELETE_BLOCKING_REUSABLE_LEASE_STATUSES]),
+                ),
+              ),
             ),
           ),
         db
@@ -564,8 +591,10 @@ export function environmentService(db: Db) {
       if (isManagedLocal) deleteBlockedReasons.push("managed_local");
       if (isInstanceDefault) deleteBlockedReasons.push("instance_default");
       if ((activeLeaseRows[0]?.activeCount ?? 0) > 0) deleteBlockedReasons.push("active_lease");
+      if ((activeLeaseRows[0]?.reusableCount ?? 0) > 0) deleteBlockedReasons.push("reusable_lease");
       if ((activeLeaseRows[0]?.pendingCleanupCount ?? 0) > 0) deleteBlockedReasons.push("pending_cleanup");
       const activeLeaseCount = activeLeaseRows[0]?.activeCount ?? 0;
+      const reusableLeaseCount = activeLeaseRows[0]?.reusableCount ?? 0;
       const pendingCleanupLeaseCount = activeLeaseRows[0]?.pendingCleanupCount ?? 0;
       const activeCustomImageSetupSessionCount = countFromRows(activeSetupRows);
 
@@ -584,10 +613,14 @@ export function environmentService(db: Db) {
         },
         activeRuntimeUse: {
           activeLeaseCount,
+          reusableLeaseCount,
           pendingCleanupLeaseCount,
           activeCustomImageSetupSessionCount,
           hasActiveRuntimeUse:
-            activeLeaseCount > 0 || pendingCleanupLeaseCount > 0 || activeCustomImageSetupSessionCount > 0,
+            activeLeaseCount > 0
+            || reusableLeaseCount > 0
+            || pendingCleanupLeaseCount > 0
+            || activeCustomImageSetupSessionCount > 0,
         },
       };
     },

@@ -393,6 +393,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
       },
       activeRuntimeUse: {
         activeLeaseCount: 1,
+        reusableLeaseCount: 0,
         pendingCleanupLeaseCount: 1,
         activeCustomImageSetupSessionCount: 1,
         hasActiveRuntimeUse: true,
@@ -529,6 +530,129 @@ describeEmbeddedPostgres("environmentService leases", () => {
 
     expect(removedDeletable?.id).toBe(deletableEnvId);
     expect(deletedRows).toHaveLength(0);
+  });
+
+  it("blocks deletion while terminal reusable leases still own provider sandboxes", async () => {
+    const companyId = randomUUID();
+    const reusableEnvId = randomUUID();
+    const ephemeralEnvId = randomUUID();
+    const now = new Date();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Reusable Lease Guard Co",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(environments).values([
+      {
+        id: reusableEnvId,
+        name: "Reusable Sandbox Guard",
+        driver: "sandbox",
+        status: "active",
+        config: {},
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: ephemeralEnvId,
+        name: "Ephemeral Sandbox Guard",
+        driver: "sandbox",
+        status: "active",
+        config: {},
+        createdAt: now,
+        updatedAt: now,
+      },
+    ]);
+
+    const releasedReusableLease = await svc.acquireLease({
+      companyId,
+      environmentId: reusableEnvId,
+      leasePolicy: "reuse_by_environment",
+      provider: "fixture-provider",
+      providerLeaseId: "released-reusable-provider-lease",
+    });
+    const retainedReusableLease = await svc.acquireLease({
+      companyId,
+      environmentId: reusableEnvId,
+      leasePolicy: "reuse_by_environment",
+      provider: "fixture-provider",
+      providerLeaseId: "retained-reusable-provider-lease",
+    });
+    const failedReusableLease = await svc.acquireLease({
+      companyId,
+      environmentId: reusableEnvId,
+      leasePolicy: "reuse_by_environment",
+      provider: "fixture-provider",
+      providerLeaseId: "failed-reusable-provider-lease",
+    });
+    await svc.releaseLease(releasedReusableLease.id, "released");
+    await svc.releaseLease(retainedReusableLease.id, "retained");
+    await svc.releaseLease(failedReusableLease.id, "failed");
+
+    const impact = await svc.getDeleteBlastRadius(reusableEnvId);
+    const removedReusableEnvironment = await svc.removeIfDeletable(reusableEnvId);
+    const reusableEnvironmentRows = await db
+      .select()
+      .from(environments)
+      .where(eq(environments.id, reusableEnvId));
+    const reusableLeaseRows = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.environmentId, reusableEnvId));
+
+    expect(impact).toMatchObject({
+      environmentId: reusableEnvId,
+      canDelete: false,
+      deleteBlockedReasons: ["reusable_lease"],
+      activeRuntimeUse: {
+        activeLeaseCount: 0,
+        reusableLeaseCount: 3,
+        pendingCleanupLeaseCount: 0,
+        activeCustomImageSetupSessionCount: 0,
+        hasActiveRuntimeUse: true,
+      },
+    });
+    expect(removedReusableEnvironment).toBeNull();
+    expect(reusableEnvironmentRows).toHaveLength(1);
+    expect(reusableLeaseRows.map((lease) => lease.status).sort()).toEqual(["failed", "released", "retained"]);
+
+    const releasedEphemeralLease = await svc.acquireLease({
+      companyId,
+      environmentId: ephemeralEnvId,
+      leasePolicy: "ephemeral",
+      provider: "fixture-provider",
+      providerLeaseId: "released-ephemeral-provider-lease",
+    });
+    await svc.releaseLease(releasedEphemeralLease.id, "released");
+
+    const ephemeralImpact = await svc.getDeleteBlastRadius(ephemeralEnvId);
+    const removedEphemeralEnvironment = await svc.removeIfDeletable(ephemeralEnvId);
+    const ephemeralEnvironmentRows = await db
+      .select()
+      .from(environments)
+      .where(eq(environments.id, ephemeralEnvId));
+    const ephemeralLeaseRows = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.environmentId, ephemeralEnvId));
+
+    expect(ephemeralImpact).toMatchObject({
+      environmentId: ephemeralEnvId,
+      canDelete: true,
+      deleteBlockedReasons: [],
+      activeRuntimeUse: {
+        activeLeaseCount: 0,
+        reusableLeaseCount: 0,
+        pendingCleanupLeaseCount: 0,
+        activeCustomImageSetupSessionCount: 0,
+        hasActiveRuntimeUse: false,
+      },
+    });
+    expect(removedEphemeralEnvironment?.id).toBe(ephemeralEnvId);
+    expect(ephemeralEnvironmentRows).toHaveLength(0);
+    expect(ephemeralLeaseRows).toHaveLength(0);
   });
 
   it("creates and then reuses the default local environment for a company", async () => {
