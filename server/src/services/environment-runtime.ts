@@ -1151,11 +1151,21 @@ function createSandboxEnvironmentDriver(
               typeof resumed.providerLeaseId === "string" && resumed.providerLeaseId.length > 0
                 ? resumed
                 : null;
-            supersededLease = providerLease ? reusableLease : null;
+            supersededLease =
+              providerLease?.providerLeaseId === reusableLease.providerLeaseId
+                ? reusableLease
+                : null;
           } catch {
             providerLease = null;
           }
           if (!providerLease) {
+            await destroyReusableSandboxLease({
+              environment: input.environment,
+              lease: reusableLease,
+              failureReason: "resume_failed",
+            });
+          }
+          if (providerLease && !supersededLease) {
             await destroyReusableSandboxLease({
               environment: input.environment,
               lease: reusableLease,
@@ -1649,6 +1659,7 @@ function readString(value: unknown): string | null {
 }
 
 const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
+  "agentId",
   "driver",
   "executionWorkspaceMode",
   PENDING_CLEANUP_RELEASE_STATUS_KEY,
@@ -1657,6 +1668,8 @@ const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "providerMetadata",
   PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY,
   "sandboxProviderPlugin",
+  "reusableSandboxLease",
+  "workspaceRealization",
 ]);
 
 function sanitizePluginSandboxConfigFromLeaseMetadata(
