@@ -473,6 +473,11 @@ export function environmentService(db: Db) {
               select 1 from ${instanceSettings}
               where ${instanceSettings.defaultEnvironmentId} = ${environments.id}
             )`,
+            sql`not exists (
+              select 1 from ${environmentLeases}
+              where ${environmentLeases.environmentId} = ${environments.id}
+                and ${environmentLeases.status} = 'pending_cleanup'
+            )`,
           ),
         )
         .returning()
@@ -536,7 +541,7 @@ export function environmentService(db: Db) {
           .where(
             and(
               eq(environmentLeases.environmentId, id),
-              eq(environmentLeases.status, "active"),
+              inArray(environmentLeases.status, ["active", "pending_cleanup"]),
             ),
           ),
         db

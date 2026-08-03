@@ -729,18 +729,6 @@ function createSandboxEnvironmentDriver(
       }
     }
 
-    const metadataConfig = sandboxConfigFromLeaseMetadataLoose(input.lease);
-    if (metadataConfig && metadataConfig.provider === input.provider) {
-      const parsed = await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, {
-        id: input.environment.id,
-        driver: "sandbox",
-        config: sanitizePluginSandboxConfigFromLeaseMetadata(metadataConfig),
-      });
-      if (parsed.driver === "sandbox") {
-        return parsed.config as unknown as Record<string, unknown>;
-      }
-    }
-
     if (input.environment.driver === "sandbox") {
       try {
         const parsed = await resolveEnvironmentDriverConfigForRuntime(
@@ -752,8 +740,19 @@ function createSandboxEnvironmentDriver(
           return parsed.config as unknown as Record<string, unknown>;
         }
       } catch {
-        // Lease metadata below is intentionally kept sufficient for cleanup
-        // after the environment config changes or becomes invalid.
+        // Lease metadata below remains the fallback when current config is unavailable.
+      }
+    }
+
+    const metadataConfig = sandboxConfigFromLeaseMetadataLoose(input.lease);
+    if (metadataConfig && metadataConfig.provider === input.provider) {
+      const parsed = await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, {
+        id: input.environment.id,
+        driver: "sandbox",
+        config: sanitizePluginSandboxConfigFromLeaseMetadata(metadataConfig),
+      });
+      if (parsed.driver === "sandbox") {
+        return parsed.config as unknown as Record<string, unknown>;
       }
     }
 

@@ -740,9 +740,15 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       timeoutMs: 1000,
     });
 
-    await environmentService(db).update(environment.id, {
-      driver: "local",
-      config: {},
+    const {
+      sandboxProviderConfig: _storedProviderConfig,
+      ...legacyMetadata
+    } = acquired.lease.metadata ?? {};
+    await environmentService(db).updateLeaseMetadata(acquired.lease.id, {
+      ...legacyMetadata,
+      remoteCwd: fakePluginConfig.remoteCwd,
+      shellCommand: fakePluginConfig.shellCommand,
+      pluginKey: fakePluginConfig.pluginKey,
     });
     const released = await runtimeWithPlugin.releaseRunLeases(runId);
 

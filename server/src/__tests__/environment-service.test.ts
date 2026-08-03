@@ -361,11 +361,11 @@ describeEmbeddedPostgres("environmentService leases", () => {
       companyId,
       environmentId,
     });
-    const releasedLease = await svc.acquireLease({
+    const pendingCleanupLease = await svc.acquireLease({
       companyId,
       environmentId,
     });
-    await svc.releaseLease(releasedLease.id);
+    await svc.releaseLease(pendingCleanupLease.id, "pending_cleanup");
     await db.insert(environmentCustomImageSetupSessions).values([
       {
         environmentId,
@@ -392,7 +392,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
         secretBindingCount: 2,
       },
       activeRuntimeUse: {
-        activeLeaseCount: 1,
+        activeLeaseCount: 2,
         activeCustomImageSetupSessionCount: 1,
         hasActiveRuntimeUse: true,
       },
@@ -403,8 +403,17 @@ describeEmbeddedPostgres("environmentService leases", () => {
     const localEnvId = randomUUID();
     const defaultEnvId = randomUUID();
     const deletableEnvId = randomUUID();
+    const pendingCleanupEnvId = randomUUID();
+    const companyId = randomUUID();
     const now = new Date();
 
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Cleanup Guard Co",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
     await db.insert(environments).values([
       {
         id: localEnvId,
@@ -443,6 +452,20 @@ describeEmbeddedPostgres("environmentService leases", () => {
         createdAt: now,
         updatedAt: now,
       },
+      {
+        id: pendingCleanupEnvId,
+        name: "Pending Cleanup Guard",
+        driver: "ssh",
+        status: "active",
+        config: {
+          host: "cleanup.example.test",
+          port: 22,
+          username: "fixture",
+          remoteWorkspacePath: "/srv/paperclip",
+        },
+        createdAt: now,
+        updatedAt: now,
+      },
     ]);
     await db.insert(instanceSettings).values({
       singletonKey: "default",
@@ -452,6 +475,11 @@ describeEmbeddedPostgres("environmentService leases", () => {
       createdAt: now,
       updatedAt: now,
     });
+    const pendingCleanupLease = await svc.acquireLease({
+      companyId,
+      environmentId: pendingCleanupEnvId,
+    });
+    await svc.releaseLease(pendingCleanupLease.id, "pending_cleanup");
 
     const removedLocal = await svc.removeIfDeletable(localEnvId);
     const localRows = await db.select().from(environments).where(eq(environments.id, localEnvId));
@@ -465,6 +493,20 @@ describeEmbeddedPostgres("environmentService leases", () => {
 
     expect(removedDefault).toBeNull();
     expect(defaultRows).toHaveLength(1);
+
+    const removedPendingCleanup = await svc.removeIfDeletable(pendingCleanupEnvId);
+    const pendingCleanupRows = await db
+      .select()
+      .from(environments)
+      .where(eq(environments.id, pendingCleanupEnvId));
+    const pendingCleanupLeaseRows = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, pendingCleanupLease.id));
+
+    expect(removedPendingCleanup).toBeNull();
+    expect(pendingCleanupRows).toHaveLength(1);
+    expect(pendingCleanupLeaseRows).toHaveLength(1);
 
     const removedDeletable = await svc.removeIfDeletable(deletableEnvId);
     const deletedRows = await db.select().from(environments).where(eq(environments.id, deletableEnvId));
