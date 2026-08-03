@@ -4,4 +4,4 @@ ALTER TABLE "environment_leases"
 
 CREATE INDEX IF NOT EXISTS "environment_leases_pending_cleanup_idx"
   ON "environment_leases" USING btree ("updated_at", "cleanup_claimed_at")
-  WHERE "status" = 'pending_cleanup' AND "lease_policy" = 'ephemeral';
+  WHERE "status" = 'pending_cleanup';

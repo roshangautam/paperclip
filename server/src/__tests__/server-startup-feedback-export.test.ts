@@ -325,11 +325,11 @@ describe("startServer feedback export wiring", () => {
       suppressed: true,
       reason: "worktree_instance",
     });
-    let intervalCallback: (() => void) | null = null;
+    const intervalCallbacks: Array<() => void> = [];
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
       .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+        intervalCallbacks.push(callback);
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -339,15 +339,17 @@ describe("startServer feedback export wiring", () => {
       expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).not.toHaveBeenCalled();
 
-      expect(intervalCallback).not.toBeNull();
-      intervalCallback?.();
+      expect(intervalCallbacks).toHaveLength(2);
+      intervalCallbacks.forEach((callback) => callback());
       await Promise.resolve();
       await Promise.resolve();
 
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(2);
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(1);
     } finally {
       setIntervalSpy.mockRestore();
     }
@@ -369,31 +371,67 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
   });
 
-  it("does not await pending sandbox cleanup before startup recovery continues", async () => {
+  it("defers pending sandbox cleanup until its periodic interval", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: 30000,
     }));
-    let cleanupStarted!: () => void;
+    const intervalCallbacks: Array<() => void> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallbacks.push(callback);
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+
+      expect(heartbeatServiceMock.promoteDueScheduledRetries).toHaveBeenCalledTimes(1);
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).not.toHaveBeenCalled();
+      expect(intervalCallbacks).toHaveLength(2);
+
+      intervalCallbacks.forEach((callback) => callback());
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(1);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("does not overlap periodic sandbox cleanup with an in-flight sweep", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: false,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    const intervalCallbacks: Array<() => void> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallbacks.push(callback);
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
     let finishCleanup!: (result: { attempted: number; cleaned: number }) => void;
-    const cleanupInvoked = new Promise<void>((resolve) => {
-      cleanupStarted = resolve;
-    });
     const cleanupPending = new Promise<{ attempted: number; cleaned: number }>((resolve) => {
       finishCleanup = resolve;
     });
-    environmentRuntimeServiceMock.retryPendingSandboxCleanups.mockImplementationOnce(() => {
-      cleanupStarted();
-      return cleanupPending;
-    });
+    environmentRuntimeServiceMock.retryPendingSandboxCleanups
+      .mockReturnValueOnce(cleanupPending);
 
-    const startup = startServer();
-    await cleanupInvoked;
+    try {
+      await startServer();
 
-    expect(heartbeatServiceMock.promoteDueScheduledRetries).toHaveBeenCalledTimes(1);
+      expect(intervalCallbacks).toHaveLength(1);
+      intervalCallbacks[0]!();
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(1);
 
-    finishCleanup({ attempted: 0, cleaned: 0 });
-    await startup;
+      finishCleanup({ attempted: 0, cleaned: 0 });
+      await cleanupPending;
+      await new Promise((resolve) => setImmediate(resolve));
+      intervalCallbacks[0]!();
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(2);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
   });
 
   it("refuses authenticated public startup without an external database URL", async () => {

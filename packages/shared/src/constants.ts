@@ -666,6 +666,7 @@ export const SECRET_BINDING_TARGET_TYPES = [
   "agent",
   "project",
   "environment",
+  "environment_lease",
   "routine",
   "plugin",
   "issue",

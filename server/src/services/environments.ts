@@ -476,7 +476,7 @@ export function environmentService(db: Db) {
             sql`not exists (
               select 1 from ${environmentLeases}
               where ${environmentLeases.environmentId} = ${environments.id}
-                and ${environmentLeases.status} = 'pending_cleanup'
+                and ${environmentLeases.status} in ('active', 'pending_cleanup')
             )`,
           ),
         )
@@ -537,7 +537,7 @@ export function environmentService(db: Db) {
           ),
         db
           .select({
-            count: sql<number>`count(*)::int`,
+            activeCount: sql<number>`count(*) filter (where ${environmentLeases.status} = 'active')::int`,
             pendingCleanupCount: sql<number>`count(*) filter (where ${environmentLeases.status} = 'pending_cleanup')::int`,
           })
           .from(environmentLeases)
@@ -563,8 +563,10 @@ export function environmentService(db: Db) {
       const deleteBlockedReasons: EnvironmentDeleteBlockedReason[] = [];
       if (isManagedLocal) deleteBlockedReasons.push("managed_local");
       if (isInstanceDefault) deleteBlockedReasons.push("instance_default");
+      if ((activeLeaseRows[0]?.activeCount ?? 0) > 0) deleteBlockedReasons.push("active_lease");
       if ((activeLeaseRows[0]?.pendingCleanupCount ?? 0) > 0) deleteBlockedReasons.push("pending_cleanup");
-      const activeLeaseCount = countFromRows(activeLeaseRows);
+      const activeLeaseCount = activeLeaseRows[0]?.activeCount ?? 0;
+      const pendingCleanupLeaseCount = activeLeaseRows[0]?.pendingCleanupCount ?? 0;
       const activeCustomImageSetupSessionCount = countFromRows(activeSetupRows);
 
       return {
@@ -582,8 +584,10 @@ export function environmentService(db: Db) {
         },
         activeRuntimeUse: {
           activeLeaseCount,
+          pendingCleanupLeaseCount,
           activeCustomImageSetupSessionCount,
-          hasActiveRuntimeUse: activeLeaseCount > 0 || activeCustomImageSetupSessionCount > 0,
+          hasActiveRuntimeUse:
+            activeLeaseCount > 0 || pendingCleanupLeaseCount > 0 || activeCustomImageSetupSessionCount > 0,
         },
       };
     },
@@ -605,6 +609,7 @@ export function environmentService(db: Db) {
     },
 
     acquireLease: async (input: {
+      id?: string;
       companyId: string;
       environmentId: string;
       executionWorkspaceId?: string | null;
@@ -620,6 +625,7 @@ export function environmentService(db: Db) {
       const row = await db
         .insert(environmentLeases)
         .values({
+          id: input.id,
           companyId: input.companyId,
           environmentId: input.environmentId,
           executionWorkspaceId: input.executionWorkspaceId ?? null,

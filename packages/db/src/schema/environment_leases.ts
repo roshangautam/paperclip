@@ -47,6 +47,6 @@ export const environmentLeases = pgTable(
     providerLeaseIdx: index("environment_leases_provider_lease_idx").on(table.providerLeaseId),
     pendingCleanupIdx: index("environment_leases_pending_cleanup_idx")
       .on(table.updatedAt, table.cleanupClaimedAt)
-      .where(sql`${table.status} = 'pending_cleanup' AND ${table.leasePolicy} = 'ephemeral'`),
+      .where(sql`${table.status} = 'pending_cleanup'`),
   }),
 );

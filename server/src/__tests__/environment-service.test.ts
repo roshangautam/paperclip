@@ -381,7 +381,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
     expect(impact).toEqual({
       environmentId,
       canDelete: false,
-      deleteBlockedReasons: ["instance_default", "pending_cleanup"],
+      deleteBlockedReasons: ["instance_default", "active_lease", "pending_cleanup"],
       staticReferences: {
         isManagedLocal: false,
         isInstanceDefault: true,
@@ -392,7 +392,8 @@ describeEmbeddedPostgres("environmentService leases", () => {
         secretBindingCount: 2,
       },
       activeRuntimeUse: {
-        activeLeaseCount: 2,
+        activeLeaseCount: 1,
+        pendingCleanupLeaseCount: 1,
         activeCustomImageSetupSessionCount: 1,
         hasActiveRuntimeUse: true,
       },
@@ -479,6 +480,21 @@ describeEmbeddedPostgres("environmentService leases", () => {
       companyId,
       environmentId: pendingCleanupEnvId,
     });
+
+    const removedActiveLease = await svc.removeIfDeletable(pendingCleanupEnvId);
+    const activeLeaseEnvironmentRows = await db
+      .select()
+      .from(environments)
+      .where(eq(environments.id, pendingCleanupEnvId));
+    const activeLeaseRows = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, pendingCleanupLease.id));
+
+    expect(removedActiveLease).toBeNull();
+    expect(activeLeaseEnvironmentRows).toHaveLength(1);
+    expect(activeLeaseRows).toHaveLength(1);
+
     await svc.releaseLease(pendingCleanupLease.id, "pending_cleanup");
 
     const removedLocal = await svc.removeIfDeletable(localEnvId);

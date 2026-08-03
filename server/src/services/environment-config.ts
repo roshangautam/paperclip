@@ -9,6 +9,7 @@ import type {
   PluginEnvironmentConfig,
   PluginSandboxEnvironmentConfig,
   SandboxEnvironmentConfig,
+  SecretBindingTargetType,
   SecretProvider,
   SecretVersionSelector,
   SshEnvironmentConfig,
@@ -244,6 +245,7 @@ async function resolveConfigSecretRefsForRuntime(input: {
   config: Record<string, unknown>;
   schema: Record<string, unknown> | null;
   context: {
+    consumerType: SecretBindingTargetType;
     consumerId: string;
     issueId?: string | null;
     heartbeatRunId?: string | null;
@@ -263,7 +265,7 @@ async function resolveConfigSecretRefsForRuntime(input: {
       nextConfig,
       path,
       await secrets.resolveSecretValue(input.companyId, trimmed, "latest", {
-        consumerType: "environment",
+        consumerType: input.context.consumerType,
         consumerId: input.context.consumerId,
         actorType: "system",
         actorId: null,
@@ -570,12 +572,21 @@ export async function resolveEnvironmentDriverConfigForRuntime(
     // but must still resolve the active custom image as prepared runtime
     // configuration and tooling so the test reflects what real agent runs use.
     applyCustomImageTemplate?: boolean;
+    secretBindingTarget?: {
+      targetType: SecretBindingTargetType;
+      targetId: string;
+    };
   },
 ): Promise<ParsedEnvironmentConfig> {
   const parsed = parseEnvironmentDriverConfig(environment);
   const secrets = secretService(db);
   const environmentId = environment.id;
-  if (parsed.driver === "ssh" && parsed.config.privateKeySecretRef && !environmentId) {
+  const secretBindingTarget = context?.secretBindingTarget ?? (
+    environmentId
+      ? { targetType: "environment" as const, targetId: environmentId }
+      : null
+  );
+  if (parsed.driver === "ssh" && parsed.config.privateKeySecretRef && !secretBindingTarget) {
     throw unprocessable("Runtime secret resolution requires an environment id");
   }
 
@@ -592,8 +603,8 @@ export async function resolveEnvironmentDriverConfigForRuntime(
           parsed.config.privateKeySecretRef.secretId,
           parsed.config.privateKeySecretRef.version ?? "latest",
           {
-            consumerType: "environment",
-            consumerId: environmentId!,
+            consumerType: secretBindingTarget!.targetType,
+            consumerId: secretBindingTarget!.targetId,
             actorType: "system",
             actorId: null,
             issueId: context?.issueId ?? null,
@@ -615,7 +626,8 @@ export async function resolveEnvironmentDriverConfigForRuntime(
         config: parsed.config as Record<string, unknown>,
         schema,
         context: {
-          consumerId: environmentId!,
+          consumerType: secretBindingTarget?.targetType ?? "environment",
+          consumerId: secretBindingTarget?.targetId ?? "",
           issueId: context?.issueId ?? null,
           heartbeatRunId: context?.heartbeatRunId ?? null,
         },

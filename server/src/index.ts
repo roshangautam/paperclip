@@ -827,6 +827,23 @@ export async function startServer(): Promise<StartedServer> {
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{ skipDrain: boolean }>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  let sandboxCleanupStopped = false;
+  let sandboxCleanupInterval: ReturnType<typeof setInterval> | null = null;
+  const sandboxCleanupInFlight = new Set<Promise<void>>();
+  const trackSandboxCleanupWork = (work: Promise<unknown>) => {
+    let tracked: Promise<void>;
+    tracked = Promise.resolve(work)
+      .then(() => undefined, () => undefined)
+      .finally(() => {
+        sandboxCleanupInFlight.delete(tracked);
+      });
+    sandboxCleanupInFlight.add(tracked);
+  };
+  const waitForSandboxCleanupIdle = async () => {
+    while (sandboxCleanupInFlight.size > 0) {
+      await Promise.allSettled([...sandboxCleanupInFlight]);
+    }
+  };
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -843,9 +860,28 @@ export async function startServer(): Promise<StartedServer> {
     }
   };
 
+  const environmentRuntime = environmentRuntimeService(db as any, { pluginWorkerManager });
+  const runPendingSandboxCleanup = () => {
+    if (sandboxCleanupStopped || sandboxCleanupInFlight.size > 0) return;
+    trackSandboxCleanupWork(environmentRuntime
+      .retryPendingSandboxCleanups()
+      .then((result) => {
+        if (result.attempted > 0) {
+          logger.info(result, "periodic pending sandbox cleanup retry complete");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "periodic pending sandbox cleanup retry failed");
+      }));
+  };
+  sandboxCleanupInterval = setInterval(
+    runPendingSandboxCleanup,
+    config.heartbeatSchedulerIntervalMs,
+  );
+  sandboxCleanupInterval.unref?.();
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
-    const environmentRuntime = environmentRuntimeService(db as any, { pluginWorkerManager });
     drainHeartbeatRunsForShutdown = heartbeat.drainRunningRunsForShutdown;
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
@@ -912,17 +948,6 @@ export async function startServer(): Promise<StartedServer> {
             }
           }
         }
-
-        trackHeartbeatSchedulerWork(environmentRuntime
-          .retryPendingSandboxCleanups()
-          .then((sandboxCleanup) => {
-            if (sandboxCleanup.attempted > 0) {
-              logger.info(sandboxCleanup, "startup pending sandbox cleanup retry complete");
-            }
-          })
-          .catch((err) => {
-            logger.error({ err }, "startup pending sandbox cleanup retry failed");
-          }));
 
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
@@ -1053,17 +1078,6 @@ export async function startServer(): Promise<StartedServer> {
 
         if (heartbeatSchedulerStopped) return;
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
-          trackHeartbeatSchedulerWork(environmentRuntime
-            .retryPendingSandboxCleanups()
-            .then((result) => {
-              if (result.attempted > 0) {
-                logger.info(result, "periodic pending sandbox cleanup retry complete");
-              }
-            })
-            .catch((err) => {
-              logger.error({ err }, "periodic pending sandbox cleanup retry failed");
-            }));
-
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
@@ -1224,9 +1238,14 @@ export async function startServer(): Promise<StartedServer> {
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       heartbeatSchedulerStopped = true;
+      sandboxCleanupStopped = true;
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
+      }
+      if (sandboxCleanupInterval) {
+        clearInterval(sandboxCleanupInterval);
+        sandboxCleanupInterval = null;
       }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
@@ -1235,6 +1254,7 @@ export async function startServer(): Promise<StartedServer> {
         waitForHeartbeatSchedulerIdle,
       });
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+      await waitForSandboxCleanupIdle();
       if (skipHeartbeatDrain) {
         logger.info(
           { signal, hotRestart: heartbeatShutdown.hotRestart },
