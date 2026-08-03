@@ -381,7 +381,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
     expect(impact).toEqual({
       environmentId,
       canDelete: false,
-      deleteBlockedReasons: ["instance_default"],
+      deleteBlockedReasons: ["instance_default", "pending_cleanup"],
       staticReferences: {
         isManagedLocal: false,
         isInstanceDefault: true,

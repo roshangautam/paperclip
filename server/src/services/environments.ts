@@ -536,7 +536,10 @@ export function environmentService(db: Db) {
             ),
           ),
         db
-          .select({ count: sql<number>`count(*)::int` })
+          .select({
+            count: sql<number>`count(*)::int`,
+            pendingCleanupCount: sql<number>`count(*) filter (where ${environmentLeases.status} = 'pending_cleanup')::int`,
+          })
           .from(environmentLeases)
           .where(
             and(
@@ -560,6 +563,7 @@ export function environmentService(db: Db) {
       const deleteBlockedReasons: EnvironmentDeleteBlockedReason[] = [];
       if (isManagedLocal) deleteBlockedReasons.push("managed_local");
       if (isInstanceDefault) deleteBlockedReasons.push("instance_default");
+      if ((activeLeaseRows[0]?.pendingCleanupCount ?? 0) > 0) deleteBlockedReasons.push("pending_cleanup");
       const activeLeaseCount = countFromRows(activeLeaseRows);
       const activeCustomImageSetupSessionCount = countFromRows(activeSetupRows);
 
