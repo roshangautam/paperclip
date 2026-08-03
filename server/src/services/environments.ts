@@ -645,6 +645,7 @@ export function environmentService(db: Db) {
         failureReason?: string;
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
         metadata?: Record<string, unknown> | null;
+        expectedCleanupClaimId?: string;
       },
     ) => {
       const now = new Date();
@@ -658,8 +659,17 @@ export function environmentService(db: Db) {
           ...(options?.failureReason !== undefined ? { failureReason: options.failureReason } : {}),
           ...(options?.cleanupStatus !== undefined ? { cleanupStatus: options.cleanupStatus } : {}),
           ...(options?.metadata !== undefined ? { metadata: options.metadata } : {}),
+          cleanupClaimId: null,
+          cleanupClaimedAt: null,
         })
-        .where(eq(environmentLeases.id, id))
+        .where(
+          options?.expectedCleanupClaimId
+            ? and(
+                eq(environmentLeases.id, id),
+                eq(environmentLeases.cleanupClaimId, options.expectedCleanupClaimId),
+              )
+            : eq(environmentLeases.id, id),
+        )
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toEnvironmentLease(row) : null;

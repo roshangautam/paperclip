@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { environments } from "./environments.js";
@@ -24,6 +25,8 @@ export const environmentLeases = pgTable(
     releasedAt: timestamp("released_at", { withTimezone: true }),
     failureReason: text("failure_reason"),
     cleanupStatus: text("cleanup_status"),
+    cleanupClaimId: uuid("cleanup_claim_id"),
+    cleanupClaimedAt: timestamp("cleanup_claimed_at", { withTimezone: true }),
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -42,5 +45,8 @@ export const environmentLeases = pgTable(
     heartbeatRunIdx: index("environment_leases_heartbeat_run_idx").on(table.heartbeatRunId),
     companyLastUsedIdx: index("environment_leases_company_last_used_idx").on(table.companyId, table.lastUsedAt),
     providerLeaseIdx: index("environment_leases_provider_lease_idx").on(table.providerLeaseId),
+    pendingCleanupIdx: index("environment_leases_pending_cleanup_idx")
+      .on(table.updatedAt, table.cleanupClaimedAt)
+      .where(sql`${table.status} = 'pending_cleanup' AND ${table.leasePolicy} = 'ephemeral'`),
   }),
 );

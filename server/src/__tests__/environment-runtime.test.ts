@@ -395,6 +395,51 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     return { pluginId, companyId, agentId, environment, runId, executionWorkspaceId, reusableLease };
   }
 
+  async function seedPendingPluginSandboxCleanup(providerLeaseId: string) {
+    const pluginId = randomUUID();
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "sandbox",
+      name: "Retrying Plugin Sandbox",
+      config: {
+        provider: "fake-plugin",
+        image: "fake:test",
+        reuseLease: false,
+      },
+    });
+    const lease = await environmentService(db).acquireLease({
+      companyId,
+      environmentId: environment.id,
+      issueId: null,
+      heartbeatRunId: runId,
+      leasePolicy: "ephemeral",
+      provider: "fake-plugin",
+      providerLeaseId,
+      metadata: {
+        driver: "sandbox",
+        provider: "fake-plugin",
+        pluginId,
+        sandboxProviderPlugin: true,
+        image: "fake:test",
+        reuseLease: false,
+      },
+    });
+    const failedRelease = environmentRuntimeService(db, {
+      pluginWorkerManager: {
+        isRunning: vi.fn(() => true),
+        call: vi.fn(async () => {
+          throw new Error("context canceled");
+        }),
+      } as unknown as PluginWorkerManager,
+    });
+    const pending = await failedRelease.releaseRunLeases(runId, "failed");
+    await db
+      .update(environmentLeases)
+      .set({ updatedAt: new Date(0) })
+      .where(eq(environmentLeases.id, lease.id));
+
+    return { pluginId, lease, pending };
+  }
+
   it("acquires and releases a local run lease through the runtime seam", async () => {
     const { companyId, environment, runId } = await seedEnvironment();
 
@@ -1806,43 +1851,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   });
 
   it("retries failed ephemeral plugin sandbox cleanup", async () => {
-    const pluginId = randomUUID();
-    const { companyId, environment, runId } = await seedEnvironment({
-      driver: "sandbox",
-      name: "Retrying Plugin Sandbox",
-      config: {
-        provider: "fake-plugin",
-        image: "fake:test",
-        reuseLease: false,
-      },
-    });
-    const lease = await environmentService(db).acquireLease({
-      companyId,
-      environmentId: environment.id,
-      issueId: null,
-      heartbeatRunId: runId,
-      leasePolicy: "ephemeral",
-      provider: "fake-plugin",
-      providerLeaseId: "failed-plugin-lease",
-      metadata: {
-        driver: "sandbox",
-        provider: "fake-plugin",
-        pluginId,
-        sandboxProviderPlugin: true,
-        image: "fake:test",
-        reuseLease: false,
-      },
-    });
-    const failedRelease = environmentRuntimeService(db, {
-      pluginWorkerManager: {
-        isRunning: vi.fn(() => true),
-        call: vi.fn(async () => {
-          throw new Error("context canceled");
-        }),
-      } as unknown as PluginWorkerManager,
-    });
-
-    const pending = await failedRelease.releaseRunLeases(runId, "failed");
+    const { pluginId, lease, pending } = await seedPendingPluginSandboxCleanup("failed-plugin-lease");
 
     expect(pending[0]?.lease).toMatchObject({
       id: lease.id,
@@ -1851,10 +1860,6 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       failureReason: "adapter_or_run_failure",
       metadata: expect.objectContaining({ pendingCleanupReleaseStatus: "failed" }),
     });
-    await db
-      .update(environmentLeases)
-      .set({ updatedAt: new Date(0) })
-      .where(eq(environmentLeases.id, lease.id));
 
     const recoveredWorkerManager = {
       isRunning: vi.fn((id: string) => id === pluginId),
@@ -1872,6 +1877,39 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect.objectContaining({ providerLeaseId: "failed-plugin-lease" }),
       undefined,
     );
+    await expect(environmentService(db).getLeaseById(lease.id)).resolves.toMatchObject({
+      status: "failed",
+      cleanupStatus: "success",
+    });
+  });
+
+  it("claims a pending sandbox cleanup once across overlapping retries", async () => {
+    const { pluginId, lease } = await seedPendingPluginSandboxCleanup("concurrent-plugin-lease");
+    let finishCleanup!: () => void;
+    const cleanupBlocked = new Promise<void>((resolve) => {
+      finishCleanup = resolve;
+    });
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async () => await cleanupBlocked),
+    } as unknown as PluginWorkerManager;
+    const firstRetry = environmentRuntimeService(db, { pluginWorkerManager: workerManager })
+      .retryPendingSandboxCleanups();
+    const secondRetry = environmentRuntimeService(db, { pluginWorkerManager: workerManager })
+      .retryPendingSandboxCleanups();
+
+    await vi.waitFor(() => expect(workerManager.call).toHaveBeenCalledTimes(1));
+    const wrongOwnerResult = await environmentService(db).releaseLease(lease.id, "failed", {
+      expectedCleanupClaimId: randomUUID(),
+    });
+    expect(wrongOwnerResult).toBeNull();
+
+    finishCleanup();
+    const results = await Promise.all([firstRetry, secondRetry]);
+
+    expect(results.reduce((total, result) => total + result.attempted, 0)).toBe(1);
+    expect(results.reduce((total, result) => total + result.cleaned, 0)).toBe(1);
+    expect(workerManager.call).toHaveBeenCalledTimes(1);
     await expect(environmentService(db).getLeaseById(lease.id)).resolves.toMatchObject({
       status: "failed",
       cleanupStatus: "success",
