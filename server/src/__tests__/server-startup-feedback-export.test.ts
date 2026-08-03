@@ -14,6 +14,8 @@ const {
   deriveAuthTrustedOriginsMock,
   environmentCustomImagesServiceMock,
   environmentCustomImagesServiceFactoryMock,
+  environmentRuntimeServiceFactoryMock,
+  environmentRuntimeServiceMock,
   feedbackExportServiceMock,
   feedbackServiceFactoryMock,
   fakeServer,
@@ -64,6 +66,10 @@ const {
     cleanupExpiredSetupSessions: vi.fn(async () => ({ scanned: 0, timedOut: 0, failed: 0 })),
   };
   const environmentCustomImagesServiceFactoryMock = vi.fn(() => environmentCustomImagesServiceMock);
+  const environmentRuntimeServiceMock = {
+    retryPendingSandboxCleanups: vi.fn(async () => ({ attempted: 0, cleaned: 0 })),
+  };
+  const environmentRuntimeServiceFactoryMock = vi.fn(() => environmentRuntimeServiceMock);
   const routineServiceMock = {
     tickScheduledTriggers: vi.fn(async () => ({ triggered: 0 })),
   };
@@ -91,6 +97,8 @@ const {
     deriveAuthTrustedOriginsMock,
     environmentCustomImagesServiceMock,
     environmentCustomImagesServiceFactoryMock,
+    environmentRuntimeServiceFactoryMock,
+    environmentRuntimeServiceMock,
     feedbackExportServiceMock,
     feedbackServiceFactoryMock,
     fakeServer,
@@ -259,6 +267,10 @@ vi.mock("../services/plugin-worker-manager.js", () => ({
   createPluginWorkerManager: vi.fn(() => ({ id: "plugin-worker-manager" })),
 }));
 
+vi.mock("../services/environment-runtime.js", () => ({
+  environmentRuntimeService: environmentRuntimeServiceFactoryMock,
+}));
+
 vi.mock("../startup-banner.js", () => ({
   printStartupBanner: vi.fn(),
 }));
@@ -355,6 +367,33 @@ describe("startServer feedback export wiring", () => {
 
     expect(heartbeatServiceMock.reconcileHotRestartAdoption).toHaveBeenCalledTimes(1);
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not await pending sandbox cleanup before startup recovery continues", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let cleanupStarted!: () => void;
+    let finishCleanup!: (result: { attempted: number; cleaned: number }) => void;
+    const cleanupInvoked = new Promise<void>((resolve) => {
+      cleanupStarted = resolve;
+    });
+    const cleanupPending = new Promise<{ attempted: number; cleaned: number }>((resolve) => {
+      finishCleanup = resolve;
+    });
+    environmentRuntimeServiceMock.retryPendingSandboxCleanups.mockImplementationOnce(() => {
+      cleanupStarted();
+      return cleanupPending;
+    });
+
+    const startup = startServer();
+    await cleanupInvoked;
+
+    expect(heartbeatServiceMock.promoteDueScheduledRetries).toHaveBeenCalledTimes(1);
+
+    finishCleanup({ attempted: 0, cleaned: 0 });
+    await startup;
   });
 
   it("refuses authenticated public startup without an external database URL", async () => {

@@ -913,10 +913,16 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
 
-        const sandboxCleanup = await environmentRuntime.retryPendingSandboxCleanups();
-        if (sandboxCleanup.attempted > 0) {
-          logger.info(sandboxCleanup, "startup pending sandbox cleanup retry complete");
-        }
+        trackHeartbeatSchedulerWork(environmentRuntime
+          .retryPendingSandboxCleanups()
+          .then((sandboxCleanup) => {
+            if (sandboxCleanup.attempted > 0) {
+              logger.info(sandboxCleanup, "startup pending sandbox cleanup retry complete");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "startup pending sandbox cleanup retry failed");
+          }));
 
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();

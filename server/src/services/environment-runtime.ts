@@ -210,6 +210,7 @@ const SANDBOX_CLEANUP_CLAIM_STALE_MS = 5 * 60 * 1000;
 const SANDBOX_CLEANUP_CLAIM_RENEW_MS = 60 * 1000;
 const SANDBOX_CLEANUP_RETRY_BATCH_SIZE = 10;
 const PENDING_CLEANUP_RELEASE_STATUS_KEY = "pendingCleanupReleaseStatus";
+const PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY = "sandboxProviderConfig";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -715,12 +716,24 @@ function createSandboxEnvironmentDriver(
     lease: EnvironmentLease;
     provider: string;
   }): Promise<Record<string, unknown>> {
+    const storedProviderConfig = input.lease.metadata?.[PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY];
+    if (isRecord(storedProviderConfig) && storedProviderConfig.provider === input.provider) {
+      const parsed = await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, {
+        id: input.environment.id,
+        driver: "sandbox",
+        config: storedProviderConfig,
+      });
+      if (parsed.driver === "sandbox") {
+        return parsed.config as unknown as Record<string, unknown>;
+      }
+    }
+
     const metadataConfig = sandboxConfigFromLeaseMetadataLoose(input.lease);
     if (metadataConfig && metadataConfig.provider === input.provider) {
       const parsed = await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, {
         id: input.environment.id,
         driver: "sandbox",
-        config: sandboxConfigForLeaseMetadata(metadataConfig),
+        config: sanitizePluginSandboxConfigFromLeaseMetadata(metadataConfig),
       });
       if (parsed.driver === "sandbox") {
         return parsed.config as unknown as Record<string, unknown>;
@@ -990,8 +1003,9 @@ function createSandboxEnvironmentDriver(
             pluginId: pluginProvider.resolved.plugin.id,
             pluginKey: pluginProvider.resolved.plugin.pluginKey,
             sandboxProviderPlugin: true,
-            ...sandboxConfigForLeaseMetadata(storedConfig),
+            ...sanitizePluginSandboxConfigFromLeaseMetadata(storedConfig),
             ...sanitizedProviderMetadata,
+            [PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY]: providerConfigForLease,
             ...(reusableScope ? { reusableSandboxLease: reusableScope } : {}),
           },
         });
@@ -1406,12 +1420,13 @@ const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "pluginKey",
   "providerMetadata",
   "remoteCwd",
+  PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY,
   "shellCommand",
   "sandboxProviderPlugin",
 ]);
 
 function sanitizePluginSandboxConfigFromLeaseMetadata(
-  metadata: Record<string, unknown> | null | undefined,
+  metadata: object | null | undefined,
 ): Record<string, unknown> {
   const sanitized: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(metadata ?? {})) {
@@ -1422,7 +1437,7 @@ function sanitizePluginSandboxConfigFromLeaseMetadata(
 }
 
 function sandboxConfigForLeaseMetadata(config: SandboxEnvironmentConfig): Record<string, unknown> {
-  return sanitizePluginSandboxConfigFromLeaseMetadata(config as unknown as Record<string, unknown>);
+  return structuredClone(config as unknown as Record<string, unknown>);
 }
 
 function tryParseCurrentPluginConfig(environment: Environment): PluginEnvironmentConfig | null {

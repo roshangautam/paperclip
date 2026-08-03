@@ -621,6 +621,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       image: "fake:test",
       timeoutMs: 1234,
       reuseLease: false,
+      remoteCwd: "/configured/workspace",
+      shellCommand: "bash",
+      pluginKey: "provider-config-key",
     };
     const environment = {
       ...baseEnvironment,
@@ -670,6 +673,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           image: "fake:test",
           timeoutMs: 1234,
           reuseLease: false,
+          remoteCwd: "/configured/workspace",
+          shellCommand: "bash",
+          pluginKey: "provider-config-key",
         }));
         expect(params.config).not.toHaveProperty("provider");
         if (method === "environmentAcquireLease") {
@@ -698,11 +704,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             image: "fake:test",
             timeoutMs: 1234,
             reuseLease: false,
+            remoteCwd: "/configured/workspace",
+            shellCommand: "bash",
+            pluginKey: "provider-config-key",
           });
           expect(params.config).not.toHaveProperty("driver");
           expect(params.config).not.toHaveProperty("executionWorkspaceMode");
           expect(params.config).not.toHaveProperty("pluginId");
-          expect(params.config).not.toHaveProperty("pluginKey");
           expect(params.config).not.toHaveProperty("providerMetadata");
           expect(params.config).not.toHaveProperty("provider");
           expect(params.config).not.toHaveProperty("sandboxProviderPlugin");
