@@ -592,6 +592,12 @@ export interface PluginEnvironmentLease {
 }
 
 export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDriverBaseParams {
+  /**
+   * Stable host-generated identifier for this acquisition. Providers must make
+   * acquisition idempotent for this identifier so the host can safely replay a
+   * request whose result was not durably recorded before a restart.
+   */
+  acquisitionId: string;
   runId: string;
   workspaceMode?: string;
   requestedCwd?: string;
@@ -607,6 +613,11 @@ export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDr
 }
 
 export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDriverBaseParams {
+  /**
+   * The existing provider resource to reconnect to. A successful resume must
+   * return this exact identifier; return `providerLeaseId: null` when the
+   * resource is missing or expired so the host can perform a fresh acquisition.
+   */
   providerLeaseId: string;
   leaseMetadata?: Record<string, unknown>;
 }

@@ -162,6 +162,7 @@ export const pluginEnvironmentDriverDeclarationSchema = z.object({
   displayName: z.string().min(1).max(100),
   description: z.string().max(500).optional(),
   supportsReusableLeases: z.boolean().optional(),
+  supportsAcquisitionReplay: z.boolean().optional(),
   supportsInteractiveSetup: z.boolean().optional(),
   interactiveSetupConnectionTypes: z.array(z.string().min(1).max(100)).max(10).optional(),
   supportsTemplateCapture: z.boolean().optional(),
