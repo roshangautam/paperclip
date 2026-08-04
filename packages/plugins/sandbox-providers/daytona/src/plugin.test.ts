@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockCreate = vi.hoisted(() => vi.fn());
@@ -418,10 +419,42 @@ describe("Daytona sandbox provider plugin", () => {
         timeoutMs: 300000,
         reuseLease: false,
       },
-    })).rejects.toThrow("workdir lookup failed");
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "workdir lookup failed",
+      data: { providerLeaseId: sandbox.id },
+    });
 
     expect(mockGet).toHaveBeenCalledTimes(2);
     expect(sandbox.delete).not.toHaveBeenCalled();
+  });
+
+  it("hands off a created Daytona sandbox when local setup cleanup also fails", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const sandbox = createMockSandbox({ id: "sandbox-delete-failed" });
+    sandbox.getWorkDir.mockRejectedValue(new Error("workdir lookup failed"));
+    sandbox.delete.mockRejectedValue(new Error("delete failed"));
+    mockCreate.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "workdir lookup failed",
+      data: { providerLeaseId: "sandbox-delete-failed" },
+    });
+
+    expect(sandbox.delete).toHaveBeenCalledWith(300);
   });
 
   it("starts an interactive setup sandbox with redacted metadata and one-time SSH payload", async () => {

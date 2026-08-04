@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const fetchMock = vi.fn();
@@ -452,7 +453,12 @@ describe("exe.dev sandbox provider plugin", () => {
         namePrefix: "paperclip",
         timeoutMs: 300000,
       },
-    })).rejects.toThrow("Failed to inspect exe.dev VM");
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: expect.stringContaining("Failed to inspect exe.dev VM"),
+      data: { providerLeaseId: vmName },
+    });
 
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock.mock.calls.map((call) => String(call[1]?.body ?? ""))).not.toContain(
