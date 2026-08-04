@@ -88,11 +88,6 @@ const manifest: PaperclipPluginManifestV1 = {
             description:
               "Annotations applied to the per-tenant ServiceAccount (e.g. `eks.amazonaws.com/role-arn` for IRSA).",
           },
-          jobTtlSecondsAfterFinished: {
-            type: "integer",
-            minimum: 0,
-            description: "Seconds after a Job completes before it is garbage-collected (default: 900).",
-          },
           podActivityDeadlineSec: {
             type: "integer",
             minimum: 1,

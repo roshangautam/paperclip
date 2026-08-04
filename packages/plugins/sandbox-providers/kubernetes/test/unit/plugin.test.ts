@@ -34,7 +34,6 @@ describe("plugin", () => {
       expect.objectContaining({
         namespacePrefix: "paperclip-",
         egressMode: "standard",
-        jobTtlSecondsAfterFinished: 900,
         podActivityDeadlineSec: 3600,
         adapterType: "claude_local",
         backend: "sandbox-cr", // new default

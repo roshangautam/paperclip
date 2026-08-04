@@ -37,6 +37,8 @@ function validateExistingSecret(
         kind?: string;
         name?: string;
         uid?: string;
+        controller?: boolean;
+        blockOwnerDeletion?: boolean;
       }>;
     };
     data?: Record<string, string>;
@@ -50,14 +52,17 @@ function validateExistingSecret(
       `Refusing to adopt Kubernetes Secret ${input.secretName}: acquisition ownership does not match ${input.acquisitionId}.`,
     );
   }
-  const owner = (typed?.metadata?.ownerReferences ?? []).find(
-    (candidate) =>
-      candidate.apiVersion === input.ownerApiVersion
-      && candidate.kind === input.ownerKind
-      && candidate.name === input.ownerName
-      && candidate.uid === input.ownerUid,
-  );
-  if (!owner) {
+  const ownerReferences = typed?.metadata?.ownerReferences ?? [];
+  const owner = ownerReferences[0];
+  if (
+    ownerReferences.length !== 1
+    || owner?.apiVersion !== input.ownerApiVersion
+    || owner.kind !== input.ownerKind
+    || owner.name !== input.ownerName
+    || owner.uid !== input.ownerUid
+    || owner.controller !== true
+    || owner.blockOwnerDeletion !== true
+  ) {
     throw new Error(
       `Refusing to adopt Kubernetes Secret ${input.secretName}: owner does not match ${input.ownerKind} ${input.ownerName} (${input.ownerUid}).`,
     );

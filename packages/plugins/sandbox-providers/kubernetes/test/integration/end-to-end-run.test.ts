@@ -53,12 +53,12 @@ describe("plugin-kubernetes end-to-end", () => {
         backend: "job",
         imageAllowList: [] as string[],
         podActivityDeadlineSec: 60,
-        jobTtlSecondsAfterFinished: 60,
       };
 
       const lease = await plugin.definition.onEnvironmentAcquireLease!({
         driverKey: "kubernetes",
         config,
+        acquisitionId: "acquisition-test-e2e-job",
         runId: "r-test-e2e-job",
         companyId: "11111111-1111-1111-1111-111111111111",
         environmentId: "env-test",
@@ -125,12 +125,12 @@ describe("plugin-kubernetes end-to-end", () => {
         backend: "sandbox-cr",
         imageAllowList: [] as string[],
         podActivityDeadlineSec: 120,
-        jobTtlSecondsAfterFinished: 60,
       };
 
       const lease = await plugin.definition.onEnvironmentAcquireLease!({
         driverKey: "kubernetes",
         config,
+        acquisitionId: "acquisition-test-e2e-sandbox-cr",
         runId: "r-test-e2e-sandbox-cr",
         companyId: "22222222-2222-2222-2222-222222222222",
         environmentId: "env-test-cr",

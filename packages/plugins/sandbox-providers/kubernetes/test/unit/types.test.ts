@@ -8,7 +8,6 @@ describe("kubernetesProviderConfigSchema", () => {
     expect(parsed.namespacePrefix).toBe("paperclip-");
     expect(parsed.imageAllowList).toEqual([]);
     expect(parsed.egressMode).toBe("standard");
-    expect(parsed.jobTtlSecondsAfterFinished).toBe(900);
   });
 
   it("accepts inline kubeconfig", () => {

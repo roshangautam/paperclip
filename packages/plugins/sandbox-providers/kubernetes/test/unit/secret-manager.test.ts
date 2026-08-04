@@ -38,6 +38,8 @@ describe("createPerRunSecret", () => {
           kind: baseInput.ownerKind,
           name: baseInput.ownerName,
           uid: baseInput.ownerUid,
+          controller: true,
+          blockOwnerDeletion: true,
         }],
       },
       data: { BOOTSTRAP_TOKEN: Buffer.from("original-token").toString("base64") },
@@ -67,10 +69,15 @@ describe("createPerRunSecret", () => {
     const created: { body: Record<string, unknown> }[] = [];
     const clients = creatingClients(created);
     await createPerRunSecret(clients as never, baseInput);
-    const body = created[0].body as { metadata: { ownerReferences: { uid: string; controller: boolean }[] } };
+    const body = created[0].body as {
+      metadata: {
+        ownerReferences: { uid: string; controller: boolean; blockOwnerDeletion: boolean }[];
+      };
+    };
     expect(body.metadata.ownerReferences).toHaveLength(1);
     expect(body.metadata.ownerReferences[0].uid).toBe("11111111-1111-1111-1111-111111111111");
     expect(body.metadata.ownerReferences[0].controller).toBe(true);
+    expect(body.metadata.ownerReferences[0].blockOwnerDeletion).toBe(true);
   });
 
   it("throws if adapterEnv contains BOOTSTRAP_TOKEN", async () => {
@@ -104,6 +111,50 @@ describe("createPerRunSecret", () => {
   it("rejects a Secret whose owner UID does not match the acquired workload", async () => {
     const secret = existingSecret();
     secret.metadata.ownerReferences[0].uid = "other-uid";
+    const clients = {
+      core: {
+        readNamespacedSecret: vi.fn().mockResolvedValue(secret),
+        createNamespacedSecret: vi.fn(),
+      },
+    };
+
+    await expect(createPerRunSecret(clients as never, baseInput)).rejects.toThrow(
+      /owner does not match/,
+    );
+    expect(clients.core.createNamespacedSecret).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Secret with additional owner references", async () => {
+    const secret = existingSecret();
+    secret.metadata.ownerReferences.push({
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      name: "other-owner",
+      uid: "22222222-2222-2222-2222-222222222222",
+      controller: false,
+      blockOwnerDeletion: false,
+    });
+    const clients = {
+      core: {
+        readNamespacedSecret: vi.fn().mockResolvedValue(secret),
+        createNamespacedSecret: vi.fn(),
+      },
+    };
+
+    await expect(createPerRunSecret(clients as never, baseInput)).rejects.toThrow(
+      /owner does not match/,
+    );
+    expect(clients.core.createNamespacedSecret).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["controller", false],
+    ["controller", undefined],
+    ["blockOwnerDeletion", false],
+    ["blockOwnerDeletion", undefined],
+  ] as const)("rejects a Secret when owner %s is %s", async (field, value) => {
+    const secret = existingSecret();
+    Object.assign(secret.metadata.ownerReferences[0], { [field]: value });
     const clients = {
       core: {
         readNamespacedSecret: vi.fn().mockResolvedValue(secret),
