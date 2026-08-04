@@ -6,6 +6,7 @@ vi.mock("@cloudflare/sandbox", () => ({
 
 import { handleBridgeRequest } from "./routes.js";
 import { resolveSandbox } from "./sandboxes.js";
+import bridgeWorker from "./index.js";
 
 vi.mock("./sandboxes.js", async () => {
   const actual = await vi.importActual<typeof import("./sandboxes.js")>("./sandboxes.js");
@@ -92,17 +93,17 @@ describe("bridge routes", () => {
   });
 
   it("replays an ephemeral acquisition against the same sandbox ID and ownership sentinel", async () => {
-    let sentinelWritten = false;
+    let sentinelAcquisitionId: string | null = null;
     const sessionExec = vi.fn().mockImplementation(async (command: string) => {
       if (command.includes("test ! -e")) {
         return {
           exitCode: 0,
-          stdout: sentinelWritten ? JSON.stringify({ acquisitionId: "acquisition-1" }) : "",
+          stdout: sentinelAcquisitionId === null ? "" : JSON.stringify({ acquisitionId: sentinelAcquisitionId }),
           stderr: "",
         };
       }
       if (command.includes("printf") && command.includes(".paperclip-lease.json")) {
-        sentinelWritten = true;
+        sentinelAcquisitionId = command.includes('"acquisitionId": null') ? null : "acquisition-1";
       }
       return { exitCode: 0, stdout: "", stderr: "" };
     });
@@ -127,8 +128,18 @@ describe("bridge routes", () => {
     );
 
     const first = await acquire();
+    const resumed = await handleBridgeRequest(
+      bridgeRequest("/api/paperclip-sandbox/v1/leases/resume", {
+        providerLeaseId: "pc-acq-acquisition-1",
+        requestedCwd: "/workspace/paperclip",
+        sessionStrategy: "named",
+        sessionId: "paperclip",
+      }),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
     const second = await acquire();
     expect(first.status).toBe(200);
+    expect(resumed.status).toBe(200);
     expect(second.status).toBe(200);
     expect(await first.json()).toMatchObject({
       providerLeaseId: "pc-acq-acquisition-1",
@@ -138,6 +149,10 @@ describe("bridge routes", () => {
       providerLeaseId: "pc-acq-acquisition-1",
       metadata: { acquisitionId: "acquisition-1" },
     });
+    expect(await resumed.json()).toMatchObject({
+      providerLeaseId: "pc-acq-acquisition-1",
+      metadata: { acquisitionId: "acquisition-1", resumedLease: true },
+    });
     expect(resolveSandbox).toHaveBeenNthCalledWith(
       1,
       expect.anything(),
@@ -145,7 +160,7 @@ describe("bridge routes", () => {
       expect.anything(),
     );
     expect(resolveSandbox).toHaveBeenNthCalledWith(
-      2,
+      3,
       expect.anything(),
       "pc-acq-acquisition-1",
       expect.anything(),
@@ -167,7 +182,7 @@ describe("bridge routes", () => {
     };
     vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
 
-    await expect(handleBridgeRequest(
+    const response = await bridgeWorker.fetch(
       bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
         acquisitionId: "acquisition-1",
         environmentId: "env-1",
@@ -178,14 +193,23 @@ describe("bridge routes", () => {
         sessionId: "paperclip",
       }),
       { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
-    )).rejects.toThrow(/acquisition ownership does not match/);
+    );
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: "acquisition_conflict",
+      message: expect.stringMatching(/acquisition ownership does not match/),
+    });
     expect(sessionExec).toHaveBeenCalledTimes(1);
     expect(sandbox.setKeepAlive).not.toHaveBeenCalled();
     expect(sandbox.destroy).not.toHaveBeenCalled();
   });
 
   it("checks lease sentinels through the named-session exec target on resume", async () => {
-    const sessionExec = vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    const sessionExec = vi.fn().mockResolvedValue({
+      exitCode: 0,
+      stdout: JSON.stringify({ acquisitionId: "acquisition-1" }),
+      stderr: "",
+    });
     const sandbox = {
       getSession: vi.fn().mockResolvedValue({ exec: sessionExec }),
       createSession: vi.fn(),
@@ -211,7 +235,8 @@ describe("bridge routes", () => {
     const [commandArg, optionsArg] = sessionExec.mock.calls[0] ?? [];
     expect(typeof commandArg).toBe("string");
     expect(commandArg).toMatch(/^sh -lc /);
-    expect(commandArg).toContain("test -s");
+    expect(commandArg).toContain("test ! -e");
+    expect(commandArg).toContain("cat");
     expect(commandArg).toContain("/workspace/paperclip/.paperclip-lease.json");
     expect(optionsArg).toEqual({ cwd: "/", timeout: expect.any(Number) });
     expect(optionsArg).not.toHaveProperty("args");

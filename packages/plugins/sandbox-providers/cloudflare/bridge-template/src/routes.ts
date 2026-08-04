@@ -207,25 +207,6 @@ async function readSentinelAcquisitionId(
   }
 }
 
-async function verifySentinel(
-  sandbox: CloudflareSandbox,
-  input: {
-    remoteCwd: string;
-    sessionStrategy: SessionStrategy;
-    sessionId: string;
-    timeoutMs: number;
-  },
-): Promise<boolean> {
-  const result = await execLeaseUtility(
-    sandbox,
-    input,
-    "sh",
-    ["-c", `test -s ${shellQuote(buildSentinelPath(input.remoteCwd))}`],
-    "/",
-  );
-  return !result.timedOut && (result.exitCode ?? 0) === 0;
-}
-
 export async function handleBridgeRequest(request: Request, env: BridgeEnv): Promise<Response> {
   if (!(await isAuthorizedRequest(request, env.BRIDGE_AUTH_TOKEN))) {
     return toErrorResponse(401, "unauthorized", "Missing or invalid bridge bearer token.");
@@ -324,7 +305,9 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
       timeoutMs,
     });
     if (existingAcquisitionId !== null && existingAcquisitionId !== body.acquisitionId) {
-      throw new Error(
+      return toErrorResponse(
+        409,
+        "acquisition_conflict",
         `Refusing to adopt Cloudflare sandbox ${providerLeaseId}: acquisition ownership does not match ${body.acquisitionId}.`,
       );
     }
@@ -383,13 +366,20 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     // created), so a failed resume doesn't leak a *new* sandbox.
     await applySandboxKeepAlive(sandbox, keepAlive);
 
-    if (!(await verifySentinel(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs }))) {
+    const acquisitionId = await readSentinelAcquisitionId(sandbox, {
+      remoteCwd,
+      sessionStrategy,
+      sessionId,
+      timeoutMs,
+    });
+    if (!acquisitionId) {
       return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox state is no longer available.");
     }
 
     await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
     await writeSentinel(sandbox, {
       providerLeaseId: body.providerLeaseId,
+      acquisitionId,
       remoteCwd,
       sessionStrategy,
       sessionId,
@@ -404,6 +394,7 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
       providerLeaseId: body.providerLeaseId,
       metadata: {
         provider: "cloudflare",
+        acquisitionId,
         remoteCwd,
         sandboxId: body.providerLeaseId,
         sessionStrategy,
