@@ -1661,10 +1661,12 @@ function createSandboxEnvironmentDriver(
             });
           }
         }
+        const acquisitionId = randomUUID();
         const acquiredLease = providerLease ?? await pluginWorkerManager.call(
           pluginProvider.resolved.plugin.id,
           "environmentAcquireLease",
           {
+            acquisitionId,
             driverKey: parsed.config.provider,
             companyId: input.companyId,
             environmentId: input.environment.id,
@@ -1673,7 +1675,7 @@ function createSandboxEnvironmentDriver(
             // Plugin SDK requires a string; ad-hoc test leases use a fresh
             // UUID so providers that validate or persist the runId still see
             // a well-formed identifier.
-            runId: input.heartbeatRunId ?? randomUUID(),
+            runId: input.heartbeatRunId ?? acquisitionId,
             workspaceMode: input.executionWorkspaceMode ?? undefined,
             agentId: input.agentId ?? undefined,
             executionWorkspaceId: input.executionWorkspaceId ?? undefined,
@@ -2785,13 +2787,15 @@ function createPluginEnvironmentDriver(
         throw new Error(`Expected plugin environment config for driver "${input.environment.driver}".`);
       }
       const { plugin } = await resolvePluginDriver(parsed.config);
+      const acquisitionId = randomUUID();
       const providerLease = await workerManager.call(plugin.id, "environmentAcquireLease", {
+        acquisitionId,
         driverKey: parsed.config.driverKey,
         companyId: input.companyId,
         environmentId: input.environment.id,
         issueId: input.issueId,
         config: parsed.config.driverConfig,
-        runId: input.heartbeatRunId ?? randomUUID(),
+        runId: input.heartbeatRunId ?? acquisitionId,
         workspaceMode: input.executionWorkspaceMode ?? undefined,
         agentId: input.agentId ?? undefined,
         executionWorkspaceId: input.executionWorkspaceId ?? undefined,

@@ -21,11 +21,13 @@ import {
   isJsonRpcRequest,
   isJsonRpcResponse,
   isJsonRpcNotification,
+  JsonRpcCallError,
   parseMessage,
   PLUGIN_RPC_ERROR_CODES,
   serializeMessage,
   type JsonRpcNotification,
   type JsonRpcResponse,
+  type PluginEnvironmentAcquireLeaseErrorData,
   type PluginInvocationContext,
 } from "../src/protocol.js";
 import { isWorkerEntrypoint, startWorkerRpcHost } from "../src/worker-rpc-host.js";
@@ -153,6 +155,78 @@ describe("worker performAction context", () => {
           companyId: null,
         },
         companyId: null,
+      });
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  });
+});
+
+describe("worker structured errors", () => {
+  it("preserves acquisition failure data across the worker RPC boundary", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    const errorData: PluginEnvironmentAcquireLeaseErrorData = {
+      providerLeaseId: "provider-lease-created-before-failure",
+    };
+    const plugin = definePlugin({
+      async setup() {},
+      async onEnvironmentAcquireLease() {
+        throw new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+          message: "workspace startup failed after lease creation",
+          data: errorData,
+        });
+      },
+    });
+    const worker = startWorkerRpcHost({
+      plugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+
+    function callWorker(method: string, params: unknown) {
+      const id = "host-structured-error";
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new JsonRpcCallError(response.error));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (!isJsonRpcResponse(message)) return;
+      pending.get(String(message.id))?.(message);
+      pending.delete(String(message.id));
+    });
+
+    try {
+      const failure = await callWorker("environmentAcquireLease", {
+        driverKey: "test-driver",
+        companyId: "company-a",
+        environmentId: "environment-a",
+        config: {},
+        acquisitionId: "acquisition-a",
+        runId: "run-a",
+      }).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(JsonRpcCallError);
+      expect(failure).toMatchObject({
+        code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+        message: "workspace startup failed after lease creation",
+        data: errorData,
       });
     } finally {
       worker.stop();

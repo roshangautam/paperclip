@@ -78,6 +78,7 @@ describe("plugin manifest validators", () => {
           driverKey: "template-provider",
           kind: "sandbox_provider",
           displayName: "Template Provider",
+          supportsAcquisitionReplay: true,
           supportsTemplateCapture: true,
           templateRefKind: "provider_template",
           templateConfigBinding: {
@@ -93,6 +94,7 @@ describe("plugin manifest validators", () => {
       field: "templateId",
       unsetFields: ["image"],
     });
+    expect(parsed.environmentDrivers?.[0]?.supportsAcquisitionReplay).toBe(true);
   });
 
   it("rejects template config bindings that replace provider identity", () => {

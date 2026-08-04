@@ -1586,8 +1586,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         typeof (err as any)?.code === "number"
           ? (err as any).code
           : PLUGIN_RPC_ERROR_CODES.WORKER_ERROR;
+      const errorData = err instanceof JsonRpcCallError ? err.data : undefined;
 
-      sendMessage(createErrorResponse(id, errorCode, errorMessage));
+      sendMessage(createErrorResponse(id, errorCode, errorMessage, errorData));
     }
   }
 
