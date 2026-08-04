@@ -17,10 +17,12 @@ import type {
   SandboxEnvironmentConfig,
 } from "@paperclipai/shared";
 import type {
+  PluginEnvironmentAcquireLeaseErrorData,
   PluginEnvironmentExecuteResult,
   PluginEnvironmentLease,
   PluginEnvironmentRealizeWorkspaceResult,
 } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
 import { environmentService } from "./environments.js";
 import {
@@ -231,6 +233,25 @@ const LEASE_SCOPED_SECRET_BINDINGS_KEY = "leaseScopedSecretBindings";
 const SANDBOX_ACQUISITION_CONTEXT_KEY = "sandboxAcquisition";
 const SANDBOX_ACQUISITION_ID_KEY = "sandboxAcquisitionId";
 const SANDBOX_LEASE_RESERVATION_KEY = "sandboxLeaseReservation";
+
+function readPluginAcquireLeaseErrorData(
+  error: unknown,
+): PluginEnvironmentAcquireLeaseErrorData | null {
+  if (
+    !(error instanceof JsonRpcCallError) ||
+    error.code !== PLUGIN_RPC_ERROR_CODES.WORKER_ERROR ||
+    !error.data ||
+    typeof error.data !== "object" ||
+    Array.isArray(error.data)
+  ) {
+    return null;
+  }
+
+  const providerLeaseId = (error.data as Partial<PluginEnvironmentAcquireLeaseErrorData>).providerLeaseId;
+  return typeof providerLeaseId === "string" && providerLeaseId.trim().length > 0
+    ? { providerLeaseId }
+    : null;
+}
 
 type SandboxAcquisitionContext = {
   version: 1;
@@ -1778,24 +1799,79 @@ function createSandboxEnvironmentDriver(
         );
       }
       const workerConfig = stripSandboxProviderEnvelope(config as unknown as SandboxEnvironmentConfig);
-      providerLease = await pluginWorkerManager.call(
-        acquisitionContext.pluginId,
-        "environmentAcquireLease",
-        {
-          acquisitionId,
-          driverKey: acquisitionContext.provider,
-          companyId: input.lease.companyId,
-          environmentId: input.environment.id,
-          issueId: input.lease.issueId,
-          config: workerConfig,
-          runId: acquisitionContext.runId,
-          workspaceMode: acquisitionContext.workspaceMode ?? undefined,
-          agentId: acquisitionContext.agentId ?? undefined,
-          executionWorkspaceId: acquisitionContext.executionWorkspaceId ?? undefined,
-          adapterType: acquisitionContext.adapterType ?? undefined,
-        },
-        resolvePluginSandboxRpcTimeoutMs(workerConfig),
-      );
+      try {
+        providerLease = await pluginWorkerManager.call(
+          acquisitionContext.pluginId,
+          "environmentAcquireLease",
+          {
+            acquisitionId,
+            driverKey: acquisitionContext.provider,
+            companyId: input.lease.companyId,
+            environmentId: input.environment.id,
+            issueId: input.lease.issueId,
+            config: workerConfig,
+            runId: acquisitionContext.runId,
+            workspaceMode: acquisitionContext.workspaceMode ?? undefined,
+            agentId: acquisitionContext.agentId ?? undefined,
+            executionWorkspaceId: acquisitionContext.executionWorkspaceId ?? undefined,
+            adapterType: acquisitionContext.adapterType ?? undefined,
+          },
+          resolvePluginSandboxRpcTimeoutMs(workerConfig),
+        );
+      } catch (error) {
+        const errorData = readPluginAcquireLeaseErrorData(error);
+        if (!errorData) throw error;
+
+        let recoveredRow: typeof environmentLeases.$inferSelect | null = null;
+        try {
+          recoveredRow = await db
+            .update(environmentLeases)
+            .set({
+              providerLeaseId: errorData.providerLeaseId,
+              metadata: sql<Record<string, unknown>>`
+                coalesce(${environmentLeases.metadata}, '{}'::jsonb)
+                || ${JSON.stringify({ [SANDBOX_LEASE_RESERVATION_KEY]: false })}::jsonb
+              `,
+              lastUsedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(and(
+              eq(environmentLeases.id, input.lease.id),
+              eq(environmentLeases.status, "pending_cleanup"),
+              eq(environmentLeases.cleanupClaimId, input.cleanupClaimId),
+              isNull(environmentLeases.providerLeaseId),
+            ))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+        } catch (persistError) {
+          logger.warn(
+            {
+              err: persistError,
+              leaseId: input.lease.id,
+              environmentId: input.environment.id,
+              providerLeaseId: errorData.providerLeaseId,
+            },
+            "failed to persist provider lease id from acquisition replay error",
+          );
+          throw error;
+        }
+
+        if (recoveredRow) return toEnvironmentLeaseSnapshot(recoveredRow);
+
+        const currentRow = await db
+          .select()
+          .from(environmentLeases)
+          .where(eq(environmentLeases.id, input.lease.id))
+          .then((rows) => rows[0] ?? null);
+        if (
+          currentRow?.status === "pending_cleanup" &&
+          currentRow.cleanupClaimId === input.cleanupClaimId &&
+          currentRow.providerLeaseId === errorData.providerLeaseId
+        ) {
+          return toEnvironmentLeaseSnapshot(currentRow);
+        }
+        throw error;
+      }
       if (!providerLease.providerLeaseId) {
         throw new Error(`Plugin-backed sandbox acquisition "${acquisitionId}" returned no provider lease id.`);
       }
@@ -2286,7 +2362,47 @@ function createSandboxEnvironmentDriver(
             resolvePluginSandboxRpcTimeoutMs(workerConfig),
           );
         } catch (error) {
-          await deferSandboxLeaseReservation(reservation, "failed", "provider_acquire_outcome_unknown");
+          const errorData = readPluginAcquireLeaseErrorData(error);
+          if (!errorData) {
+            await deferSandboxLeaseReservation(reservation, "failed", "provider_acquire_outcome_unknown");
+            throw error;
+          }
+
+          const cleanupMetadata = {
+            ...fallbackLeaseMetadata,
+            [SANDBOX_LEASE_RESERVATION_KEY]: false,
+          };
+          await compensateFailedSandboxLeaseAcquisition(
+            input.environment,
+            {
+              companyId: input.companyId,
+              environmentId: input.environment.id,
+              executionWorkspaceId: input.executionWorkspaceId,
+              issueId: input.issueId,
+              heartbeatRunId: input.heartbeatRunId,
+              leasePolicy: resolvedLeasePolicy,
+              provider: parsed.config.provider,
+              providerLeaseId: errorData.providerLeaseId,
+              metadata: cleanupMetadata,
+            },
+            reservation,
+            async () => await pluginWorkerManager.call(
+              pluginProvider.resolved.plugin.id,
+              resolvedLeasePolicy === "reuse_by_environment"
+                ? "environmentDestroyLease"
+                : "environmentReleaseLease",
+              {
+                driverKey: parsed.config.provider,
+                companyId: input.companyId,
+                environmentId: input.environment.id,
+                issueId: input.issueId,
+                config: workerConfig,
+                providerLeaseId: errorData.providerLeaseId,
+                leaseMetadata: cleanupMetadata,
+              },
+              resolvePluginSandboxRpcTimeoutMs(workerConfig),
+            ),
+          );
           throw error;
         }
         if (!acquiredLease.providerLeaseId) {

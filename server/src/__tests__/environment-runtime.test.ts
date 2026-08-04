@@ -31,6 +31,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { environmentRuntimeService, findReusableSandboxLeaseId } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.ts";
@@ -1285,6 +1286,108 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await expect(environmentService(db).getLeaseById(pending!.id)).resolves.toMatchObject({
       status: "failed",
       providerLeaseId: "replayed-plugin-acquisition",
+      cleanupStatus: "success",
+    });
+  });
+
+  it("cleans up a provider lease reported by a structured plugin acquisition error", async () => {
+    const { pluginId, companyId, environment, runId } = await seedPluginSandboxEnvironment({
+      supportsAcquisitionReplay: true,
+    });
+    const acquisitionError = new JsonRpcCallError({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "provider setup failed after creation",
+      data: { providerLeaseId: "structured-failed-acquisition" },
+    });
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentAcquireLease") throw acquisitionError;
+        if (method === "environmentReleaseLease") return undefined;
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    await expect(runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toBe(acquisitionError);
+
+    expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+    ]);
+    const [terminal] = await db.select().from(environmentLeases);
+    expect(terminal).toMatchObject({
+      status: "expired",
+      providerLeaseId: "structured-failed-acquisition",
+      cleanupStatus: "success",
+      metadata: expect.objectContaining({
+        sandboxLeaseReservation: false,
+      }),
+    });
+  });
+
+  it("retries cleanup without replaying acquisition after a structured plugin failure", async () => {
+    const { pluginId, companyId, environment, runId } = await seedPluginSandboxEnvironment({
+      supportsAcquisitionReplay: true,
+    });
+    const acquisitionError = new JsonRpcCallError({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "provider setup failed after creation",
+      data: { providerLeaseId: "structured-cleanup-retry" },
+    });
+    let failRelease = true;
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentAcquireLease") throw acquisitionError;
+        if (method === "environmentReleaseLease") {
+          if (failRelease) throw new Error("cleanup unavailable");
+          return undefined;
+        }
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    await expect(runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toBe(acquisitionError);
+
+    const [pending] = await db.select().from(environmentLeases);
+    expect(pending).toMatchObject({
+      status: "pending_cleanup",
+      providerLeaseId: "structured-cleanup-retry",
+      cleanupStatus: "failed",
+    });
+    failRelease = false;
+    await db
+      .update(environmentLeases)
+      .set({ updatedAt: new Date(0) })
+      .where(eq(environmentLeases.id, pending!.id));
+
+    await expect(runtimeWithPlugin.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 1,
+      cleaned: 1,
+      pending: 0,
+    });
+    expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+      "environmentReleaseLease",
+    ]);
+    await expect(environmentService(db).getLeaseById(pending!.id)).resolves.toMatchObject({
+      status: "expired",
+      providerLeaseId: "structured-cleanup-retry",
       cleanupStatus: "success",
     });
   });
@@ -4577,6 +4680,130 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       status: "released",
       providerLeaseId: "possibly-acquired-before-crash",
       cleanupStatus: "success",
+    });
+  });
+
+  it("persists and cleans a provider lease id reported by acquisition replay", async () => {
+    const seeded = await seedPendingPluginSandboxAcquisition({
+      providerLeaseIdBeforeCrash: "structured-replay-lease",
+    });
+    const replayError = new JsonRpcCallError({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "replayed setup failed after creation",
+      data: { providerLeaseId: "structured-replay-lease" },
+    });
+    const recoveredWorkerManager = {
+      isRunning: vi.fn((id: string) => id === seeded.pluginId),
+      call: vi.fn(async (_pluginId: string, method: string, params: Record<string, unknown>) => {
+        if (method === "environmentAcquireLease") {
+          expect(params).toEqual(seeded.initialAcquireParams);
+          throw replayError;
+        }
+        if (method === "environmentReleaseLease") return undefined;
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const recoveredRuntime = environmentRuntimeService(db, {
+      pluginWorkerManager: recoveredWorkerManager,
+    });
+
+    await expect(recoveredRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 1,
+      cleaned: 1,
+      pending: 0,
+    });
+    expect(recoveredWorkerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+    ]);
+    await expect(environmentService(db).getLeaseById(seeded.reservation.id)).resolves.toMatchObject({
+      status: "released",
+      providerLeaseId: "structured-replay-lease",
+      cleanupStatus: "success",
+      metadata: expect.objectContaining({
+        sandboxLeaseReservation: false,
+      }),
+    });
+  });
+
+  it.each([
+    ["empty", { providerLeaseId: "" }],
+    ["whitespace-only", { providerLeaseId: "   " }],
+    ["malformed", { providerLeaseId: 42 }],
+  ])("keeps replay pending for %s structured acquisition error data", async (_label, data) => {
+    const seeded = await seedPendingPluginSandboxAcquisition({
+      providerLeaseIdBeforeCrash: "unknown-replay-outcome",
+    });
+    const recoveredWorkerManager = {
+      isRunning: vi.fn((id: string) => id === seeded.pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method !== "environmentAcquireLease") {
+          throw new Error(`Unexpected plugin method: ${method}`);
+        }
+        throw new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+          message: "replay outcome remains unknown",
+          data,
+        });
+      }),
+    } as unknown as PluginWorkerManager;
+
+    await expect(environmentRuntimeService(db, { pluginWorkerManager: recoveredWorkerManager })
+      .retryPendingSandboxCleanups()).resolves.toEqual({
+        attempted: 1,
+        cleaned: 0,
+        pending: 1,
+      });
+    expect(recoveredWorkerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+    ]);
+    await expect(environmentService(db).getLeaseById(seeded.reservation.id)).resolves.toMatchObject({
+      status: "pending_cleanup",
+      providerLeaseId: null,
+      cleanupStatus: "failed",
+    });
+  });
+
+  it("does not attach a structured replay lease id after cleanup ownership changes", async () => {
+    const seeded = await seedPendingPluginSandboxAcquisition({
+      providerLeaseIdBeforeCrash: "claim-lost-replay-lease",
+    });
+    const competingClaimId = randomUUID();
+    const recoveredWorkerManager = {
+      isRunning: vi.fn((id: string) => id === seeded.pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method !== "environmentAcquireLease") {
+          throw new Error(`Unexpected plugin method: ${method}`);
+        }
+        await db
+          .update(environmentLeases)
+          .set({ cleanupClaimId: competingClaimId, cleanupClaimedAt: new Date() })
+          .where(eq(environmentLeases.id, seeded.reservation.id));
+        throw new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+          message: "setup failed after cleanup claim changed",
+          data: { providerLeaseId: "claim-lost-replay-lease" },
+        });
+      }),
+    } as unknown as PluginWorkerManager;
+
+    await expect(environmentRuntimeService(db, { pluginWorkerManager: recoveredWorkerManager })
+      .retryPendingSandboxCleanups()).resolves.toEqual({
+        attempted: 1,
+        cleaned: 0,
+        pending: 1,
+      });
+    expect(recoveredWorkerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+    ]);
+    const [claimed] = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, seeded.reservation.id));
+    expect(claimed).toMatchObject({
+      status: "pending_cleanup",
+      providerLeaseId: null,
+      cleanupClaimId: competingClaimId,
     });
   });
 
