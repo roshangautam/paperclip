@@ -45,6 +45,7 @@ interface RuntimeContractCase {
   config: Record<string, unknown>;
   setup?: () => Promise<() => Promise<void>>;
   expectLease: (lease: {
+    id: string;
     providerLeaseId: string | null;
     metadata: Record<string, unknown> | null;
   }, environment: Environment) => void;
@@ -253,7 +254,7 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
         reuseLease: false,
       },
       expectLease: (lease) => {
-        expect(lease.providerLeaseId).toMatch(/^sandbox:\/\/fake\/[0-9a-f-]+\/[0-9a-f-]+$/);
+        expect(lease.providerLeaseId).toBe(`sandbox://fake/${lease.id}`);
         expect(lease.metadata).toMatchObject({
           provider: "fake",
           image: "ubuntu:24.04",

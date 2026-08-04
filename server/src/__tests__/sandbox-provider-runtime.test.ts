@@ -44,8 +44,9 @@ describe("sandbox provider runtime", () => {
     })).rejects.toThrow('Sandbox provider "fake-plugin" is not registered as a built-in provider.');
   });
 
-  it("does not resume fake leases because the built-in fake provider does not opt in", async () => {
+  it("replays fake acquisitions without opting into reusable leases", async () => {
     const lease = await acquireSandboxProviderLease({
+      acquisitionId: "acquisition-1",
       config: {
         provider: "fake",
         image: "ubuntu:24.04",
@@ -56,14 +57,29 @@ describe("sandbox provider runtime", () => {
       issueId: "issue-1",
     });
 
-    expect(lease.providerLeaseId).toMatch(/^sandbox:\/\/fake\/run-1\/[0-9a-f-]+$/);
+    expect(lease.providerLeaseId).toBe("sandbox://fake/acquisition-1");
     expect(lease.metadata).toEqual(expect.objectContaining({
       provider: "fake",
       image: "ubuntu:24.04",
       reuseLease: true,
+      acquisitionId: "acquisition-1",
     }));
 
+    const replayed = await acquireSandboxProviderLease({
+      acquisitionId: "acquisition-1",
+      config: {
+        provider: "fake",
+        image: "ubuntu:24.04",
+        reuseLease: true,
+      },
+      environmentId: "env-1",
+      heartbeatRunId: "run-2",
+      issueId: "issue-1",
+    });
+    expect(replayed.providerLeaseId).toBe(lease.providerLeaseId);
+
     const resumed = await acquireSandboxProviderLease({
+      acquisitionId: "acquisition-2",
       config: {
         provider: "fake",
         image: "ubuntu:24.04",
@@ -75,7 +91,7 @@ describe("sandbox provider runtime", () => {
       reusableProviderLeaseId: lease.providerLeaseId,
     });
 
-    expect(resumed.providerLeaseId).toMatch(/^sandbox:\/\/fake\/run-2\/[0-9a-f-]+$/);
+    expect(resumed.providerLeaseId).toBe("sandbox://fake/acquisition-2");
     expect(resumed.providerLeaseId).not.toBe(lease.providerLeaseId);
     expect(resumed.metadata).not.toEqual(expect.objectContaining({ resumedLease: true }));
   });

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type {
   EnvironmentLeaseStatus,
   EnvironmentProbeResult,
@@ -14,6 +13,7 @@ export interface SandboxProviderValidationResult {
 }
 
 export interface AcquireSandboxLeaseInput {
+  acquisitionId: string;
   config: SandboxEnvironmentConfig;
   environmentId: string;
   heartbeatRunId: string;
@@ -79,9 +79,11 @@ export interface SandboxExecuteResult {
 export interface SandboxProvider {
   readonly provider: SandboxEnvironmentProvider;
   readonly supportsReusableLeases?: boolean;
+  readonly supportsAcquisitionReplay?: boolean;
   validateConfig(config: SandboxEnvironmentConfig): Promise<SandboxProviderValidationResult>;
   probe(config: SandboxEnvironmentConfig): Promise<EnvironmentProbeResult>;
   acquireLease(input: AcquireSandboxLeaseInput): Promise<SandboxLeaseHandle>;
+  /** Return the requested provider lease handle, or `null` when it no longer exists. */
   resumeLease(input: ResumeSandboxLeaseInput): Promise<SandboxLeaseHandle | null>;
   releaseLease(input: ReleaseSandboxLeaseInput): Promise<void>;
   destroyLease(input: DestroySandboxLeaseInput): Promise<void>;
@@ -119,6 +121,7 @@ function buildFakeSandboxProbe(config: FakeSandboxEnvironmentConfig): Environmen
 class FakeSandboxProvider implements SandboxProvider {
   readonly provider = "fake" as const;
   readonly supportsReusableLeases = false;
+  readonly supportsAcquisitionReplay = true;
 
   async validateConfig(config: SandboxEnvironmentConfig): Promise<SandboxProviderValidationResult> {
     assertProviderConfig<FakeSandboxEnvironmentConfig>(this.provider, config);
@@ -142,7 +145,7 @@ class FakeSandboxProvider implements SandboxProvider {
     assertProviderConfig<FakeSandboxEnvironmentConfig>(this.provider, input.config);
     const providerLeaseId = input.config.reuseLease && this.supportsReusableLeases
       ? `sandbox://fake/${input.environmentId}/${input.executionWorkspaceId ?? "workspace"}/${input.agentId ?? "agent"}`
-      : `sandbox://fake/${input.heartbeatRunId}/${randomUUID()}`;
+      : `sandbox://fake/${input.acquisitionId}`;
 
     return {
       providerLeaseId,
@@ -150,6 +153,7 @@ class FakeSandboxProvider implements SandboxProvider {
         provider: input.config.provider,
         image: input.config.image,
         reuseLease: input.config.reuseLease,
+        acquisitionId: input.acquisitionId,
       },
     };
   }
@@ -329,6 +333,7 @@ export async function probeSandboxProvider(
 }
 
 export async function acquireSandboxProviderLease(input: {
+  acquisitionId: string;
   config: SandboxEnvironmentConfig;
   environmentId: string;
   heartbeatRunId: string;
@@ -349,6 +354,7 @@ export async function acquireSandboxProviderLease(input: {
   }
 
   return await provider.acquireLease({
+    acquisitionId: input.acquisitionId,
     config: input.config,
     environmentId: input.environmentId,
     heartbeatRunId: input.heartbeatRunId,

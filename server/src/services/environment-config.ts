@@ -108,8 +108,20 @@ const pluginEnvironmentConfigSchema = z.object({
 export type ParsedEnvironmentConfig =
   | { driver: "local"; config: LocalEnvironmentConfig }
   | { driver: "ssh"; config: SshEnvironmentConfig }
-  | { driver: "sandbox"; config: SandboxEnvironmentConfig }
+  | {
+      driver: "sandbox";
+      config: SandboxEnvironmentConfig;
+      resolvedSecretVersions?: ResolvedEnvironmentSecretVersion[];
+    }
   | { driver: "plugin"; config: PluginEnvironmentConfig };
+
+export type ResolvedEnvironmentSecretVersion = {
+  secretId: string;
+  configPath: string;
+  version: number;
+  bindingId: string;
+  versionSelector: string;
+};
 
 function toErrorMessage(error: z.ZodError) {
   const first = error.issues[0];
@@ -250,9 +262,13 @@ async function resolveConfigSecretRefsForRuntime(input: {
     issueId?: string | null;
     heartbeatRunId?: string | null;
   };
-}): Promise<Record<string, unknown>> {
+}): Promise<{
+  config: Record<string, unknown>;
+  resolvedSecretVersions: ResolvedEnvironmentSecretVersion[];
+}> {
   const secrets = secretService(input.db);
   let nextConfig = { ...input.config };
+  const resolvedSecretVersions: ResolvedEnvironmentSecretVersion[] = [];
   for (const path of collectSecretRefPaths(input.schema)) {
     const current = readConfigValueAtPath(nextConfig, path);
     if (typeof current !== "string") continue;
@@ -261,21 +277,25 @@ async function resolveConfigSecretRefsForRuntime(input: {
     if (!input.context.consumerId) {
       throw unprocessable("Runtime secret resolution requires an environment id");
     }
-    nextConfig = writeConfigValueAtPath(
-      nextConfig,
-      path,
-      await secrets.resolveSecretValue(input.companyId, trimmed, "latest", {
-        consumerType: input.context.consumerType,
-        consumerId: input.context.consumerId,
-        actorType: "system",
-        actorId: null,
-        issueId: input.context.issueId ?? null,
-        heartbeatRunId: input.context.heartbeatRunId ?? null,
-        configPath: path,
-      }),
-    );
+    const resolved = await secrets.resolveSecretValueForBindingWithMetadata(input.companyId, trimmed, {
+      consumerType: input.context.consumerType,
+      consumerId: input.context.consumerId,
+      actorType: "system",
+      actorId: null,
+      issueId: input.context.issueId ?? null,
+      heartbeatRunId: input.context.heartbeatRunId ?? null,
+      configPath: path,
+    });
+    nextConfig = writeConfigValueAtPath(nextConfig, path, resolved.value);
+    resolvedSecretVersions.push({
+      secretId: trimmed,
+      configPath: path,
+      version: resolved.version,
+      bindingId: resolved.bindingId,
+      versionSelector: resolved.versionSelector,
+    });
   }
-  return nextConfig;
+  return { config: nextConfig, resolvedSecretVersions };
 }
 
 async function resolveConfigSecretRefsForProbe(input: {
@@ -619,8 +639,9 @@ export async function resolveEnvironmentDriverConfigForRuntime(
   if (parsed.driver === "sandbox" && parsed.config.provider !== "fake") {
     const schema = await getSandboxProviderConfigSchema(db, parsed.config.provider);
     let runtimeConfig = parsed.config;
+    let resolvedSecretVersions: ResolvedEnvironmentSecretVersion[] = [];
     if (companyId) {
-      runtimeConfig = await resolveConfigSecretRefsForRuntime({
+      const resolved = await resolveConfigSecretRefsForRuntime({
         db,
         companyId,
         config: parsed.config as Record<string, unknown>,
@@ -631,7 +652,9 @@ export async function resolveEnvironmentDriverConfigForRuntime(
           issueId: context?.issueId ?? null,
           heartbeatRunId: context?.heartbeatRunId ?? null,
         },
-      }) as SandboxEnvironmentConfig;
+      });
+      runtimeConfig = resolved.config as SandboxEnvironmentConfig;
+      resolvedSecretVersions = resolved.resolvedSecretVersions;
     } else {
       for (const path of collectSecretRefPaths(schema)) {
         const current = readConfigValueAtPath(parsed.config as Record<string, unknown>, path);
@@ -653,6 +676,7 @@ export async function resolveEnvironmentDriverConfigForRuntime(
             secretRefExcludePaths: collectSecretRefPaths(schema),
           })
         : runtimeConfig,
+      resolvedSecretVersions,
     };
   }
 
