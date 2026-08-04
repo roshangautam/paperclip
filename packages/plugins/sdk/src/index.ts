@@ -174,6 +174,7 @@ export type {
   PluginEnvironmentProbeParams,
   PluginEnvironmentProbeResult,
   PluginEnvironmentLease,
+  PluginEnvironmentAcquireLeaseErrorData,
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentResumeLeaseParams,
   PluginEnvironmentReleaseLeaseParams,

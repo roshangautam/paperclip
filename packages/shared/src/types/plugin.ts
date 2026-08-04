@@ -151,6 +151,12 @@ export interface PluginEnvironmentDriverDeclaration {
    * behavior even if their config schema exposes a reuse-like setting.
    */
   supportsReusableLeases?: boolean;
+  /**
+   * Sandbox providers must opt in before the host may replay an acquire request
+   * with the same acquisition id after an ambiguous outcome. Providers without
+   * this flag are never assumed to implement idempotent acquisition replay.
+   */
+  supportsAcquisitionReplay?: boolean;
   /** Provider can keep a temporary setup sandbox alive for user-driven sandbox customization and capture. */
   supportsInteractiveSetup?: boolean;
   /** Connection types the setup sandbox can expose. Initially `ssh`; providers may add custom values. */

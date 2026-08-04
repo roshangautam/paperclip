@@ -503,7 +503,7 @@ describe("environment plugin scaffold", () => {
     const harness = createEnvironmentTestHarness({ manifest, environmentDriver: driver });
     await plugin.definition.setup(harness.ctx);
 
-    const lease = await harness.acquireLease({ ...BASE_PARAMS, runId: "run-1" });
+    const lease = await harness.acquireLease({ ...BASE_PARAMS, acquisitionId: "acquisition-1", runId: "run-1" });
     expect(lease.providerLeaseId).toBeTruthy();
 
     await harness.realizeWorkspace({

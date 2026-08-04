@@ -50,7 +50,7 @@ describe("fake sandbox provider plugin", () => {
       metadata: { provider: "fake-plugin", image: "fake:test" },
     });
 
-    const lease = await harness.acquireLease({ ...base, runId: "run-1" });
+    const lease = await harness.acquireLease({ ...base, acquisitionId: "acquisition-1", runId: "run-1" });
     expect(lease.providerLeaseId).toContain("fake-plugin://run-1/");
 
     const realized = await harness.realizeWorkspace({
@@ -380,7 +380,7 @@ describe("fake sandbox provider plugin", () => {
         environmentId: "env-1",
         config: { image: "fake:test", reuseLease: false },
       };
-      const lease = await harness.acquireLease({ ...base, runId: "run-1" });
+      const lease = await harness.acquireLease({ ...base, acquisitionId: "acquisition-1", runId: "run-1" });
       const realized = await harness.realizeWorkspace({
         ...base,
         lease,
@@ -434,7 +434,7 @@ describe("fake sandbox provider plugin", () => {
       environmentId: "env-1",
       config: { image: "fake:test", reuseLease: false },
     };
-    const lease = await harness.acquireLease({ ...base, runId: "run-1" });
+    const lease = await harness.acquireLease({ ...base, acquisitionId: "acquisition-1", runId: "run-1" });
     const realized = await harness.realizeWorkspace({
       ...base,
       lease,
@@ -476,7 +476,7 @@ describe("fake sandbox provider plugin", () => {
       environmentId: "env-1",
       config: { image: "fake:test", reuseLease: false },
     };
-    const lease = await harness.acquireLease({ ...base, runId: "run-1" });
+    const lease = await harness.acquireLease({ ...base, acquisitionId: "acquisition-1", runId: "run-1" });
     const realized = await harness.realizeWorkspace({
       ...base,
       lease,
