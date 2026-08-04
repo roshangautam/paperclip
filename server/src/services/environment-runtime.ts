@@ -1408,6 +1408,7 @@ function createSandboxEnvironmentDriver(
       if (!cleanupLease) {
         try {
           await cleanupUnrecordedLease();
+          await abandonSandboxLeaseReservation(reservation, "acquire_handoff_failed");
           return;
         } catch (unrecordedCleanupError) {
           logger.error(

@@ -1943,6 +1943,99 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
+  it("terminalizes the reservation when direct provider cleanup succeeds after cleanup handoff fails", async () => {
+    const seeded = await seedPluginSandboxEnvironment({ secretValue: "original-provider-key" });
+    const replacementSecret = await secretService(db).create(seeded.companyId, {
+      name: `replacement-provider-key-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "replacement-provider-key",
+    });
+    let reservationId: string | null = null;
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === seeded.pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentAcquireLease") {
+          const [reservation] = await db.select().from(environmentLeases);
+          reservationId = reservation?.id ?? null;
+          expect(reservation).toMatchObject({
+            status: "active",
+            providerLeaseId: null,
+          });
+          await expect(db
+            .select()
+            .from(companySecretBindings)
+            .where(eq(companySecretBindings.targetId, reservation!.id)))
+            .resolves.toHaveLength(1);
+          await secretService(db).syncSecretRefsForTarget(
+            seeded.companyId,
+            { targetType: "environment", targetId: seeded.environment.id },
+            [{ secretId: replacementSecret.id, configPath: "apiKey" }],
+            { replaceAll: true },
+          );
+          return {
+            providerLeaseId: "directly-cleaned-provider-lease",
+            metadata: { provider: "reservation-plugin", image: "fake:test", reuseLease: false },
+          };
+        }
+        if (method === "environmentReleaseLease") return undefined;
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const originalUpdate = db.update.bind(db);
+    const updateSpy = vi.spyOn(db, "update").mockImplementation(((table: unknown) => {
+      const updateBuilder = (originalUpdate as any)(table) as any;
+      if (table !== environmentLeases) return updateBuilder;
+      const originalSet = updateBuilder.set.bind(updateBuilder);
+      updateBuilder.set = (values: Record<string, unknown>) => {
+        const setBuilder = originalSet(values) as any;
+        if (
+          values.status !== "pending_cleanup" ||
+          values.failureReason !== "acquire_handoff_failed" ||
+          values.providerLeaseId !== "directly-cleaned-provider-lease"
+        ) {
+          return setBuilder;
+        }
+        const originalWhere = setBuilder.where.bind(setBuilder);
+        setBuilder.where = (condition: unknown) => {
+          const whereBuilder = originalWhere(condition) as any;
+          whereBuilder.returning = () => Promise.reject(
+            new Error("cleanup handoff persistence unavailable"),
+          );
+          return whereBuilder;
+        };
+        return setBuilder;
+      };
+      return updateBuilder;
+    }) as typeof db.update);
+
+    await expect(runtimeWithPlugin.acquireRunLease({
+      companyId: seeded.companyId,
+      environment: seeded.environment,
+      issueId: null,
+      heartbeatRunId: seeded.runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toThrow('Sandbox secret binding changed while acquiring lease at "apiKey".');
+    updateSpy.mockRestore();
+
+    expect(reservationId).not.toBeNull();
+    await expect(environmentService(db).getLeaseById(reservationId!)).resolves.toMatchObject({
+      providerLeaseId: null,
+      status: "failed",
+      cleanupStatus: "success",
+      failureReason: "acquire_handoff_failed",
+    });
+    await expect(db
+      .select()
+      .from(companySecretBindings)
+      .where(eq(companySecretBindings.targetId, reservationId!)))
+      .resolves.toHaveLength(0);
+    expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+    ]);
+  });
+
   it("preserves an active cleanup claim when a provider acquisition returns late", async () => {
     const seeded = await seedPluginSandboxEnvironment({ secretValue: "original-provider-key" });
     const replacementSecret = await secretService(db).create(seeded.companyId, {
