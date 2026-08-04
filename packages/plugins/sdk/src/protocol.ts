@@ -593,9 +593,10 @@ export interface PluginEnvironmentLease {
 
 export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDriverBaseParams {
   /**
-   * Stable host-generated identifier for this acquisition. Providers must make
-   * acquisition idempotent for this identifier so the host can safely replay a
-   * request whose result was not durably recorded before a restart.
+   * Stable host-generated identifier for this acquisition. Providers that
+   * advertise `supportsAcquisitionReplay` must make acquisition idempotent for
+   * this identifier so the host can safely replay a request whose result was
+   * not durably recorded before a restart.
    */
   acquisitionId: string;
   runId: string;
