@@ -6262,6 +6262,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
 
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", {
+      acquisitionId: expect.any(String),
       driverKey: "fake-plugin",
       companyId,
       environmentId: environment.id,

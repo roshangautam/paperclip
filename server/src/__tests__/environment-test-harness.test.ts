@@ -39,7 +39,7 @@ describe("environment test harness", () => {
       environmentDriver: driver,
     });
 
-    const lease = await harness.acquireLease({ ...BASE_PARAMS, runId: "run-1" });
+    const lease = await harness.acquireLease({ ...BASE_PARAMS, acquisitionId: "acquisition-1", runId: "run-1" });
     expect(lease.providerLeaseId).toBe("fake-lease-1");
 
     await harness.realizeWorkspace({
@@ -109,7 +109,7 @@ describe("environment test harness", () => {
       environmentDriver: driver,
     });
 
-    await expect(harness.acquireLease({ ...BASE_PARAMS, runId: "run-1" })).rejects.toThrow("No capacity");
+    await expect(harness.acquireLease({ ...BASE_PARAMS, acquisitionId: "acquisition-1", runId: "run-1" })).rejects.toThrow("No capacity");
     const errorEvent = assertEnvironmentError(harness.environmentEvents, "acquireLease");
     expect(errorEvent.error).toBe("No capacity");
   });
@@ -121,7 +121,7 @@ describe("environment test harness", () => {
       environmentDriver: driver,
     });
 
-    const lease = await harness.acquireLease({ ...BASE_PARAMS, runId: "run-1" });
+    const lease = await harness.acquireLease({ ...BASE_PARAMS, acquisitionId: "acquisition-1", runId: "run-1" });
     const result = await harness.execute({
       ...BASE_PARAMS,
       lease,
@@ -138,7 +138,7 @@ describe("environment test harness", () => {
       environmentDriver: driver,
     });
 
-    const lease = await harness.acquireLease({ ...BASE_PARAMS, runId: "run-1" });
+    const lease = await harness.acquireLease({ ...BASE_PARAMS, acquisitionId: "acquisition-1", runId: "run-1" });
     const resumed = await harness.resumeLease({
       ...BASE_PARAMS,
       providerLeaseId: lease.providerLeaseId!,
@@ -165,7 +165,7 @@ describe("environment test harness", () => {
       environmentDriver: driver,
     });
 
-    const lease = await harness.acquireLease({ ...BASE_PARAMS, runId: "run-1" });
+    const lease = await harness.acquireLease({ ...BASE_PARAMS, acquisitionId: "acquisition-1", runId: "run-1" });
     await harness.destroyLease({
       ...BASE_PARAMS,
       providerLeaseId: lease.providerLeaseId,
@@ -185,7 +185,7 @@ describe("environment test harness", () => {
       environmentDriver: driver,
     });
 
-    const lease = await harness.acquireLease({ ...BASE_PARAMS, runId: "run-1" });
+    const lease = await harness.acquireLease({ ...BASE_PARAMS, acquisitionId: "acquisition-1", runId: "run-1" });
     await harness.realizeWorkspace({
       ...BASE_PARAMS,
       lease,
@@ -204,7 +204,7 @@ describe("environment test harness", () => {
       environmentDriver: driver,
     });
 
-    const lease = await harness.acquireLease({ ...BASE_PARAMS, runId: "run-1" });
+    const lease = await harness.acquireLease({ ...BASE_PARAMS, acquisitionId: "acquisition-1", runId: "run-1" });
     await harness.execute({ ...BASE_PARAMS, lease, command: "ls" });
     await harness.execute({ ...BASE_PARAMS, lease, command: "pwd" });
     await harness.releaseLease({ ...BASE_PARAMS, providerLeaseId: lease.providerLeaseId });

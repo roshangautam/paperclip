@@ -209,6 +209,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     }, { timeout: 5_000 });
 
     expect(workerManager.call).toHaveBeenNthCalledWith(1, pluginId, "environmentAcquireLease", {
+      acquisitionId: expect.any(String),
       driverKey: "sandbox",
       companyId,
       environmentId,
@@ -671,6 +672,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     }, { timeout: 5_000 });
 
     expect(workerManager.call).toHaveBeenNthCalledWith(1, pluginId, "environmentAcquireLease", {
+      acquisitionId: expect.any(String),
       driverKey: "sandbox",
       companyId,
       environmentId: newEnvironmentId,

@@ -180,6 +180,7 @@ export const pluginEnvironmentDriverDeclarationSchema = z.object({
   description: z.string().max(500).optional(),
   supportsReusableLeases: z.boolean().optional(),
   sandboxCapabilities: sandboxProviderCapabilitiesSchema.optional(),
+  supportsAcquisitionReplay: z.boolean().optional(),
   supportsInteractiveSetup: z.boolean().optional(),
   interactiveSetupConnectionTypes: z.array(z.string().min(1).max(100)).max(10).optional(),
   supportsTemplateCapture: z.boolean().optional(),
