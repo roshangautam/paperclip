@@ -591,6 +591,15 @@ export interface PluginEnvironmentLease {
   expiresAt?: string | null;
 }
 
+/**
+ * Structured error data returned when a provider created a lease but could
+ * not complete acquisition. The stable identifier lets the host persist and
+ * clean up that provider resource through its normal compensation flow.
+ */
+export interface PluginEnvironmentAcquireLeaseErrorData {
+  providerLeaseId: string;
+}
+
 export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDriverBaseParams {
   /**
    * Stable host-generated identifier for this acquisition. Providers that
