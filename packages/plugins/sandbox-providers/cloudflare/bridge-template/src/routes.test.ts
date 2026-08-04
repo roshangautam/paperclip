@@ -31,6 +31,19 @@ describe("bridge routes", () => {
     vi.mocked(resolveSandbox).mockReset();
   });
 
+  it("advertises replay-safe acquisition support", async () => {
+    const response = await handleBridgeRequest(
+      new Request("https://bridge.example.test/api/paperclip-sandbox/v1/health", {
+        headers: { Authorization: "Bearer secret-token" },
+      }),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
+
+    expect(await response.json()).toMatchObject({
+      capabilities: { acquisitionReplay: true },
+    });
+  });
+
   it("writes lease sentinels through the named-session exec target", async () => {
     const sessionExec = vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
     const sandbox = {
@@ -44,6 +57,7 @@ describe("bridge routes", () => {
 
     const response = await handleBridgeRequest(
       bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
+        acquisitionId: "acquisition-1",
         environmentId: "env-1",
         runId: "run-1",
         requestedCwd: "/workspace/paperclip",
@@ -61,7 +75,7 @@ describe("bridge routes", () => {
     // Both calls use a single command string — the SDK's exec API ignores
     // any `args` or `stdin` option, so the bridge folds them into the
     // command line itself.
-    expect(sessionExec).toHaveBeenCalledTimes(2);
+    expect(sessionExec).toHaveBeenCalledTimes(3);
     for (const call of sessionExec.mock.calls) {
       const [commandArg, optionsArg] = call;
       expect(typeof commandArg).toBe("string");
@@ -70,9 +84,104 @@ describe("bridge routes", () => {
       expect(optionsArg).not.toHaveProperty("args");
       expect(optionsArg).not.toHaveProperty("stdin");
     }
-    expect(sessionExec.mock.calls[0]?.[0]).toContain("mkdir");
-    expect(sessionExec.mock.calls[0]?.[0]).toContain("/workspace/paperclip");
-    expect(sessionExec.mock.calls[1]?.[0]).toContain("/workspace/paperclip/.paperclip-lease.json");
+    expect(sessionExec.mock.calls[0]?.[0]).toContain("cat");
+    expect(sessionExec.mock.calls[1]?.[0]).toContain("mkdir");
+    expect(sessionExec.mock.calls[1]?.[0]).toContain("/workspace/paperclip");
+    expect(sessionExec.mock.calls[2]?.[0]).toContain("/workspace/paperclip/.paperclip-lease.json");
+    expect(sessionExec.mock.calls[2]?.[0]).toContain("acquisition-1");
+  });
+
+  it("replays an ephemeral acquisition against the same sandbox ID and ownership sentinel", async () => {
+    let sentinelWritten = false;
+    const sessionExec = vi.fn().mockImplementation(async (command: string) => {
+      if (command.includes("test ! -e")) {
+        return {
+          exitCode: 0,
+          stdout: sentinelWritten ? JSON.stringify({ acquisitionId: "acquisition-1" }) : "",
+          stderr: "",
+        };
+      }
+      if (command.includes("printf") && command.includes(".paperclip-lease.json")) {
+        sentinelWritten = true;
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+    const sandbox = {
+      getSession: vi.fn().mockResolvedValue({ exec: sessionExec }),
+      createSession: vi.fn(),
+      setKeepAlive: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn(),
+    };
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
+    const acquire = () => handleBridgeRequest(
+      bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
+        acquisitionId: "acquisition-1",
+        environmentId: "env-1",
+        runId: "run-1",
+        requestedCwd: "/workspace/paperclip",
+        sessionStrategy: "named",
+        sessionId: "paperclip",
+      }),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
+
+    const first = await acquire();
+    const second = await acquire();
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(await first.json()).toMatchObject({
+      providerLeaseId: "pc-acq-acquisition-1",
+      metadata: { acquisitionId: "acquisition-1" },
+    });
+    expect(await second.json()).toMatchObject({
+      providerLeaseId: "pc-acq-acquisition-1",
+      metadata: { acquisitionId: "acquisition-1" },
+    });
+    expect(resolveSandbox).toHaveBeenNthCalledWith(
+      1,
+      expect.anything(),
+      "pc-acq-acquisition-1",
+      expect.anything(),
+    );
+    expect(resolveSandbox).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      "pc-acq-acquisition-1",
+      expect.anything(),
+    );
+    expect(sandbox.destroy).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("rejects a sandbox whose sentinel belongs to another acquisition (reuseLease=%s)", async (reuseLease) => {
+    const sessionExec = vi.fn().mockResolvedValue({
+      exitCode: 0,
+      stdout: JSON.stringify({ acquisitionId: "other-acquisition" }),
+      stderr: "",
+    });
+    const sandbox = {
+      getSession: vi.fn().mockResolvedValue({ exec: sessionExec }),
+      createSession: vi.fn(),
+      setKeepAlive: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn(),
+    };
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
+    await expect(handleBridgeRequest(
+      bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
+        acquisitionId: "acquisition-1",
+        environmentId: "env-1",
+        runId: "run-1",
+        reuseLease,
+        requestedCwd: "/workspace/paperclip",
+        sessionStrategy: "named",
+        sessionId: "paperclip",
+      }),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    )).rejects.toThrow(/acquisition ownership does not match/);
+    expect(sessionExec).toHaveBeenCalledTimes(1);
+    expect(sandbox.setKeepAlive).not.toHaveBeenCalled();
+    expect(sandbox.destroy).not.toHaveBeenCalled();
   });
 
   it("checks lease sentinels through the named-session exec target on resume", async () => {

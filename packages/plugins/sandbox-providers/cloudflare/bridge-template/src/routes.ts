@@ -27,6 +27,7 @@ interface ProbeRequestBody {
 }
 
 interface AcquireLeaseRequestBody extends ProbeRequestBody {
+  acquisitionId?: string;
   environmentId?: string;
   runId?: string;
   issueId?: string | null;
@@ -141,6 +142,7 @@ async function writeSentinel(
   sandbox: CloudflareSandbox,
   input: {
     providerLeaseId: string;
+    acquisitionId?: string;
     remoteCwd: string;
     sessionStrategy: SessionStrategy;
     sessionId: string;
@@ -154,6 +156,7 @@ async function writeSentinel(
   const sentinelPayload = JSON.stringify({
     provider: "cloudflare",
     providerLeaseId: input.providerLeaseId,
+    acquisitionId: input.acquisitionId ?? null,
     remoteCwd: input.remoteCwd,
     sessionStrategy: input.sessionStrategy,
     sessionId: input.sessionId,
@@ -175,6 +178,33 @@ async function writeSentinel(
     "/",
   );
   requireZeroExit(`write sentinel ${sentinelPath}`, result);
+}
+
+async function readSentinelAcquisitionId(
+  sandbox: CloudflareSandbox,
+  input: {
+    remoteCwd: string;
+    sessionStrategy: SessionStrategy;
+    sessionId: string;
+    timeoutMs: number;
+  },
+): Promise<string | null> {
+  const sentinelPath = buildSentinelPath(input.remoteCwd);
+  const result = await execLeaseUtility(
+    sandbox,
+    input,
+    "sh",
+    ["-c", `test ! -e ${shellQuote(sentinelPath)} || cat ${shellQuote(sentinelPath)}`],
+    "/",
+  );
+  requireZeroExit(`read sentinel ${sentinelPath}`, result);
+  if (!result.stdout.trim()) return null;
+  try {
+    const parsed = JSON.parse(result.stdout) as { acquisitionId?: unknown };
+    return typeof parsed.acquisitionId === "string" ? parsed.acquisitionId : "";
+  } catch {
+    return "";
+  }
 }
 
 async function verifySentinel(
@@ -210,6 +240,7 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
       provider: "cloudflare",
       bridgeVersion: "0.1.0",
       capabilities: {
+        acquisitionReplay: true,
         reuseLease: true,
         namedSessions: true,
         previewUrls: false,
@@ -262,8 +293,12 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
 
   if (request.method === "POST" && pathname === "/api/paperclip-sandbox/v1/leases/acquire") {
     const body = await readJson<AcquireLeaseRequestBody>(request);
-    if (!body.environmentId || !body.runId) {
-      return toErrorResponse(400, "invalid_request", "environmentId and runId are required.");
+    if (!body.acquisitionId || !body.environmentId || !body.runId) {
+      return toErrorResponse(
+        400,
+        "invalid_request",
+        "acquisitionId, environmentId, and runId are required.",
+      );
     }
 
     const reuseLease = readBoolean(body.reuseLease, false);
@@ -275,42 +310,47 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
     const providerLeaseId = buildLeaseSandboxId({
+      acquisitionId: body.acquisitionId,
       environmentId: body.environmentId,
       runId: body.runId,
       reuseLease,
       normalizeId,
     });
     const sandbox = await resolveSandbox(env, providerLeaseId, { keepAlive, sleepAfter, normalizeId });
-    // Guard against orphaning a keepAlive sandbox if workspace setup throws
-    // after creation: Paperclip never sees the lease ID in that case, so it
-    // can't clean up. Destroy here unless this is a reuseLease handshake
-    // (where the sandbox may have been created by a prior acquire and we
-    // shouldn't destroy it on a transient setup failure during reattachment).
-    try {
-      await applySandboxKeepAlive(sandbox, keepAlive);
-      await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
-      await writeSentinel(sandbox, {
-        providerLeaseId,
-        remoteCwd,
-        sessionStrategy,
-        sessionId,
-        keepAlive,
-        sleepAfter,
-        normalizeId,
-        resumedLease: false,
-        timeoutMs,
-      });
-    } catch (err) {
-      if (!reuseLease) {
-        await sandbox.destroy().catch(() => undefined);
-      }
-      throw err;
+    const existingAcquisitionId = await readSentinelAcquisitionId(sandbox, {
+      remoteCwd,
+      sessionStrategy,
+      sessionId,
+      timeoutMs,
+    });
+    if (existingAcquisitionId !== null && existingAcquisitionId !== body.acquisitionId) {
+      throw new Error(
+        `Refusing to adopt Cloudflare sandbox ${providerLeaseId}: acquisition ownership does not match ${body.acquisitionId}.`,
+      );
     }
+    // Resolution does not reveal whether the Durable Object was created by
+    // this request or already existed. Leave it intact on setup failure so a
+    // host replay with the same acquisition ID can reconcile it safely.
+    await applySandboxKeepAlive(sandbox, keepAlive);
+    await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
+    await writeSentinel(sandbox, {
+      providerLeaseId,
+      acquisitionId: body.acquisitionId,
+      remoteCwd,
+      sessionStrategy,
+      sessionId,
+      keepAlive,
+      sleepAfter,
+      normalizeId,
+      resumedLease: false,
+      timeoutMs,
+    });
 
     return toJsonResponse({
       providerLeaseId,
       metadata: {
         provider: "cloudflare",
+        acquisitionId: body.acquisitionId,
         remoteCwd,
         sandboxId: providerLeaseId,
         sessionStrategy,

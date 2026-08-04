@@ -97,6 +97,14 @@ describe("Cloudflare sandbox provider plugin", () => {
   it("maps acquire lease responses from the bridge", async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
+        ok: true,
+        provider: "cloudflare",
+        bridgeVersion: "0.1.0",
+        capabilities: { acquisitionReplay: true, reuseLease: true, namedSessions: true, previewUrls: false },
+      }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
         providerLeaseId: "pc-run-1-abcd1234",
         metadata: {
           provider: "cloudflare",
@@ -110,6 +118,7 @@ describe("Cloudflare sandbox provider plugin", () => {
       driverKey: "cloudflare",
       companyId: "company-1",
       environmentId: "env-1",
+      acquisitionId: "acquisition-1",
       issueId: "issue-1",
       runId: "run-1",
       requestedCwd: "/workspace/paperclip",
@@ -134,10 +143,12 @@ describe("Cloudflare sandbox provider plugin", () => {
         headers: expect.any(Headers),
       }),
     );
-    expect(requestHeadersAt().get("X-Paperclip-Run-Id")).toBe("run-1");
-    expect(requestHeadersAt().get("X-Paperclip-Environment-Id")).toBe("env-1");
-    expect(requestHeadersAt().get("X-Paperclip-Issue-Id")).toBe("issue-1");
-    expect(requestBodyAt()).toMatchObject({
+    expect(requestHeadersAt(1).get("X-Paperclip-Run-Id")).toBe("run-1");
+    expect(requestHeadersAt(1).get("X-Paperclip-Environment-Id")).toBe("env-1");
+    expect(requestHeadersAt(1).get("X-Paperclip-Issue-Id")).toBe("issue-1");
+    expect(requestHeadersAt(1).get("X-Paperclip-Acquisition-Id")).toBe("acquisition-1");
+    expect(requestBodyAt(1)).toMatchObject({
+      acquisitionId: "acquisition-1",
       environmentId: "env-1",
       runId: "run-1",
       issueId: "issue-1",
@@ -146,6 +157,14 @@ describe("Cloudflare sandbox provider plugin", () => {
   });
 
   it("defaults the sleepAfter passed to the bridge to 1h so long runs don't idle out", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        ok: true,
+        provider: "cloudflare",
+        bridgeVersion: "0.1.0",
+        capabilities: { acquisitionReplay: true, reuseLease: true, namedSessions: true, previewUrls: false },
+      }),
+    );
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
         providerLeaseId: "pc-run-1-abcd1234",
@@ -157,6 +176,7 @@ describe("Cloudflare sandbox provider plugin", () => {
       driverKey: "cloudflare",
       companyId: "company-1",
       environmentId: "env-1",
+      acquisitionId: "acquisition-1",
       runId: "run-1",
       requestedCwd: "/workspace/paperclip",
       config: {
@@ -165,7 +185,32 @@ describe("Cloudflare sandbox provider plugin", () => {
       },
     });
 
-    expect(requestBodyAt()).toMatchObject({ sleepAfter: "1h" });
+    expect(requestBodyAt(1)).toMatchObject({ sleepAfter: "1h" });
+  });
+
+  it("rejects bridges that cannot replay an acquisition safely", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        ok: true,
+        provider: "cloudflare",
+        bridgeVersion: "0.1.0",
+        capabilities: { reuseLease: true, namedSessions: true, previewUrls: false },
+      }),
+    );
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "cloudflare",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId: "acquisition-1",
+      runId: "run-1",
+      config: {
+        bridgeBaseUrl: "https://bridge.example.workers.dev",
+        bridgeAuthToken: "resolved-token",
+      },
+    })).rejects.toThrow("does not support replay-safe lease acquisition");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("returns expired lease semantics when resume reports lost state", async () => {

@@ -187,8 +187,20 @@ const plugin = definePlugin({
     params: PluginEnvironmentAcquireLeaseParams,
   ): Promise<PluginEnvironmentLease> {
     const { config, client } = bridgeClientFor(params.config);
+    const health = await client.health({
+      acquisitionId: params.acquisitionId,
+      environmentId: params.environmentId,
+      runId: params.runId,
+      issueId: params.issueId,
+    });
+    if (health.capabilities?.acquisitionReplay !== true) {
+      throw new Error(
+        "Cloudflare sandbox bridge does not support replay-safe lease acquisition; deploy the current bridge before acquiring leases.",
+      );
+    }
     return await client.acquireLease(
       {
+        acquisitionId: params.acquisitionId,
         environmentId: params.environmentId,
         runId: params.runId,
         issueId: params.issueId,
@@ -201,7 +213,12 @@ const plugin = definePlugin({
         sessionId: config.sessionId,
         timeoutMs: config.timeoutMs,
       },
-      { environmentId: params.environmentId, runId: params.runId, issueId: params.issueId },
+      {
+        acquisitionId: params.acquisitionId,
+        environmentId: params.environmentId,
+        runId: params.runId,
+        issueId: params.issueId,
+      },
     );
   },
 

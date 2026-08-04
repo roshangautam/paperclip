@@ -2,23 +2,24 @@ import { describe, expect, it } from "vitest";
 import { buildLeaseSandboxId, buildSentinelPath, isTimeoutError } from "./helpers.js";
 
 describe("bridge sandbox helpers", () => {
-  it("builds reusable lease IDs from environment IDs", () => {
+  it("builds reusable lease IDs from acquisition IDs for host-managed reuse", () => {
     expect(buildLeaseSandboxId({
+      acquisitionId: "Acquisition_123",
       environmentId: "Env_123",
       runId: "run-ignored",
       reuseLease: true,
       normalizeId: true,
-    })).toBe("pc-env-env-123");
+    })).toBe("pc-acq-acquisition-123");
   });
 
-  it("builds ephemeral lease IDs from run IDs", () => {
+  it("builds ephemeral lease IDs from acquisition IDs", () => {
     expect(buildLeaseSandboxId({
+      acquisitionId: "Acquisition_123",
       environmentId: "env-1",
       runId: "Run_123",
       reuseLease: false,
       normalizeId: true,
-      randomId: "ABCD1234",
-    })).toBe("pc-run-123-abcd1234");
+    })).toBe("pc-acq-acquisition-123");
   });
 
   it("builds the workspace sentinel path", () => {

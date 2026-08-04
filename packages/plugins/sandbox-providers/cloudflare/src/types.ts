@@ -18,6 +18,7 @@ export interface CloudflareBridgeHealthResponse {
   provider: "cloudflare";
   bridgeVersion: string;
   capabilities: {
+    acquisitionReplay?: boolean;
     reuseLease: boolean;
     namedSessions: boolean;
     previewUrls: boolean;
@@ -41,6 +42,7 @@ export interface CloudflareBridgeProbeResponse {
 }
 
 export interface CloudflareBridgeAcquireLeaseRequest {
+  acquisitionId: string;
   environmentId: string;
   runId: string;
   issueId?: string | null;

@@ -12,6 +12,7 @@ import type {
 } from "./types.js";
 
 interface BridgeClientHeaders {
+  acquisitionId?: string;
   environmentId?: string;
   runId?: string;
   issueId?: string | null;
@@ -53,6 +54,7 @@ function buildHeaders(config: CloudflareDriverConfig, extra: BridgeClientHeaders
   const headers = new Headers();
   headers.set("Authorization", `Bearer ${config.bridgeAuthToken}`);
   headers.set("Content-Type", "application/json");
+  if (extra.acquisitionId) headers.set("X-Paperclip-Acquisition-Id", extra.acquisitionId);
   if (extra.environmentId) headers.set("X-Paperclip-Environment-Id", extra.environmentId);
   if (extra.runId) headers.set("X-Paperclip-Run-Id", extra.runId);
   if (extra.issueId) headers.set("X-Paperclip-Issue-Id", extra.issueId);
