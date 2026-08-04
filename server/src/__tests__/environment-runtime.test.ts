@@ -2832,30 +2832,54 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     }));
   });
 
-  it("does not claim a pending cleanup when its environment driver is unavailable", async () => {
-    const { lease } = await seedPendingPluginSandboxCleanup("missing-driver-plugin-lease");
+  it("defers unavailable cleanup rows so they cannot starve the retry batch", async () => {
+    const { pluginId, lease } = await seedPendingPluginSandboxCleanup("recoverable-plugin-lease");
+    const [pendingRow] = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, lease.id));
+    expect(pendingRow).toBeDefined();
+    await db.insert(environmentLeases).values(
+      Array.from({ length: 10 }, (_, index) => ({
+        ...pendingRow!,
+        id: randomUUID(),
+        metadata: { ...pendingRow!.metadata, driver: "missing-driver" },
+        providerLeaseId: `missing-driver-plugin-lease-${index}`,
+      })),
+    );
     await db
       .update(environmentLeases)
-      .set({
-        metadata: { ...lease.metadata, driver: "missing-driver" },
-        updatedAt: new Date(0),
-      })
+      .set({ updatedAt: new Date(1) })
       .where(eq(environmentLeases.id, lease.id));
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async () => undefined),
+    } as unknown as PluginWorkerManager;
+    const recoveredRuntime = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
-    await expect(runtime.retryPendingSandboxCleanups()).resolves.toEqual({
+    await expect(recoveredRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
       attempted: 0,
       cleaned: 0,
       pending: 0,
     });
+    expect(workerManager.call).not.toHaveBeenCalled();
     const [pendingLease] = await db
       .select()
       .from(environmentLeases)
-      .where(eq(environmentLeases.id, lease.id));
+      .where(eq(environmentLeases.providerLeaseId, "missing-driver-plugin-lease-0"));
     expect(pendingLease).toMatchObject({
       status: "pending_cleanup",
       cleanupClaimId: null,
       cleanupClaimedAt: null,
     });
+    expect(pendingLease!.updatedAt.getTime()).toBeGreaterThan(0);
+
+    await expect(recoveredRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 1,
+      cleaned: 1,
+      pending: 0,
+    });
+    expect(workerManager.call).toHaveBeenCalledTimes(1);
   });
 
   it("does not let a late failed initial cleanup overwrite a successful release", async () => {

@@ -2390,16 +2390,20 @@ export function environmentRuntimeService(
       let attempted = 0;
       let cleaned = 0;
       for (const leaseRow of leaseRows) {
-        const environment = await environmentsSvc.getById(leaseRow.environmentId);
-        if (!environment) continue;
-        const preclaimLease = toEnvironmentLeaseSnapshot(leaseRow);
-        const driver = getDriver(getLeaseDriverKey(preclaimLease, environment));
-        if (!driver) continue;
-
         const claim = await claimPendingSandboxCleanup({ leaseId: leaseRow.id, updatedBefore });
         if (!claim) continue;
 
         const lease = toEnvironmentLeaseSnapshot(claim.row);
+        const environment = await environmentsSvc.getById(lease.environmentId);
+        const driver = environment ? getDriver(getLeaseDriverKey(lease, environment)) : null;
+        if (!environment || !driver) {
+          await deferSandboxCleanupClaim(
+            claim,
+            lease.failureReason ?? "cleanup_prerequisite_unavailable",
+          );
+          continue;
+        }
+
         attempted += 1;
         const claimRenewal = renewPendingSandboxCleanupClaim(lease.id, claim.claimId);
         try {
