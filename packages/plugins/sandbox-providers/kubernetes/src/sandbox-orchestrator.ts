@@ -10,6 +10,12 @@ export interface SandboxStatus {
   message?: string;
 }
 
+export interface SandboxClaimResult {
+  uid: string;
+  /** True only when this invocation received a successful create response. */
+  created: boolean;
+}
+
 /**
  * Abstract interface over a sandbox runtime backend. The current implementation
  * is Job-backed (job-orchestrator.ts). Future backends slot in by exporting an
@@ -23,7 +29,8 @@ export interface SandboxOrchestrator {
     clients: KubeClients,
     namespace: string,
     manifest: Record<string, unknown>,
-  ): Promise<{ uid: string }>;
+    acquisitionId: string,
+  ): Promise<SandboxClaimResult>;
 
   /** Read current lifecycle phase. */
   getStatus(

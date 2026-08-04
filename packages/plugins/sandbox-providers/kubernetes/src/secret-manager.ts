@@ -3,6 +3,7 @@ import type { KubeClients } from "./kube-client.js";
 export interface CreatePerRunSecretInput {
   namespace: string;
   secretName: string;
+  acquisitionId: string;
   runId: string;
   ownerKind: string;
   ownerApiVersion: string;
@@ -12,16 +13,93 @@ export interface CreatePerRunSecretInput {
   adapterEnv: Record<string, string>;
 }
 
-export async function createPerRunSecret(clients: KubeClients, input: CreatePerRunSecretInput): Promise<void> {
+export interface CreatePerRunSecretResult {
+  /** True only when this invocation received a successful create response. */
+  created: boolean;
+}
+
+const MANAGED_BY = "paperclip-k8s-plugin";
+
+function statusCode(error: unknown): number | undefined {
+  return (error as { code?: number; statusCode?: number } | null)?.code
+    ?? (error as { code?: number; statusCode?: number } | null)?.statusCode;
+}
+
+function validateExistingSecret(
+  secret: unknown,
+  input: CreatePerRunSecretInput,
+): CreatePerRunSecretResult {
+  const typed = secret as {
+    metadata?: {
+      labels?: Record<string, string>;
+      ownerReferences?: Array<{
+        apiVersion?: string;
+        kind?: string;
+        name?: string;
+        uid?: string;
+      }>;
+    };
+    data?: Record<string, string>;
+  } | null;
+  const labels = typed?.metadata?.labels ?? {};
+  if (
+    labels["paperclip.io/managed-by"] !== MANAGED_BY
+    || labels["paperclip.io/acquisition-id"] !== input.acquisitionId
+  ) {
+    throw new Error(
+      `Refusing to adopt Kubernetes Secret ${input.secretName}: acquisition ownership does not match ${input.acquisitionId}.`,
+    );
+  }
+  const owner = (typed?.metadata?.ownerReferences ?? []).find(
+    (candidate) =>
+      candidate.apiVersion === input.ownerApiVersion
+      && candidate.kind === input.ownerKind
+      && candidate.name === input.ownerName
+      && candidate.uid === input.ownerUid,
+  );
+  if (!owner) {
+    throw new Error(
+      `Refusing to adopt Kubernetes Secret ${input.secretName}: owner does not match ${input.ownerKind} ${input.ownerName} (${input.ownerUid}).`,
+    );
+  }
+  if (typeof typed?.data?.BOOTSTRAP_TOKEN !== "string" || typed.data.BOOTSTRAP_TOKEN.length === 0) {
+    throw new Error(
+      `Refusing to adopt Kubernetes Secret ${input.secretName}: BOOTSTRAP_TOKEN is missing.`,
+    );
+  }
+  return { created: false };
+}
+
+async function readExistingSecret(
+  clients: KubeClients,
+  input: CreatePerRunSecretInput,
+): Promise<CreatePerRunSecretResult | null> {
+  try {
+    const secret = await clients.core.readNamespacedSecret({
+      namespace: input.namespace,
+      name: input.secretName,
+    });
+    return validateExistingSecret(secret, input);
+  } catch (error) {
+    if (statusCode(error) === 404) return null;
+    throw error;
+  }
+}
+
+export async function createPerRunSecret(
+  clients: KubeClients,
+  input: CreatePerRunSecretInput,
+): Promise<CreatePerRunSecretResult> {
   if (!input.ownerUid) {
     throw new Error("createPerRunSecret requires a non-empty ownerUid");
   }
   if ("BOOTSTRAP_TOKEN" in input.adapterEnv) {
     throw new Error("adapterEnv must not contain BOOTSTRAP_TOKEN (reserved key)");
   }
-  await clients.core.createNamespacedSecret({
-    namespace: input.namespace,
-    body: {
+  const existing = await readExistingSecret(clients, input);
+  if (existing) return existing;
+
+  const body = {
       apiVersion: "v1",
       kind: "Secret",
       type: "Opaque",
@@ -29,6 +107,7 @@ export async function createPerRunSecret(clients: KubeClients, input: CreatePerR
         name: input.secretName,
         namespace: input.namespace,
         labels: {
+          "paperclip.io/acquisition-id": input.acquisitionId,
           "paperclip.io/run-id": input.runId,
           "paperclip.io/managed-by": "paperclip-k8s-plugin",
         },
@@ -47,6 +126,20 @@ export async function createPerRunSecret(clients: KubeClients, input: CreatePerR
         BOOTSTRAP_TOKEN: input.bootstrapToken,
         ...input.adapterEnv,
       },
-    },
-  });
+    };
+
+  try {
+    await clients.core.createNamespacedSecret({
+      namespace: input.namespace,
+      body,
+    });
+    return { created: true };
+  } catch (createError) {
+    // Never patch or replace a Secret after an ambiguous create. The original
+    // bootstrap token must survive replay, so reconcile by exact name and
+    // validate ownership instead.
+    const reconciled = await readExistingSecret(clients, input);
+    if (reconciled) return reconciled;
+    throw createError;
+  }
 }

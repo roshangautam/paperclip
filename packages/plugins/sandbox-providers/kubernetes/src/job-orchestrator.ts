@@ -1,5 +1,61 @@
 import type { KubeClients } from "./kube-client.js";
-import type { SandboxOrchestrator, SandboxStatus } from "./sandbox-orchestrator.js";
+import type {
+  SandboxClaimResult,
+  SandboxOrchestrator,
+  SandboxStatus,
+} from "./sandbox-orchestrator.js";
+
+const MANAGED_BY = "paperclip-k8s-plugin";
+
+function statusCode(error: unknown): number | undefined {
+  return (error as { code?: number; statusCode?: number } | null)?.code
+    ?? (error as { code?: number; statusCode?: number } | null)?.statusCode;
+}
+
+function jobNameFromManifest(manifest: Record<string, unknown>): string {
+  const metadata = manifest.metadata as { name?: unknown } | undefined;
+  if (typeof metadata?.name !== "string" || metadata.name.length === 0) {
+    throw new Error("Job manifest requires metadata.name");
+  }
+  return metadata.name;
+}
+
+function validateAcquiredJob(
+  job: unknown,
+  name: string,
+  acquisitionId: string,
+): SandboxClaimResult {
+  const metadata = (job as {
+    metadata?: { uid?: unknown; labels?: Record<string, string> };
+  } | null)?.metadata;
+  if (
+    metadata?.labels?.["paperclip.io/managed-by"] !== MANAGED_BY
+    || metadata.labels["paperclip.io/acquisition-id"] !== acquisitionId
+  ) {
+    throw new Error(
+      `Refusing to adopt Kubernetes Job ${name}: acquisition ownership does not match ${acquisitionId}.`,
+    );
+  }
+  if (typeof metadata.uid !== "string" || metadata.uid.length === 0) {
+    throw new Error(`Kubernetes Job ${name} has no UID`);
+  }
+  return { uid: metadata.uid, created: false };
+}
+
+async function readAcquiredJob(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  acquisitionId: string,
+): Promise<SandboxClaimResult | null> {
+  try {
+    const job = await clients.batch.readNamespacedJob({ namespace, name });
+    return validateAcquiredJob(job, name, acquisitionId);
+  } catch (error) {
+    if (statusCode(error) === 404) return null;
+    throw error;
+  }
+}
 
 export class JobTimeoutError extends Error {
   constructor(namespace: string, name: string, timeoutMs: number) {
@@ -12,11 +68,25 @@ export async function createJob(
   clients: KubeClients,
   namespace: string,
   manifest: Record<string, unknown>,
-): Promise<{ uid: string }> {
-  const result = await clients.batch.createNamespacedJob({ namespace, body: manifest as never });
-  const uid = (result as { metadata?: { uid?: string } }).metadata?.uid;
-  if (!uid) throw new Error("Job created without a UID");
-  return { uid };
+  acquisitionId: string,
+): Promise<SandboxClaimResult> {
+  const name = jobNameFromManifest(manifest);
+  const existing = await readAcquiredJob(clients, namespace, name, acquisitionId);
+  if (existing) return existing;
+
+  try {
+    const result = await clients.batch.createNamespacedJob({ namespace, body: manifest as never });
+    const uid = (result as { metadata?: { uid?: string } }).metadata?.uid;
+    if (!uid) throw new Error("Job created without a UID");
+    return { uid, created: true };
+  } catch (createError) {
+    // A timeout/409 can mean the API server committed the create but the
+    // response was lost. Re-read the exact deterministic name once and adopt
+    // only if both Paperclip ownership labels match.
+    const reconciled = await readAcquiredJob(clients, namespace, name, acquisitionId);
+    if (reconciled) return reconciled;
+    throw createError;
+  }
 }
 
 export type JobStatus = SandboxStatus;

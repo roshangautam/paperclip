@@ -36,9 +36,9 @@ import {
 import { execInPod, wrapCommandWithEnv } from "./pod-exec.js";
 import { checkLeaseResumable, destroyLeaseResources } from "./lease-lifecycle.js";
 import {
+  deriveAcquisitionResourceName,
   deriveCompanySlug,
   deriveNamespaceName,
-  newRunUlidDns,
   paperclipLabels,
 } from "./utils.js";
 
@@ -252,12 +252,13 @@ const plugin = definePlugin({
       resourceQuota: DEFAULT_RESOURCE_QUOTA,
     });
 
-    const jobName = `pc-${newRunUlidDns()}`;
+    const jobName = deriveAcquisitionResourceName(params.acquisitionId);
     const secretName = `${jobName}-env`;
 
     // TODO: use params.runId as stand-in for agentId in labels; future
     // versions will have a dedicated agentId on AcquireLeaseParams.
     const labels = paperclipLabels({
+      acquisitionId: params.acquisitionId,
       runId: params.runId,
       agentId: params.runId,
       companyId: params.companyId,
@@ -302,7 +303,12 @@ const plugin = definePlugin({
           imagePullSecrets: config.imagePullSecrets,
         });
 
-    const { uid: ownerUid } = await orchestrator.claim(clients, namespace, manifest);
+    const { uid: ownerUid, created: workloadCreated } = await orchestrator.claim(
+      clients,
+      namespace,
+      manifest,
+      params.acquisitionId,
+    );
 
     // defaultEnv (non-secret base, e.g. the inference base URL) is layered first;
     // the process-env secrets named by envKeys override it.
@@ -314,33 +320,45 @@ const plugin = definePlugin({
     // NOTE: For sandbox-cr, if the Secret outlives the Sandbox due to a cluster
     // quirk, the release() call will still clean it up via namespace GC or
     // explicit delete in a future iteration.
-    await createPerRunSecret(clients, {
-      namespace,
-      secretName,
-      runId: params.runId,
-      ownerKind: isSandboxCrBackend ? "Sandbox" : "Job",
-      ownerApiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1alpha1" : "batch/v1",
-      ownerName: jobName,
-      ownerUid,
-      bootstrapToken,
-      adapterEnv,
-    });
+    try {
+      await createPerRunSecret(clients, {
+        namespace,
+        secretName,
+        acquisitionId: params.acquisitionId,
+        runId: params.runId,
+        ownerKind: isSandboxCrBackend ? "Sandbox" : "Job",
+        ownerApiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1alpha1" : "batch/v1",
+        ownerName: jobName,
+        ownerUid,
+        bootstrapToken,
+        adapterEnv,
+      });
 
-    const podName = await orchestrator.findPod(clients, namespace, jobName);
+      const podName = await orchestrator.findPod(clients, namespace, jobName);
 
-    const leaseMetadata: KubernetesLeaseMetadata = {
-      namespace,
-      jobName,
-      podName,
-      secretName,
-      phase: "Pending",
-      backend: config.backend,
-    };
+      const leaseMetadata: KubernetesLeaseMetadata = {
+        acquisitionId: params.acquisitionId,
+        namespace,
+        jobName,
+        podName,
+        secretName,
+        phase: "Pending",
+        backend: config.backend,
+      };
 
-    return {
-      providerLeaseId: jobName,
-      metadata: leaseMetadata as unknown as Record<string, unknown>,
-    };
+      return {
+        providerLeaseId: jobName,
+        metadata: leaseMetadata as unknown as Record<string, unknown>,
+      };
+    } catch (error) {
+      // Only a workload created by this invocation is safe to remove. An
+      // adopted workload may be the durable result of the previous crashed
+      // acquisition attempt and must remain available for the next replay.
+      if (workloadCreated) {
+        await orchestrator.release(clients, namespace, jobName).catch(() => undefined);
+      }
+      throw error;
+    }
   },
 
   async onEnvironmentResumeLease(
@@ -398,6 +416,10 @@ const plugin = definePlugin({
     }
 
     const leaseMetadata: KubernetesLeaseMetadata = {
+      acquisitionId:
+        typeof params.leaseMetadata?.acquisitionId === "string"
+          ? params.leaseMetadata.acquisitionId
+          : "",
       namespace,
       jobName: params.providerLeaseId,
       podName: check.podName,

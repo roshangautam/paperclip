@@ -24,15 +24,29 @@ function makeCr(phase: string, podName?: string): Record<string, unknown> {
 }
 
 describe("createSandboxCr", () => {
+  const acquisitionId = "acquisition-1";
+  const labels = {
+    "paperclip.io/managed-by": "paperclip-k8s-plugin",
+    "paperclip.io/acquisition-id": acquisitionId,
+  };
+
   it("calls custom.createNamespacedCustomObject with the correct params", async () => {
     const create = vi.fn().mockResolvedValue({ metadata: { uid: "test-uid" } });
-    const clients = { custom: { createNamespacedCustomObject: create } };
+    const get = vi.fn().mockRejectedValue({ code: 404 });
+    const clients = { custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get } };
     const manifest = {
       apiVersion: "agents.x-k8s.io/v1alpha1",
       kind: "Sandbox",
-      metadata: { name: "pc-abc", namespace: "paperclip-acme" },
+      metadata: { name: "pc-abc", namespace: "paperclip-acme", labels },
     };
-    const result = await createSandboxCr(clients as never, "paperclip-acme", manifest);
+    const result = await createSandboxCr(clients as never, "paperclip-acme", manifest, acquisitionId);
+    expect(get).toHaveBeenCalledWith({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: "paperclip-acme",
+      plural: SANDBOX_PLURAL,
+      name: "pc-abc",
+    });
     expect(create).toHaveBeenCalledWith({
       group: SANDBOX_GROUP,
       version: SANDBOX_VERSION,
@@ -41,14 +55,71 @@ describe("createSandboxCr", () => {
       body: manifest,
     });
     expect(result.uid).toBe("test-uid");
+    expect(result.created).toBe(true);
   });
 
   it("throws if the API response has no UID", async () => {
     const create = vi.fn().mockResolvedValue({ metadata: {} });
-    const clients = { custom: { createNamespacedCustomObject: create } };
+    const get = vi.fn().mockRejectedValue({ code: 404 });
+    const clients = { custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get } };
     await expect(
-      createSandboxCr(clients as never, "ns", {}),
+      createSandboxCr(clients as never, "ns", { metadata: { name: "pc-abc", labels } }, acquisitionId),
     ).rejects.toThrow("Sandbox CR created without a UID");
+  });
+
+  it("adopts an existing exactly-owned Sandbox without creating another", async () => {
+    const get = vi.fn().mockResolvedValue({ metadata: { uid: "existing-uid", labels } });
+    const create = vi.fn();
+    const clients = { custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get } };
+
+    await expect(
+      createSandboxCr(
+        clients as never,
+        "ns",
+        { metadata: { name: "pc-abc", labels } },
+        acquisitionId,
+      ),
+    ).resolves.toEqual({ uid: "existing-uid", created: false });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("rejects a deterministic-name collision owned by another acquisition", async () => {
+    const get = vi.fn().mockResolvedValue({
+      metadata: {
+        uid: "other-uid",
+        labels: { ...labels, "paperclip.io/acquisition-id": "other-acquisition" },
+      },
+    });
+    const create = vi.fn();
+    const clients = { custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get } };
+
+    await expect(
+      createSandboxCr(
+        clients as never,
+        "ns",
+        { metadata: { name: "pc-abc", labels } },
+        acquisitionId,
+      ),
+    ).rejects.toThrow(/ownership does not match/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an ambiguous create error by exact name and ownership", async () => {
+    const get = vi.fn()
+      .mockRejectedValueOnce({ code: 404 })
+      .mockResolvedValueOnce({ metadata: { uid: "committed-uid", labels } });
+    const create = vi.fn().mockRejectedValue(new Error("response lost"));
+    const clients = { custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get } };
+
+    await expect(
+      createSandboxCr(
+        clients as never,
+        "ns",
+        { metadata: { name: "pc-abc", labels } },
+        acquisitionId,
+      ),
+    ).resolves.toEqual({ uid: "committed-uid", created: false });
+    expect(get).toHaveBeenCalledTimes(2);
   });
 });
 

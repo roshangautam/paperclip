@@ -2,13 +2,62 @@ import { describe, it, expect, vi } from "vitest";
 import { createJob, deleteJob, getJobStatus, findPodForJob, JobTimeoutError, waitForJobCompletion } from "../../src/job-orchestrator.js";
 
 describe("createJob", () => {
+  const acquisitionId = "acquisition-1";
+  const labels = {
+    "paperclip.io/managed-by": "paperclip-k8s-plugin",
+    "paperclip.io/acquisition-id": acquisitionId,
+  };
+
   it("calls batch.createNamespacedJob with the manifest", async () => {
     const create = vi.fn().mockResolvedValue({ metadata: { uid: "abc-uid" } });
-    const clients = { batch: { createNamespacedJob: create } };
-    const jobManifest = { apiVersion: "batch/v1", kind: "Job", metadata: { name: "r-1", namespace: "ns" }, spec: { template: {} } };
-    const result = await createJob(clients as never, "ns", jobManifest);
+    const read = vi.fn().mockRejectedValue({ code: 404 });
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+    const jobManifest = { apiVersion: "batch/v1", kind: "Job", metadata: { name: "r-1", namespace: "ns", labels }, spec: { template: {} } };
+    const result = await createJob(clients as never, "ns", jobManifest, acquisitionId);
+    expect(read).toHaveBeenCalledWith({ namespace: "ns", name: "r-1" });
     expect(create).toHaveBeenCalledWith({ namespace: "ns", body: jobManifest });
     expect(result.uid).toBe("abc-uid");
+    expect(result.created).toBe(true);
+  });
+
+  it("adopts an existing exactly-owned Job without creating another", async () => {
+    const read = vi.fn().mockResolvedValue({ metadata: { uid: "existing-uid", labels } });
+    const create = vi.fn();
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+
+    await expect(
+      createJob(clients as never, "ns", { metadata: { name: "r-1", labels } }, acquisitionId),
+    ).resolves.toEqual({ uid: "existing-uid", created: false });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("rejects a deterministic-name collision owned by another acquisition", async () => {
+    const read = vi.fn().mockResolvedValue({
+      metadata: {
+        uid: "other-uid",
+        labels: { ...labels, "paperclip.io/acquisition-id": "other-acquisition" },
+      },
+    });
+    const create = vi.fn();
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+
+    await expect(
+      createJob(clients as never, "ns", { metadata: { name: "r-1" } }, acquisitionId),
+    ).rejects.toThrow(/ownership does not match/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an ambiguous create error by exact name and ownership", async () => {
+    const read = vi.fn()
+      .mockRejectedValueOnce({ code: 404 })
+      .mockResolvedValueOnce({ metadata: { uid: "committed-uid", labels } });
+    const create = vi.fn().mockRejectedValue(new Error("response lost"));
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+
+    await expect(
+      createJob(clients as never, "ns", { metadata: { name: "r-1", labels } }, acquisitionId),
+    ).resolves.toEqual({ uid: "committed-uid", created: false });
+    expect(read).toHaveBeenCalledTimes(2);
   });
 });
 

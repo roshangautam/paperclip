@@ -82,6 +82,7 @@ export function parseKubernetesProviderConfig(input: unknown): KubernetesProvide
 }
 
 export interface KubernetesLeaseMetadata {
+  acquisitionId: string;
   namespace: string;
   /** Name of the workload resource (Job name for job backend, Sandbox CR name for sandbox-cr backend). */
   jobName: string;
