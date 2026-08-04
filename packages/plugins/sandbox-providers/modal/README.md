@@ -16,9 +16,9 @@ The host plugin installer runs `npm install` into the managed plugin directory, 
 
 ## Runtime support note
 
-Modal's official JS SDK README pins support to **Node 22 or later**. Paperclip's repo baseline is currently `node >= 20`; empirically `modal@0.7.4` imports and operates against the Modal API under Node 20, so the plugin runs there today, but the vendor support contract is Node 22+. The plugin logs a startup warning when it detects Node `< 22`. Operators who can pin their Paperclip runtime to Node 22+ should do so; treat Node-20 usage as best-effort until the host bumps its baseline.
+Modal's official JS SDK README pins support to **Node 22 or later**. Paperclip's repo baseline is currently `node >= 20`, while this plugin requires `modal@^0.7.5` because acquisition replay relies on create-time sandbox tags introduced in `0.7.5`. Node 20 is therefore outside the vendor support contract and the current dependency's Node-20 behavior is best-effort. The plugin logs a startup warning when it detects Node `< 22`; operators who can pin their Paperclip runtime to Node 22+ should do so.
 
-The empirical Node 20 compatibility check is recorded in [PAPA-352](/PAPA/issues/PAPA-352).
+The earlier `modal@0.7.4` Node 20 compatibility check is recorded in [PAPA-352](/PAPA/issues/PAPA-352); it does not establish compatibility for the current SDK range.
 
 ## Configuration
 
