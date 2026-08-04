@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -15,6 +16,7 @@ vi.mock("node:child_process", async () => {
 });
 
 import plugin, { validateSshPrivateKey } from "./plugin.js";
+import manifest from "./manifest.js";
 
 class MockChildProcess extends EventEmitter {
   stdout = new EventEmitter();
@@ -60,6 +62,7 @@ describe("exe.dev sandbox provider plugin", () => {
     });
     expect(plugin.definition.onEnvironmentAcquireLease).toBeTypeOf("function");
     expect(plugin.definition.onEnvironmentExecute).toBeTypeOf("function");
+    expect(manifest.environmentDrivers?.[0]?.supportsAcquisitionReplay).toBe(true);
   });
 
   it("normalizes config and emits SSH guidance warnings", async () => {
@@ -316,6 +319,145 @@ describe("exe.dev sandbox provider plugin", () => {
         reuseLease: false,
       },
     });
+  });
+
+  it("creates a deterministic acquisition VM with an ownership tag", async () => {
+    const acquisitionId = "acquisition-create-1";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
+    const ownershipTag = `paperclip-acquisition-${digest}`;
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        vm_name: vmName,
+        ssh_dest: `${vmName}.exe.xyz`,
+        status: "running",
+        tags: [ownershipTag],
+      }), { status: 200 }));
+    queueSpawnResult({ stdout: "/home/exe\nbash\n" });
+    queueSpawnResult({});
+
+    const lease = await plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        apiKey: "api-key",
+        namePrefix: "paperclip",
+        timeoutMs: 300000,
+      },
+    });
+
+    expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toBe(`ls --json '${vmName}'`);
+    expect(String(fetchMock.mock.calls[1]?.[1]?.body ?? "")).toContain(`--name='${vmName}'`);
+    expect(String(fetchMock.mock.calls[1]?.[1]?.body ?? "")).toContain(`--tag='${ownershipTag}'`);
+    expect(lease).toMatchObject({
+      providerLeaseId: vmName,
+      metadata: { acquisitionId },
+    });
+  });
+
+  it("adopts an exactly-owned exe.dev VM on acquisition replay", async () => {
+    const acquisitionId = "acquisition-replay-1";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      vms: [{
+        vm_name: vmName,
+        ssh_dest: `${vmName}.exe.xyz`,
+        status: "running",
+        tags: [`paperclip-acquisition-${digest}`],
+      }],
+    }), { status: 200 }));
+    queueSpawnResult({ stdout: "/home/exe\nbash\n" });
+    queueSpawnResult({});
+
+    const lease = await plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-replayed",
+      config: {
+        apiKey: "api-key",
+        namePrefix: "paperclip",
+        timeoutMs: 300000,
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(lease).toMatchObject({
+      providerLeaseId: vmName,
+      metadata: { acquisitionId },
+    });
+  });
+
+  it("rejects an exe.dev deterministic name owned by another acquisition", async () => {
+    const acquisitionId = "acquisition-collision-1";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      vms: [{
+        vm_name: vmName,
+        ssh_dest: `${vmName}.exe.xyz`,
+        status: "running",
+        tags: ["paperclip-acquisition-other"],
+      }],
+    }), { status: 200 }));
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        apiKey: "api-key",
+        namePrefix: "paperclip",
+        timeoutMs: 300000,
+      },
+    })).rejects.toThrow(/acquisition ownership does not match/);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an ambiguous exe.dev create without deleting the adopted VM", async () => {
+    const acquisitionId = "acquisition-ambiguous-1";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response("response lost", { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        vms: [{
+          vm_name: vmName,
+          ssh_dest: `${vmName}.exe.xyz`,
+          status: "running",
+          tags: [`paperclip-acquisition-${digest}`],
+        }],
+      }), { status: 200 }));
+    queueSpawnResult({ code: 1, stderr: "ssh setup failed" });
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        apiKey: "api-key",
+        namePrefix: "paperclip",
+        timeoutMs: 300000,
+      },
+    })).rejects.toThrow("Failed to inspect exe.dev VM");
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.map((call) => String(call[1]?.body ?? ""))).not.toContain(
+      `rm --json '${vmName}'`,
+    );
   });
 
   it("uses a pasted sshPrivateKey when connecting to the VM", async () => {
