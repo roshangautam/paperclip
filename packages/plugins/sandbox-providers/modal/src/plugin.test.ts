@@ -11,13 +11,18 @@ const mockAppFromName = vi.hoisted(() => vi.fn());
 const mockImageFromRegistry = vi.hoisted(() => vi.fn(() => ({ kind: "image" })));
 const mockSandboxesCreate = vi.hoisted(() => vi.fn());
 const mockSandboxesFromId = vi.hoisted(() => vi.fn());
+const mockSandboxesFromName = vi.hoisted(() => vi.fn());
 const mockClientClose = vi.hoisted(() => vi.fn());
 
 vi.mock("modal", () => ({
   ModalClient: class MockModalClient {
     apps = { fromName: mockAppFromName };
     images = { fromRegistry: mockImageFromRegistry };
-    sandboxes = { create: mockSandboxesCreate, fromId: mockSandboxesFromId };
+    sandboxes = {
+      create: mockSandboxesCreate,
+      fromId: mockSandboxesFromId,
+      fromName: mockSandboxesFromName,
+    };
     close = mockClientClose;
     constructor(_params?: unknown) {}
   },
@@ -30,6 +35,7 @@ import plugin from "./plugin.js";
 
 interface FakeSandboxOverrides {
   id?: string;
+  tags?: Record<string, string>;
   execImpl?: (argv: string[], params?: unknown) => Promise<FakeProcess>;
 }
 
@@ -70,6 +76,9 @@ function createFakeSandbox(overrides: FakeSandboxOverrides = {}) {
     execCalls,
     openedFiles,
     setTags: vi.fn().mockResolvedValue(undefined),
+    getTags: vi.fn().mockResolvedValue(overrides.tags ?? {
+      "paperclip-acquisition-id": "acquisition-1",
+    }),
     terminate: vi.fn().mockResolvedValue(undefined),
     detach: vi.fn(),
     poll: vi.fn().mockResolvedValue(null),
@@ -98,6 +107,7 @@ const baseAcquireParams = {
   driverKey: "modal",
   companyId: "company-1",
   environmentId: "env-1",
+  acquisitionId: "acquisition-1",
   runId: "run-1",
 };
 
@@ -116,13 +126,15 @@ const baseConfigWithTokens = {
 };
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   mockAppFromName.mockReset();
   mockImageFromRegistry.mockReset();
   mockImageFromRegistry.mockReturnValue({ kind: "image" });
   mockSandboxesCreate.mockReset();
   mockSandboxesFromId.mockReset();
+  mockSandboxesFromName.mockReset();
+  mockSandboxesFromName.mockRejectedValue(new MockNotFoundError("not found"));
   mockClientClose.mockReset();
-  vi.restoreAllMocks();
   delete process.env.MODAL_TOKEN_ID;
   delete process.env.MODAL_TOKEN_SECRET;
 });
@@ -249,10 +261,16 @@ describe("Modal sandbox provider plugin", () => {
       environment: undefined,
     });
     expect(mockImageFromRegistry).toHaveBeenCalledWith("node:20");
-    expect(sandbox.setTags).toHaveBeenCalledWith(expect.objectContaining({
-      "paperclip-provider": "modal",
-      "paperclip-company-id": "c-1",
-    }));
+    expect(mockSandboxesCreate).toHaveBeenCalledWith(
+      { appId: "ap-1" },
+      { kind: "image" },
+      expect.objectContaining({
+        tags: expect.objectContaining({
+          "paperclip-provider": "modal",
+          "paperclip-company-id": "c-1",
+        }),
+      }),
+    );
     // First exec is the mkdir for the workspace, second is the probe command.
     expect(sandbox.execCalls[0]?.argv).toEqual([
       "sh",
@@ -340,11 +358,114 @@ describe("Modal sandbox provider plugin", () => {
         resumedLease: false,
       }),
     });
-    expect(sandbox.setTags).toHaveBeenCalledWith(expect.objectContaining({
-      "paperclip-run-id": "run-1",
-      "paperclip-reuse-lease": "true",
-    }));
+    expect(mockSandboxesFromName).toHaveBeenCalledWith(
+      "paperclip-app",
+      expect.stringMatching(/^pc-acq-[a-f0-9]{32}$/),
+      { environment: undefined },
+    );
+    expect(mockSandboxesCreate).toHaveBeenCalledWith(
+      { appId: "ap-1" },
+      { kind: "image" },
+      expect.objectContaining({
+        name: expect.stringMatching(/^pc-acq-[a-f0-9]{32}$/),
+        tags: expect.objectContaining({
+          "paperclip-acquisition-id": "acquisition-1",
+          "paperclip-run-id": "run-1",
+          "paperclip-reuse-lease": "true",
+        }),
+      }),
+    );
     expect(sandbox.execCalls[0]?.argv).toEqual(["sh", "-lc", "mkdir -p '/srv/work'"]);
+  });
+
+  it("replays an acquisition by exact name without creating a second sandbox", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-existing" });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+
+    const lease = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    });
+
+    expect(lease).toMatchObject({
+      providerLeaseId: "sb-existing",
+      metadata: {
+        acquisitionId: "acquisition-1",
+        resumedLease: false,
+      },
+    });
+    expect(mockSandboxesCreate).not.toHaveBeenCalled();
+    expect(sandbox.setTags).not.toHaveBeenCalled();
+    expect(sandbox.terminate).not.toHaveBeenCalled();
+  });
+
+  it("rejects an untagged sandbox after an ambiguous create error", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-reconciled", tags: {} });
+    let rejectCreate!: (error: Error) => void;
+    const pendingCreate = new Promise<never>((_resolve, reject) => {
+      rejectCreate = reject;
+    });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesCreate.mockReturnValue(pendingCreate);
+
+    const acquisition = plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    });
+    await vi.waitFor(() => expect(mockSandboxesCreate).toHaveBeenCalledTimes(1));
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+    rejectCreate(new Error("create response lost"));
+
+    await expect(acquisition).rejects.toThrow("Refusing to adopt unowned Modal sandbox");
+    expect(mockSandboxesCreate).toHaveBeenCalledTimes(1);
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(2);
+    expect(sandbox.setTags).not.toHaveBeenCalled();
+    expect(sandbox.terminate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a deterministic-name sandbox owned by another acquisition", async () => {
+    const sandbox = createFakeSandbox({
+      id: "sb-conflict",
+      tags: { "paperclip-acquisition-id": "different-acquisition" },
+    });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    })).rejects.toThrow("acquisition ownership does not match acquisition-1");
+    expect(mockSandboxesCreate).not.toHaveBeenCalled();
+    expect(sandbox.terminate).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unowned deterministic-name sandbox before creating", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-unowned", tags: {} });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    })).rejects.toThrow("Refusing to adopt unowned Modal sandbox");
+    expect(mockSandboxesCreate).not.toHaveBeenCalled();
+    expect(sandbox.setTags).not.toHaveBeenCalled();
+  });
+
+  it("does not terminate an adopted sandbox when workspace setup fails", async () => {
+    const sandbox = createFakeSandbox({
+      id: "sb-adopted",
+      execImpl: async () => makeFakeProcess({ throwOnWait: new Error("mkdir failed") }),
+    });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    })).rejects.toThrow("mkdir failed");
+    expect(sandbox.terminate).not.toHaveBeenCalled();
   });
 
   it("terminates the sandbox if acquire workspace setup throws", async () => {
