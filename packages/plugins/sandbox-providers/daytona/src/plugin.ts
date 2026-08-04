@@ -9,7 +9,11 @@ import type {
   Resources,
   Sandbox,
 } from "@daytonaio/sdk";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import {
+  definePlugin,
+  JsonRpcCallError,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentCancelInteractiveSetupParams,
@@ -264,6 +268,14 @@ function resolveTimeoutMs(paramsTimeoutMs: number | undefined, config: DaytonaDr
 
 function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function acquisitionFailureWithLease(error: unknown, providerLeaseId: string): JsonRpcCallError {
+  return new JsonRpcCallError({
+    code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+    message: formatErrorMessage(error),
+    data: { providerLeaseId },
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -976,9 +988,14 @@ const plugin = definePlugin({
       };
     } catch (error) {
       if (created) {
-        await sandbox.delete(toTimeoutSeconds(config.timeoutMs)).catch(() => undefined);
+        try {
+          await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
+        } catch {
+          throw acquisitionFailureWithLease(error, sandbox.id);
+        }
+        throw error;
       }
-      throw error;
+      throw acquisitionFailureWithLease(error, sandbox.id);
     }
   },
 

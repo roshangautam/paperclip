@@ -3,7 +3,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import {
+  definePlugin,
+  JsonRpcCallError,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -285,6 +289,14 @@ function shellQuote(value: string): string {
 
 function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function acquisitionFailureWithLease(error: unknown, providerLeaseId: string): JsonRpcCallError {
+  return new JsonRpcCallError({
+    code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+    message: formatErrorMessage(error),
+    data: { providerLeaseId },
+  });
 }
 
 function buildVmName(config: ExeDevDriverConfig, params: PluginEnvironmentAcquireLeaseParams): string {
@@ -891,9 +903,14 @@ const plugin = definePlugin({
       return await buildLease(config, vm, params.requestedCwd, false, params.acquisitionId);
     } catch (error) {
       if (created) {
-        await deleteVm(config, vm.name).catch(() => undefined);
+        try {
+          await deleteVm(config, vm.name);
+        } catch {
+          throw acquisitionFailureWithLease(error, vm.name);
+        }
+        throw error;
       }
-      throw error;
+      throw acquisitionFailureWithLease(error, vm.name);
     }
   },
 
