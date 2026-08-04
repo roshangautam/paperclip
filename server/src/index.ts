@@ -58,6 +58,7 @@ import {
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { environmentRuntimeService } from "./services/environment-runtime.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -826,6 +827,23 @@ export async function startServer(): Promise<StartedServer> {
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{ skipDrain: boolean }>) | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  let sandboxCleanupStopped = false;
+  let sandboxCleanupInterval: ReturnType<typeof setInterval> | null = null;
+  const sandboxCleanupInFlight = new Set<Promise<void>>();
+  const trackSandboxCleanupWork = (work: Promise<unknown>) => {
+    let tracked: Promise<void>;
+    tracked = Promise.resolve(work)
+      .then(() => undefined, () => undefined)
+      .finally(() => {
+        sandboxCleanupInFlight.delete(tracked);
+      });
+    sandboxCleanupInFlight.add(tracked);
+  };
+  const waitForSandboxCleanupIdle = async () => {
+    while (sandboxCleanupInFlight.size > 0) {
+      await Promise.allSettled([...sandboxCleanupInFlight]);
+    }
+  };
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -841,6 +859,26 @@ export async function startServer(): Promise<StartedServer> {
       await Promise.allSettled([...heartbeatSchedulerInFlight]);
     }
   };
+
+  const environmentRuntime = environmentRuntimeService(db as any, { pluginWorkerManager });
+  const runPendingSandboxCleanup = () => {
+    if (sandboxCleanupStopped || sandboxCleanupInFlight.size > 0) return;
+    trackSandboxCleanupWork(environmentRuntime
+      .retryPendingSandboxCleanups()
+      .then((result) => {
+        if (result.attempted > 0) {
+          logger.info(result, "periodic pending sandbox cleanup retry complete");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "periodic pending sandbox cleanup retry failed");
+      }));
+  };
+  sandboxCleanupInterval = setInterval(
+    runPendingSandboxCleanup,
+    config.heartbeatSchedulerIntervalMs,
+  );
+  sandboxCleanupInterval.unref?.();
 
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
@@ -1200,9 +1238,14 @@ export async function startServer(): Promise<StartedServer> {
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       heartbeatSchedulerStopped = true;
+      sandboxCleanupStopped = true;
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
+      }
+      if (sandboxCleanupInterval) {
+        clearInterval(sandboxCleanupInterval);
+        sandboxCleanupInterval = null;
       }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
@@ -1211,6 +1254,7 @@ export async function startServer(): Promise<StartedServer> {
         waitForHeartbeatSchedulerIdle,
       });
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+      await waitForSandboxCleanupIdle();
       if (skipHeartbeatDrain) {
         logger.info(
           { signal, hotRestart: heartbeatShutdown.hotRestart },

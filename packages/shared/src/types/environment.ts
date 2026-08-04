@@ -83,7 +83,12 @@ export interface Environment {
   updatedAt: Date;
 }
 
-export type EnvironmentDeleteBlockedReason = "managed_local" | "instance_default";
+export type EnvironmentDeleteBlockedReason =
+  | "managed_local"
+  | "instance_default"
+  | "active_lease"
+  | "reusable_lease"
+  | "pending_cleanup";
 
 export interface EnvironmentDeleteBlastRadius {
   environmentId: string;
@@ -100,6 +105,8 @@ export interface EnvironmentDeleteBlastRadius {
   };
   activeRuntimeUse: {
     activeLeaseCount: number;
+    reusableLeaseCount: number;
+    pendingCleanupLeaseCount: number;
     activeCustomImageSetupSessionCount: number;
     hasActiveRuntimeUse: boolean;
   };

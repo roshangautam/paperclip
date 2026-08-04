@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -43,6 +43,8 @@ const KUBERNETES_PROVIDER_KEY = "kubernetes";
 /** Metadata marker for the company's managed-by-config Kubernetes sandbox environment. */
 const KUBERNETES_MANAGED_MARKER = "managedKubernetesSandbox";
 const ACTIVE_CUSTOM_IMAGE_SETUP_STATUSES = ["starting", "waiting_for_user", "capturing"] as const;
+const DELETE_BLOCKING_LEASE_STATUSES = ["active", "pending_cleanup"] as const satisfies readonly EnvironmentLeaseStatus[];
+const DELETE_BLOCKING_REUSABLE_LEASE_STATUSES = ["released", "retained", "failed"] as const satisfies readonly EnvironmentLeaseStatus[];
 
 /**
  * Configuration accepted by `ensureKubernetesEnvironment`. Mirrors the keys of
@@ -473,6 +475,23 @@ export function environmentService(db: Db) {
               select 1 from ${instanceSettings}
               where ${instanceSettings.defaultEnvironmentId} = ${environments.id}
             )`,
+            sql`not exists (
+              select 1 from ${environmentLeases}
+              where ${environmentLeases.environmentId} = ${environments.id}
+                and (
+                  ${environmentLeases.status} in (${sql.join(
+                    DELETE_BLOCKING_LEASE_STATUSES.map((status) => sql`${status}`),
+                    sql`, `,
+                  )})
+                  or (
+                    ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+                    and ${environmentLeases.status} in (${sql.join(
+                      DELETE_BLOCKING_REUSABLE_LEASE_STATUSES.map((status) => sql`${status}`),
+                      sql`, `,
+                    )})
+                  )
+                )
+            )`,
           ),
         )
         .returning()
@@ -531,12 +550,28 @@ export function environmentService(db: Db) {
             ),
           ),
         db
-          .select({ count: sql<number>`count(*)::int` })
+          .select({
+            activeCount: sql<number>`count(*) filter (where ${environmentLeases.status} = 'active')::int`,
+            reusableCount: sql<number>`count(*) filter (
+              where ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+                and ${environmentLeases.status} in (${sql.join(
+                  DELETE_BLOCKING_REUSABLE_LEASE_STATUSES.map((status) => sql`${status}`),
+                  sql`, `,
+                )})
+            )::int`,
+            pendingCleanupCount: sql<number>`count(*) filter (where ${environmentLeases.status} = 'pending_cleanup')::int`,
+          })
           .from(environmentLeases)
           .where(
             and(
               eq(environmentLeases.environmentId, id),
-              eq(environmentLeases.status, "active"),
+              or(
+                inArray(environmentLeases.status, [...DELETE_BLOCKING_LEASE_STATUSES]),
+                and(
+                  eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+                  inArray(environmentLeases.status, [...DELETE_BLOCKING_REUSABLE_LEASE_STATUSES]),
+                ),
+              ),
             ),
           ),
         db
@@ -555,7 +590,12 @@ export function environmentService(db: Db) {
       const deleteBlockedReasons: EnvironmentDeleteBlockedReason[] = [];
       if (isManagedLocal) deleteBlockedReasons.push("managed_local");
       if (isInstanceDefault) deleteBlockedReasons.push("instance_default");
-      const activeLeaseCount = countFromRows(activeLeaseRows);
+      if ((activeLeaseRows[0]?.activeCount ?? 0) > 0) deleteBlockedReasons.push("active_lease");
+      if ((activeLeaseRows[0]?.reusableCount ?? 0) > 0) deleteBlockedReasons.push("reusable_lease");
+      if ((activeLeaseRows[0]?.pendingCleanupCount ?? 0) > 0) deleteBlockedReasons.push("pending_cleanup");
+      const activeLeaseCount = activeLeaseRows[0]?.activeCount ?? 0;
+      const reusableLeaseCount = activeLeaseRows[0]?.reusableCount ?? 0;
+      const pendingCleanupLeaseCount = activeLeaseRows[0]?.pendingCleanupCount ?? 0;
       const activeCustomImageSetupSessionCount = countFromRows(activeSetupRows);
 
       return {
@@ -573,8 +613,14 @@ export function environmentService(db: Db) {
         },
         activeRuntimeUse: {
           activeLeaseCount,
+          reusableLeaseCount,
+          pendingCleanupLeaseCount,
           activeCustomImageSetupSessionCount,
-          hasActiveRuntimeUse: activeLeaseCount > 0 || activeCustomImageSetupSessionCount > 0,
+          hasActiveRuntimeUse:
+            activeLeaseCount > 0
+            || reusableLeaseCount > 0
+            || pendingCleanupLeaseCount > 0
+            || activeCustomImageSetupSessionCount > 0,
         },
       };
     },
@@ -596,6 +642,7 @@ export function environmentService(db: Db) {
     },
 
     acquireLease: async (input: {
+      id?: string;
       companyId: string;
       environmentId: string;
       executionWorkspaceId?: string | null;
@@ -611,6 +658,7 @@ export function environmentService(db: Db) {
       const row = await db
         .insert(environmentLeases)
         .values({
+          id: input.id,
           companyId: input.companyId,
           environmentId: input.environmentId,
           executionWorkspaceId: input.executionWorkspaceId ?? null,
@@ -644,6 +692,9 @@ export function environmentService(db: Db) {
       options?: {
         failureReason?: string;
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
+        metadata?: Record<string, unknown> | null;
+        expectedCleanupClaimId?: string;
+        expectedStatus?: EnvironmentLeaseStatus;
       },
     ) => {
       const now = new Date();
@@ -656,8 +707,21 @@ export function environmentService(db: Db) {
           updatedAt: now,
           ...(options?.failureReason !== undefined ? { failureReason: options.failureReason } : {}),
           ...(options?.cleanupStatus !== undefined ? { cleanupStatus: options.cleanupStatus } : {}),
+          ...(options?.metadata !== undefined ? { metadata: options.metadata } : {}),
+          cleanupClaimId: null,
+          cleanupClaimedAt: null,
         })
-        .where(eq(environmentLeases.id, id))
+        .where(
+          and(
+            eq(environmentLeases.id, id),
+            options?.expectedCleanupClaimId
+              ? eq(environmentLeases.cleanupClaimId, options.expectedCleanupClaimId)
+              : undefined,
+            options?.expectedStatus
+              ? eq(environmentLeases.status, options.expectedStatus)
+              : undefined,
+          ),
+        )
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toEnvironmentLease(row) : null;

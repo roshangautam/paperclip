@@ -141,6 +141,8 @@ function createDeleteBlastRadius(overrides: Partial<{
   projectSelectionCount: number;
   secretBindingCount: number;
   activeLeaseCount: number;
+  reusableLeaseCount: number;
+  pendingCleanupLeaseCount: number;
   activeCustomImageSetupSessionCount: number;
 }> = {}) {
   const staticReferences = {
@@ -154,9 +156,13 @@ function createDeleteBlastRadius(overrides: Partial<{
   };
   const activeRuntimeUse = {
     activeLeaseCount: overrides.activeLeaseCount ?? 0,
+    reusableLeaseCount: overrides.reusableLeaseCount ?? 0,
+    pendingCleanupLeaseCount: overrides.pendingCleanupLeaseCount ?? 0,
     activeCustomImageSetupSessionCount: overrides.activeCustomImageSetupSessionCount ?? 0,
     hasActiveRuntimeUse:
       (overrides.activeLeaseCount ?? 0) > 0
+      || (overrides.reusableLeaseCount ?? 0) > 0
+      || (overrides.pendingCleanupLeaseCount ?? 0) > 0
       || (overrides.activeCustomImageSetupSessionCount ?? 0) > 0,
   };
   const deleteBlockedReasons = [
@@ -431,6 +437,8 @@ describe("environment routes", () => {
       },
       activeRuntimeUse: {
         activeLeaseCount: 1,
+        reusableLeaseCount: 0,
+        pendingCleanupLeaseCount: 0,
         activeCustomImageSetupSessionCount: 0,
         hasActiveRuntimeUse: true,
       },

@@ -14,6 +14,8 @@ const {
   deriveAuthTrustedOriginsMock,
   environmentCustomImagesServiceMock,
   environmentCustomImagesServiceFactoryMock,
+  environmentRuntimeServiceFactoryMock,
+  environmentRuntimeServiceMock,
   feedbackExportServiceMock,
   feedbackServiceFactoryMock,
   fakeServer,
@@ -64,6 +66,10 @@ const {
     cleanupExpiredSetupSessions: vi.fn(async () => ({ scanned: 0, timedOut: 0, failed: 0 })),
   };
   const environmentCustomImagesServiceFactoryMock = vi.fn(() => environmentCustomImagesServiceMock);
+  const environmentRuntimeServiceMock = {
+    retryPendingSandboxCleanups: vi.fn(async () => ({ attempted: 0, cleaned: 0 })),
+  };
+  const environmentRuntimeServiceFactoryMock = vi.fn(() => environmentRuntimeServiceMock);
   const routineServiceMock = {
     tickScheduledTriggers: vi.fn(async () => ({ triggered: 0 })),
   };
@@ -91,6 +97,8 @@ const {
     deriveAuthTrustedOriginsMock,
     environmentCustomImagesServiceMock,
     environmentCustomImagesServiceFactoryMock,
+    environmentRuntimeServiceFactoryMock,
+    environmentRuntimeServiceMock,
     feedbackExportServiceMock,
     feedbackServiceFactoryMock,
     fakeServer,
@@ -259,6 +267,10 @@ vi.mock("../services/plugin-worker-manager.js", () => ({
   createPluginWorkerManager: vi.fn(() => ({ id: "plugin-worker-manager" })),
 }));
 
+vi.mock("../services/environment-runtime.js", () => ({
+  environmentRuntimeService: environmentRuntimeServiceFactoryMock,
+}));
+
 vi.mock("../startup-banner.js", () => ({
   printStartupBanner: vi.fn(),
 }));
@@ -313,11 +325,11 @@ describe("startServer feedback export wiring", () => {
       suppressed: true,
       reason: "worktree_instance",
     });
-    let intervalCallback: (() => void) | null = null;
+    const intervalCallbacks: Array<() => void> = [];
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
       .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+        intervalCallbacks.push(callback);
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -327,15 +339,17 @@ describe("startServer feedback export wiring", () => {
       expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).not.toHaveBeenCalled();
 
-      expect(intervalCallback).not.toBeNull();
-      intervalCallback?.();
+      expect(intervalCallbacks).toHaveLength(2);
+      intervalCallbacks.forEach((callback) => callback());
       await Promise.resolve();
       await Promise.resolve();
 
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(2);
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(1);
     } finally {
       setIntervalSpy.mockRestore();
     }
@@ -355,6 +369,69 @@ describe("startServer feedback export wiring", () => {
 
     expect(heartbeatServiceMock.reconcileHotRestartAdoption).toHaveBeenCalledTimes(1);
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
+  });
+
+  it("defers pending sandbox cleanup until its periodic interval", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    const intervalCallbacks: Array<() => void> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallbacks.push(callback);
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+
+      expect(heartbeatServiceMock.promoteDueScheduledRetries).toHaveBeenCalledTimes(1);
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).not.toHaveBeenCalled();
+      expect(intervalCallbacks).toHaveLength(2);
+
+      intervalCallbacks.forEach((callback) => callback());
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(1);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("does not overlap periodic sandbox cleanup with an in-flight sweep", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: false,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    const intervalCallbacks: Array<() => void> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallbacks.push(callback);
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+    let finishCleanup!: (result: { attempted: number; cleaned: number }) => void;
+    const cleanupPending = new Promise<{ attempted: number; cleaned: number }>((resolve) => {
+      finishCleanup = resolve;
+    });
+    environmentRuntimeServiceMock.retryPendingSandboxCleanups
+      .mockReturnValueOnce(cleanupPending);
+
+    try {
+      await startServer();
+
+      expect(intervalCallbacks).toHaveLength(1);
+      intervalCallbacks[0]!();
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(1);
+
+      finishCleanup({ attempted: 0, cleaned: 0 });
+      await cleanupPending;
+      await new Promise((resolve) => setImmediate(resolve));
+      intervalCallbacks[0]!();
+      expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(2);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
   });
 
   it("refuses authenticated public startup without an external database URL", async () => {
