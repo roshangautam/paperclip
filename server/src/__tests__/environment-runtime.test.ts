@@ -1840,6 +1840,67 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
+  it("preserves an active cleanup claim when a provider acquisition returns late", async () => {
+    const seeded = await seedPluginSandboxEnvironment({ secretValue: "original-provider-key" });
+    const replacementSecret = await secretService(db).create(seeded.companyId, {
+      name: `replacement-provider-key-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "replacement-provider-key",
+    });
+    const cleanupClaimId = randomUUID();
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === seeded.pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        expect(method).toBe("environmentAcquireLease");
+        await secretService(db).syncSecretRefsForTarget(
+          seeded.companyId,
+          { targetType: "environment", targetId: seeded.environment.id },
+          [{ secretId: replacementSecret.id, configPath: "apiKey" }],
+          { replaceAll: true },
+        );
+        const [reservation] = await db.select().from(environmentLeases);
+        await db
+          .update(environmentLeases)
+          .set({
+            status: "pending_cleanup",
+            cleanupStatus: "failed",
+            cleanupClaimId,
+            cleanupClaimedAt: new Date(),
+            failureReason: "provider_acquire_in_progress",
+            metadata: {
+              ...(reservation?.metadata ?? {}),
+              pendingCleanupReleaseStatus: "released",
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(environmentLeases.id, reservation!.id));
+        return {
+          providerLeaseId: "late-provider-lease",
+          metadata: { provider: "reservation-plugin", image: "fake:test" },
+        };
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    await expect(runtimeWithPlugin.acquireRunLease({
+      companyId: seeded.companyId,
+      environment: seeded.environment,
+      issueId: null,
+      heartbeatRunId: seeded.runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toThrow('Sandbox secret binding changed while acquiring lease at "apiKey".');
+
+    expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual(["environmentAcquireLease"]);
+    const [reservation] = await db.select().from(environmentLeases);
+    expect(reservation).toMatchObject({
+      status: "pending_cleanup",
+      providerLeaseId: null,
+      cleanupClaimId,
+      failureReason: "provider_acquire_in_progress",
+      metadata: expect.objectContaining({ pendingCleanupReleaseStatus: "released" }),
+    });
+  });
+
   it("falls back to current config when a lease-scoped sandbox secret is deleted", async () => {
     const pluginId = randomUUID();
     const { companyId, environment: baseEnvironment, runId } = await seedEnvironment();
@@ -4043,7 +4104,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         pluginId: seeded.pluginId,
         pluginKey: "acme.reservation-sandbox-provider",
         sandboxProviderConfig: expect.objectContaining({ provider: "reservation-plugin" }),
-        sandboxAcquisition: expect.objectContaining({ kind: "plugin" }),
+        sandboxAcquisition: expect.objectContaining({
+          kind: "plugin",
+          pluginPackageName: "@acme/reservation-sandbox-provider",
+          pluginVersion: "1.0.0",
+          pluginSupportsAcquisitionReplay: true,
+        }),
       }),
     });
     const recovered = await environmentService(db).getLeaseById(seeded.reservation.id);
@@ -4343,11 +4409,25 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
-  it("does not replay a legacy plugin sandbox acquisition without an idempotency guarantee", async () => {
+  it("does not replay when the original plugin did not declare acquisition replay", async () => {
     const seeded = await seedPendingPluginSandboxAcquisition({
       providerLeaseIdBeforeCrash: "possibly-acquired-by-legacy-plugin",
       supportsAcquisitionReplay: false,
     });
+    const [plugin] = await db.select().from(plugins).where(eq(plugins.id, seeded.pluginId));
+    const manifest = plugin!.manifestJson as any;
+    await db
+      .update(plugins)
+      .set({
+        manifestJson: {
+          ...manifest,
+          environmentDrivers: manifest.environmentDrivers.map((driver: Record<string, unknown>) => ({
+            ...driver,
+            supportsAcquisitionReplay: true,
+          })),
+        },
+      })
+      .where(eq(plugins.id, seeded.pluginId));
     const recoveredWorkerManager = {
       isRunning: vi.fn((id: string) => id === seeded.pluginId),
       call: vi.fn(async () => {
@@ -4382,6 +4462,45 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(pending?.cleanupClaimedAt).toBeNull();
     expect(seeded.providerLeases.get(seeded.reservation.id)).toBe("possibly-acquired-by-legacy-plugin");
   });
+
+  it.each(["package", "version"] as const)(
+    "does not replay a plugin sandbox acquisition after its %s changes",
+    async (identityField) => {
+      const seeded = await seedPendingPluginSandboxAcquisition({
+        providerLeaseIdBeforeCrash: "possibly-acquired-before-plugin-upgrade",
+      });
+      const [plugin] = await db.select().from(plugins).where(eq(plugins.id, seeded.pluginId));
+      await db
+        .update(plugins)
+        .set(identityField === "package"
+          ? { packageName: "@acme/replaced-sandbox-provider" }
+          : {
+              version: "2.0.0",
+              manifestJson: { ...plugin!.manifestJson, version: "2.0.0" },
+            })
+        .where(eq(plugins.id, seeded.pluginId));
+      const recoveredWorkerManager = {
+        isRunning: vi.fn((id: string) => id === seeded.pluginId),
+        call: vi.fn(async () => {
+          throw new Error("changed plugin identity must not receive acquisition replay");
+        }),
+      } as unknown as PluginWorkerManager;
+
+      await expect(environmentRuntimeService(db, { pluginWorkerManager: recoveredWorkerManager })
+        .retryPendingSandboxCleanups()).resolves.toEqual({
+          attempted: 1,
+          cleaned: 0,
+          pending: 1,
+        });
+
+      expect(recoveredWorkerManager.call).not.toHaveBeenCalled();
+      await expect(environmentService(db).getLeaseById(seeded.reservation.id)).resolves.toMatchObject({
+        status: "pending_cleanup",
+        providerLeaseId: null,
+        cleanupStatus: "failed",
+      });
+    },
+  );
 
   it("keeps a failed acquisition replay pending without blindly terminalizing its reservation", async () => {
     const seeded = await seedPendingPluginSandboxAcquisition({

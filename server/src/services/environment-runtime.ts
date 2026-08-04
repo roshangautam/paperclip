@@ -238,6 +238,9 @@ type SandboxAcquisitionContext = {
   provider: string;
   pluginId?: string;
   pluginKey?: string;
+  pluginPackageName?: string;
+  pluginVersion?: string;
+  pluginSupportsAcquisitionReplay?: boolean;
   config: Record<string, unknown>;
   runId: string;
   workspaceMode: string | null;
@@ -1217,7 +1220,7 @@ function createSandboxEnvironmentDriver(
   async function persistSandboxLeaseCleanup(
     reservation: EnvironmentLease,
     input: Parameters<typeof environmentsSvc.acquireLease>[0],
-  ): Promise<EnvironmentLease> {
+  ): Promise<EnvironmentLease | null> {
     const now = new Date();
     const row = await db
       .update(environmentLeases)
@@ -1233,8 +1236,6 @@ function createSandboxEnvironmentDriver(
         releasedAt: now,
         failureReason: "acquire_handoff_failed",
         cleanupStatus: "failed",
-        cleanupClaimId: null,
-        cleanupClaimedAt: null,
         metadata: {
           ...(input.metadata ?? {}),
           [LEASE_SCOPED_SECRET_BINDINGS_KEY]: true,
@@ -1247,13 +1248,26 @@ function createSandboxEnvironmentDriver(
         eq(environmentLeases.id, reservation.id),
         inArray(environmentLeases.status, ["active", "pending_cleanup"]),
         isNull(environmentLeases.providerLeaseId),
+        isNull(environmentLeases.cleanupClaimId),
+        isNull(environmentLeases.cleanupClaimedAt),
       ))
       .returning()
       .then((rows) => rows[0] ?? null);
-    if (!row) {
-      throw new Error(`Sandbox lease reservation "${reservation.id}" changed before cleanup handoff.`);
+    if (row) return toEnvironmentLeaseSnapshot(row);
+
+    const current = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, reservation.id))
+      .then((rows) => rows[0] ?? null);
+    if (
+      current?.status === "pending_cleanup" &&
+      (!current.providerLeaseId && (current.cleanupClaimId || current.cleanupClaimedAt))
+    ) {
+      return null;
     }
-    return toEnvironmentLeaseSnapshot(row);
+    if (input.providerLeaseId && current?.providerLeaseId === input.providerLeaseId) return null;
+    throw new Error(`Sandbox lease reservation "${reservation.id}" changed before cleanup handoff.`);
   }
 
   async function persistStandaloneSandboxLeaseCleanup(
@@ -1367,6 +1381,7 @@ function createSandboxEnvironmentDriver(
     let cleanupLease: EnvironmentLease | null = null;
     try {
       cleanupLease = await persistSandboxLeaseCleanup(reservation, input);
+      if (!cleanupLease) return;
       await cleanupPersistedSandboxLease(environment, cleanupLease, "acquire_handoff_failed");
     } catch (cleanupError) {
       if (!cleanupLease) {
@@ -1745,13 +1760,19 @@ function createSandboxEnvironmentDriver(
       if (
         pluginProvider.state !== "running" ||
         pluginProvider.resolved.plugin.id !== acquisitionContext.pluginId ||
-        pluginProvider.resolved.plugin.pluginKey !== acquisitionContext.pluginKey
+        pluginProvider.resolved.plugin.pluginKey !== acquisitionContext.pluginKey ||
+        pluginProvider.resolved.plugin.packageName !== acquisitionContext.pluginPackageName ||
+        pluginProvider.resolved.plugin.version !== acquisitionContext.pluginVersion ||
+        pluginProvider.resolved.plugin.manifestJson.version !== acquisitionContext.pluginVersion
       ) {
         throw new Error(
           `Plugin-backed sandbox acquisition "${acquisitionId}" cannot resolve its original provider plugin.`,
         );
       }
-      if (pluginProvider.resolved.driver.supportsAcquisitionReplay !== true) {
+      if (
+        acquisitionContext.pluginSupportsAcquisitionReplay !== true ||
+        pluginProvider.resolved.driver.supportsAcquisitionReplay !== true
+      ) {
         throw new Error(
           `Plugin-backed sandbox provider "${acquisitionContext.provider}" does not support acquisition replay.`,
         );
@@ -2104,6 +2125,10 @@ function createSandboxEnvironmentDriver(
           provider: parsed.config.provider,
           pluginId: pluginProvider.resolved.plugin.id,
           pluginKey: pluginProvider.resolved.plugin.pluginKey,
+          pluginPackageName: pluginProvider.resolved.plugin.packageName,
+          pluginVersion: pluginProvider.resolved.plugin.version,
+          pluginSupportsAcquisitionReplay:
+            pluginProvider.resolved.driver.supportsAcquisitionReplay === true,
           config: providerConfigForLease,
           runId: input.heartbeatRunId ?? acquisitionId,
           workspaceMode: input.executionWorkspaceMode,
@@ -3012,6 +3037,11 @@ function readSandboxAcquisitionContext(lease: EnvironmentLease): SandboxAcquisit
 
   const pluginId = readString(value.pluginId) ?? undefined;
   const pluginKey = readString(value.pluginKey) ?? undefined;
+  const pluginPackageName = readString(value.pluginPackageName) ?? undefined;
+  const pluginVersion = readString(value.pluginVersion) ?? undefined;
+  const pluginSupportsAcquisitionReplay = typeof value.pluginSupportsAcquisitionReplay === "boolean"
+    ? value.pluginSupportsAcquisitionReplay
+    : undefined;
   if (value.kind === "plugin" && (!pluginId || !pluginKey)) return null;
   const hasCustomImageReplay = Object.prototype.hasOwnProperty.call(value, "customImageReplay");
   const customImageReplay = hasCustomImageReplay && value.customImageReplay !== null
@@ -3025,6 +3055,9 @@ function readSandboxAcquisitionContext(lease: EnvironmentLease): SandboxAcquisit
     provider,
     pluginId,
     pluginKey,
+    pluginPackageName,
+    pluginVersion,
+    pluginSupportsAcquisitionReplay,
     config,
     runId,
     workspaceMode: readString(value.workspaceMode),
