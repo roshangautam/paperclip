@@ -20,6 +20,7 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       driverKey: "daytona",
       kind: "sandbox_provider",
+      supportsAcquisitionReplay: true,
       displayName: "Daytona Sandbox",
       description:
         "Provisions Daytona sandboxes with configurable image or snapshot selection, startup timeouts, and lease reuse.",

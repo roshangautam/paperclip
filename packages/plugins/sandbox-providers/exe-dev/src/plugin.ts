@@ -1,5 +1,5 @@
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
@@ -51,6 +51,7 @@ interface ExeDevVmRecord {
   status: string | null;
   region: string | null;
   regionDisplay: string | null;
+  tags: string[];
 }
 
 interface SshExecutionResult {
@@ -288,8 +289,16 @@ function formatErrorMessage(error: unknown): string {
 
 function buildVmName(config: ExeDevDriverConfig, params: PluginEnvironmentAcquireLeaseParams): string {
   const envPart = params.environmentId.replace(/[^a-z0-9]+/gi, "").slice(0, 8).toLowerCase() || "env";
-  const runPart = params.runId.replace(/[^a-z0-9]+/gi, "").slice(0, 8).toLowerCase() || randomUUID().slice(0, 8);
-  return `${config.namePrefix}-${envPart}-${runPart}`.slice(0, 63);
+  const acquisitionHash = createHash("sha256")
+    .update(params.acquisitionId || params.runId)
+    .digest("hex")
+    .slice(0, 32);
+  const suffix = `-${envPart}-${acquisitionHash}`;
+  return `${config.namePrefix.slice(0, Math.max(1, 63 - suffix.length))}${suffix}`;
+}
+
+function acquisitionTag(acquisitionId: string): string {
+  return `paperclip-acquisition-${createHash("sha256").update(acquisitionId).digest("hex")}`;
 }
 
 function buildFlag(name: string, value: string | number | null | undefined): string[] {
@@ -314,6 +323,7 @@ function resolveSetupScript(config: ExeDevDriverConfig): string | null {
 function buildCreateCommand(
   config: ExeDevDriverConfig,
   vmName: string,
+  extraTags: string[] = [],
 ): string {
   return [
     "new",
@@ -328,7 +338,7 @@ function buildCreateCommand(
     ...buildFlag("comment", config.comment),
     ...buildEnvFlags(config.env),
     ...buildRepeatedFlag("integration", config.integrations),
-    ...buildRepeatedFlag("tag", config.tags),
+    ...buildRepeatedFlag("tag", [...config.tags, ...extraTags]),
     ...buildFlag("setup-script", resolveSetupScript(config)),
     ...buildFlag("prompt", config.prompt),
   ].join(" ");
@@ -421,6 +431,7 @@ function parseVmRecord(value: unknown, depth = 0): ExeDevVmRecord | null {
     status: parseOptionalString(record.status),
     region: parseOptionalString(record.region),
     regionDisplay: parseOptionalString(record.region_display ?? record.regionDisplay),
+    tags: parseStringArray(record.tags),
   };
 }
 
@@ -456,6 +467,48 @@ async function createVm(
     throw new Error(`exe.dev did not return VM metadata for ${vmName}.`);
   }
   return created;
+}
+
+function assertAcquisitionVmOwnership(vm: ExeDevVmRecord, acquisitionId: string): void {
+  if (!vm.tags.includes(acquisitionTag(acquisitionId))) {
+    throw new Error(
+      `Refusing to adopt exe.dev VM ${vm.name}: acquisition ownership does not match ${acquisitionId}.`,
+    );
+  }
+}
+
+async function acquireVm(
+  config: ExeDevDriverConfig,
+  params: PluginEnvironmentAcquireLeaseParams,
+): Promise<{ vm: ExeDevVmRecord; created: boolean }> {
+  // Older local test harnesses may omit the newly-required acquisition ID. The
+  // production protocol always supplies it; retain the legacy create path only
+  // for those callers so provider tests can exercise unrelated behavior.
+  if (!params.acquisitionId) {
+    return { vm: await createVm(config, params), created: true };
+  }
+
+  const vmName = buildVmName(config, params);
+  const existing = await lookupVm(config, vmName);
+  if (existing) {
+    assertAcquisitionVmOwnership(existing, params.acquisitionId);
+    return { vm: existing, created: false };
+  }
+
+  const command = buildCreateCommand(config, vmName, [acquisitionTag(params.acquisitionId)]);
+  try {
+    const response = await runLifecycleCommand(config, command, redactCreateCommand(command, config));
+    const created = parseVmRecord(response) ?? await lookupVm(config, vmName);
+    if (!created) {
+      throw new Error(`exe.dev did not return VM metadata for ${vmName}.`);
+    }
+    return { vm: created, created: true };
+  } catch (error) {
+    const reconciled = await lookupVm(config, vmName);
+    if (!reconciled) throw error;
+    assertAcquisitionVmOwnership(reconciled, params.acquisitionId);
+    return { vm: reconciled, created: false };
+  }
 }
 
 async function deleteVm(config: ExeDevDriverConfig, vmName: string): Promise<void> {
@@ -682,6 +735,7 @@ async function buildLease(
   vm: ExeDevVmRecord,
   requestedCwd: string | undefined,
   resumedLease: boolean,
+  acquisitionId?: string,
 ): Promise<PluginEnvironmentLease> {
   const remote = await detectRemoteContext(config, vm);
   const remoteCwd = requestedCwd?.trim() || path.posix.join(remote.homeDir, "paperclip-workspace");
@@ -692,6 +746,7 @@ async function buildLease(
     metadata: {
       provider: "exe-dev",
       vmName: vm.name,
+      ...(acquisitionId ? { acquisitionId } : {}),
       sshDest: vm.sshDest,
       httpsUrl: vm.httpsUrl,
       region: vm.region,
@@ -718,6 +773,7 @@ function metadataVmRecord(params: {
     status: parseOptionalString(params.leaseMetadata?.status),
     region: parseOptionalString(params.leaseMetadata?.region),
     regionDisplay: parseOptionalString(params.leaseMetadata?.regionDisplay),
+    tags: [],
   };
 }
 
@@ -830,11 +886,13 @@ const plugin = definePlugin({
     params: PluginEnvironmentAcquireLeaseParams,
   ): Promise<PluginEnvironmentLease> {
     const config = parseDriverConfig(params.config);
-    const vm = await createVm(config, params);
+    const { vm, created } = await acquireVm(config, params);
     try {
-      return await buildLease(config, vm, params.requestedCwd, false);
+      return await buildLease(config, vm, params.requestedCwd, false, params.acquisitionId);
     } catch (error) {
-      await deleteVm(config, vm.name).catch(() => undefined);
+      if (created) {
+        await deleteVm(config, vm.name).catch(() => undefined);
+      }
       throw error;
     }
   },

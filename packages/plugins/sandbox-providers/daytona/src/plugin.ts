@@ -191,8 +191,10 @@ function buildResources(config: DaytonaDriverConfig): Resources | undefined {
 function buildCreateParams(
   config: DaytonaDriverConfig,
   labels: Record<string, string>,
+  name?: string,
 ): CreateSandboxFromImageParams | CreateSandboxFromSnapshotParams {
   const base: CreateSandboxBaseParams = {
+    name,
     labels,
     language: config.language ?? undefined,
     autoStopInterval: config.autoStopInterval ?? undefined,
@@ -232,6 +234,7 @@ function validateRuntimeResourceRequest(config: DaytonaDriverConfig): string | n
 function buildSandboxLabels(input: {
   companyId: string;
   environmentId: string;
+  acquisitionId?: string;
   runId?: string;
   setupSessionId?: string;
   purpose?: string;
@@ -242,6 +245,7 @@ function buildSandboxLabels(input: {
     "paperclip-company-id": input.companyId,
     "paperclip-environment-id": input.environmentId,
     "paperclip-reuse-lease": input.reuseLease ? "true" : "false",
+    ...(input.acquisitionId ? { "paperclip-acquisition-id": input.acquisitionId } : {}),
     ...(input.runId ? { "paperclip-run-id": input.runId } : {}),
     ...(input.setupSessionId ? { "paperclip-setup-session-id": input.setupSessionId } : {}),
     ...(input.purpose ? { "paperclip-purpose": input.purpose } : {}),
@@ -426,6 +430,7 @@ async function verifyWorkspaceSentinel(input: {
 function leaseMetadata(input: {
   config: DaytonaDriverConfig;
   sandbox: Sandbox;
+  acquisitionId?: string;
   shellCommand: "bash" | "sh";
   remoteCwd: string;
   resumedLease: boolean;
@@ -437,6 +442,7 @@ function leaseMetadata(input: {
     sandboxId: input.sandbox.id,
     sandboxName: input.sandbox.name,
     sandboxState: input.sandbox.state ?? null,
+    ...(input.acquisitionId ? { acquisitionId: input.acquisitionId } : {}),
     image: input.config.image,
     snapshot: input.config.snapshot,
     target: input.sandbox.target,
@@ -690,6 +696,63 @@ async function createSandbox(
   return sandbox;
 }
 
+function acquisitionSandboxName(acquisitionId: string): string {
+  const digest = createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32);
+  return `pc-acq-${digest}`;
+}
+
+function assertAcquisitionSandboxOwnership(sandbox: Sandbox, acquisitionId: string): void {
+  const labels = (sandbox as Sandbox & { labels?: Record<string, string> }).labels;
+  if (labels?.["paperclip-acquisition-id"] !== acquisitionId) {
+    throw new Error(
+      `Refusing to adopt Daytona sandbox ${sandbox.name}: acquisition ownership does not match ${acquisitionId}.`,
+    );
+  }
+}
+
+async function acquireSandbox(
+  params: PluginEnvironmentAcquireLeaseParams,
+  config: DaytonaDriverConfig,
+): Promise<{ sandbox: Sandbox; created: boolean }> {
+  if (!params.acquisitionId) {
+    return { sandbox: await createSandbox(params, config), created: true };
+  }
+  const resourceRequestError = validateRuntimeResourceRequest(config);
+  if (resourceRequestError) {
+    throw new Error(resourceRequestError);
+  }
+
+  const client = createDaytonaClient(config);
+  const name = acquisitionSandboxName(params.acquisitionId);
+  const existing = await getSandboxOrNull(config, name);
+  if (existing) {
+    assertAcquisitionSandboxOwnership(existing, params.acquisitionId);
+    await ensureSandboxStarted(existing, toTimeoutSeconds(config.timeoutMs));
+    return { sandbox: existing, created: false };
+  }
+
+  const createParams = buildCreateParams(config, buildSandboxLabels({
+    companyId: params.companyId,
+    environmentId: params.environmentId,
+    acquisitionId: params.acquisitionId,
+    runId: params.runId,
+    reuseLease: config.reuseLease,
+  }), name);
+
+  try {
+    const sandbox = await client.create(createParams, {
+      timeout: toTimeoutSeconds(config.timeoutMs),
+    });
+    return { sandbox, created: true };
+  } catch (error) {
+    const reconciled = await getSandboxOrNull(config, name);
+    if (!reconciled) throw error;
+    assertAcquisitionSandboxOwnership(reconciled, params.acquisitionId);
+    await ensureSandboxStarted(reconciled, toTimeoutSeconds(config.timeoutMs));
+    return { sandbox: reconciled, created: false };
+  }
+}
+
 async function getSandbox(config: DaytonaDriverConfig, sandboxId: string): Promise<Sandbox> {
   const client = createDaytonaClient(config);
   return await client.get(sandboxId);
@@ -888,7 +951,7 @@ const plugin = definePlugin({
     params: PluginEnvironmentAcquireLeaseParams,
   ): Promise<PluginEnvironmentLease> {
     const config = parseDriverConfig(params.config);
-    const sandbox = await createSandbox(params, config);
+    const { sandbox, created } = await acquireSandbox(params, config);
     try {
       const remoteCwd = await resolveSandboxWorkingDirectory(sandbox);
       const shellCommand = await detectSandboxShellCommand(sandbox, toTimeoutSeconds(config.timeoutMs));
@@ -904,6 +967,7 @@ const plugin = definePlugin({
         metadata: leaseMetadata({
           config,
           sandbox,
+          acquisitionId: params.acquisitionId,
           shellCommand,
           remoteCwd,
           resumedLease: false,
@@ -911,7 +975,9 @@ const plugin = definePlugin({
         }),
       };
     } catch (error) {
-      await sandbox.delete(toTimeoutSeconds(config.timeoutMs)).catch(() => undefined);
+      if (created) {
+        await sandbox.delete(toTimeoutSeconds(config.timeoutMs)).catch(() => undefined);
+      }
       throw error;
     }
   },
