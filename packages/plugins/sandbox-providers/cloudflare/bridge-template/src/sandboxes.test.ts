@@ -214,6 +214,28 @@ describe("durable lease ownership", () => {
     });
   });
 
+  it("prunes expired execution fences when a new execution starts", async () => {
+    const activeExecution = {
+      executionId: "execution-active",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const record: LeaseOwnershipRecord = {
+      ...ownership(),
+      activeExecutions: [
+        { executionId: "execution-expired", expiresAt: new Date(Date.now() - 1).toISOString() },
+        activeExecution,
+      ],
+    };
+    const { sandbox } = createOwnershipSandbox(record);
+    const identity = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
+    const expiresAt = new Date(Date.now() + 120_000).toISOString();
+
+    expect(await sandbox.beginLeaseExecution(identity, "execution-new", expiresAt)).toMatchObject({
+      status: "started",
+      ownership: { activeExecutions: [activeExecution, { executionId: "execution-new", expiresAt }] },
+    });
+  });
+
   it("atomically completes an execution fence and begins lease destruction", async () => {
     const record: LeaseOwnershipRecord = {
       ...ownership(),

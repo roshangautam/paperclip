@@ -241,7 +241,9 @@ export class Sandbox extends CloudflareSandbox {
       if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
       if (stored.state === "destroying") return { status: "destroying", ownership: stored };
 
-      const activeExecutions = stored.activeExecutions ?? [];
+      const now = Date.now();
+      const activeExecutions = (stored.activeExecutions ?? [])
+        .filter((execution) => Date.parse(execution.expiresAt) > now);
       if (activeExecutions.some((execution) => execution.executionId === executionId)) {
         return { status: "replayed", ownership: stored };
       }
