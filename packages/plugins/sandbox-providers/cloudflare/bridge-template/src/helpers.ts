@@ -8,15 +8,18 @@ export function normalizeLeaseIdPart(input: string): string {
 }
 
 export function buildLeaseSandboxId(input: {
+  acquisitionId?: string;
   environmentId: string;
+  reuseScopeId?: string;
   runId: string;
   reuseLease: boolean;
   normalizeId: boolean;
-  randomId?: string;
 }): string {
   const base = input.reuseLease
-    ? `pc-env-${input.environmentId}`
-    : `pc-${input.runId}-${input.randomId ?? crypto.randomUUID().slice(0, 8)}`;
+    ? input.reuseScopeId
+      ? `pc-scope-${input.reuseScopeId}`
+      : `pc-env-${input.environmentId}`
+    : `pc-acq-${input.acquisitionId ?? input.runId}`;
   return input.normalizeId ? normalizeLeaseIdPart(base) : base;
 }
 

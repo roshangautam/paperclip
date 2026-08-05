@@ -1,7 +1,6 @@
-import type { Sandbox as CloudflareSandbox } from "@cloudflare/sandbox";
 import { isAuthorizedRequest } from "./auth.js";
 import { executeInSandbox } from "./exec.js";
-import { shellQuote } from "./helpers.js";
+import { isTimeoutError, shellQuote } from "./helpers.js";
 import {
   buildLeaseSandboxId,
   buildSentinelPath,
@@ -13,6 +12,9 @@ import {
   toErrorResponse,
   toJsonResponse,
   type BridgeEnv,
+  type LeaseOwnershipIdentity,
+  type LeaseOwnershipRecord,
+  type Sandbox,
 } from "./sandboxes.js";
 import type { SessionStrategy } from "./sessions.js";
 
@@ -27,7 +29,9 @@ interface ProbeRequestBody {
 }
 
 interface AcquireLeaseRequestBody extends ProbeRequestBody {
+  acquisitionId?: string;
   environmentId?: string;
+  reuseScopeId?: string;
   runId?: string;
   issueId?: string | null;
   reuseLease?: boolean;
@@ -35,16 +39,23 @@ interface AcquireLeaseRequestBody extends ProbeRequestBody {
 
 interface ResumeLeaseRequestBody extends ProbeRequestBody {
   providerLeaseId?: string;
+  acquisitionId?: string;
 }
 
-interface ReleaseLeaseRequestBody {
+interface ReleaseLeaseRequestBody extends ProbeRequestBody {
   providerLeaseId?: string;
+  acquisitionId?: string;
   reuseLease?: boolean;
-  keepAlive?: boolean;
+}
+
+interface DestroyLeaseRequestBody extends ProbeRequestBody {
+  providerLeaseId?: string;
+  acquisitionId?: string;
 }
 
 interface ExecuteRequestBody {
   providerLeaseId?: string;
+  acquisitionId?: string;
   command?: string;
   args?: string[];
   cwd?: string;
@@ -55,6 +66,10 @@ interface ExecuteRequestBody {
   sessionStrategy?: SessionStrategy;
   sessionId?: string;
 }
+
+const EXECUTION_FENCE_RENEW_INTERVAL_MS = 15_000;
+const EXECUTION_FENCE_TTL_MS = EXECUTION_FENCE_RENEW_INTERVAL_MS * 4;
+const SENTINEL_OWNERSHIP_MAX_BYTES = 4_096;
 
 function readBoolean(value: unknown, fallback: boolean): boolean {
   return value === undefined ? fallback : value === true;
@@ -71,6 +86,22 @@ function readInteger(value: unknown, fallback: number): number {
 
 function readSessionStrategy(value: unknown): SessionStrategy {
   return value === "default" ? "default" : "named";
+}
+
+function buildAcquisitionFingerprint(input: {
+  environmentId: string;
+  runId: string;
+  issueId: string | null;
+  remoteCwd: string;
+  sessionStrategy: SessionStrategy;
+  sessionId: string;
+  keepAlive: boolean;
+  sleepAfter: string;
+  normalizeId: boolean;
+  reuseLease: boolean;
+  reuseScopeId: string | null;
+}): string {
+  return JSON.stringify(input);
 }
 
 async function readJson<T>(request: Request): Promise<T> {
@@ -91,7 +122,7 @@ function toSseResponse(stream: ReadableStream<Uint8Array>): Response {
 }
 
 async function execLeaseUtility(
-  sandbox: CloudflareSandbox,
+  sandbox: Sandbox,
   options: {
     remoteCwd: string;
     sessionStrategy: SessionStrategy;
@@ -125,7 +156,7 @@ function requireZeroExit(action: string, result: { exitCode: number | null; time
 }
 
 async function ensureWorkspace(
-  sandbox: CloudflareSandbox,
+  sandbox: Sandbox,
   options: {
     remoteCwd: string;
     sessionStrategy: SessionStrategy;
@@ -137,8 +168,8 @@ async function ensureWorkspace(
   requireZeroExit(`ensure workspace ${options.remoteCwd}`, result);
 }
 
-async function writeSentinel(
-  sandbox: CloudflareSandbox,
+async function writeLegacySentinel(
+  sandbox: Sandbox,
   input: {
     providerLeaseId: string;
     remoteCwd: string;
@@ -150,7 +181,7 @@ async function writeSentinel(
     resumedLease: boolean;
     timeoutMs: number;
   },
-) {
+): Promise<void> {
   const sentinelPayload = JSON.stringify({
     provider: "cloudflare",
     providerLeaseId: input.providerLeaseId,
@@ -168,32 +199,446 @@ async function writeSentinel(
     sandbox,
     input,
     "sh",
-    [
-      "-c",
-      `mkdir -p ${shellQuote(input.remoteCwd)} && printf '%s\\n' ${shellQuote(sentinelPayload)} > ${shellQuote(sentinelPath)}`,
-    ],
+    ["-c", `mkdir -p ${shellQuote(input.remoteCwd)} && printf '%s\\n' ${shellQuote(sentinelPayload)} > ${shellQuote(sentinelPath)}`],
     "/",
   );
   requireZeroExit(`write sentinel ${sentinelPath}`, result);
 }
 
-async function verifySentinel(
-  sandbox: CloudflareSandbox,
+async function writeSentinelMirror(
+  sandbox: Sandbox,
   input: {
+    providerLeaseId: string;
+    acquisitionId: string;
+    acquisitionFingerprint: string;
+    remoteCwd: string;
+    sessionStrategy: SessionStrategy;
+    sessionId: string;
+    keepAlive: boolean;
+    sleepAfter: string;
+    normalizeId: boolean;
+    resumedLease: boolean;
+    timeoutMs: number;
+  },
+): Promise<void> {
+  const sentinelPayload = JSON.stringify({
+    provider: "cloudflare",
+    providerLeaseId: input.providerLeaseId,
+    acquisitionId: input.acquisitionId,
+    acquisitionFingerprint: input.acquisitionFingerprint,
+    remoteCwd: input.remoteCwd,
+    sessionStrategy: input.sessionStrategy,
+    sessionId: input.sessionId,
+    keepAlive: input.keepAlive,
+    sleepAfter: input.sleepAfter,
+    normalizeId: input.normalizeId,
+    resumedLease: input.resumedLease,
+    updatedAt: new Date().toISOString(),
+  }, null, 2);
+  const sentinelPath = buildSentinelPath(input.remoteCwd);
+  const pendingPath = `${sentinelPath}.pending.${crypto.randomUUID()}`;
+  const script = [
+    "set -eu",
+    `mkdir -p ${shellQuote(input.remoteCwd)}`,
+    `pending_path=${shellQuote(pendingPath)}`,
+    `trap 'rm -f -- "$pending_path"' EXIT`,
+    `printf '%s\\n' ${shellQuote(sentinelPayload)} > "$pending_path"`,
+    `mv -- "$pending_path" ${shellQuote(sentinelPath)}`,
+  ].join("\n");
+  const result = await execLeaseUtility(
+    sandbox,
+    input,
+    "sh",
+    ["-c", script],
+    "/",
+  );
+  requireZeroExit(`write ownership mirror ${sentinelPath}`, result);
+}
+
+type SentinelOwnership =
+  | { status: "missing" | "invalid" }
+  | {
+      status: "owned";
+      acquisitionId: string | null;
+      acquisitionFingerprint: string;
+      legacy: boolean;
+    };
+
+async function readSentinelOwnership(
+  sandbox: Sandbox,
+  input: {
+    providerLeaseId: string;
     remoteCwd: string;
     sessionStrategy: SessionStrategy;
     sessionId: string;
     timeoutMs: number;
   },
-): Promise<boolean> {
+): Promise<SentinelOwnership> {
+  const sentinelPath = buildSentinelPath(input.remoteCwd);
   const result = await execLeaseUtility(
     sandbox,
     input,
     "sh",
-    ["-c", `test -s ${shellQuote(buildSentinelPath(input.remoteCwd))}`],
+    ["-c", `test ! -e ${shellQuote(sentinelPath)} || head -c ${SENTINEL_OWNERSHIP_MAX_BYTES + 1} ${shellQuote(sentinelPath)}`],
     "/",
   );
-  return !result.timedOut && (result.exitCode ?? 0) === 0;
+  requireZeroExit(`read sentinel ${sentinelPath}`, result);
+  if (new TextEncoder().encode(result.stdout).byteLength > SENTINEL_OWNERSHIP_MAX_BYTES) {
+    return { status: "invalid" };
+  }
+  if (!result.stdout.trim()) return { status: "missing" };
+  try {
+    const parsed = JSON.parse(result.stdout) as {
+      providerLeaseId?: unknown;
+      acquisitionId?: unknown;
+      acquisitionFingerprint?: unknown;
+      remoteCwd?: unknown;
+    };
+    if (parsed.providerLeaseId !== input.providerLeaseId || parsed.remoteCwd !== input.remoteCwd) {
+      return { status: "invalid" };
+    }
+    if (typeof parsed.acquisitionId === "string" && parsed.acquisitionId.length > 0) {
+      return {
+        status: "owned",
+        acquisitionId: parsed.acquisitionId,
+        acquisitionFingerprint:
+          typeof parsed.acquisitionFingerprint === "string" && parsed.acquisitionFingerprint.length > 0
+            ? parsed.acquisitionFingerprint
+            : `migrated:${input.providerLeaseId}:${parsed.acquisitionId}`,
+        legacy: false,
+      };
+    }
+    return parsed.acquisitionId === undefined
+      ? {
+          status: "owned",
+          acquisitionId: null,
+          acquisitionFingerprint: `legacy:${input.providerLeaseId}`,
+          legacy: true,
+        }
+      : { status: "invalid" };
+  } catch {
+    return { status: "invalid" };
+  }
+}
+
+function ownershipConflict(message: string): Response {
+  return toErrorResponse(409, "acquisition_conflict", message);
+}
+
+async function migrateSentinelOwnership(
+  sandbox: Sandbox,
+  input: {
+    providerLeaseId: string;
+    requestedAcquisitionId: string;
+    remoteCwd: string;
+    sessionStrategy: SessionStrategy;
+    sessionId: string;
+    timeoutMs: number;
+  },
+): Promise<{ status: "owned"; ownership: LeaseOwnershipRecord } | { status: "conflict" }> {
+  const sentinel = await readSentinelOwnership(sandbox, input);
+  if (sentinel.status !== "owned") return { status: "conflict" };
+
+  let acquisitionId = sentinel.acquisitionId;
+  if (acquisitionId === null) {
+    acquisitionId = input.requestedAcquisitionId || `legacy:${input.providerLeaseId}`;
+  } else if (!input.requestedAcquisitionId || input.requestedAcquisitionId !== acquisitionId) {
+    return { status: "conflict" };
+  }
+
+  const claim = await sandbox.claimLeaseOwnership({
+    providerLeaseId: input.providerLeaseId,
+    acquisitionId,
+    acquisitionFingerprint: sentinel.acquisitionFingerprint,
+  });
+  if (claim.status !== "claimed" && claim.status !== "replayed") return { status: "conflict" };
+  return { status: "owned", ownership: claim.ownership };
+}
+
+async function resolveOwnedLease(
+  sandbox: Sandbox,
+  input: {
+    providerLeaseId: string;
+    requestedAcquisitionId: string;
+    remoteCwd: string;
+    sessionStrategy: SessionStrategy;
+    sessionId: string;
+    timeoutMs: number;
+    allowSentinelMigration?: boolean;
+    allowDestroying?: boolean;
+  },
+): Promise<{ status: "owned"; ownership: LeaseOwnershipRecord } | { status: "conflict" }> {
+  const ownership = await sandbox.readLeaseOwnership();
+  if (ownership.status === "owned" || (input.allowDestroying && ownership.status === "destroying")) {
+    const legacyAcquisitionId = `legacy:${input.providerLeaseId}`;
+    const expectedAcquisitionId = input.requestedAcquisitionId
+      || (input.allowSentinelMigration && ownership.ownership.acquisitionFingerprint === legacyAcquisitionId
+        ? legacyAcquisitionId
+        : "");
+    if (
+      ownership.ownership.providerLeaseId !== input.providerLeaseId
+      || ownership.ownership.acquisitionId !== expectedAcquisitionId
+    ) {
+      return { status: "conflict" };
+    }
+    return { status: "owned", ownership: ownership.ownership };
+  }
+  if (ownership.status !== "missing" || !input.allowSentinelMigration) return { status: "conflict" };
+  return await migrateSentinelOwnership(sandbox, input);
+}
+
+type DestroyOwnedLeaseResult = "destroyed" | "completed" | "in_progress" | "missing" | "invalid" | "conflict";
+
+async function destroyOwnedLease(
+  sandbox: Sandbox,
+  identity: LeaseOwnershipIdentity,
+): Promise<DestroyOwnedLeaseResult> {
+  const destruction = await sandbox.destroyLease(identity, crypto.randomUUID());
+  return destruction.status === "started" ? "in_progress" : destruction.status;
+}
+
+async function destroyOwnedLeaseAfterExecution(
+  sandbox: Sandbox,
+  identity: LeaseOwnershipIdentity,
+  executionId: string,
+): Promise<DestroyOwnedLeaseResult> {
+  const destruction = await sandbox.destroyLease(identity, crypto.randomUUID(), executionId);
+  return destruction.status === "started" ? "in_progress" : destruction.status;
+}
+
+async function destroyRequestedLease(
+  sandbox: Sandbox,
+  input: {
+    providerLeaseId: string;
+    requestedAcquisitionId: string;
+    remoteCwd: string;
+    sessionStrategy: SessionStrategy;
+    sessionId: string;
+    timeoutMs: number;
+  },
+): Promise<DestroyOwnedLeaseResult> {
+  if (input.requestedAcquisitionId) {
+    return await destroyOwnedLease(sandbox, {
+      providerLeaseId: input.providerLeaseId,
+      acquisitionId: input.requestedAcquisitionId,
+    });
+  }
+
+  const legacyIdentity = {
+    providerLeaseId: input.providerLeaseId,
+    acquisitionId: `legacy:${input.providerLeaseId}`,
+  };
+  const legacyRetry = await destroyOwnedLease(sandbox, legacyIdentity);
+  if (legacyRetry !== "missing") return legacyRetry;
+
+  const migrated = await resolveOwnedLease(sandbox, {
+    ...input,
+    allowSentinelMigration: true,
+  });
+  if (migrated.status === "conflict") return "conflict";
+  return await destroyOwnedLease(sandbox, migrated.ownership);
+}
+
+async function completeLeaseExecution(
+  sandbox: Sandbox,
+  identity: LeaseOwnershipIdentity,
+  executionId: string,
+  completeSetup = false,
+): Promise<void> {
+  const completed = await sandbox.completeLeaseExecution(identity, executionId, completeSetup);
+  if (completed.status === "destruction_started") {
+    const destructionId = completed.ownership.destructionId;
+    if (!destructionId) {
+      throw new Error(`Cloudflare sandbox ${identity.providerLeaseId} entered destruction without an operation ID.`);
+    }
+    const destruction = await sandbox.destroyLease(identity, destructionId);
+    if (destruction.status !== "destroyed" && destruction.status !== "completed") {
+      throw new Error(
+        `Cloudflare sandbox ${identity.providerLeaseId} entered destruction, but coordinated destruction failed (${destruction.status}).`,
+      );
+    }
+    return;
+  }
+  if (completed.status !== "completed") {
+    throw new Error(
+      `Cloudflare sandbox ${identity.providerLeaseId} execution completed, but its ownership fence could not be released (${completed.status}).`,
+    );
+  }
+}
+
+function executionFenceExpiry(): string {
+  return new Date(Date.now() + EXECUTION_FENCE_TTL_MS).toISOString();
+}
+
+interface ExecutionFenceRenewal {
+  failure: Promise<never>;
+  stop: () => Promise<void>;
+}
+
+function startExecutionFenceRenewal(
+  sandbox: Sandbox,
+  identity: LeaseOwnershipIdentity,
+  executionId: string,
+): ExecutionFenceRenewal {
+  let stopped = false;
+  let renewalFailure: unknown;
+  let rejectFailure!: (reason?: unknown) => void;
+  const failure = new Promise<never>((_resolve, reject) => {
+    rejectFailure = reject;
+  });
+  let pendingRenewal = Promise.resolve();
+  const timer = setInterval(() => {
+    pendingRenewal = pendingRenewal
+      .then(async () => {
+        const renewed = await sandbox.renewLeaseExecution(
+          identity,
+          executionId,
+          executionFenceExpiry(),
+        );
+        if (renewed.status !== "renewed") {
+          throw new Error(
+            `Cloudflare sandbox ${identity.providerLeaseId} execution fence could not be renewed (${renewed.status}).`,
+          );
+        }
+      })
+      .catch((error) => {
+        if (renewalFailure === undefined) {
+          renewalFailure = error;
+          rejectFailure(error);
+        }
+      });
+  }, EXECUTION_FENCE_RENEW_INTERVAL_MS);
+
+  return {
+    failure,
+    stop: async () => {
+      if (!stopped) {
+        stopped = true;
+        clearInterval(timer);
+      }
+      await pendingRenewal;
+      if (renewalFailure !== undefined) throw renewalFailure;
+    },
+  };
+}
+
+async function finalizeLeaseExecution(
+  sandbox: Sandbox,
+  identity: LeaseOwnershipIdentity,
+  executionId: string,
+  renewal: ExecutionFenceRenewal,
+  destroyAfterExecution = false,
+  completeSetup = false,
+): Promise<void> {
+  let renewalError: unknown;
+  try {
+    await renewal.stop();
+  } catch (error) {
+    renewalError = error;
+  }
+  try {
+    if (destroyAfterExecution || renewalError !== undefined) {
+      const destroyed = await destroyOwnedLeaseAfterExecution(sandbox, identity, executionId);
+      if (destroyed !== "destroyed" && destroyed !== "completed" && destroyed !== "in_progress") {
+        throw new Error(
+          `Cloudflare sandbox ${identity.providerLeaseId} timed out, but coordinated destruction failed (${destroyed}).`,
+        );
+      }
+    } else {
+      await completeLeaseExecution(sandbox, identity, executionId, completeSetup);
+    }
+  } catch (cleanupError) {
+    if (renewalError !== undefined) {
+      throw new AggregateError(
+        [renewalError, cleanupError],
+        `Cloudflare sandbox ${identity.providerLeaseId} execution fence renewal and cleanup failed.`,
+      );
+    }
+    throw cleanupError;
+  }
+  if (renewalError !== undefined) throw renewalError;
+}
+
+async function runFencedOperation<T>(
+  sandbox: Sandbox,
+  identity: LeaseOwnershipIdentity,
+  executionId: string,
+  renewal: ExecutionFenceRenewal,
+  operation: () => Promise<T>,
+  options?: {
+    destroyAfterExecution?: (result: T) => boolean;
+    destroyOnError?: boolean | ((error: unknown) => boolean);
+    completeSetupOnSuccess?: boolean;
+  },
+): Promise<T> {
+  let result: T;
+  let renewalFailed = false;
+  const operationPromise = Promise.resolve().then(operation);
+  try {
+    result = await Promise.race([
+      operationPromise,
+      renewal.failure.catch(async (error) => {
+        renewalFailed = true;
+        let quarantineError: unknown;
+        try {
+          const quarantined = await sandbox.quarantineLeaseExecution(
+            identity,
+            executionId,
+            crypto.randomUUID(),
+          );
+          if (quarantined.status !== "quarantined" && quarantined.status !== "in_progress") {
+            throw new Error(
+              `Cloudflare sandbox ${identity.providerLeaseId} could not be quarantined after execution fence renewal failed (${quarantined.status}).`,
+            );
+          }
+        } catch (quarantineFailure) {
+          quarantineError = quarantineFailure;
+        }
+        // The Cloudflare execution API does not expose an abort primitive.
+        // Quarantine ownership immediately, but keep the execution fence and
+        // sandbox intact until the in-flight operation settles.
+        await operationPromise.catch(() => undefined);
+        if (quarantineError !== undefined) {
+          throw new AggregateError(
+            [error, quarantineError],
+            `Cloudflare sandbox ${identity.providerLeaseId} execution fence renewal and quarantine failed.`,
+          );
+        }
+        throw error;
+      }),
+    ]);
+  } catch (error) {
+    try {
+      await finalizeLeaseExecution(
+        sandbox,
+        identity,
+        executionId,
+        renewalFailed
+          ? { ...renewal, stop: async () => { await renewal.stop().catch(() => undefined); } }
+          : renewal,
+        (typeof options?.destroyOnError === "function"
+          ? options.destroyOnError(error)
+          : options?.destroyOnError ?? false) || renewalFailed,
+      );
+    } catch (cleanupError) {
+      const operationMessage = error instanceof Error ? error.message : String(error);
+      const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      throw new AggregateError(
+        [error, cleanupError],
+        `Cloudflare sandbox ${identity.providerLeaseId} operation failed (${operationMessage}), and execution fence cleanup failed (${cleanupMessage}).`,
+      );
+    }
+    throw error;
+  }
+  await finalizeLeaseExecution(
+    sandbox,
+    identity,
+    executionId,
+    renewal,
+    options?.destroyAfterExecution?.(result) ?? false,
+    options?.completeSetupOnSuccess ?? false,
+  );
+  return result;
 }
 
 export async function handleBridgeRequest(request: Request, env: BridgeEnv): Promise<Response> {
@@ -201,8 +646,10 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     return toErrorResponse(401, "unauthorized", "Missing or invalid bridge bearer token.");
   }
 
-  const url = new URL(request.url);
-  const pathname = url.pathname.replace(/\/+$/, "");
+  const rawPathname = new URL(request.url).pathname.replace(/\/+$/, "");
+  const isV2 = rawPathname.startsWith("/api/paperclip-sandbox/v2/");
+  const pathname = rawPathname
+    .replace(/^\/api\/paperclip-sandbox\/v2(?=\/)/, "/api/paperclip-sandbox/v1");
 
   if (request.method === "GET" && pathname === "/api/paperclip-sandbox/v1/health") {
     return toJsonResponse({
@@ -210,6 +657,8 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
       provider: "cloudflare",
       bridgeVersion: "0.1.0",
       capabilities: {
+        acquisitionReplay: true,
+        scopedReuse: true,
         reuseLease: true,
         namedSessions: true,
         previewUrls: false,
@@ -228,7 +677,7 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
     const sandboxId = buildLeaseSandboxId({
       environmentId: "probe",
-      runId: `probe-${Date.now()}`,
+      runId: `probe-${Date.now()}-${crypto.randomUUID()}`,
       reuseLease: false,
       normalizeId,
     });
@@ -256,14 +705,23 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
         },
       });
     } finally {
-      await sandbox.destroy().catch(() => undefined);
+      await sandbox.destroy();
     }
   }
 
   if (request.method === "POST" && pathname === "/api/paperclip-sandbox/v1/leases/acquire") {
     const body = await readJson<AcquireLeaseRequestBody>(request);
-    if (!body.environmentId || !body.runId) {
-      return toErrorResponse(400, "invalid_request", "environmentId and runId are required.");
+    const acquisitionId = readString(body.acquisitionId, "");
+    const environmentId = readString(body.environmentId, "");
+    const runId = readString(body.runId, "");
+    if (!environmentId || !runId || (isV2 && !acquisitionId)) {
+      return toErrorResponse(
+        400,
+        "invalid_request",
+        isV2
+          ? "acquisitionId, environmentId, and runId are required."
+          : "environmentId and runId are required.",
+      );
     }
 
     const reuseLease = readBoolean(body.reuseLease, false);
@@ -274,43 +732,160 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const sessionStrategy = readSessionStrategy(body.sessionStrategy);
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
+    const reuseScopeId = readString(body.reuseScopeId, "") || null;
+    if (reuseLease && !/^[a-f0-9]{32}$/.test(reuseScopeId ?? "")) {
+      return toErrorResponse(
+        400,
+        "invalid_request",
+        "reuseScopeId must be a 32-character lowercase hex string when reuseLease is true.",
+      );
+    }
+    if (!isV2 && !acquisitionId) {
+      const providerLeaseId = buildLeaseSandboxId({
+        environmentId,
+        runId,
+        reuseLease,
+        normalizeId,
+      });
+      const sandbox = await resolveSandbox(env, providerLeaseId, { keepAlive, sleepAfter, normalizeId });
+      if ((await sandbox.readLeaseOwnership()).status !== "missing") {
+        return ownershipConflict(
+          `Refusing legacy acquisition of Cloudflare sandbox ${providerLeaseId}: authoritative ownership already exists.`,
+        );
+      }
+      try {
+        await applySandboxKeepAlive(sandbox, keepAlive);
+        await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
+        await writeLegacySentinel(sandbox, {
+          providerLeaseId,
+          remoteCwd,
+          sessionStrategy,
+          sessionId,
+          keepAlive,
+          sleepAfter,
+          normalizeId,
+          resumedLease: false,
+          timeoutMs,
+        });
+      } catch (error) {
+        if (!reuseLease) await sandbox.destroy().catch(() => undefined);
+        throw error;
+      }
+      return toJsonResponse({
+        providerLeaseId,
+        metadata: {
+          provider: "cloudflare",
+          remoteCwd,
+          sandboxId: providerLeaseId,
+          sessionStrategy,
+          sessionId,
+          keepAlive,
+          sleepAfter,
+          normalizeId,
+          resumedLease: false,
+        },
+      });
+    }
+    const acquisitionFingerprint = buildAcquisitionFingerprint({
+      environmentId,
+      runId,
+      issueId: readString(body.issueId, "") || null,
+      remoteCwd,
+      sessionStrategy,
+      sessionId,
+      keepAlive,
+      sleepAfter,
+      normalizeId,
+      reuseLease,
+      reuseScopeId,
+    });
     const providerLeaseId = buildLeaseSandboxId({
-      environmentId: body.environmentId,
-      runId: body.runId,
+      acquisitionId,
+      environmentId,
+      reuseScopeId: reuseScopeId ?? undefined,
+      runId,
       reuseLease,
       normalizeId,
     });
     const sandbox = await resolveSandbox(env, providerLeaseId, { keepAlive, sleepAfter, normalizeId });
-    // Guard against orphaning a keepAlive sandbox if workspace setup throws
-    // after creation: Paperclip never sees the lease ID in that case, so it
-    // can't clean up. Destroy here unless this is a reuseLease handshake
-    // (where the sandbox may have been created by a prior acquire and we
-    // shouldn't destroy it on a transient setup failure during reattachment).
+    let claimedOwnership: LeaseOwnershipRecord | null = null;
     try {
-      await applySandboxKeepAlive(sandbox, keepAlive);
-      await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
-      await writeSentinel(sandbox, {
+      const acquisitionExecutionId = crypto.randomUUID();
+      const claim = await sandbox.claimLeaseOwnership({
         providerLeaseId,
-        remoteCwd,
-        sessionStrategy,
-        sessionId,
-        keepAlive,
-        sleepAfter,
-        normalizeId,
-        resumedLease: false,
-        timeoutMs,
+        acquisitionId,
+        acquisitionFingerprint,
+        setupExecutionId: acquisitionExecutionId,
+        setupExpiresAt: executionFenceExpiry(),
       });
-    } catch (err) {
-      if (!reuseLease) {
-        await sandbox.destroy().catch(() => undefined);
+      if (claim.status === "in_progress") {
+        return toErrorResponse(
+          503,
+          "acquisition_in_progress",
+          `Cloudflare sandbox ${providerLeaseId} setup is still in progress.`,
+          { providerLeaseId },
+        );
       }
-      throw err;
+      if (claim.status !== "claimed" && claim.status !== "replayed") {
+        return ownershipConflict(
+          `Refusing to adopt Cloudflare sandbox ${providerLeaseId}: acquisition ownership does not match ${acquisitionId}.`,
+        );
+      }
+      if (claim.status === "claimed") {
+        claimedOwnership = claim.ownership;
+        const stopAcquisitionFenceRenewal = startExecutionFenceRenewal(
+          sandbox,
+          claim.ownership,
+          acquisitionExecutionId,
+        );
+        await runFencedOperation(
+          sandbox,
+          claim.ownership,
+          acquisitionExecutionId,
+          stopAcquisitionFenceRenewal,
+          async () => {
+            await applySandboxKeepAlive(sandbox, keepAlive);
+            await writeSentinelMirror(sandbox, {
+              providerLeaseId,
+              acquisitionId,
+              acquisitionFingerprint,
+              remoteCwd,
+              sessionStrategy,
+              sessionId,
+              keepAlive,
+              sleepAfter,
+              normalizeId,
+              resumedLease: false,
+              timeoutMs,
+            });
+          },
+          { destroyOnError: true, completeSetupOnSuccess: true },
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      let cleanupFailed = false;
+      if (claimedOwnership) {
+        try {
+          const destroyed = await destroyOwnedLease(sandbox, claimedOwnership);
+          cleanupFailed = destroyed !== "destroyed" && destroyed !== "completed";
+        } catch {
+          cleanupFailed = true;
+        }
+      }
+      return toErrorResponse(
+        500,
+        "acquisition_failed",
+        message,
+        cleanupFailed ? { providerLeaseId } : undefined,
+      );
     }
 
     return toJsonResponse({
       providerLeaseId,
       metadata: {
         provider: "cloudflare",
+        acquisitionId,
         remoteCwd,
         sandboxId: providerLeaseId,
         sessionStrategy,
@@ -318,6 +893,8 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
         keepAlive,
         sleepAfter,
         normalizeId,
+        reuseLease,
+        reuseScopeId,
         resumedLease: false,
       },
     });
@@ -328,6 +905,7 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     if (!body.providerLeaseId) {
       return toErrorResponse(400, "invalid_request", "providerLeaseId is required.");
     }
+    const expectedAcquisitionId = readString(body.acquisitionId, "");
     const keepAlive = readBoolean(body.keepAlive, false);
     const sleepAfter = readString(body.sleepAfter, "10m");
     const normalizeId = readBoolean(body.normalizeId, true);
@@ -336,44 +914,138 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
     const sandbox = await resolveSandbox(env, body.providerLeaseId, { keepAlive, sleepAfter, normalizeId });
-    // Resume always reattaches to a providerLeaseId the operator already
-    // owns, so we deliberately do NOT destroy on failure here — the operator
-    // has the ID and can issue an explicit release/destroy. Calling
-    // `getSandbox` is idempotent on the Sandbox SDK side (no new sandbox is
-    // created), so a failed resume doesn't leak a *new* sandbox.
-    await applySandboxKeepAlive(sandbox, keepAlive);
-
-    if (!(await verifySentinel(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs }))) {
-      return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox state is no longer available.");
-    }
-
-    await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
-    await writeSentinel(sandbox, {
-      providerLeaseId: body.providerLeaseId,
-      remoteCwd,
-      sessionStrategy,
-      sessionId,
-      keepAlive,
-      sleepAfter,
-      normalizeId,
-      resumedLease: true,
-      timeoutMs,
-    });
-
-    return toJsonResponse({
-      providerLeaseId: body.providerLeaseId,
-      metadata: {
-        provider: "cloudflare",
+    if (!isV2 && !expectedAcquisitionId) {
+      if ((await sandbox.readLeaseOwnership()).status !== "missing") {
+        return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox state is no longer available.");
+      }
+      const sentinel = await readSentinelOwnership(sandbox, {
+        providerLeaseId: body.providerLeaseId,
         remoteCwd,
-        sandboxId: body.providerLeaseId,
+        sessionStrategy,
+        sessionId,
+        timeoutMs,
+      });
+      if (sentinel.status !== "owned" || !sentinel.legacy) {
+        return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox state is no longer available.");
+      }
+      await applySandboxKeepAlive(sandbox, keepAlive);
+      await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
+      await writeLegacySentinel(sandbox, {
+        providerLeaseId: body.providerLeaseId,
+        remoteCwd,
         sessionStrategy,
         sessionId,
         keepAlive,
         sleepAfter,
         normalizeId,
         resumedLease: true,
-      },
+        timeoutMs,
+      });
+      return toJsonResponse({
+        providerLeaseId: body.providerLeaseId,
+        metadata: {
+          provider: "cloudflare",
+          remoteCwd,
+          sandboxId: body.providerLeaseId,
+          sessionStrategy,
+          sessionId,
+          keepAlive,
+          sleepAfter,
+          normalizeId,
+          resumedLease: true,
+        },
+      });
+    }
+    // Resume always reattaches to a providerLeaseId the operator already
+    // owns, so we deliberately do NOT destroy on failure here — the operator
+    // has the ID and can issue an explicit release/destroy. Calling
+    // `getSandbox` is idempotent on the Sandbox SDK side (no new sandbox is
+    // created), so a failed resume doesn't leak a *new* sandbox.
+    const containerState = await sandbox.readContainerState();
+    if (containerState.status !== "running" && containerState.status !== "healthy") {
+      return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox state is no longer available.");
+    }
+    const resolvedOwnership = await resolveOwnedLease(sandbox, {
+      providerLeaseId: body.providerLeaseId,
+      requestedAcquisitionId: expectedAcquisitionId,
+      remoteCwd,
+      sessionStrategy,
+      sessionId,
+      timeoutMs,
+      allowSentinelMigration: true,
     });
+    if (resolvedOwnership.status === "conflict") {
+      return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox state is no longer available.");
+    }
+    const sentinelOwnership = await readSentinelOwnership(sandbox, {
+      providerLeaseId: body.providerLeaseId,
+      remoteCwd,
+      sessionStrategy,
+      sessionId,
+      timeoutMs,
+    });
+    const sentinelMatchesOwnership = sentinelOwnership.status === "owned"
+      && sentinelOwnership.acquisitionFingerprint === resolvedOwnership.ownership.acquisitionFingerprint
+      && (sentinelOwnership.legacy
+        ? sentinelOwnership.acquisitionId === null
+        : sentinelOwnership.acquisitionId === resolvedOwnership.ownership.acquisitionId);
+    if (!sentinelMatchesOwnership) {
+      return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox state is no longer available.");
+    }
+    const resumeExecutionId = crypto.randomUUID();
+    const resumeExecution = await sandbox.beginLeaseExecution(
+      resolvedOwnership.ownership,
+      resumeExecutionId,
+      executionFenceExpiry(),
+    );
+    if (resumeExecution.status !== "started" && resumeExecution.status !== "replayed") {
+      return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox ownership changed during resume.");
+    }
+    const stopResumeFenceRenewal = startExecutionFenceRenewal(
+      sandbox,
+      resolvedOwnership.ownership,
+      resumeExecutionId,
+    );
+    return await runFencedOperation(
+      sandbox,
+      resolvedOwnership.ownership,
+      resumeExecutionId,
+      stopResumeFenceRenewal,
+      async () => {
+        await applySandboxKeepAlive(sandbox, keepAlive);
+        await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
+        await writeSentinelMirror(sandbox, {
+          providerLeaseId: body.providerLeaseId!,
+          acquisitionId: resolvedOwnership.ownership.acquisitionId,
+          acquisitionFingerprint: resolvedOwnership.ownership.acquisitionFingerprint,
+          remoteCwd,
+          sessionStrategy,
+          sessionId,
+          keepAlive,
+          sleepAfter,
+          normalizeId,
+          resumedLease: true,
+          timeoutMs,
+        });
+
+        return toJsonResponse({
+          providerLeaseId: body.providerLeaseId,
+          metadata: {
+            provider: "cloudflare",
+            acquisitionId: resolvedOwnership.ownership.acquisitionId,
+            remoteCwd,
+            sandboxId: body.providerLeaseId,
+            sessionStrategy,
+            sessionId,
+            keepAlive,
+            sleepAfter,
+            normalizeId,
+            resumedLease: true,
+          },
+        });
+      },
+      { destroyOnError: (error) => sessionStrategy === "default" && isTimeoutError(error) },
+    );
   }
 
   if (request.method === "POST" && pathname === "/api/paperclip-sandbox/v1/leases/release") {
@@ -381,15 +1053,63 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     if (!body.providerLeaseId) {
       return toJsonResponse({ ok: true });
     }
-    if (readBoolean(body.reuseLease, false)) {
+    const reuseLease = readBoolean(body.reuseLease, false);
+    const acquisitionId = readString(body.acquisitionId, "");
+    if (!isV2 && !acquisitionId) {
+      if (reuseLease) return toJsonResponse({ ok: true });
+      const sandbox = await resolveSandbox(env, body.providerLeaseId, {
+        keepAlive: readBoolean(body.keepAlive, false),
+        sleepAfter: "10m",
+        normalizeId: true,
+      });
+      if ((await sandbox.readLeaseOwnership()).status !== "missing") {
+        return ownershipConflict(
+          `Refusing legacy release of Cloudflare sandbox ${body.providerLeaseId}: authoritative ownership already exists.`,
+        );
+      }
+      await sandbox.destroy().catch(() => undefined);
       return toJsonResponse({ ok: true });
     }
+    const remoteCwd = readString(body.requestedCwd, DEFAULT_REMOTE_CWD);
+    const sessionStrategy = readSessionStrategy(body.sessionStrategy);
+    const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
+    const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
     const sandbox = await resolveSandbox(env, body.providerLeaseId, {
       keepAlive: readBoolean(body.keepAlive, false),
       sleepAfter: "10m",
       normalizeId: true,
     });
-    await sandbox.destroy().catch(() => undefined);
+    if (reuseLease) {
+      const resolvedOwnership = await resolveOwnedLease(sandbox, {
+        providerLeaseId: body.providerLeaseId,
+        requestedAcquisitionId: acquisitionId,
+        remoteCwd,
+        sessionStrategy,
+        sessionId,
+        timeoutMs,
+      });
+      if (resolvedOwnership.status === "conflict") {
+        return ownershipConflict(`Refusing to release Cloudflare sandbox ${body.providerLeaseId}: acquisition ownership does not match.`);
+      }
+      const refreshed = await sandbox.updateLeaseOwnership(resolvedOwnership.ownership);
+      if (refreshed.status !== "updated") {
+        return ownershipConflict(`Refusing to release Cloudflare sandbox ${body.providerLeaseId}: acquisition ownership changed.`);
+      }
+      return toJsonResponse({ ok: true });
+    }
+    const destroyed = await destroyRequestedLease(sandbox, {
+      providerLeaseId: body.providerLeaseId,
+      requestedAcquisitionId: acquisitionId,
+      remoteCwd,
+      sessionStrategy,
+      sessionId,
+      timeoutMs,
+    });
+    if (destroyed !== "destroyed" && destroyed !== "completed") {
+      return ownershipConflict(
+        `Refusing to release Cloudflare sandbox ${body.providerLeaseId}: acquisition ownership does not match (${destroyed}).`,
+      );
+    }
     return toJsonResponse({ ok: true });
   }
 
@@ -398,27 +1118,115 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     if (providerLeaseId.length === 0) {
       return toErrorResponse(400, "invalid_request", "providerLeaseId path parameter is required.");
     }
+    const body = await readJson<DestroyLeaseRequestBody>(request).catch((): DestroyLeaseRequestBody => ({}));
+    const remoteCwd = readString(body.requestedCwd, DEFAULT_REMOTE_CWD);
+    const sessionStrategy = readSessionStrategy(body.sessionStrategy);
+    const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
+    const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
+    const acquisitionId = readString(body.acquisitionId, "");
     const sandbox = await resolveSandbox(env, providerLeaseId, {
       keepAlive: false,
       sleepAfter: "10m",
       normalizeId: true,
     });
-    await sandbox.destroy().catch(() => undefined);
+    if (!isV2 && !acquisitionId) {
+      if ((await sandbox.readLeaseOwnership()).status !== "missing") {
+        return ownershipConflict(
+          `Refusing legacy destruction of Cloudflare sandbox ${providerLeaseId}: authoritative ownership already exists.`,
+        );
+      }
+      await sandbox.destroy().catch(() => undefined);
+      return toJsonResponse({ ok: true });
+    }
+    const destroyed = await destroyRequestedLease(sandbox, {
+      providerLeaseId,
+      requestedAcquisitionId: acquisitionId,
+      remoteCwd,
+      sessionStrategy,
+      sessionId,
+      timeoutMs,
+    });
+    if (destroyed !== "destroyed" && destroyed !== "completed") {
+      return ownershipConflict(
+        `Refusing to destroy a Cloudflare sandbox owned by another acquisition (${destroyed}).`,
+      );
+    }
     return toJsonResponse({ ok: true });
   }
 
   if (request.method === "POST" && pathname === "/api/paperclip-sandbox/v1/exec") {
     const body = await readJson<ExecuteRequestBody>(request);
-    if (!body.providerLeaseId || !body.command) {
-      return toErrorResponse(400, "invalid_request", "providerLeaseId and command are required.");
+    const acquisitionId = readString(body.acquisitionId, "");
+    if (!body.providerLeaseId || !body.command || (isV2 && !acquisitionId)) {
+      return toErrorResponse(
+        400,
+        "invalid_request",
+        isV2
+          ? "providerLeaseId, acquisitionId, and command are required."
+          : "providerLeaseId and command are required.",
+      );
     }
     const sessionStrategy = readSessionStrategy(body.sessionStrategy);
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
+    const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
     const sandbox = await resolveSandbox(env, body.providerLeaseId, {
       keepAlive: false,
       sleepAfter: "10m",
       normalizeId: true,
     });
+    const executionIdentity = acquisitionId
+      ? { providerLeaseId: body.providerLeaseId, acquisitionId }
+      : null;
+    const executionId = executionIdentity ? crypto.randomUUID() : null;
+    let stopExecutionFenceRenewal: ExecutionFenceRenewal | null = null;
+    if (!executionIdentity && (await sandbox.readLeaseOwnership()).status !== "missing") {
+      return ownershipConflict(
+        `Refusing legacy execution in Cloudflare sandbox ${body.providerLeaseId}: authoritative ownership already exists.`,
+      );
+    }
+    if (executionIdentity && executionId) {
+      const execution = await sandbox.beginLeaseExecution(
+        executionIdentity,
+        executionId,
+        executionFenceExpiry(),
+      );
+      if (execution.status !== "started" && execution.status !== "replayed") {
+        return ownershipConflict(
+          `Refusing to execute in Cloudflare sandbox ${body.providerLeaseId}: acquisition ownership does not match.`,
+        );
+      }
+      stopExecutionFenceRenewal = startExecutionFenceRenewal(
+        sandbox,
+        executionIdentity,
+        executionId,
+      );
+    }
+    const runExecution = async (
+      onOutput?: (stream: "stdout" | "stderr", data: string) => void | Promise<void>,
+    ) => {
+      const operation = async () => await executeInSandbox({
+        sandbox,
+        command: body.command!,
+        args: Array.isArray(body.args) ? body.args.filter((value): value is string => typeof value === "string") : [],
+        cwd: typeof body.cwd === "string" ? body.cwd : undefined,
+        env: body.env,
+        stdin: body.stdin ?? null,
+        timeoutMs,
+        sessionStrategy,
+        sessionId,
+        onOutput,
+      });
+      return executionIdentity && executionId && stopExecutionFenceRenewal
+        ? await runFencedOperation(
+            sandbox,
+            executionIdentity,
+            executionId,
+            stopExecutionFenceRenewal,
+            operation,
+            { destroyAfterExecution: (result) => result.timedOut && sessionStrategy === "default" },
+          )
+        : await operation();
+    };
     if (body.streamOutput === true) {
       const encoder = new TextEncoder();
       const stream = new ReadableStream<Uint8Array>({
@@ -435,19 +1243,8 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
             }
           }, 15_000);
           try {
-            const result = await executeInSandbox({
-              sandbox,
-              command: body.command!,
-              args: Array.isArray(body.args) ? body.args.filter((value): value is string => typeof value === "string") : [],
-              cwd: typeof body.cwd === "string" ? body.cwd : undefined,
-              env: body.env,
-              stdin: body.stdin ?? null,
-              timeoutMs: readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS),
-              sessionStrategy,
-              sessionId,
-              onOutput: async (streamName, data) => {
-                controller.enqueue(encoder.encode(encodeSseEvent(streamName, { data })));
-              },
+            const result = await runExecution(async (streamName, data) => {
+              controller.enqueue(encoder.encode(encodeSseEvent(streamName, { data })));
             });
             controller.enqueue(encoder.encode(encodeSseEvent("complete", result)));
           } catch (error) {
@@ -462,18 +1259,7 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
       });
       return toSseResponse(stream);
     }
-    const result = await executeInSandbox({
-      sandbox,
-      command: body.command,
-      args: Array.isArray(body.args) ? body.args.filter((value): value is string => typeof value === "string") : [],
-      cwd: typeof body.cwd === "string" ? body.cwd : undefined,
-      env: body.env,
-      stdin: body.stdin ?? null,
-      timeoutMs: readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS),
-      sessionStrategy,
-      sessionId,
-    });
-    return toJsonResponse(result);
+    return toJsonResponse(await runExecution());
   }
 
   return toErrorResponse(404, "not_found", `No bridge route matched ${request.method} ${pathname}.`);

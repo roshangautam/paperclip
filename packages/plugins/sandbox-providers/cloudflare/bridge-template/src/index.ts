@@ -1,6 +1,5 @@
-import { Sandbox } from "@cloudflare/sandbox";
-import { handleBridgeRequest, } from "./routes.js";
-import type { BridgeEnv } from "./sandboxes.js";
+import { handleBridgeRequest } from "./routes.js";
+import { Sandbox, type BridgeEnv } from "./sandboxes.js";
 
 export { Sandbox };
 
