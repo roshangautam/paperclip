@@ -267,35 +267,36 @@ describe("durable lease ownership", () => {
     });
   });
 
-  it("keeps quarantined destruction fenced after its execution expires", async () => {
-    const execution = { executionId: "execution-one", expiresAt: new Date(Date.now() - 1).toISOString() };
-    const record: LeaseOwnershipRecord = { ...ownership(), activeExecutions: [execution] };
-    const { sandbox, records, transaction } = createOwnershipSandbox(record);
-    const identity = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
+  it("resumes quarantined destruction after its execution fence expires", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T00:00:00.000Z"));
+      const execution = { executionId: "execution-one", expiresAt: new Date(Date.now() + 1_000).toISOString() };
+      const record: LeaseOwnershipRecord = { ...ownership(), activeExecutions: [execution] };
+      const { sandbox, records, destroy } = createOwnershipSandbox(record);
+      const identity = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
 
-    const quarantined = await sandbox.quarantineLeaseExecution(
-      identity,
-      execution.executionId,
-      "destruction-one",
-    );
-    expect(quarantined).toMatchObject({
-      status: "quarantined",
-      ownership: {
-        state: "destroying",
-        destructionId: "destruction-one",
-        activeExecutions: [execution],
-      },
-    });
-    transaction.put.mockClear();
+      expect(await sandbox.quarantineLeaseExecution(
+        identity,
+        execution.executionId,
+        "destruction-one",
+      )).toMatchObject({
+        status: "quarantined",
+        ownership: {
+          state: "destroying",
+          destructionId: "destruction-one",
+          activeExecutions: [execution],
+        },
+      });
 
-    expect(await sandbox.beginLeaseDestruction(identity, "destruction-two")).toEqual({
-      status: "in_progress",
-      ownership: quarantined.status === "quarantined" ? quarantined.ownership : undefined,
-    });
-    expect(records.get(LEASE_OWNERSHIP_STORAGE_KEY)).toEqual(
-      quarantined.status === "quarantined" ? quarantined.ownership : undefined,
-    );
-    expect(transaction.put).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1_000);
+
+      expect(await sandbox.destroyLease(identity, "destruction-two")).toEqual({ status: "destroyed" });
+      expect(destroy).toHaveBeenCalledOnce();
+      expect(records.has(LEASE_OWNERSHIP_STORAGE_KEY)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("defers destruction until the final live execution completes", async () => {

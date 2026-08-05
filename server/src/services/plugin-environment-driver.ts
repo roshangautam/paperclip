@@ -287,6 +287,7 @@ export async function destroyPluginEnvironmentLease(input: {
   environmentId: string;
   issueId?: string | null;
   config: PluginEnvironmentConfig;
+  acquisitionId?: string;
   providerLeaseId: string | null;
   leaseMetadata?: Record<string, unknown>;
 }): Promise<void> {
@@ -297,6 +298,7 @@ export async function destroyPluginEnvironmentLease(input: {
     environmentId: input.environmentId,
     issueId: input.issueId ?? null,
     config: input.config.driverConfig,
+    ...(input.acquisitionId ? { acquisitionId: input.acquisitionId } : {}),
     providerLeaseId: input.providerLeaseId,
     leaseMetadata: input.leaseMetadata,
   });

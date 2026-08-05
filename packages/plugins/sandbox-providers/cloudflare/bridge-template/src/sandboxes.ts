@@ -417,11 +417,17 @@ export class Sandbox extends CloudflareSandbox {
       if (stored === undefined) return { status: "missing" };
       if (!isLeaseOwnershipRecord(stored)) return { status: "invalid" };
       if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
-      if (stored.state === "destroying") return { status: "in_progress", ownership: stored };
-
       const now = Date.now();
       const executions = stored.activeExecutions ?? [];
       const activeExecutions = executions.filter((execution) => Date.parse(execution.expiresAt) > now);
+      if (stored.state === "destroying") {
+        if (activeExecutions.length === executions.length) {
+          return { status: "in_progress", ownership: stored };
+        }
+        const ownership = { ...stored, activeExecutions, updatedAt: new Date(now).toISOString() };
+        await transaction.put(LEASE_OWNERSHIP_STORAGE_KEY, ownership);
+        return { status: "in_progress", ownership };
+      }
       if (activeExecutions.length > 0) {
         if (activeExecutions.length === executions.length) {
           return { status: "in_progress", ownership: stored };

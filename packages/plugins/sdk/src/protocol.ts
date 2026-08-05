@@ -633,6 +633,12 @@ export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDri
 }
 
 export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDriverBaseParams {
+  /**
+   * Stable host-generated identifier from the matching acquisition request.
+   * This is optional so providers can still clean up leases created by hosts
+   * that predate the acquisition identity lifecycle contract.
+   */
+  acquisitionId?: string;
   providerLeaseId: string | null;
   leaseMetadata?: Record<string, unknown>;
 }

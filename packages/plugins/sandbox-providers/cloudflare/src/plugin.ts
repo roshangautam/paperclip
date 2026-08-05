@@ -419,7 +419,8 @@ const plugin = definePlugin({
     const { config, client } = bridgeClientFor(params.config);
     const reuseLease = isReusableSandboxLeaseScope(params.leaseMetadata?.reusableSandboxLease, params);
     if (reuseLease) return;
-    const acquisitionId = readLeaseAcquisitionId(params.leaseMetadata);
+    const acquisitionId = readNonEmptyString(params.acquisitionId)
+      ?? readLeaseAcquisitionId(params.leaseMetadata);
     await client.releaseLease(
       {
         providerLeaseId: params.providerLeaseId,
@@ -442,7 +443,8 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const { config, client } = bridgeClientFor(params.config);
-    const acquisitionId = readLeaseAcquisitionId(params.leaseMetadata);
+    const acquisitionId = readNonEmptyString(params.acquisitionId)
+      ?? readLeaseAcquisitionId(params.leaseMetadata);
     await client.destroyLease({
       providerLeaseId: params.providerLeaseId,
       acquisitionId: acquisitionId ?? undefined,

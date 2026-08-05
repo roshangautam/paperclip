@@ -1154,10 +1154,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const acquireParams = workerManager.call.mock.calls[0]?.[2];
     const releaseParams = workerManager.call.mock.calls[1]?.[2];
     expect(releaseParams).toMatchObject({
+      acquisitionId: acquireParams.acquisitionId,
       providerLeaseId: "structured-failed-acquisition",
-      leaseMetadata: {
-        sandboxAcquisitionId: acquireParams.acquisitionId,
-      },
     });
     const [terminal] = await db.select().from(environmentLeases);
     expect(terminal).toMatchObject({
@@ -1165,7 +1163,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       providerLeaseId: "structured-failed-acquisition",
       cleanupStatus: "success",
       metadata: {
-        sandboxAcquisitionId: acquireParams.acquisitionId,
+        acquisitionId: acquireParams.acquisitionId,
       },
     });
   });
@@ -1576,6 +1574,10 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   it("retires the reusable plugin lease and its bindings after a successful handoff", async () => {
     const { pluginId, companyId, agentId, environment, runId, executionWorkspaceId, reusableLease } =
       await seedReusablePluginSandboxLease();
+    const acquisitionId = randomUUID();
+    await db.update(environmentLeases)
+      .set({ metadata: { ...reusableLease.metadata, acquisitionId } })
+      .where(eq(environmentLeases.id, reusableLease.id));
     const cleanupSecret = await secretService(db).create(companyId, {
       name: `reusable-handoff-secret-${randomUUID()}`,
       provider: "local_encrypted",
@@ -1616,6 +1618,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
     expect(acquired.lease.id).not.toBe(reusableLease.id);
     expect(acquired.lease.providerLeaseId).toBe(reusableLease.providerLeaseId);
+    expect(acquired.lease.metadata?.acquisitionId).toBe(acquisitionId);
     expect(workerManager.call).toHaveBeenCalledOnce();
     await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
       status: "expired",
@@ -3483,9 +3486,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       runId,
       workspaceMode: undefined,
     });
+    const acquireParams = workerManager.call.mock.calls[0]?.[2];
     expect(acquired.lease.providerLeaseId).toBe("plugin-lease-1");
     expect(acquired.lease.expiresAt?.toISOString()).toBe(expiresAt);
     expect(acquired.lease.metadata).toMatchObject({
+      acquisitionId: acquireParams.acquisitionId,
       driver: "plugin",
       pluginId,
       pluginKey: "acme.environments",
@@ -3511,6 +3516,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
     expect(released).toHaveLength(1);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", {
+      acquisitionId: acquireParams.acquisitionId,
       driverKey: "fake-plugin",
       companyId,
       environmentId: environment.id,
@@ -3518,6 +3524,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       config: {},
       providerLeaseId: "plugin-lease-1",
       leaseMetadata: expect.objectContaining({
+        acquisitionId: acquireParams.acquisitionId,
         driver: "plugin",
         pluginId,
         providerMetadata: expect.objectContaining({
@@ -3595,10 +3602,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     ]);
     const acquireParams = workerManager.call.mock.calls[0]?.[2];
     expect(workerManager.call.mock.calls[1]?.[2]).toMatchObject({
+      acquisitionId: acquireParams.acquisitionId,
       providerLeaseId: "structured-generic-acquisition",
-      leaseMetadata: {
-        sandboxAcquisitionId: acquireParams.acquisitionId,
-      },
     });
     const [terminal] = await db.select().from(environmentLeases);
     expect(terminal).toMatchObject({
@@ -3606,7 +3611,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       providerLeaseId: "structured-generic-acquisition",
       cleanupStatus: "success",
       metadata: {
-        sandboxAcquisitionId: acquireParams.acquisitionId,
+        acquisitionId: acquireParams.acquisitionId,
       },
     });
   });
@@ -3862,6 +3867,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       environmentId: environment.id,
       issueId: null,
       config: { template: "base" },
+      acquisitionId: acquired.lease.metadata?.acquisitionId,
       providerLeaseId: "plugin-lease-full",
       leaseMetadata: expect.objectContaining({
         driver: "plugin",

@@ -730,6 +730,7 @@ function createSandboxEnvironmentDriver(
   async function compensateFailedSandboxLeaseAcquisition(
     environment: Environment,
     input: Parameters<typeof environmentsSvc.acquireLease>[0],
+    acquisitionId?: string,
   ) {
     let cleanupLease: EnvironmentLease | null = null;
     try {
@@ -788,6 +789,7 @@ function createSandboxEnvironmentDriver(
               environmentId: environment.id,
               issueId: input.issueId,
               config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
+              ...(acquisitionId ? { acquisitionId } : {}),
               providerLeaseId: input.providerLeaseId ?? null,
               leaseMetadata: input.metadata ?? undefined,
             },
@@ -888,6 +890,7 @@ function createSandboxEnvironmentDriver(
     environment: Environment,
     input: Parameters<typeof environmentsSvc.acquireLease>[0],
     supersededLease?: EnvironmentLease | null,
+    acquisitionId?: string,
   ) {
     try {
       return await acquireSandboxLease(environment, input, supersededLease);
@@ -895,7 +898,11 @@ function createSandboxEnvironmentDriver(
       // A resumed provider lease remains represented by the superseded row
       // when the handoff transaction rolls back; only fresh leases need cleanup.
       if (!supersededLease) {
-        await compensateFailedSandboxLeaseAcquisition(environment, input);
+        await compensateFailedSandboxLeaseAcquisition(
+          environment,
+          input,
+          acquisitionId ?? readPersistedAcquisitionId(input.metadata) ?? undefined,
+        );
       }
       throw error;
     }
@@ -1331,7 +1338,9 @@ function createSandboxEnvironmentDriver(
             });
           }
         }
-        const acquisitionId = randomUUID();
+        const acquisitionId = readPersistedAcquisitionId(reusableLease?.metadata)
+          ?? readPersistedAcquisitionId(providerLease?.metadata)
+          ?? randomUUID();
         // Ad-hoc test leases are never publishable for reuse: storing them
         // as `reuse_by_environment` would let a concurrent heartbeat resume
         // the test's provider lease and lose its sandbox when the test ends.
@@ -1391,9 +1400,9 @@ function createSandboxEnvironmentDriver(
                 sandboxProviderPlugin: true,
                 ...sanitizePluginSandboxConfigFromLeaseMetadata(storedConfig),
                 [PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY]: providerConfigForLease,
-                [SANDBOX_ACQUISITION_ID_KEY]: acquisitionId,
+                acquisitionId,
               },
-            });
+            }, acquisitionId);
             throw error;
           }
         }
@@ -1434,10 +1443,11 @@ function createSandboxEnvironmentDriver(
             sandboxProviderPlugin: true,
             ...sanitizePluginSandboxConfigFromLeaseMetadata(storedConfig),
             ...sanitizedProviderMetadata,
+            acquisitionId,
             [PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY]: providerConfigForLease,
             ...(reusableScope ? { reusableSandboxLease: reusableScope } : {}),
           },
-        }, supersededLease);
+        }, supersededLease, acquisitionId);
       }
 
       // Built-in sandbox provider path. Same guard as the plugin-backed path:
@@ -1755,6 +1765,7 @@ function createSandboxEnvironmentDriver(
           environmentId: input.environment.id,
           issueId: input.lease.issueId,
           config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
+          ...acquisitionIdentityParams(metadata),
           providerLeaseId: input.lease.providerLeaseId,
           leaseMetadata: metadata,
         }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)));
@@ -1839,6 +1850,7 @@ function createSandboxEnvironmentDriver(
             environmentId: input.environment.id,
             issueId: lease.issueId,
             config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
+            ...acquisitionIdentityParams(metadata),
             providerLeaseId: lease.providerLeaseId,
             leaseMetadata: metadata,
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)));
@@ -1888,8 +1900,21 @@ function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function readPersistedAcquisitionId(metadata: Record<string, unknown> | null | undefined): string | null {
+  return readString(metadata?.[SANDBOX_ACQUISITION_ID_KEY])
+    ?? readString(metadata?.acquisitionId);
+}
+
+function acquisitionIdentityParams(
+  metadata: Record<string, unknown> | null | undefined,
+): { acquisitionId?: string } {
+  const acquisitionId = readPersistedAcquisitionId(metadata);
+  return acquisitionId ? { acquisitionId } : {};
+}
+
 const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "agentId",
+  "acquisitionId",
   "driver",
   "executionWorkspaceMode",
   PENDING_CLEANUP_RELEASE_STATUS_KEY,
@@ -2049,7 +2074,7 @@ function createPluginEnvironmentDriver(
           pluginId: plugin.id,
           pluginKey: parsed.config.pluginKey,
           driverKey: parsed.config.driverKey,
-          [SANDBOX_ACQUISITION_ID_KEY]: acquisitionId,
+          acquisitionId,
         };
         let cleanupLease: EnvironmentLease | null = null;
         let cleanupError: unknown | null = null;
@@ -2076,6 +2101,7 @@ function createPluginEnvironmentDriver(
             environmentId: input.environment.id,
             issueId: input.issueId,
             config: parsed.config.driverConfig,
+            acquisitionId,
             providerLeaseId: errorData.providerLeaseId,
             leaseMetadata: cleanupMetadata,
           });
@@ -2130,6 +2156,7 @@ function createPluginEnvironmentDriver(
           pluginId: plugin.id,
           pluginKey: parsed.config.pluginKey,
           driverKey: parsed.config.driverKey,
+          acquisitionId,
         },
       });
     },
@@ -2142,6 +2169,7 @@ function createPluginEnvironmentDriver(
         environmentId: input.environment.id,
         issueId: input.lease.issueId,
         config: driverConfig,
+        ...acquisitionIdentityParams(input.lease.metadata),
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });
@@ -2167,6 +2195,7 @@ function createPluginEnvironmentDriver(
           driverKey,
           driverConfig,
         },
+        ...acquisitionIdentityParams(input.lease.metadata),
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });
@@ -2188,6 +2217,7 @@ function createPluginEnvironmentDriver(
           driverKey,
           driverConfig,
         },
+        ...acquisitionIdentityParams(input.lease.metadata),
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });

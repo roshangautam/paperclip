@@ -769,6 +769,28 @@ describe("Cloudflare sandbox provider plugin", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("uses the explicit acquisition identity when release metadata omits it", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    await plugin.definition.onEnvironmentReleaseLease?.({
+      driverKey: "cloudflare",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId: "host-acquisition",
+      providerLeaseId: "pc-scope-one",
+      config: {
+        bridgeBaseUrl: "https://bridge.example.workers.dev",
+        bridgeAuthToken: "resolved-token",
+      },
+    });
+
+    expect(requestBodyAt()).toMatchObject({
+      providerLeaseId: "pc-scope-one",
+      acquisitionId: "host-acquisition",
+    });
+    expect(requestHeadersAt().get("X-Paperclip-Acquisition-Id")).toBe("host-acquisition");
+  });
+
   it.each([
     {},
     { version: 1 },
@@ -861,17 +883,18 @@ describe("Cloudflare sandbox provider plugin", () => {
     expect(requestHeadersAt().get("X-Paperclip-Acquisition-Id")).toBe("acquisition-1");
   });
 
-  it("uses the host acquisition identity when cleaning up a partial reusable acquisition", async () => {
+  it("prefers the explicit host acquisition identity when destroying a partial acquisition", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
 
     await plugin.definition.onEnvironmentDestroyLease?.({
       driverKey: "cloudflare",
       companyId: "company-1",
       environmentId: "env-1",
+      acquisitionId: "host-acquisition",
       providerLeaseId: "pc-scope-one",
       leaseMetadata: {
         acquisitionId: "stale-bridge-acquisition",
-        sandboxAcquisitionId: "host-acquisition",
+        sandboxAcquisitionId: "stale-host-metadata",
         remoteCwd: "/workspace/custom",
       },
       config: {
