@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockCreate = vi.hoisted(() => vi.fn());
 const mockGet = vi.hoisted(() => vi.fn());
+const mockList = vi.hoisted(() => vi.fn());
 const mockSnapshotGet = vi.hoisted(() => vi.fn());
 const mockSnapshotDelete = vi.hoisted(() => vi.fn());
 const { MockDaytonaNotFoundError, MockDaytonaTimeoutError } = vi.hoisted(() => {
@@ -16,6 +17,7 @@ vi.mock("@daytonaio/sdk", () => ({
   Daytona: class MockDaytona {
     create = mockCreate;
     get = mockGet;
+    list = mockList;
     snapshot = {
       get: mockSnapshotGet,
       delete: mockSnapshotDelete,
@@ -78,6 +80,7 @@ describe("Daytona sandbox provider plugin", () => {
   beforeEach(() => {
     mockCreate.mockReset();
     mockGet.mockReset();
+    mockList.mockReset();
     mockSnapshotGet.mockReset();
     mockSnapshotDelete.mockReset();
     vi.restoreAllMocks();
@@ -312,7 +315,7 @@ describe("Daytona sandbox provider plugin", () => {
     );
   });
 
-  it("uses a deterministic owned sandbox for acquisition replay", async () => {
+  it("replays by listing the exact sandbox name instead of looking it up as an ID", async () => {
     process.env.DAYTONA_API_KEY = "host-key";
     const acquisitionId = "acquisition-replay-1";
     const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
@@ -321,7 +324,13 @@ describe("Daytona sandbox provider plugin", () => {
       name: sandboxName,
       labels: { "paperclip-acquisition-id": acquisitionId },
     });
-    mockGet.mockResolvedValue(sandbox);
+    mockList.mockResolvedValue({
+      items: [createMockSandbox({ name: `${sandboxName}-other` }), sandbox],
+      total: 2,
+      page: 1,
+      totalPages: 1,
+    });
+    mockGet.mockRejectedValue(new MockDaytonaNotFoundError("sandbox names are not IDs"));
 
     const lease = await plugin.definition.onEnvironmentAcquireLease?.({
       driverKey: "daytona",
@@ -336,7 +345,8 @@ describe("Daytona sandbox provider plugin", () => {
       },
     });
 
-    expect(mockGet).toHaveBeenCalledWith(sandboxName);
+    expect(mockList).toHaveBeenCalledWith(undefined, 1, 100);
+    expect(mockGet).not.toHaveBeenCalled();
     expect(mockCreate).not.toHaveBeenCalled();
     expect(lease).toMatchObject({
       providerLeaseId: "sandbox-replay",
@@ -349,7 +359,7 @@ describe("Daytona sandbox provider plugin", () => {
     const acquisitionId = "acquisition-create-1";
     const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
     const sandbox = createMockSandbox({ id: "sandbox-created", name: sandboxName });
-    mockGet.mockRejectedValue(new MockDaytonaNotFoundError("missing"));
+    mockList.mockResolvedValue({ items: [], total: 0, page: 1, totalPages: 0 });
     mockCreate.mockResolvedValue(sandbox);
 
     await plugin.definition.onEnvironmentAcquireLease?.({
@@ -375,10 +385,12 @@ describe("Daytona sandbox provider plugin", () => {
   it("rejects a deterministic Daytona name owned by another acquisition", async () => {
     process.env.DAYTONA_API_KEY = "host-key";
     const acquisitionId = "acquisition-collision-1";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
     const sandbox = createMockSandbox({
+      name: sandboxName,
       labels: { "paperclip-acquisition-id": "other-acquisition" },
     });
-    mockGet.mockResolvedValue(sandbox);
+    mockList.mockResolvedValue({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
 
     await expect(plugin.definition.onEnvironmentAcquireLease?.({
       driverKey: "daytona",
@@ -396,16 +408,55 @@ describe("Daytona sandbox provider plugin", () => {
     expect(mockCreate).not.toHaveBeenCalled();
   });
 
+  it("rejects ambiguous exact-name Daytona acquisition matches across pages", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-duplicate-name-1";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const labels = { "paperclip-acquisition-id": acquisitionId };
+    mockList
+      .mockResolvedValueOnce({
+        items: [createMockSandbox({ id: "sandbox-duplicate-1", name: sandboxName, labels })],
+        total: 2,
+        page: 1,
+        totalPages: 2,
+      })
+      .mockResolvedValueOnce({
+        items: [createMockSandbox({ id: "sandbox-duplicate-2", name: sandboxName, labels })],
+        total: 2,
+        page: 2,
+        totalPages: 2,
+      });
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toThrow(`Refusing to reconcile multiple Daytona sandboxes named ${sandboxName}.`);
+
+    expect(mockList).toHaveBeenNthCalledWith(1, undefined, 1, 100);
+    expect(mockList).toHaveBeenNthCalledWith(2, undefined, 2, 100);
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
   it("reconciles an ambiguous Daytona create without deleting the adopted sandbox", async () => {
     process.env.DAYTONA_API_KEY = "host-key";
     const acquisitionId = "acquisition-ambiguous-1";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
     const sandbox = createMockSandbox({
+      name: sandboxName,
       labels: { "paperclip-acquisition-id": acquisitionId },
     });
     sandbox.getWorkDir.mockRejectedValue(new Error("workdir lookup failed"));
-    mockGet
-      .mockRejectedValueOnce(new MockDaytonaNotFoundError("missing"))
-      .mockResolvedValueOnce(sandbox);
+    mockList
+      .mockResolvedValueOnce({ items: [], total: 0, page: 1, totalPages: 0 })
+      .mockResolvedValueOnce({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
     mockCreate.mockRejectedValue(new Error("response lost"));
 
     await expect(plugin.definition.onEnvironmentAcquireLease?.({
@@ -426,7 +477,8 @@ describe("Daytona sandbox provider plugin", () => {
       data: { providerLeaseId: sandbox.id },
     });
 
-    expect(mockGet).toHaveBeenCalledTimes(2);
+    expect(mockList).toHaveBeenCalledTimes(2);
+    expect(mockGet).not.toHaveBeenCalled();
     expect(sandbox.delete).not.toHaveBeenCalled();
   });
 

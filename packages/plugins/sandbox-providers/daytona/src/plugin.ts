@@ -121,6 +121,7 @@ const NONINTERACTIVE_GIT_ENV: Record<string, string> = {
 };
 const DEFAULT_SSH_ACCESS_MINUTES = 60;
 const DAYTONA_SSH_GATEWAY_HOST = "ssh.app.daytona.io";
+const DAYTONA_SANDBOX_LIST_PAGE_SIZE = 100;
 
 function parseOptionalString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -736,7 +737,7 @@ async function acquireSandbox(
 
   const client = createDaytonaClient(config);
   const name = acquisitionSandboxName(params.acquisitionId);
-  const existing = await getSandboxOrNull(config, name);
+  const existing = await findSandboxByNameOrNull(client, name);
   if (existing) {
     assertAcquisitionSandboxOwnership(existing, params.acquisitionId);
     await ensureSandboxStarted(existing, toTimeoutSeconds(config.timeoutMs));
@@ -757,12 +758,27 @@ async function acquireSandbox(
     });
     return { sandbox, created: true };
   } catch (error) {
-    const reconciled = await getSandboxOrNull(config, name);
+    const reconciled = await findSandboxByNameOrNull(client, name);
     if (!reconciled) throw error;
     assertAcquisitionSandboxOwnership(reconciled, params.acquisitionId);
     await ensureSandboxStarted(reconciled, toTimeoutSeconds(config.timeoutMs));
     return { sandbox: reconciled, created: false };
   }
+}
+
+async function findSandboxByNameOrNull(client: Daytona, name: string): Promise<Sandbox | null> {
+  const matches: Sandbox[] = [];
+
+  for (let page = 1; ; page += 1) {
+    const result = await client.list(undefined, page, DAYTONA_SANDBOX_LIST_PAGE_SIZE);
+    matches.push(...result.items.filter((sandbox) => sandbox.name === name));
+    if (matches.length > 1) {
+      throw new Error(`Refusing to reconcile multiple Daytona sandboxes named ${name}.`);
+    }
+    if (page >= result.totalPages) break;
+  }
+
+  return matches[0] ?? null;
 }
 
 async function getSandbox(config: DaytonaDriverConfig, sandboxId: string): Promise<Sandbox> {
