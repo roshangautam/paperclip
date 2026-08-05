@@ -23,7 +23,7 @@ function ownership(providerLeaseId = "pc-acq-one", acquisitionId = "acquisition-
   };
 }
 
-function createOwnershipSandbox(initial?: unknown) {
+function createOwnershipSandbox(initial?: unknown, destroy = vi.fn().mockResolvedValue(undefined)) {
   const records = new Map<string, unknown>();
   if (initial !== undefined) records.set(LEASE_OWNERSHIP_STORAGE_KEY, initial);
   const transaction = {
@@ -41,7 +41,8 @@ function createOwnershipSandbox(initial?: unknown) {
   };
   const sandbox = Object.create(Sandbox.prototype) as Sandbox;
   Object.defineProperty(sandbox, "ctx", { value: { storage } });
-  return { sandbox, storage, transaction, records };
+  Object.defineProperty(sandbox, "destroy", { value: destroy });
+  return { sandbox, storage, transaction, records, destroy };
 }
 
 describe("bridge sandbox helpers", () => {
@@ -461,5 +462,64 @@ describe("durable lease ownership", () => {
       ownership: record,
     });
     expect(transaction.put).not.toHaveBeenCalled();
+  });
+
+  it("retries failed destruction with the persisted operation id", async () => {
+    const record = ownership();
+    const destroy = vi.fn()
+      .mockRejectedValueOnce(new Error("destroy unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const { sandbox, records } = createOwnershipSandbox(record, destroy);
+    const identity = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
+
+    await expect(sandbox.destroyLease(identity, "destruction-one")).rejects.toThrow("destroy unavailable");
+    expect(records.get(LEASE_OWNERSHIP_STORAGE_KEY)).toMatchObject({
+      state: "destroying",
+      destructionId: "destruction-one",
+    });
+
+    expect(await sandbox.destroyLease(identity, "destruction-two")).toEqual({ status: "destroyed" });
+    expect(destroy).toHaveBeenCalledTimes(2);
+    expect(records.has(LEASE_OWNERSHIP_STORAGE_KEY)).toBe(false);
+  });
+
+  it("shares one in-flight destruction across duplicate retries", async () => {
+    const record = ownership();
+    let finishDestroy!: () => void;
+    const destroy = vi.fn().mockReturnValue(new Promise<void>((resolve) => { finishDestroy = resolve; }));
+    const { sandbox } = createOwnershipSandbox(record, destroy);
+    const identity = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
+
+    const first = sandbox.destroyLease(identity, "destruction-one");
+    await vi.waitFor(() => expect(destroy).toHaveBeenCalledOnce());
+    const duplicate = sandbox.destroyLease(identity, "destruction-two");
+    await Promise.resolve();
+    expect(destroy).toHaveBeenCalledOnce();
+
+    finishDestroy();
+    await expect(first).resolves.toEqual({ status: "destroyed" });
+    await expect(duplicate).resolves.toEqual({ status: "destroyed" });
+  });
+
+  it("does not coalesce release or distinct execution cleanups", async () => {
+    const record: LeaseOwnershipRecord = {
+      ...ownership(),
+      activeExecutions: ["release", "execution-two"].map((executionId) => ({
+        executionId,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      })),
+    };
+    const { sandbox, records, destroy } = createOwnershipSandbox(record);
+    const identity = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
+
+    const release = sandbox.destroyLease(identity, "destruction-release");
+    const firstExecutionCleanup = sandbox.destroyLease(identity, "destruction-one", "release");
+    const secondExecutionCleanup = sandbox.destroyLease(identity, "destruction-two", "execution-two");
+
+    await expect(release).resolves.toMatchObject({ status: "in_progress" });
+    await expect(firstExecutionCleanup).resolves.toMatchObject({ status: "in_progress" });
+    await expect(secondExecutionCleanup).resolves.toEqual({ status: "destroyed" });
+    expect(destroy).toHaveBeenCalledOnce();
+    expect(records.has(LEASE_OWNERSHIP_STORAGE_KEY)).toBe(false);
   });
 });

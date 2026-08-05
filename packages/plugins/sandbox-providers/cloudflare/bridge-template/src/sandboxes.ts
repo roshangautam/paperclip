@@ -61,7 +61,7 @@ export type LeaseOwnershipExecutionResult =
 export type LeaseOwnershipDestroyResult =
   | { status: "started"; ownership: LeaseOwnershipRecord }
   | { status: "in_progress"; ownership: LeaseOwnershipRecord }
-  | { status: "completed" }
+  | { status: "completed" | "destroyed" }
   | { status: "missing" | "invalid" }
   | { status: "conflict"; ownership: LeaseOwnershipRecord };
 
@@ -145,6 +145,11 @@ function newOwnershipRecord(claim: LeaseOwnershipClaim): LeaseOwnershipRecord {
  * SDK's typed RPC proxy returned from getSandbox().
  */
 export class Sandbox extends CloudflareSandbox {
+  private leaseDestruction?: {
+    key: string;
+    promise: Promise<LeaseOwnershipDestroyResult>;
+  };
+
   async readContainerState(): Promise<Awaited<ReturnType<CloudflareSandbox["getState"]>>> {
     return await this.getState();
   }
@@ -451,6 +456,54 @@ export class Sandbox extends CloudflareSandbox {
       await transaction.delete(LEASE_OWNERSHIP_STORAGE_KEY);
       return { status: "completed" };
     });
+  }
+
+  async destroyLease(
+    identity: LeaseOwnershipIdentity,
+    destructionId: string,
+    executionId?: string,
+  ): Promise<LeaseOwnershipDestroyResult> {
+    const key = JSON.stringify([identity.providerLeaseId, identity.acquisitionId, executionId ?? null]);
+    if (this.leaseDestruction?.key === key) return await this.leaseDestruction.promise;
+    if (this.leaseDestruction) {
+      await this.leaseDestruction.promise.catch(() => undefined);
+      return await this.destroyLease(identity, destructionId, executionId);
+    }
+
+    const promise = this.performLeaseDestruction(identity, destructionId, executionId);
+    this.leaseDestruction = { key, promise };
+    try {
+      return await promise;
+    } finally {
+      if (this.leaseDestruction?.promise === promise) this.leaseDestruction = undefined;
+    }
+  }
+
+  private async performLeaseDestruction(
+    identity: LeaseOwnershipIdentity,
+    destructionId: string,
+    executionId?: string,
+  ): Promise<LeaseOwnershipDestroyResult> {
+    const destruction = executionId
+      ? await this.beginLeaseDestructionAfterExecution(identity, executionId, destructionId)
+      : await this.beginLeaseDestruction(identity, destructionId);
+    if (destruction.status === "completed") return destruction;
+    if (destruction.status !== "started") {
+      if (
+        destruction.status !== "in_progress"
+        || destruction.ownership.state !== "destroying"
+        || (destruction.ownership.activeExecutions?.length ?? 0) > 0
+      ) {
+        return destruction;
+      }
+    }
+
+    const persistedDestructionId = destruction.ownership.destructionId;
+    if (!persistedDestructionId) return { status: "invalid" };
+
+    await this.destroy();
+    const completed = await this.completeLeaseDestruction(identity, persistedDestructionId);
+    return completed.status === "completed" ? { status: "destroyed" } : completed;
   }
 
 }

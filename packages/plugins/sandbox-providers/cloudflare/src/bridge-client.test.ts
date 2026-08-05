@@ -29,22 +29,25 @@ describe("Cloudflare bridge client timeouts", () => {
     })).toBe(30_000);
   });
 
-  it("extends exec requests to the command timeout when needed", () => {
+  it("keeps exec requests alive for timeout cleanup", () => {
     expect(resolveRequestTimeoutMs(baseConfig, "/api/paperclip-sandbox/v1/exec", {
       method: "POST",
       body: JSON.stringify({ command: "opencode", timeoutMs: 270_000 }),
-    })).toBe(270_000);
+    })).toBe(330_000);
   });
 
-  it("falls back to the configured timeout when exec timeout is missing or smaller", () => {
+  it("falls back to the configured timeout when exec timeout is missing", () => {
     expect(resolveRequestTimeoutMs(baseConfig, "/api/paperclip-sandbox/v1/exec", {
       method: "POST",
       body: JSON.stringify({ command: "pwd" }),
     })).toBe(30_000);
+  });
+
+  it("adds cleanup grace even when the command timeout is smaller", () => {
     expect(resolveRequestTimeoutMs(baseConfig, "/api/paperclip-sandbox/v1/exec", {
       method: "POST",
       body: JSON.stringify({ command: "pwd", timeoutMs: 5_000 }),
-    })).toBe(30_000);
+    })).toBe(65_000);
   });
 
   it("consumes streamed exec output and returns the final result", async () => {

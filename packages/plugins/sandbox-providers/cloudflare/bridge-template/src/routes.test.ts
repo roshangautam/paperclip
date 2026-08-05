@@ -59,6 +59,7 @@ function createSandbox(options: {
 } = {}) {
   let current = options.ownership ?? null;
   const completed = new Set<string>();
+  let destructionInFlight: Promise<unknown> | null = null;
   const identityKey = (identity: LeaseOwnershipIdentity) => `${identity.providerLeaseId}:${identity.acquisitionId}`;
   const sessionExec = options.sessionExec ?? vi.fn().mockImplementation(async (command: string) => ({
     exitCode: 0,
@@ -259,6 +260,38 @@ function createSandbox(options: {
       completed.add(identityKey(identity));
       current = null;
       return { status: "completed" } as const;
+    }),
+    destroyLease: vi.fn(async (
+      identity: LeaseOwnershipIdentity,
+      destructionId: string,
+      executionId?: string,
+    ) => {
+      if (destructionInFlight) return await destructionInFlight;
+      destructionInFlight = (async () => {
+        const destruction = executionId
+          ? await sandbox.beginLeaseDestructionAfterExecution(identity, executionId, destructionId)
+          : await sandbox.beginLeaseDestruction(identity, destructionId);
+        if (destruction.status === "completed") return destruction;
+        if (destruction.status !== "started") {
+          if (
+            destruction.status !== "in_progress"
+            || destruction.ownership.state !== "destroying"
+            || (destruction.ownership.activeExecutions?.length ?? 0) > 0
+          ) {
+            return destruction;
+          }
+        }
+        const persistedDestructionId = destruction.ownership.destructionId;
+        if (!persistedDestructionId) return { status: "invalid" } as const;
+        await sandbox.destroy();
+        const finalized = await sandbox.completeLeaseDestruction(identity, persistedDestructionId);
+        return finalized.status === "completed" ? { status: "destroyed" } as const : finalized;
+      })();
+      try {
+        return await destructionInFlight;
+      } finally {
+        destructionInFlight = null;
+      }
     }),
   };
   return { sandbox, sessionExec, getOwnership: () => current };
@@ -1015,7 +1048,7 @@ describe("bridge routes", () => {
     expect(sessionExec).not.toHaveBeenCalled();
   });
 
-  it("allows only the winning destruction caller to invoke sandbox.destroy", async () => {
+  it("replays duplicate destruction through the in-flight operation", async () => {
     let finishDestroy!: () => void;
     const destroyPending = new Promise<void>((resolve) => {
       finishDestroy = resolve;
@@ -1034,7 +1067,7 @@ describe("bridge routes", () => {
     );
     await vi.waitFor(() => expect(destroy).toHaveBeenCalledOnce());
 
-    const duplicate = await handleBridgeRequest(
+    const duplicate = handleBridgeRequest(
       bridgeRequest(
         "/api/paperclip-sandbox/v1/leases/pc-acq-acquisition-1",
         { acquisitionId: "acquisition-1" },
@@ -1042,11 +1075,12 @@ describe("bridge routes", () => {
       ),
       { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
     );
-    expect(duplicate.status).toBe(409);
+    await Promise.resolve();
     expect(destroy).toHaveBeenCalledOnce();
 
     finishDestroy();
     expect((await first).status).toBe(200);
+    expect((await duplicate).status).toBe(200);
   });
 
   it("replays completed destruction without touching a later owner", async () => {
@@ -1145,9 +1179,9 @@ describe("bridge routes", () => {
       ),
       { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
     );
-    expect(retry.status).toBe(409);
-    expect(sandbox.destroy).toHaveBeenCalledOnce();
-    expect(sandbox.completeLeaseDestruction).not.toHaveBeenCalled();
+    expect(retry.status).toBe(200);
+    expect(sandbox.destroy).toHaveBeenCalledTimes(2);
+    expect(sandbox.completeLeaseDestruction).toHaveBeenCalledOnce();
   });
 
   it("clears ownership only after successful destruction", async () => {

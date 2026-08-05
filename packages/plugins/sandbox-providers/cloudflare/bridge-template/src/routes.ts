@@ -348,17 +348,8 @@ async function destroyOwnedLease(
   sandbox: Sandbox,
   identity: LeaseOwnershipIdentity,
 ): Promise<DestroyOwnedLeaseResult> {
-  const destructionId = crypto.randomUUID();
-  const destruction = await sandbox.beginLeaseDestruction(identity, destructionId);
-  if (destruction.status === "completed") return "completed";
-  if (destruction.status !== "started") return destruction.status;
-
-  const startedDestructionId = destruction.ownership.destructionId;
-  if (!startedDestructionId) {
-    throw new Error(`Cloudflare sandbox ${identity.providerLeaseId} entered destruction without an operation ID.`);
-  }
-  await completeStartedDestruction(sandbox, identity, startedDestructionId);
-  return "destroyed";
+  const destruction = await sandbox.destroyLease(identity, crypto.randomUUID());
+  return destruction.status === "started" ? "in_progress" : destruction.status;
 }
 
 async function destroyOwnedLeaseAfterExecution(
@@ -366,35 +357,8 @@ async function destroyOwnedLeaseAfterExecution(
   identity: LeaseOwnershipIdentity,
   executionId: string,
 ): Promise<DestroyOwnedLeaseResult> {
-  const destructionId = crypto.randomUUID();
-  const destruction = await sandbox.beginLeaseDestructionAfterExecution(identity, executionId, destructionId);
-  if (destruction.status === "completed") return "completed";
-  if (destruction.status !== "started") return destruction.status;
-
-  const startedDestructionId = destruction.ownership.destructionId;
-  if (!startedDestructionId) {
-    throw new Error(`Cloudflare sandbox ${identity.providerLeaseId} entered destruction without an operation ID.`);
-  }
-  await completeStartedDestruction(sandbox, identity, startedDestructionId);
-  return "destroyed";
-}
-
-async function completeStartedDestruction(
-  sandbox: Sandbox,
-  identity: LeaseOwnershipIdentity,
-  destructionId: string,
-): Promise<void> {
-  // A rejected provider call has an indeterminate outcome: the sandbox may
-  // already be gone even though the response was lost. Keep ownership in the
-  // destroying state so no later request can treat that sandbox as usable.
-  await sandbox.destroy();
-
-  const completed = await sandbox.completeLeaseDestruction(identity, destructionId);
-  if (completed.status !== "completed") {
-    throw new Error(
-      `Cloudflare sandbox ${identity.providerLeaseId} was destroyed, but its ownership completion could not be recorded (${completed.status}).`,
-    );
-  }
+  const destruction = await sandbox.destroyLease(identity, crypto.randomUUID(), executionId);
+  return destruction.status === "started" ? "in_progress" : destruction.status;
 }
 
 async function destroyRequestedLease(
@@ -442,7 +406,12 @@ async function completeLeaseExecution(
     if (!destructionId) {
       throw new Error(`Cloudflare sandbox ${identity.providerLeaseId} entered destruction without an operation ID.`);
     }
-    await completeStartedDestruction(sandbox, identity, destructionId);
+    const destruction = await sandbox.destroyLease(identity, destructionId);
+    if (destruction.status !== "destroyed" && destruction.status !== "completed") {
+      throw new Error(
+        `Cloudflare sandbox ${identity.providerLeaseId} entered destruction, but coordinated destruction failed (${destruction.status}).`,
+      );
+    }
     return;
   }
   if (completed.status !== "completed") {

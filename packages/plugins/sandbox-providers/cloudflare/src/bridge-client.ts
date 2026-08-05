@@ -35,6 +35,7 @@ interface BridgeErrorBody {
 
 const API_PREFIX = "/api/paperclip-sandbox/v1";
 const OWNERSHIP_API_PREFIX = "/api/paperclip-sandbox/v2";
+const EXEC_REQUEST_CLEANUP_GRACE_MS = 60_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -102,7 +103,10 @@ export function resolveRequestTimeoutMs(
   const requestedTimeoutMs = parseExecuteTimeoutMs(init.body);
   return requestedTimeoutMs === null
     ? config.bridgeRequestTimeoutMs
-    : Math.max(config.bridgeRequestTimeoutMs, requestedTimeoutMs);
+    : Math.max(
+        config.bridgeRequestTimeoutMs,
+        requestedTimeoutMs + EXEC_REQUEST_CLEANUP_GRACE_MS,
+      );
 }
 
 async function requestJson<T>(
