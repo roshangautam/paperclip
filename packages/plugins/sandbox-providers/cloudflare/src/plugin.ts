@@ -259,12 +259,17 @@ const plugin = definePlugin({
     params: PluginEnvironmentAcquireLeaseParams,
   ): Promise<PluginEnvironmentLease> {
     const { config, client } = bridgeClientFor(params.config);
-    const health = await client.health({
+    const acquisitionDeadline = Date.now() + Math.max(config.timeoutMs, config.bridgeRequestTimeoutMs);
+    const acquisitionHeaders = {
       acquisitionId: params.acquisitionId,
       environmentId: params.environmentId,
       runId: params.runId,
       issueId: params.issueId,
-    });
+    };
+    const health = await client.health(
+      acquisitionHeaders,
+      { timeoutMs: acquisitionDeadline - Date.now() },
+    );
     if (health.capabilities?.acquisitionReplay !== true) {
       throw new Error(
         "Cloudflare sandbox bridge does not support replay-safe lease acquisition; deploy the current bridge before acquiring leases.",
@@ -291,24 +296,28 @@ const plugin = definePlugin({
       sessionId: config.sessionId,
       timeoutMs: config.timeoutMs,
     };
-    const acquisitionHeaders = {
-      acquisitionId: params.acquisitionId,
-      environmentId: params.environmentId,
-      runId: params.runId,
-      issueId: params.issueId,
-    };
-    let replayDeadline: number | null = null;
     try {
       for (let attempt = 1; ; attempt += 1) {
+        const remainingMs = acquisitionDeadline - Date.now();
+        if (remainingMs <= 0) {
+          throw new Error("Cloudflare sandbox lease acquisition exceeded its setup deadline.");
+        }
         try {
-          return await client.acquireLease(acquisitionRequest, acquisitionHeaders);
+          return await client.acquireLease(
+            {
+              ...acquisitionRequest,
+              timeoutMs: Math.min(acquisitionRequest.timeoutMs, remainingMs),
+            },
+            acquisitionHeaders,
+            { timeoutMs: remainingMs },
+          );
         } catch (error) {
           if (!shouldReplayAcquisition(error)) {
             throw error;
           }
-          replayDeadline ??= Date.now() + Math.max(config.timeoutMs, config.bridgeRequestTimeoutMs);
-          if (Date.now() >= replayDeadline) throw error;
-          await waitForAcquisitionReplay(attempt, replayDeadline);
+          if (Date.now() >= acquisitionDeadline) throw error;
+          await waitForAcquisitionReplay(attempt, acquisitionDeadline);
+          if (Date.now() >= acquisitionDeadline) throw error;
         }
       }
     } catch (error) {

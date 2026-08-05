@@ -7,6 +7,7 @@ vi.mock("@cloudflare/sandbox", () => ({
 
 import { buildLeaseSandboxId, buildSentinelPath, isTimeoutError } from "./helpers.js";
 import {
+  LEASE_DESTRUCTION_STORAGE_KEY,
   LEASE_OWNERSHIP_STORAGE_KEY,
   Sandbox,
   type LeaseOwnershipRecord,
@@ -23,9 +24,14 @@ function ownership(providerLeaseId = "pc-acq-one", acquisitionId = "acquisition-
   };
 }
 
-function createOwnershipSandbox(initial?: unknown, destroy = vi.fn().mockResolvedValue(undefined)) {
+function createOwnershipSandbox(
+  initial?: unknown,
+  destroy = vi.fn().mockResolvedValue(undefined),
+  legacyDestruction?: unknown,
+) {
   const records = new Map<string, unknown>();
   if (initial !== undefined) records.set(LEASE_OWNERSHIP_STORAGE_KEY, initial);
+  if (legacyDestruction !== undefined) records.set(LEASE_DESTRUCTION_STORAGE_KEY, legacyDestruction);
   const transaction = {
     get: vi.fn(async (key: string) => records.get(key)),
     put: vi.fn(async (key: string, value: unknown) => {
@@ -448,7 +454,7 @@ describe("durable lease ownership", () => {
     expect(await sandbox.readLeaseOwnership()).toEqual({ status: "missing" });
   });
 
-  it("keeps completed destruction idempotent after a later acquisition takes ownership", async () => {
+  it("keeps acquisition A terminal after acquisition B destroys the same reusable sandbox", async () => {
     const record = ownership();
     const { sandbox, records } = createOwnershipSandbox(record);
     const matching = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
@@ -470,17 +476,31 @@ describe("durable lease ownership", () => {
 
     expect(await sandbox.beginLeaseDestruction(laterClaim, "destruction-two")).toMatchObject({ status: "started" });
     expect(await sandbox.completeLeaseDestruction(laterClaim, "destruction-two")).toEqual({ status: "completed" });
-    expect(records.size).toBe(1);
-    expect([...records.values()]).toEqual([expect.objectContaining({ acquisitionId: "acquisition-two" })]);
-
-    const newestClaim = { ...laterClaim, acquisitionId: "acquisition-three" };
-    expect(await sandbox.claimLeaseOwnership(newestClaim)).toMatchObject({ status: "claimed" });
-    expect(await sandbox.beginLeaseDestruction(matching, "destruction-stale")).toMatchObject({
-      status: "conflict",
-      ownership: newestClaim,
-    });
+    expect(records.size).toBe(2);
+    expect([...records.values()]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ acquisitionId: "acquisition-one" }),
+      expect.objectContaining({ acquisitionId: "acquisition-two" }),
+    ]));
+    expect(await sandbox.claimLeaseOwnership(record)).toEqual({ status: "completed" });
     expect(await sandbox.beginLeaseDestruction(laterClaim, "destruction-retry")).toEqual({ status: "completed" });
-    expect(await sandbox.readLeaseOwnership()).toMatchObject({ status: "owned", ownership: newestClaim });
+    expect(await sandbox.readLeaseOwnership()).toEqual({ status: "missing" });
+  });
+
+  it("keeps legacy singleton destruction tombstones replay-compatible", async () => {
+    const record = ownership();
+    const legacyDestruction = {
+      version: 1,
+      providerLeaseId: record.providerLeaseId,
+      acquisitionId: record.acquisitionId,
+      completedAt: "2026-08-04T00:01:00.000Z",
+    };
+    const { sandbox, records } = createOwnershipSandbox(undefined, undefined, legacyDestruction);
+
+    expect(await sandbox.claimLeaseOwnership(record)).toEqual({ status: "completed" });
+    expect(await sandbox.beginLeaseDestruction(record, "destruction-retry")).toEqual({ status: "completed" });
+    expect(await sandbox.completeLeaseDestruction(record, "destruction-retry")).toEqual({ status: "completed" });
+    expect(records.get(LEASE_DESTRUCTION_STORAGE_KEY)).toEqual(legacyDestruction);
+    expect(await sandbox.readLeaseOwnership()).toEqual({ status: "missing" });
   });
 
   it("keeps old destruction quarantined regardless of age", async () => {

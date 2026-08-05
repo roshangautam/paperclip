@@ -356,8 +356,8 @@ describe("Cloudflare sandbox provider plugin", () => {
         config: {
           bridgeBaseUrl: "https://bridge.example.workers.dev",
           bridgeAuthToken: "resolved-token",
-          timeoutMs: 2_000,
-          bridgeRequestTimeoutMs: 2_000,
+          timeoutMs: 4_000,
+          bridgeRequestTimeoutMs: 4_000,
         },
       });
 
@@ -374,6 +374,54 @@ describe("Cloudflare sandbox provider plugin", () => {
         });
         expect(requestHeadersAt(requestIndex).get("X-Paperclip-Acquisition-Id")).toBe("acquisition-1");
       }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shares one timeout budget across health and provider acquisition", async () => {
+    vi.useFakeTimers();
+    try {
+      fetchMock
+        .mockImplementationOnce(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 1_500));
+          return jsonResponse({
+            ok: true,
+            provider: "cloudflare",
+            bridgeVersion: "0.1.0",
+            capabilities: { acquisitionReplay: true, reuseLease: true, namedSessions: true, previewUrls: false },
+          });
+        })
+        .mockImplementationOnce(async (_url: string, init: RequestInit) =>
+          await new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("Aborted", "AbortError")),
+              { once: true },
+            );
+          }));
+
+      const acquisition = plugin.definition.onEnvironmentAcquireLease?.({
+        driverKey: "cloudflare",
+        companyId: "company-1",
+        environmentId: "env-1",
+        acquisitionId: "acquisition-1",
+        runId: "run-1",
+        config: {
+          bridgeBaseUrl: "https://bridge.example.workers.dev",
+          bridgeAuthToken: "resolved-token",
+          timeoutMs: 2_000,
+          bridgeRequestTimeoutMs: 2_000,
+        },
+      });
+
+      const rejected = expect(acquisition).rejects.toThrow(
+        "Cloudflare sandbox bridge request timed out after 500ms.",
+      );
+      await vi.advanceTimersByTimeAsync(2_000);
+      await rejected;
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(requestBodyAt(1)).toMatchObject({ timeoutMs: 500 });
     } finally {
       vi.useRealTimers();
     }
@@ -422,7 +470,7 @@ describe("Cloudflare sandbox provider plugin", () => {
       });
       await vi.advanceTimersByTimeAsync(1_000);
       await rejected;
-      expect(fetchMock).toHaveBeenCalledTimes(5);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
     } finally {
       vi.useRealTimers();
     }

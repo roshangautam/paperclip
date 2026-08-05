@@ -27,6 +27,10 @@ interface BridgeExecuteOptions {
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
 }
 
+interface BridgeRequestOptions {
+  timeoutMs?: number;
+}
+
 interface BridgeErrorBody {
   error?: string;
   message?: string;
@@ -114,9 +118,13 @@ async function requestJson<T>(
   path: string,
   init: RequestInit,
   extraHeaders: BridgeClientHeaders = {},
+  options: BridgeRequestOptions = {},
 ): Promise<T> {
   const controller = new AbortController();
-  const requestTimeoutMs = resolveRequestTimeoutMs(config, path, init);
+  const defaultRequestTimeoutMs = resolveRequestTimeoutMs(config, path, init);
+  const requestTimeoutMs = options.timeoutMs === undefined
+    ? defaultRequestTimeoutMs
+    : Math.max(1, Math.min(defaultRequestTimeoutMs, Math.trunc(options.timeoutMs)));
   const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
   const baseUrl = config.bridgeBaseUrl.replace(/\/+$/, "");
 
@@ -288,8 +296,17 @@ export function createCloudflareBridgeClient(options: BridgeClientOptions) {
   const { config } = options;
 
   return {
-    health(extraHeaders?: BridgeClientHeaders): Promise<CloudflareBridgeHealthResponse> {
-      return requestJson<CloudflareBridgeHealthResponse>(config, `${API_PREFIX}/health`, { method: "GET" }, extraHeaders);
+    health(
+      extraHeaders?: BridgeClientHeaders,
+      options?: BridgeRequestOptions,
+    ): Promise<CloudflareBridgeHealthResponse> {
+      return requestJson<CloudflareBridgeHealthResponse>(
+        config,
+        `${API_PREFIX}/health`,
+        { method: "GET" },
+        extraHeaders,
+        options,
+      );
     },
 
     probe(body: CloudflareBridgeProbeRequest, extraHeaders?: BridgeClientHeaders): Promise<CloudflareBridgeProbeResponse> {
@@ -304,12 +321,14 @@ export function createCloudflareBridgeClient(options: BridgeClientOptions) {
     acquireLease(
       body: CloudflareBridgeAcquireLeaseRequest,
       extraHeaders?: BridgeClientHeaders,
+      options?: BridgeRequestOptions,
     ): Promise<CloudflareBridgeLeaseResponse> {
       return requestJson<CloudflareBridgeLeaseResponse>(
         config,
         `${OWNERSHIP_API_PREFIX}/leases/acquire`,
         { method: "POST", body: JSON.stringify(body) },
         extraHeaders,
+        options,
       );
     },
 
