@@ -168,6 +168,43 @@ async function ensureWorkspace(
   requireZeroExit(`ensure workspace ${options.remoteCwd}`, result);
 }
 
+async function writeLegacySentinel(
+  sandbox: Sandbox,
+  input: {
+    providerLeaseId: string;
+    remoteCwd: string;
+    sessionStrategy: SessionStrategy;
+    sessionId: string;
+    keepAlive: boolean;
+    sleepAfter: string;
+    normalizeId: boolean;
+    resumedLease: boolean;
+    timeoutMs: number;
+  },
+): Promise<void> {
+  const sentinelPayload = JSON.stringify({
+    provider: "cloudflare",
+    providerLeaseId: input.providerLeaseId,
+    remoteCwd: input.remoteCwd,
+    sessionStrategy: input.sessionStrategy,
+    sessionId: input.sessionId,
+    keepAlive: input.keepAlive,
+    sleepAfter: input.sleepAfter,
+    normalizeId: input.normalizeId,
+    resumedLease: input.resumedLease,
+    updatedAt: new Date().toISOString(),
+  }, null, 2);
+  const sentinelPath = buildSentinelPath(input.remoteCwd);
+  const result = await execLeaseUtility(
+    sandbox,
+    input,
+    "sh",
+    ["-c", `mkdir -p ${shellQuote(input.remoteCwd)} && printf '%s\\n' ${shellQuote(sentinelPayload)} > ${shellQuote(sentinelPath)}`],
+    "/",
+  );
+  requireZeroExit(`write sentinel ${sentinelPath}`, result);
+}
+
 async function writeSentinelMirror(
   sandbox: Sandbox,
   input: {
@@ -609,9 +646,9 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     return toErrorResponse(401, "unauthorized", "Missing or invalid bridge bearer token.");
   }
 
-  const url = new URL(request.url);
-  const pathname = url.pathname
-    .replace(/\/+$/, "")
+  const rawPathname = new URL(request.url).pathname.replace(/\/+$/, "");
+  const isV2 = rawPathname.startsWith("/api/paperclip-sandbox/v2/");
+  const pathname = rawPathname
     .replace(/^\/api\/paperclip-sandbox\/v2(?=\/)/, "/api/paperclip-sandbox/v1");
 
   if (request.method === "GET" && pathname === "/api/paperclip-sandbox/v1/health") {
@@ -677,11 +714,13 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const acquisitionId = readString(body.acquisitionId, "");
     const environmentId = readString(body.environmentId, "");
     const runId = readString(body.runId, "");
-    if (!acquisitionId || !environmentId || !runId) {
+    if (!environmentId || !runId || (isV2 && !acquisitionId)) {
       return toErrorResponse(
         400,
         "invalid_request",
-        "acquisitionId, environmentId, and runId are required.",
+        isV2
+          ? "acquisitionId, environmentId, and runId are required."
+          : "environmentId and runId are required.",
       );
     }
 
@@ -693,6 +732,52 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const sessionStrategy = readSessionStrategy(body.sessionStrategy);
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
+    if (!isV2 && !acquisitionId) {
+      const providerLeaseId = buildLeaseSandboxId({
+        environmentId,
+        runId,
+        reuseLease,
+        normalizeId,
+      });
+      const sandbox = await resolveSandbox(env, providerLeaseId, { keepAlive, sleepAfter, normalizeId });
+      if ((await sandbox.readLeaseOwnership()).status !== "missing") {
+        return ownershipConflict(
+          `Refusing legacy acquisition of Cloudflare sandbox ${providerLeaseId}: authoritative ownership already exists.`,
+        );
+      }
+      try {
+        await applySandboxKeepAlive(sandbox, keepAlive);
+        await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
+        await writeLegacySentinel(sandbox, {
+          providerLeaseId,
+          remoteCwd,
+          sessionStrategy,
+          sessionId,
+          keepAlive,
+          sleepAfter,
+          normalizeId,
+          resumedLease: false,
+          timeoutMs,
+        });
+      } catch (error) {
+        if (!reuseLease) await sandbox.destroy().catch(() => undefined);
+        throw error;
+      }
+      return toJsonResponse({
+        providerLeaseId,
+        metadata: {
+          provider: "cloudflare",
+          remoteCwd,
+          sandboxId: providerLeaseId,
+          sessionStrategy,
+          sessionId,
+          keepAlive,
+          sleepAfter,
+          normalizeId,
+          resumedLease: false,
+        },
+      });
+    }
     const reuseScopeId = readString(body.reuseScopeId, "") || null;
     if (reuseLease && !/^[a-f0-9]{32}$/.test(reuseScopeId ?? "")) {
       return toErrorResponse(
@@ -828,7 +913,52 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const sessionStrategy = readSessionStrategy(body.sessionStrategy);
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
+    if (isV2 && !expectedAcquisitionId) {
+      return toErrorResponse(400, "invalid_request", "acquisitionId is required.");
+    }
     const sandbox = await resolveSandbox(env, body.providerLeaseId, { keepAlive, sleepAfter, normalizeId });
+    if (!isV2 && !expectedAcquisitionId) {
+      if ((await sandbox.readLeaseOwnership()).status !== "missing") {
+        return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox state is no longer available.");
+      }
+      const sentinel = await readSentinelOwnership(sandbox, {
+        providerLeaseId: body.providerLeaseId,
+        remoteCwd,
+        sessionStrategy,
+        sessionId,
+        timeoutMs,
+      });
+      if (sentinel.status !== "owned" || !sentinel.legacy) {
+        return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox state is no longer available.");
+      }
+      await applySandboxKeepAlive(sandbox, keepAlive);
+      await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
+      await writeLegacySentinel(sandbox, {
+        providerLeaseId: body.providerLeaseId,
+        remoteCwd,
+        sessionStrategy,
+        sessionId,
+        keepAlive,
+        sleepAfter,
+        normalizeId,
+        resumedLease: true,
+        timeoutMs,
+      });
+      return toJsonResponse({
+        providerLeaseId: body.providerLeaseId,
+        metadata: {
+          provider: "cloudflare",
+          remoteCwd,
+          sandboxId: body.providerLeaseId,
+          sessionStrategy,
+          sessionId,
+          keepAlive,
+          sleepAfter,
+          normalizeId,
+          resumedLease: true,
+        },
+      });
+    }
     // Resume always reattaches to a providerLeaseId the operator already
     // owns, so we deliberately do NOT destroy on failure here — the operator
     // has the ID and can issue an explicit release/destroy. Calling
@@ -928,7 +1058,22 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     }
     const reuseLease = readBoolean(body.reuseLease, false);
     const acquisitionId = readString(body.acquisitionId, "");
-    if (!acquisitionId && reuseLease) {
+    if (!isV2 && !acquisitionId) {
+      if (reuseLease) return toJsonResponse({ ok: true });
+      const sandbox = await resolveSandbox(env, body.providerLeaseId, {
+        keepAlive: readBoolean(body.keepAlive, false),
+        sleepAfter: "10m",
+        normalizeId: true,
+      });
+      if ((await sandbox.readLeaseOwnership()).status !== "missing") {
+        return ownershipConflict(
+          `Refusing legacy release of Cloudflare sandbox ${body.providerLeaseId}: authoritative ownership already exists.`,
+        );
+      }
+      await sandbox.destroy().catch(() => undefined);
+      return toJsonResponse({ ok: true });
+    }
+    if (!acquisitionId) {
       return toErrorResponse(400, "invalid_request", "acquisitionId is required to release a lease.");
     }
     const remoteCwd = readString(body.requestedCwd, DEFAULT_REMOTE_CWD);
@@ -985,11 +1130,23 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
     const acquisitionId = readString(body.acquisitionId, "");
+    if (isV2 && !acquisitionId) {
+      return toErrorResponse(400, "invalid_request", "acquisitionId is required to destroy a lease.");
+    }
     const sandbox = await resolveSandbox(env, providerLeaseId, {
       keepAlive: false,
       sleepAfter: "10m",
       normalizeId: true,
     });
+    if (!isV2 && !acquisitionId) {
+      if ((await sandbox.readLeaseOwnership()).status !== "missing") {
+        return ownershipConflict(
+          `Refusing legacy destruction of Cloudflare sandbox ${providerLeaseId}: authoritative ownership already exists.`,
+        );
+      }
+      await sandbox.destroy().catch(() => undefined);
+      return toJsonResponse({ ok: true });
+    }
     const destroyed = await destroyRequestedLease(sandbox, {
       providerLeaseId,
       requestedAcquisitionId: acquisitionId,
@@ -1009,8 +1166,14 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
   if (request.method === "POST" && pathname === "/api/paperclip-sandbox/v1/exec") {
     const body = await readJson<ExecuteRequestBody>(request);
     const acquisitionId = readString(body.acquisitionId, "");
-    if (!body.providerLeaseId || !acquisitionId || !body.command) {
-      return toErrorResponse(400, "invalid_request", "providerLeaseId, acquisitionId, and command are required.");
+    if (!body.providerLeaseId || !body.command || (isV2 && !acquisitionId)) {
+      return toErrorResponse(
+        400,
+        "invalid_request",
+        isV2
+          ? "providerLeaseId, acquisitionId, and command are required."
+          : "providerLeaseId and command are required.",
+      );
     }
     const sessionStrategy = readSessionStrategy(body.sessionStrategy);
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
@@ -1020,26 +1183,59 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
       sleepAfter: "10m",
       normalizeId: true,
     });
-    const executionIdentity = {
-      providerLeaseId: body.providerLeaseId,
-      acquisitionId,
-    };
-    const executionId = crypto.randomUUID();
-    const execution = await sandbox.beginLeaseExecution(
-      executionIdentity,
-      executionId,
-      executionFenceExpiry(),
-    );
-    if (execution.status !== "started" && execution.status !== "replayed") {
+    const executionIdentity = acquisitionId
+      ? { providerLeaseId: body.providerLeaseId, acquisitionId }
+      : null;
+    const executionId = executionIdentity ? crypto.randomUUID() : null;
+    let stopExecutionFenceRenewal: ExecutionFenceRenewal | null = null;
+    if (!executionIdentity && (await sandbox.readLeaseOwnership()).status !== "missing") {
       return ownershipConflict(
-        `Refusing to execute in Cloudflare sandbox ${body.providerLeaseId}: acquisition ownership does not match.`,
+        `Refusing legacy execution in Cloudflare sandbox ${body.providerLeaseId}: authoritative ownership already exists.`,
       );
     }
-    const stopExecutionFenceRenewal = startExecutionFenceRenewal(
-      sandbox,
-      executionIdentity,
-      executionId,
-    );
+    if (executionIdentity && executionId) {
+      const execution = await sandbox.beginLeaseExecution(
+        executionIdentity,
+        executionId,
+        executionFenceExpiry(),
+      );
+      if (execution.status !== "started" && execution.status !== "replayed") {
+        return ownershipConflict(
+          `Refusing to execute in Cloudflare sandbox ${body.providerLeaseId}: acquisition ownership does not match.`,
+        );
+      }
+      stopExecutionFenceRenewal = startExecutionFenceRenewal(
+        sandbox,
+        executionIdentity,
+        executionId,
+      );
+    }
+    const runExecution = async (
+      onOutput?: (stream: "stdout" | "stderr", data: string) => void | Promise<void>,
+    ) => {
+      const operation = async () => await executeInSandbox({
+        sandbox,
+        command: body.command!,
+        args: Array.isArray(body.args) ? body.args.filter((value): value is string => typeof value === "string") : [],
+        cwd: typeof body.cwd === "string" ? body.cwd : undefined,
+        env: body.env,
+        stdin: body.stdin ?? null,
+        timeoutMs,
+        sessionStrategy,
+        sessionId,
+        onOutput,
+      });
+      return executionIdentity && executionId && stopExecutionFenceRenewal
+        ? await runFencedOperation(
+            sandbox,
+            executionIdentity,
+            executionId,
+            stopExecutionFenceRenewal,
+            operation,
+            { destroyAfterExecution: (result) => result.timedOut && sessionStrategy === "default" },
+          )
+        : await operation();
+    };
     if (body.streamOutput === true) {
       const encoder = new TextEncoder();
       const stream = new ReadableStream<Uint8Array>({
@@ -1056,29 +1252,9 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
             }
           }, 15_000);
           try {
-            const result = await runFencedOperation(
-              sandbox,
-              executionIdentity,
-              executionId,
-              stopExecutionFenceRenewal,
-              async () => await executeInSandbox({
-                sandbox,
-                command: body.command!,
-                args: Array.isArray(body.args) ? body.args.filter((value): value is string => typeof value === "string") : [],
-                cwd: typeof body.cwd === "string" ? body.cwd : undefined,
-                env: body.env,
-                stdin: body.stdin ?? null,
-                timeoutMs,
-                sessionStrategy,
-                sessionId,
-                onOutput: async (streamName, data) => {
-                  controller.enqueue(encoder.encode(encodeSseEvent(streamName, { data })));
-                },
-              }),
-              {
-                destroyAfterExecution: (result) => result.timedOut && sessionStrategy === "default",
-              },
-            );
+            const result = await runExecution(async (streamName, data) => {
+              controller.enqueue(encoder.encode(encodeSseEvent(streamName, { data })));
+            });
             controller.enqueue(encoder.encode(encodeSseEvent("complete", result)));
           } catch (error) {
             controller.enqueue(encoder.encode(encodeSseEvent("error", {
@@ -1092,27 +1268,7 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
       });
       return toSseResponse(stream);
     }
-    const result = await runFencedOperation(
-      sandbox,
-      executionIdentity,
-      executionId,
-      stopExecutionFenceRenewal,
-      async () => await executeInSandbox({
-        sandbox,
-        command: body.command!,
-        args: Array.isArray(body.args) ? body.args.filter((value): value is string => typeof value === "string") : [],
-        cwd: typeof body.cwd === "string" ? body.cwd : undefined,
-        env: body.env,
-        stdin: body.stdin ?? null,
-        timeoutMs,
-        sessionStrategy,
-        sessionId,
-      }),
-      {
-        destroyAfterExecution: (result) => result.timedOut && sessionStrategy === "default",
-      },
-    );
-    return toJsonResponse(result);
+    return toJsonResponse(await runExecution());
   }
 
   return toErrorResponse(404, "not_found", `No bridge route matched ${request.method} ${pathname}.`);

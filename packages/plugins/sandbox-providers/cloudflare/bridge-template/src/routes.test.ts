@@ -373,6 +373,30 @@ describe("bridge routes", () => {
     expect(sandboxIds[0]).not.toBe(sandboxIds[1]);
   });
 
+  it("keeps v1 acquisition without acquisitionId compatible and rejects it in v2", async () => {
+    const { sandbox } = createSandbox();
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
+    const legacy = await handleBridgeRequest(
+      bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", acquireBody("")),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
+    const strict = await handleBridgeRequest(
+      bridgeRequest("/api/paperclip-sandbox/v2/leases/acquire", acquireBody("")),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
+
+    expect(legacy.status).toBe(200);
+    expect(await legacy.json()).toMatchObject({
+      providerLeaseId: "pc-acq-run-1",
+      metadata: { resumedLease: false },
+    });
+    expect(sandbox.claimLeaseOwnership).not.toHaveBeenCalled();
+    expect(strict.status).toBe(400);
+    expect(await strict.json()).toMatchObject({ error: "invalid_request" });
+    expect(resolveSandbox).toHaveBeenCalledOnce();
+  });
+
   it("claims ownership before writing the filesystem mirror", async () => {
     const { sandbox, sessionExec } = createSandbox();
     vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
@@ -776,7 +800,7 @@ describe("bridge routes", () => {
     expect(sessionExec.mock.calls.some(([command]) => String(command).includes("acquisitionFingerprint"))).toBe(true);
   });
 
-  it("migrates a matching legacy sentinel when resume omits acquisitionId", async () => {
+  it("keeps legacy resume without acquisitionId stateless", async () => {
     const sessionExec = vi.fn().mockImplementation(async (command: string) => ({
       exitCode: 0,
       stdout: command.includes("test ! -e")
@@ -798,27 +822,10 @@ describe("bridge routes", () => {
     const replay = await resume();
 
     expect([response.status, replay.status]).toEqual([200, 200]);
-    expect(await response.json()).toMatchObject({
-      metadata: { acquisitionId: "legacy:pc-acq-acquisition-1" },
-    });
-    expect(await replay.json()).toMatchObject({
-      metadata: { acquisitionId: "legacy:pc-acq-acquisition-1" },
-    });
-    expect(sandbox.claimLeaseOwnership).toHaveBeenCalledWith({
-      providerLeaseId: "pc-acq-acquisition-1",
-      acquisitionId: "legacy:pc-acq-acquisition-1",
-      acquisitionFingerprint: "legacy:pc-acq-acquisition-1",
-    });
-    expect(sandbox.claimLeaseOwnership).toHaveBeenCalledOnce();
-    expect(sandbox.beginLeaseExecution).toHaveBeenCalledTimes(2);
-    expect(sandbox.beginLeaseExecution).toHaveBeenCalledWith(
-      expect.objectContaining({
-        providerLeaseId: "pc-acq-acquisition-1",
-        acquisitionId: "legacy:pc-acq-acquisition-1",
-      }),
-      expect.any(String),
-      expect.any(String),
-    );
+    expect(await response.json()).not.toHaveProperty("metadata.acquisitionId");
+    expect(await replay.json()).not.toHaveProperty("metadata.acquisitionId");
+    expect(sandbox.claimLeaseOwnership).not.toHaveBeenCalled();
+    expect(sandbox.beginLeaseExecution).not.toHaveBeenCalled();
   });
 
   it("rejects missing acquisitionId against modern authoritative ownership", async () => {
@@ -1051,7 +1058,7 @@ describe("bridge routes", () => {
     expect(sandbox.completeLeaseDestruction).not.toHaveBeenCalled();
   });
 
-  it("migrates matching legacy ownership for non-reusable release without an acquisition identity", async () => {
+  it("directly destroys a legacy non-reusable release without creating ownership", async () => {
     const sessionExec = vi.fn().mockImplementation(async (command: string) => ({
       exitCode: 0,
       stdout: command.includes("test ! -e")
@@ -1071,15 +1078,11 @@ describe("bridge routes", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(sandbox.claimLeaseOwnership).toHaveBeenCalledWith({
-      providerLeaseId: "pc-acq-acquisition-1",
-      acquisitionId: "legacy:pc-acq-acquisition-1",
-      acquisitionFingerprint: "legacy:pc-acq-acquisition-1",
-    });
+    expect(sandbox.claimLeaseOwnership).not.toHaveBeenCalled();
     expect(sandbox.destroy).toHaveBeenCalledOnce();
   });
 
-  it("migrates matching legacy ownership at its persisted custom workspace for DELETE", async () => {
+  it("directly destroys a legacy DELETE without creating ownership", async () => {
     const sessionExec = vi.fn().mockImplementation(async (command: string) => ({
       exitCode: 0,
       stdout: command.includes("test ! -e")
@@ -1100,45 +1103,23 @@ describe("bridge routes", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(sandbox.claimLeaseOwnership).toHaveBeenCalledWith({
-      providerLeaseId: "pc-acq-acquisition-1",
-      acquisitionId: "legacy:pc-acq-acquisition-1",
-      acquisitionFingerprint: "legacy:pc-acq-acquisition-1",
-    });
+    expect(sandbox.claimLeaseOwnership).not.toHaveBeenCalled();
     expect(sandbox.destroy).toHaveBeenCalledOnce();
   });
 
-  it("does not adopt legacy ownership from a caller-selected workspace", async () => {
-    const sessionExec = vi.fn().mockImplementation(async (command: string) => ({
-      exitCode: 0,
-      stdout: command.includes("/tmp/caller-selected-workspace")
-        ? JSON.stringify({ providerLeaseId: "pc-acq-acquisition-1", remoteCwd: DEFAULT_REMOTE_CWD })
-        : "",
-      stderr: "",
-    }));
-    const { sandbox } = createSandbox({ sessionExec });
-    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
-
+  it("rejects v2 DELETE without acquisitionId before resolving a sandbox", async () => {
     const response = await handleBridgeRequest(
       bridgeRequest(
-        "/api/paperclip-sandbox/v1/leases/pc-acq-acquisition-1",
-        {
-          requestedCwd: "/tmp/caller-selected-workspace",
-        },
+        "/api/paperclip-sandbox/v2/leases/pc-acq-acquisition-1",
+        {},
         "DELETE",
       ),
       { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
     );
 
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ error: "acquisition_conflict" });
-    expect(sessionExec).toHaveBeenCalledWith(
-      expect.stringContaining("/tmp/caller-selected-workspace"),
-      expect.anything(),
-    );
-    expect(sandbox.claimLeaseOwnership).not.toHaveBeenCalled();
-    expect(sandbox.destroy).not.toHaveBeenCalled();
-    expect(sandbox.completeLeaseDestruction).not.toHaveBeenCalled();
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "invalid_request" });
+    expect(resolveSandbox).not.toHaveBeenCalled();
   });
 
   it("rejects replay while destruction of the same acquisition is in flight", async () => {

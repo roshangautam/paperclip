@@ -566,14 +566,44 @@ describe("durable lease ownership", () => {
 
     expect(await sandbox.beginLeaseDestruction(laterClaim, "destruction-two")).toMatchObject({ status: "started" });
     expect(await sandbox.completeLeaseDestruction(laterClaim, "destruction-two")).toEqual({ status: "completed" });
-    expect(records.size).toBe(2);
-    expect([...records.values()]).toEqual(expect.arrayContaining([
-      expect.objectContaining({ acquisitionId: "acquisition-one" }),
-      expect.objectContaining({ acquisitionId: "acquisition-two" }),
-    ]));
+    expect(records.size).toBe(1);
+    expect(records.get(LEASE_DESTRUCTION_STORAGE_KEY)).toEqual({
+      version: 2,
+      entries: [
+        expect.objectContaining({ acquisitionId: "acquisition-two" }),
+        expect.objectContaining({ acquisitionId: "acquisition-one" }),
+      ],
+    });
     expect(await sandbox.claimLeaseOwnership(record)).toEqual({ status: "completed" });
     expect(await sandbox.beginLeaseDestruction(laterClaim, "destruction-retry")).toEqual({ status: "completed" });
     expect(await sandbox.readLeaseOwnership()).toEqual({ status: "missing" });
+  });
+
+  it("caps destruction history at 32 acquisitions", async () => {
+    const { sandbox, records } = createOwnershipSandbox();
+
+    for (let index = 0; index < 40; index += 1) {
+      const claim = {
+        providerLeaseId: "pc-env-shared",
+        acquisitionId: `acquisition-${index}`,
+        acquisitionFingerprint: `fingerprint-${index}`,
+      };
+      expect(await sandbox.claimLeaseOwnership(claim)).toMatchObject({ status: "claimed" });
+      expect(await sandbox.beginLeaseDestruction(claim, `destruction-${index}`)).toMatchObject({ status: "started" });
+      expect(await sandbox.completeLeaseDestruction(claim, `destruction-${index}`)).toEqual({ status: "completed" });
+    }
+
+    expect(records.size).toBe(1);
+    expect(records.get(LEASE_DESTRUCTION_STORAGE_KEY)).toMatchObject({
+      version: 2,
+      entries: expect.arrayContaining([
+        expect.objectContaining({ acquisitionId: "acquisition-39" }),
+        expect.objectContaining({ acquisitionId: "acquisition-8" }),
+      ]),
+    });
+    const history = records.get(LEASE_DESTRUCTION_STORAGE_KEY) as { entries: Array<{ acquisitionId: string }> };
+    expect(history.entries).toHaveLength(32);
+    expect(history.entries.map((entry) => entry.acquisitionId)).not.toContain("acquisition-7");
   });
 
   it("keeps legacy singleton destruction tombstones replay-compatible", async () => {
@@ -590,6 +620,24 @@ describe("durable lease ownership", () => {
     expect(await sandbox.beginLeaseDestruction(record, "destruction-retry")).toEqual({ status: "completed" });
     expect(await sandbox.completeLeaseDestruction(record, "destruction-retry")).toEqual({ status: "completed" });
     expect(records.get(LEASE_DESTRUCTION_STORAGE_KEY)).toEqual(legacyDestruction);
+    expect(await sandbox.readLeaseOwnership()).toEqual({ status: "missing" });
+  });
+
+  it("keeps legacy per-acquisition destruction tombstones replay-compatible", async () => {
+    const record = ownership();
+    const { sandbox, records } = createOwnershipSandbox();
+    records.set(
+      `${LEASE_DESTRUCTION_STORAGE_KEY}:${JSON.stringify([record.providerLeaseId, record.acquisitionId])}`,
+      {
+        version: 1,
+        providerLeaseId: record.providerLeaseId,
+        acquisitionId: record.acquisitionId,
+        completedAt: "2026-08-04T00:01:00.000Z",
+      },
+    );
+
+    expect(await sandbox.claimLeaseOwnership(record)).toEqual({ status: "completed" });
+    expect(await sandbox.beginLeaseDestruction(record, "destruction-retry")).toEqual({ status: "completed" });
     expect(await sandbox.readLeaseOwnership()).toEqual({ status: "missing" });
   });
 
