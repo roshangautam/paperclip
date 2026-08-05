@@ -535,6 +535,39 @@ describe("Cloudflare sandbox provider plugin", () => {
     );
   });
 
+  it.each([
+    {
+      mismatch: "provider lease",
+      response: {
+        providerLeaseId: "pc-env-another-env",
+        metadata: { provider: "cloudflare", acquisitionId: "acquisition-1" },
+      },
+      expectedError: "Cloudflare sandbox bridge resumed a different provider lease.",
+    },
+    {
+      mismatch: "lease acquisition",
+      response: {
+        providerLeaseId: "pc-env-env-1",
+        metadata: { provider: "cloudflare", acquisitionId: "acquisition-2" },
+      },
+      expectedError: "Cloudflare sandbox bridge resumed a different lease acquisition.",
+    },
+  ])("rejects resume responses for a different $mismatch", async ({ response, expectedError }) => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(response));
+
+    await expect(plugin.definition.onEnvironmentResumeLease?.({
+      driverKey: "cloudflare",
+      companyId: "company-1",
+      environmentId: "env-1",
+      providerLeaseId: "pc-env-env-1",
+      leaseMetadata: { acquisitionId: "acquisition-1" },
+      config: {
+        bridgeBaseUrl: "https://bridge.example.workers.dev",
+        bridgeAuthToken: "resolved-token",
+      },
+    })).rejects.toThrow(expectedError);
+  });
+
   it("fails closed before an old bridge can resume a lease", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ error: "not_found" }, 404));
 

@@ -353,10 +353,17 @@ const plugin = definePlugin({
         },
         { environmentId: params.environmentId, issueId: params.issueId },
       );
-      if (!readLeaseAcquisitionId(resumed.metadata)) {
+      const resumedAcquisitionId = readLeaseAcquisitionId(resumed.metadata);
+      if (!resumedAcquisitionId) {
         throw new Error(
           "Cloudflare sandbox bridge resume response is missing lease ownership metadata; deploy the current bridge before resuming leases.",
         );
+      }
+      if (resumed.providerLeaseId !== params.providerLeaseId) {
+        throw new Error("Cloudflare sandbox bridge resumed a different provider lease.");
+      }
+      if (acquisitionId && resumedAcquisitionId !== acquisitionId) {
+        throw new Error("Cloudflare sandbox bridge resumed a different lease acquisition.");
       }
       return resumed;
     } catch (error) {

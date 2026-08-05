@@ -822,7 +822,7 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     // `getSandbox` is idempotent on the Sandbox SDK side (no new sandbox is
     // created), so a failed resume doesn't leak a *new* sandbox.
     const containerState = await sandbox.readContainerState();
-    if (containerState.status !== "healthy") {
+    if (containerState.status !== "running" && containerState.status !== "healthy") {
       return toErrorResponse(409, "sandbox_state_lost", "Cloudflare sandbox state is no longer available.");
     }
     const resolvedOwnership = await resolveOwnedLease(sandbox, {

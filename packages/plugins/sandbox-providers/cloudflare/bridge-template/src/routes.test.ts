@@ -671,11 +671,12 @@ describe("bridge routes", () => {
   });
 
   it.each([
-    "running",
-    "stopping",
-    "stopped",
-    "stopped_with_code",
-  ] as const)("rejects resume when the container state is %s", async (status) => {
+    ["running", 200],
+    ["healthy", 200],
+    ["stopping", 409],
+    ["stopped", 409],
+    ["stopped_with_code", 409],
+  ] as const)("handles resume when the container state is %s", async (status, expectedStatus) => {
     const { sandbox, sessionExec } = createSandbox({ ownership: ownership() });
     sandbox.readContainerState.mockResolvedValue({ status, lastChange: 0 });
     vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
@@ -690,11 +691,16 @@ describe("bridge routes", () => {
       { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
     );
 
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ error: "sandbox_state_lost" });
-    expect(sandbox.beginLeaseExecution).not.toHaveBeenCalled();
-    expect(sandbox.setKeepAlive).not.toHaveBeenCalled();
-    expect(sessionExec).not.toHaveBeenCalled();
+    expect(response.status).toBe(expectedStatus);
+    if (expectedStatus === 200) {
+      expect(sandbox.beginLeaseExecution).toHaveBeenCalledOnce();
+      expect(sandbox.setKeepAlive).toHaveBeenCalledWith(true);
+    } else {
+      expect(await response.json()).toMatchObject({ error: "sandbox_state_lost" });
+      expect(sandbox.beginLeaseExecution).not.toHaveBeenCalled();
+      expect(sandbox.setKeepAlive).not.toHaveBeenCalled();
+      expect(sessionExec).not.toHaveBeenCalled();
+    }
   });
 
   it("migrates a matching legacy sentinel only during resume", async () => {
