@@ -69,6 +69,7 @@ interface ExecuteRequestBody {
 
 const EXECUTION_FENCE_RENEW_INTERVAL_MS = 15_000;
 const EXECUTION_FENCE_TTL_MS = EXECUTION_FENCE_RENEW_INTERVAL_MS * 4;
+const SENTINEL_OWNERSHIP_MAX_BYTES = 4_096;
 
 function readBoolean(value: unknown, fallback: boolean): boolean {
   return value === undefined ? fallback : value === true;
@@ -241,10 +242,13 @@ async function readSentinelOwnership(
     sandbox,
     input,
     "sh",
-    ["-c", `test ! -e ${shellQuote(sentinelPath)} || cat ${shellQuote(sentinelPath)}`],
+    ["-c", `test ! -e ${shellQuote(sentinelPath)} || head -c ${SENTINEL_OWNERSHIP_MAX_BYTES + 1} ${shellQuote(sentinelPath)}`],
     "/",
   );
   requireZeroExit(`read sentinel ${sentinelPath}`, result);
+  if (new TextEncoder().encode(result.stdout).byteLength > SENTINEL_OWNERSHIP_MAX_BYTES) {
+    return { status: "invalid" };
+  }
   if (!result.stdout.trim()) return { status: "missing" };
   try {
     const parsed = JSON.parse(result.stdout) as {

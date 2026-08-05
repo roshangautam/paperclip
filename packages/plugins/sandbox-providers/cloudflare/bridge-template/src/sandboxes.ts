@@ -2,7 +2,7 @@ import { Sandbox as CloudflareSandbox, getSandbox } from "@cloudflare/sandbox";
 import { buildLeaseSandboxId, buildSentinelPath, isTimeoutError } from "./helpers.js";
 
 export const LEASE_OWNERSHIP_STORAGE_KEY = "paperclip.leaseOwnership.v1";
-const LEASE_DESTRUCTION_STORAGE_PREFIX = "paperclip.leaseDestruction.v1";
+const LEASE_DESTRUCTION_STORAGE_KEY = "paperclip.leaseDestruction.v1";
 
 export interface LeaseOwnershipRecord {
   version: 1;
@@ -114,8 +114,9 @@ function isLeaseDestructionRecord(value: unknown): value is LeaseDestructionReco
     && candidate.completedAt.length > 0;
 }
 
-function destructionStorageKey(identity: LeaseOwnershipIdentity): string {
-  return `${LEASE_DESTRUCTION_STORAGE_PREFIX}:${encodeURIComponent(identity.providerLeaseId)}:${encodeURIComponent(identity.acquisitionId)}`;
+function destructionMatches(record: LeaseDestructionRecord, identity: LeaseOwnershipIdentity): boolean {
+  return record.providerLeaseId === identity.providerLeaseId
+    && record.acquisitionId === identity.acquisitionId;
 }
 
 function ownershipMatches(record: LeaseOwnershipRecord, identity: LeaseOwnershipIdentity): boolean {
@@ -170,13 +171,10 @@ export class Sandbox extends CloudflareSandbox {
       return { status: "invalid" };
     }
     return await this.ctx.storage.transaction(async (transaction) => {
-      const completed = await transaction.get<unknown>(destructionStorageKey(claim));
+      const completed = await transaction.get<unknown>(LEASE_DESTRUCTION_STORAGE_KEY);
       if (completed !== undefined) {
-        return isLeaseDestructionRecord(completed)
-            && completed.providerLeaseId === claim.providerLeaseId
-            && completed.acquisitionId === claim.acquisitionId
-          ? { status: "completed" }
-          : { status: "invalid" };
+        if (!isLeaseDestructionRecord(completed)) return { status: "invalid" };
+        if (destructionMatches(completed, claim)) return { status: "completed" };
       }
 
       const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
@@ -294,13 +292,10 @@ export class Sandbox extends CloudflareSandbox {
     destructionId: string,
   ): Promise<LeaseOwnershipDestroyResult> {
     return await this.ctx.storage.transaction(async (transaction) => {
-      const completed = await transaction.get<unknown>(destructionStorageKey(identity));
+      const completed = await transaction.get<unknown>(LEASE_DESTRUCTION_STORAGE_KEY);
       if (completed !== undefined) {
-        return isLeaseDestructionRecord(completed)
-            && completed.providerLeaseId === identity.providerLeaseId
-            && completed.acquisitionId === identity.acquisitionId
-          ? { status: "completed" }
-          : { status: "invalid" };
+        if (!isLeaseDestructionRecord(completed)) return { status: "invalid" };
+        if (destructionMatches(completed, identity)) return { status: "completed" };
       }
 
       const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
@@ -390,13 +385,10 @@ export class Sandbox extends CloudflareSandbox {
     destructionId: string,
   ): Promise<LeaseOwnershipDestroyResult> {
     return await this.ctx.storage.transaction(async (transaction) => {
-      const completed = await transaction.get<unknown>(destructionStorageKey(identity));
+      const completed = await transaction.get<unknown>(LEASE_DESTRUCTION_STORAGE_KEY);
       if (completed !== undefined) {
-        return isLeaseDestructionRecord(completed)
-            && completed.providerLeaseId === identity.providerLeaseId
-            && completed.acquisitionId === identity.acquisitionId
-          ? { status: "completed" }
-          : { status: "invalid" };
+        if (!isLeaseDestructionRecord(completed)) return { status: "invalid" };
+        if (destructionMatches(completed, identity)) return { status: "completed" };
       }
 
       const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
@@ -436,12 +428,10 @@ export class Sandbox extends CloudflareSandbox {
     return await this.ctx.storage.transaction(async (transaction) => {
       const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
       if (stored === undefined) {
-        const completed = await transaction.get<unknown>(destructionStorageKey(identity));
-        return isLeaseDestructionRecord(completed)
-            && completed.providerLeaseId === identity.providerLeaseId
-            && completed.acquisitionId === identity.acquisitionId
-          ? { status: "completed" }
-          : { status: "missing" };
+        const completed = await transaction.get<unknown>(LEASE_DESTRUCTION_STORAGE_KEY);
+        if (completed === undefined) return { status: "missing" };
+        if (!isLeaseDestructionRecord(completed)) return { status: "invalid" };
+        return destructionMatches(completed, identity) ? { status: "completed" } : { status: "missing" };
       }
       if (!isLeaseOwnershipRecord(stored)) return { status: "invalid" };
       if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
@@ -454,7 +444,7 @@ export class Sandbox extends CloudflareSandbox {
         ...identity,
         completedAt: new Date().toISOString(),
       };
-      await transaction.put(destructionStorageKey(identity), completed);
+      await transaction.put(LEASE_DESTRUCTION_STORAGE_KEY, completed);
       await transaction.delete(LEASE_OWNERSHIP_STORAGE_KEY);
       return { status: "completed" };
     });

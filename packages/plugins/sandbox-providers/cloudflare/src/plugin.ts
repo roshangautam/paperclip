@@ -27,8 +27,8 @@ const SANDBOX_EXEC_CHANNEL_BRIDGE = "bridge";
 const SANDBOX_ACQUISITION_ID_KEY = "sandboxAcquisitionId";
 const CLOUDFLARE_EXEC_STDOUT_PREFIX = "[cloudflare exec stdout]";
 const CLOUDFLARE_EXEC_STDERR_PREFIX = "[cloudflare exec stderr]";
-const ACQUISITION_REPLAY_MAX_ATTEMPTS = 4;
-const ACQUISITION_IN_PROGRESS_RETRY_DELAY_MS = 250;
+const ACQUISITION_REPLAY_INITIAL_DELAY_MS = 250;
+const ACQUISITION_REPLAY_MAX_DELAY_MS = 5_000;
 
 function isLostLeaseError(error: unknown): boolean {
   return error instanceof CloudflareBridgeError && error.status === 409;
@@ -69,10 +69,14 @@ function shouldReplayAcquisition(error: unknown): boolean {
   return error.status >= 500 && error.code !== "acquisition_failed";
 }
 
-async function waitForAcquisitionReplay(error: unknown): Promise<void> {
-  if (error instanceof CloudflareBridgeError && error.code === "acquisition_in_progress") {
-    await new Promise((resolve) => setTimeout(resolve, ACQUISITION_IN_PROGRESS_RETRY_DELAY_MS));
-  }
+async function waitForAcquisitionReplay(attempt: number, deadline: number): Promise<void> {
+  const remainingMs = deadline - Date.now();
+  const delayMs = Math.min(
+    ACQUISITION_REPLAY_INITIAL_DELAY_MS * 2 ** (attempt - 1),
+    ACQUISITION_REPLAY_MAX_DELAY_MS,
+    remainingMs,
+  );
+  if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function readLeaseAcquisitionId(metadata: Record<string, unknown> | undefined): string | null {
@@ -293,15 +297,18 @@ const plugin = definePlugin({
       runId: params.runId,
       issueId: params.issueId,
     };
+    let replayDeadline: number | null = null;
     try {
       for (let attempt = 1; ; attempt += 1) {
         try {
           return await client.acquireLease(acquisitionRequest, acquisitionHeaders);
         } catch (error) {
-          if (attempt >= ACQUISITION_REPLAY_MAX_ATTEMPTS || !shouldReplayAcquisition(error)) {
+          if (!shouldReplayAcquisition(error)) {
             throw error;
           }
-          await waitForAcquisitionReplay(error);
+          replayDeadline ??= Date.now() + Math.max(config.timeoutMs, config.bridgeRequestTimeoutMs);
+          if (Date.now() >= replayDeadline) throw error;
+          await waitForAcquisitionReplay(attempt, replayDeadline);
         }
       }
     } catch (error) {

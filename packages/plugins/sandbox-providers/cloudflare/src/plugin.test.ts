@@ -304,7 +304,7 @@ describe("Cloudflare sandbox provider plugin", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("replays ambiguous and in-progress acquisitions with the same acquisition ID", async () => {
+  it("replays ambiguous and in-progress acquisitions through the setup deadline", async () => {
     vi.useFakeTimers();
     try {
       fetchMock
@@ -316,7 +316,20 @@ describe("Cloudflare sandbox provider plugin", () => {
             capabilities: { acquisitionReplay: true, reuseLease: true, namedSessions: true, previewUrls: false },
           }),
         )
-        .mockRejectedValueOnce(new TypeError("connection closed before the response arrived"))
+        .mockImplementationOnce(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 1_500));
+          throw new TypeError("connection closed before the response arrived");
+        })
+        .mockResolvedValueOnce(
+          jsonResponse(
+            {
+              error: "acquisition_in_progress",
+              message: "Cloudflare sandbox setup is still in progress.",
+              details: { providerLeaseId: "pc-acq-acquisition-1" },
+            },
+            503,
+          ),
+        )
         .mockResolvedValueOnce(
           jsonResponse(
             {
@@ -343,15 +356,17 @@ describe("Cloudflare sandbox provider plugin", () => {
         config: {
           bridgeBaseUrl: "https://bridge.example.workers.dev",
           bridgeAuthToken: "resolved-token",
+          timeoutMs: 2_000,
+          bridgeRequestTimeoutMs: 2_000,
         },
       });
 
-      await vi.advanceTimersByTimeAsync(250);
+      await vi.advanceTimersByTimeAsync(3_250);
       await expect(acquisition).resolves.toMatchObject({
         providerLeaseId: "pc-acq-acquisition-1",
       });
-      expect(fetchMock).toHaveBeenCalledTimes(4);
-      for (const requestIndex of [1, 2, 3]) {
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+      for (const requestIndex of [1, 2, 3, 4]) {
         expect(requestBodyAt(requestIndex)).toMatchObject({
           acquisitionId: "acquisition-1",
           environmentId: "env-1",
@@ -375,18 +390,16 @@ describe("Cloudflare sandbox provider plugin", () => {
           capabilities: { acquisitionReplay: true, reuseLease: true, namedSessions: true, previewUrls: false },
         }),
       );
-      for (let attempt = 0; attempt < 4; attempt += 1) {
-        fetchMock.mockResolvedValueOnce(
-          jsonResponse(
-            {
-              error: "acquisition_in_progress",
-              message: "Cloudflare sandbox setup is still in progress.",
-              details: { providerLeaseId: "pc-acq-acquisition-1" },
-            },
-            503,
-          ),
-        );
-      }
+      fetchMock.mockImplementation(async () =>
+        jsonResponse(
+          {
+            error: "acquisition_in_progress",
+            message: "Cloudflare sandbox setup is still in progress.",
+            details: { providerLeaseId: "pc-acq-acquisition-1" },
+          },
+          503,
+        ),
+      );
 
       const acquisition = plugin.definition.onEnvironmentAcquireLease?.({
         driverKey: "cloudflare",
@@ -397,6 +410,8 @@ describe("Cloudflare sandbox provider plugin", () => {
         config: {
           bridgeBaseUrl: "https://bridge.example.workers.dev",
           bridgeAuthToken: "resolved-token",
+          timeoutMs: 1_000,
+          bridgeRequestTimeoutMs: 1_000,
         },
       });
 
@@ -405,7 +420,7 @@ describe("Cloudflare sandbox provider plugin", () => {
         code: -32002,
         data: { providerLeaseId: "pc-acq-acquisition-1" },
       });
-      await vi.advanceTimersByTimeAsync(750);
+      await vi.advanceTimersByTimeAsync(1_000);
       await rejected;
       expect(fetchMock).toHaveBeenCalledTimes(5);
     } finally {

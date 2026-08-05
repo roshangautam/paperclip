@@ -635,6 +635,41 @@ describe("bridge routes", () => {
     },
   );
 
+  it("rejects oversized sentinel contents before resuming the lease", async () => {
+    const sentinelContents = JSON.stringify({
+      providerLeaseId: "pc-acq-acquisition-1",
+      acquisitionId: "acquisition-1",
+      acquisitionFingerprint: "fingerprint-1",
+      remoteCwd: "/workspace/paperclip",
+      padding: "x".repeat(4_096),
+    });
+    const sessionExec = vi.fn().mockResolvedValue({
+      exitCode: 0,
+      stdout: sentinelContents,
+      stderr: "",
+    });
+    const { sandbox } = createSandbox({ ownership: ownership(), sessionExec });
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
+    const response = await handleBridgeRequest(
+      bridgeRequest("/api/paperclip-sandbox/v1/leases/resume", {
+        providerLeaseId: "pc-acq-acquisition-1",
+        acquisitionId: "acquisition-1",
+        requestedCwd: "/workspace/paperclip",
+        keepAlive: true,
+      }),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: "sandbox_state_lost" });
+    expect(sandbox.beginLeaseExecution).not.toHaveBeenCalled();
+    expect(sandbox.setKeepAlive).not.toHaveBeenCalled();
+    expect(sessionExec).toHaveBeenCalledOnce();
+    expect(String(sessionExec.mock.calls[0]?.[0])).toContain("head -c 4097");
+    expect(String(sessionExec.mock.calls[0]?.[0])).not.toContain("cat");
+  });
+
   it.each([
     "running",
     "stopping",

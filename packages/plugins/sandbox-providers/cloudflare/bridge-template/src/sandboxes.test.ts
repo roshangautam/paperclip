@@ -450,7 +450,7 @@ describe("durable lease ownership", () => {
 
   it("keeps completed destruction idempotent after a later acquisition takes ownership", async () => {
     const record = ownership();
-    const { sandbox } = createOwnershipSandbox(record);
+    const { sandbox, records } = createOwnershipSandbox(record);
     const matching = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
 
     expect(await sandbox.beginLeaseDestruction(matching, "destruction-one")).toMatchObject({ status: "started" });
@@ -467,6 +467,20 @@ describe("durable lease ownership", () => {
       status: "owned",
       ownership: laterClaim,
     });
+
+    expect(await sandbox.beginLeaseDestruction(laterClaim, "destruction-two")).toMatchObject({ status: "started" });
+    expect(await sandbox.completeLeaseDestruction(laterClaim, "destruction-two")).toEqual({ status: "completed" });
+    expect(records.size).toBe(1);
+    expect([...records.values()]).toEqual([expect.objectContaining({ acquisitionId: "acquisition-two" })]);
+
+    const newestClaim = { ...laterClaim, acquisitionId: "acquisition-three" };
+    expect(await sandbox.claimLeaseOwnership(newestClaim)).toMatchObject({ status: "claimed" });
+    expect(await sandbox.beginLeaseDestruction(matching, "destruction-stale")).toMatchObject({
+      status: "conflict",
+      ownership: newestClaim,
+    });
+    expect(await sandbox.beginLeaseDestruction(laterClaim, "destruction-retry")).toEqual({ status: "completed" });
+    expect(await sandbox.readLeaseOwnership()).toMatchObject({ status: "owned", ownership: newestClaim });
   });
 
   it("keeps old destruction quarantined regardless of age", async () => {

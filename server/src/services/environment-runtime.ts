@@ -2079,6 +2079,7 @@ function createPluginEnvironmentDriver(
             providerLeaseId: errorData.providerLeaseId,
             leaseMetadata: cleanupMetadata,
           });
+          cleanupError = null;
           if (cleanupLease) {
             await environmentsSvc.releaseLease(cleanupLease.id, "expired", {
               cleanupStatus: "success",

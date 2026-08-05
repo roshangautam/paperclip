@@ -35,6 +35,7 @@ import { environmentRuntimeService, findReusableSandboxLeaseId } from "../servic
 import { environmentService } from "../services/environments.ts";
 import { secretService } from "../services/secrets.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
+import { logger } from "../middleware/logger.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -3610,7 +3611,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
-  it("still compensates a generic plugin lease when recording the cleanup lease fails", async () => {
+  it("does not report failed generic plugin compensation when direct release succeeds", async () => {
     const pluginId = randomUUID();
     const { companyId, environment, runId } = await seedEnvironment({
       driver: "plugin",
@@ -3659,10 +3660,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           await db.delete(environments).where(eq(environments.id, environment.id));
           throw acquisitionError;
         }
-        if (method === "environmentReleaseLease") throw new Error("provider cleanup unavailable");
+        if (method === "environmentReleaseLease") return undefined;
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
     } as unknown as PluginWorkerManager;
+    const loggerError = vi.spyOn(logger, "error");
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
 
     await expect(runtimeWithPlugin.acquireRunLease({
@@ -3677,6 +3679,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       "environmentAcquireLease",
       "environmentReleaseLease",
     ]);
+    expect(loggerError).not.toHaveBeenCalled();
+    loggerError.mockRestore();
     await expect(db.select().from(environmentLeases)).resolves.toHaveLength(0);
   });
 
