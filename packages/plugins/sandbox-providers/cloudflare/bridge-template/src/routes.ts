@@ -732,6 +732,14 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const sessionStrategy = readSessionStrategy(body.sessionStrategy);
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
+    const reuseScopeId = readString(body.reuseScopeId, "") || null;
+    if (reuseLease && !/^[a-f0-9]{32}$/.test(reuseScopeId ?? "")) {
+      return toErrorResponse(
+        400,
+        "invalid_request",
+        "reuseScopeId must be a 32-character lowercase hex string when reuseLease is true.",
+      );
+    }
     if (!isV2 && !acquisitionId) {
       const providerLeaseId = buildLeaseSandboxId({
         environmentId,
@@ -777,14 +785,6 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
           resumedLease: false,
         },
       });
-    }
-    const reuseScopeId = readString(body.reuseScopeId, "") || null;
-    if (reuseLease && !/^[a-f0-9]{32}$/.test(reuseScopeId ?? "")) {
-      return toErrorResponse(
-        400,
-        "invalid_request",
-        "reuseScopeId must be a 32-character lowercase hex string when reuseLease is true.",
-      );
     }
     const acquisitionFingerprint = buildAcquisitionFingerprint({
       environmentId,
@@ -913,9 +913,6 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const sessionStrategy = readSessionStrategy(body.sessionStrategy);
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
-    if (isV2 && !expectedAcquisitionId) {
-      return toErrorResponse(400, "invalid_request", "acquisitionId is required.");
-    }
     const sandbox = await resolveSandbox(env, body.providerLeaseId, { keepAlive, sleepAfter, normalizeId });
     if (!isV2 && !expectedAcquisitionId) {
       if ((await sandbox.readLeaseOwnership()).status !== "missing") {
@@ -1073,9 +1070,6 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
       await sandbox.destroy().catch(() => undefined);
       return toJsonResponse({ ok: true });
     }
-    if (!acquisitionId) {
-      return toErrorResponse(400, "invalid_request", "acquisitionId is required to release a lease.");
-    }
     const remoteCwd = readString(body.requestedCwd, DEFAULT_REMOTE_CWD);
     const sessionStrategy = readSessionStrategy(body.sessionStrategy);
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
@@ -1130,9 +1124,6 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
     const acquisitionId = readString(body.acquisitionId, "");
-    if (isV2 && !acquisitionId) {
-      return toErrorResponse(400, "invalid_request", "acquisitionId is required to destroy a lease.");
-    }
     const sandbox = await resolveSandbox(env, providerLeaseId, {
       keepAlive: false,
       sleepAfter: "10m",

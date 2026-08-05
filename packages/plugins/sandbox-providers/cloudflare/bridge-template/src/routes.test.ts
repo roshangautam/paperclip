@@ -406,6 +406,7 @@ describe("bridge routes", () => {
       bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
         ...acquireBody(""),
         reuseLease: true,
+        reuseScopeId: "0123456789abcdef0123456789abcdef",
         sessionStrategy: "default",
       }),
       { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
@@ -569,18 +570,20 @@ describe("bridge routes", () => {
   });
 
   it("rejects reusable acquisitions without a valid scope", async () => {
-    for (const reuseScopeId of [undefined, "not-a-scope"]) {
-      const response = await handleBridgeRequest(
-        bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
-          ...acquireBody(),
-          reuseLease: true,
-          reuseScopeId,
-        }),
-        { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
-      );
+    for (const acquisitionId of ["acquisition-1", ""]) {
+      for (const reuseScopeId of [undefined, "not-a-scope"]) {
+        const response = await handleBridgeRequest(
+          bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
+            ...acquireBody(acquisitionId),
+            reuseLease: true,
+            reuseScopeId,
+          }),
+          { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+        );
 
-      expect(response.status).toBe(400);
-      await expect(response.json()).resolves.toMatchObject({ error: "invalid_request" });
+        expect(response.status).toBe(400);
+        await expect(response.json()).resolves.toMatchObject({ error: "invalid_request" });
+      }
     }
     expect(resolveSandbox).not.toHaveBeenCalled();
   });
@@ -816,6 +819,34 @@ describe("bridge routes", () => {
       acquisitionFingerprint: "legacy:pc-acq-acquisition-1",
     });
     expect(sessionExec.mock.calls.some(([command]) => String(command).includes("acquisitionFingerprint"))).toBe(true);
+  });
+
+  it("migrates a pre-contract lease during v2 resume without an acquisition ID", async () => {
+    const sessionExec = vi.fn().mockImplementation(async (command: string) => ({
+      exitCode: 0,
+      stdout: command.includes("test ! -e")
+        ? JSON.stringify({ providerLeaseId: "pc-acq-acquisition-1", remoteCwd: "/workspace/paperclip" })
+        : "",
+      stderr: "",
+    }));
+    const { sandbox } = createSandbox({ sessionExec });
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
+    const response = await handleBridgeRequest(
+      bridgeRequest("/api/paperclip-sandbox/v2/leases/resume", {
+        providerLeaseId: "pc-acq-acquisition-1",
+        requestedCwd: "/workspace/paperclip",
+      }),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      metadata: { acquisitionId: "legacy:pc-acq-acquisition-1" },
+    });
+    expect(sandbox.claimLeaseOwnership).toHaveBeenCalledWith(expect.objectContaining({
+      acquisitionId: "legacy:pc-acq-acquisition-1",
+    }));
   });
 
   it("keeps legacy resume without acquisitionId stateless", async () => {
@@ -1125,19 +1156,30 @@ describe("bridge routes", () => {
     expect(sandbox.destroy).toHaveBeenCalledOnce();
   });
 
-  it("rejects v2 DELETE without acquisitionId before resolving a sandbox", async () => {
+  it.each([
+    ["release", "/api/paperclip-sandbox/v2/leases/release", "POST"],
+    ["destroy", "/api/paperclip-sandbox/v2/leases/pc-acq-acquisition-1", "DELETE"],
+  ] as const)("migrates and destroys a pre-contract lease during v2 %s", async (_operation, path, method) => {
+    const sessionExec = vi.fn().mockImplementation(async (command: string) => ({
+      exitCode: 0,
+      stdout: command.includes("test ! -e")
+        ? JSON.stringify({ providerLeaseId: "pc-acq-acquisition-1", remoteCwd: "/workspace/paperclip" })
+        : "",
+      stderr: "",
+    }));
+    const { sandbox } = createSandbox({ sessionExec });
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
     const response = await handleBridgeRequest(
-      bridgeRequest(
-        "/api/paperclip-sandbox/v2/leases/pc-acq-acquisition-1",
-        {},
-        "DELETE",
-      ),
+      bridgeRequest(path, method === "POST" ? { providerLeaseId: "pc-acq-acquisition-1" } : {}, method),
       { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
     );
 
-    expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({ error: "invalid_request" });
-    expect(resolveSandbox).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(sandbox.claimLeaseOwnership).toHaveBeenCalledWith(expect.objectContaining({
+      acquisitionId: "legacy:pc-acq-acquisition-1",
+    }));
+    expect(sandbox.destroy).toHaveBeenCalledOnce();
   });
 
   it("rejects replay while destruction of the same acquisition is in flight", async () => {

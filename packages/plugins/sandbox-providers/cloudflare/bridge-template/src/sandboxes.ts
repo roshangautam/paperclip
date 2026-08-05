@@ -366,11 +366,11 @@ export class Sandbox extends CloudflareSandbox {
     try {
       return await this.ctx.storage.transaction(async (transaction) => {
         const destruction = await readLeaseDestructionStatus(transaction, identity);
-        if (destruction === "invalid") return { status: "invalid" };
+        if (destruction === "invalid" || destruction === "exhausted") return { status: "invalid" };
         if (destruction === "completed") return { status: "completed" };
 
         const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
-        if (stored === undefined) return { status: destruction === "exhausted" ? "invalid" : "missing" };
+        if (stored === undefined) return { status: "missing" };
         if (!isLeaseOwnershipRecord(stored) || !executionId || !destructionId) return { status: "invalid" };
         if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
         const executions = stored.activeExecutions ?? [];
@@ -460,11 +460,11 @@ export class Sandbox extends CloudflareSandbox {
   ): Promise<LeaseOwnershipDestroyResult> {
     return await this.ctx.storage.transaction(async (transaction) => {
       const destruction = await readLeaseDestructionStatus(transaction, identity);
-      if (destruction === "invalid") return { status: "invalid" };
+      if (destruction === "invalid" || destruction === "exhausted") return { status: "invalid" };
       if (destruction === "completed") return { status: "completed" };
 
       const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
-      if (stored === undefined) return { status: destruction === "exhausted" ? "invalid" : "missing" };
+      if (stored === undefined) return { status: "missing" };
       if (!isLeaseOwnershipRecord(stored)) return { status: "invalid" };
       if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
       if (this.liveLeaseExecutions.size > 0) return { status: "in_progress", ownership: stored };

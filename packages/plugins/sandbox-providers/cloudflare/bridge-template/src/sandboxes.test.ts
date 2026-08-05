@@ -356,6 +356,32 @@ describe("durable lease ownership", () => {
     });
   });
 
+  it.each([false, true])("fails closed before destruction when live tombstone history is full (after execution=%s)", async (afterExecution) => {
+    const execution = { executionId: "execution-one", expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    const record: LeaseOwnershipRecord = {
+      ...ownership(),
+      activeExecutions: afterExecution ? [execution] : undefined,
+    };
+    const history = {
+      version: 2,
+      entries: Array.from({ length: 32 }, (_, index) => ({
+        version: 1,
+        providerLeaseId: "pc-env-shared",
+        acquisitionId: `acquisition-${index}`,
+        completedAt: new Date().toISOString(),
+      })),
+    };
+    const { sandbox, destroy } = createOwnershipSandbox(record, undefined, history);
+    const identity = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
+
+    expect(await sandbox.destroyLease(
+      identity,
+      "destruction-one",
+      afterExecution ? execution.executionId : undefined,
+    )).toEqual({ status: "invalid" });
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
   it("resumes quarantined destruction after its execution fence expires", async () => {
     vi.useFakeTimers();
     try {
