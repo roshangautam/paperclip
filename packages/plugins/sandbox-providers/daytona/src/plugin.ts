@@ -1,6 +1,12 @@
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { Daytona, DaytonaNotFoundError, DaytonaTimeoutError } from "@daytonaio/sdk";
+import {
+  Daytona,
+  DaytonaConnectionError,
+  DaytonaConflictError,
+  DaytonaNotFoundError,
+  DaytonaTimeoutError,
+} from "@daytonaio/sdk";
 import type {
   CreateSandboxBaseParams,
   CreateSandboxFromImageParams,
@@ -108,6 +114,9 @@ const ARCHIVE_ON_RELEASE_AUTO_DELETE_MINUTES = 60;
 // so a stalled remote or missing credential never consumes the full 900 s adapter
 // RPC ceiling; callers always see an actionable error within this window.
 const GIT_NETWORK_TIMEOUT_MS = 120_000;
+
+const ACQUISITION_RECONCILE_ATTEMPTS = 5;
+const ACQUISITION_RECONCILE_DELAY_MS = 250;
 
 // Noninteractive git credential defaults injected into every Daytona one-shot
 // command so that git operations never stall waiting for a terminal prompt.
@@ -723,6 +732,32 @@ function assertAcquisitionSandboxOwnership(sandbox: Sandbox, acquisitionId: stri
   }
 }
 
+function isAmbiguousDaytonaCreateError(error: unknown): boolean {
+  const statusCode = isRecord(error) && typeof error.statusCode === "number"
+    ? error.statusCode
+    : null;
+  return error instanceof DaytonaConflictError
+    || error instanceof DaytonaTimeoutError
+    || error instanceof DaytonaConnectionError
+    || statusCode === 408
+    || (statusCode != null && statusCode >= 500);
+}
+
+async function reconcileAcquisitionSandbox(client: Daytona, name: string): Promise<Sandbox | null> {
+  for (let attempt = 0; attempt < ACQUISITION_RECONCILE_ATTEMPTS; attempt += 1) {
+    try {
+      const sandbox = await findSandboxByNameOrNull(client, name);
+      if (sandbox) return sandbox;
+    } catch (error) {
+      if (!isAmbiguousDaytonaCreateError(error)) throw error;
+    }
+    if (attempt < ACQUISITION_RECONCILE_ATTEMPTS - 1) {
+      await new Promise((resolve) => setTimeout(resolve, ACQUISITION_RECONCILE_DELAY_MS));
+    }
+  }
+  return null;
+}
+
 async function acquireSandbox(
   params: PluginEnvironmentAcquireLeaseParams,
   config: DaytonaDriverConfig,
@@ -762,8 +797,9 @@ async function acquireSandbox(
     });
     return { sandbox, created: true };
   } catch (error) {
-    const reconciled = await findSandboxByNameOrNull(client, name);
-    if (!reconciled) throw error;
+    if (!isAmbiguousDaytonaCreateError(error)) throw error;
+    const reconciled = await reconcileAcquisitionSandbox(client, name);
+    if (!reconciled) throw acquisitionFailureWithLease(error, name);
     assertAcquisitionSandboxOwnership(reconciled, params.acquisitionId);
     try {
       await ensureSandboxStarted(reconciled, toTimeoutSeconds(config.timeoutMs));
@@ -803,6 +839,27 @@ async function getSandboxOrNull(config: DaytonaDriverConfig, sandboxId: string):
     }
     throw error;
   }
+}
+
+async function getSandboxForCleanup(
+  config: DaytonaDriverConfig,
+  params: PluginEnvironmentReleaseLeaseParams,
+): Promise<Sandbox | null> {
+  if (!params.providerLeaseId) return null;
+  const acquisitionName = params.acquisitionId
+    ? acquisitionSandboxName(params.acquisitionId)
+    : null;
+  const sandbox = params.providerLeaseId === acquisitionName
+    ? await findSandboxByNameOrNull(createDaytonaClient(config), params.providerLeaseId)
+    : await getSandboxOrNull(config, params.providerLeaseId);
+  if (!sandbox) {
+    if (params.providerLeaseId === acquisitionName) {
+      throw new Error(`Daytona sandbox ${params.providerLeaseId} is not visible yet; cleanup must be retried.`);
+    }
+    return null;
+  }
+  if (params.acquisitionId) assertAcquisitionSandboxOwnership(sandbox, params.acquisitionId);
+  return sandbox;
 }
 
 // One-shot command execution via Daytona's `process.executeCommand`. The
@@ -1067,7 +1124,7 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const config = parseDriverConfig(params.config);
-    const sandbox = await getSandboxOrNull(config, params.providerLeaseId);
+    const sandbox = await getSandboxForCleanup(config, params);
     if (!sandbox) return;
 
     if (config.reuseLease) {
@@ -1111,7 +1168,7 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const config = parseDriverConfig(params.config);
-    const sandbox = await getSandboxOrNull(config, params.providerLeaseId);
+    const sandbox = await getSandboxForCleanup(config, params);
     if (!sandbox) return;
     await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
   },

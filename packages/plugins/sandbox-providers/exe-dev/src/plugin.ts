@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   definePlugin,
   JsonRpcCallError,
@@ -71,6 +72,8 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 const EXE_DEV_API_MAX_TIMEOUT_MS = 29_000;
 const SSH_SIGKILL_GRACE_MS = 250;
 const MAX_VM_RECORD_DEPTH = 4;
+const ACQUISITION_RECONCILIATION_ATTEMPTS = 3;
+const ACQUISITION_RECONCILIATION_DELAY_MS = 100;
 const EXE_DEV_SSH_ONBOARDING_MARKER = "Please complete registration by running: ssh exe.dev";
 const EXE_DEV_SSH_EMAIL_PROMPT = "Please enter your email address:";
 const EXE_DEV_SSH_INVALID_KEY_FORMAT = /Load key [^\n]*invalid format/i;
@@ -448,7 +451,7 @@ function parseVmRecord(value: unknown, depth = 0): ExeDevVmRecord | null {
 }
 
 async function lookupVm(config: ExeDevDriverConfig, vmName: string): Promise<ExeDevVmRecord | null> {
-  const response = await runLifecycleCommand(config, `ls --json ${shellQuote(vmName)}`);
+  const response = await runLifecycleCommand(config, `ls -l --json ${shellQuote(vmName)}`);
   const list = Array.isArray((response as { vms?: unknown[] } | null)?.vms)
     ? (response as { vms: unknown[] }).vms
     : Array.isArray(response)
@@ -463,6 +466,33 @@ async function lookupVm(config: ExeDevDriverConfig, vmName: string): Promise<Exe
     }
   }
   return null;
+}
+
+async function reconcileAcquisitionVm(
+  config: ExeDevDriverConfig,
+  vmName: string,
+): Promise<ExeDevVmRecord | null> {
+  for (let attempt = 0; attempt < ACQUISITION_RECONCILIATION_ATTEMPTS; attempt += 1) {
+    try {
+      const vm = await lookupVm(config, vmName);
+      if (vm) return vm;
+    } catch {
+      // A failed lookup is also ambiguous. Retry for eventual visibility and,
+      // if it remains unresolved, preserve the deterministic lease ID below.
+    }
+
+    if (attempt < ACQUISITION_RECONCILIATION_ATTEMPTS - 1) {
+      await delay(ACQUISITION_RECONCILIATION_DELAY_MS);
+    }
+  }
+  return null;
+}
+
+function isAmbiguousCreateError(error: unknown): boolean {
+  return !(error instanceof ExeDevApiError)
+    || error.status === 408
+    || error.status === 409
+    || error.status >= 500;
 }
 
 async function createVm(
@@ -516,8 +546,9 @@ async function acquireVm(
     }
     return { vm: created, created: true };
   } catch (error) {
-    const reconciled = await lookupVm(config, vmName);
-    if (!reconciled) throw error;
+    if (!isAmbiguousCreateError(error)) throw error;
+    const reconciled = await reconcileAcquisitionVm(config, vmName);
+    if (!reconciled) throw acquisitionFailureWithLease(error, vmName);
     assertAcquisitionVmOwnership(reconciled, params.acquisitionId);
     return { vm: reconciled, created: false };
   }
@@ -525,6 +556,23 @@ async function acquireVm(
 
 async function deleteVm(config: ExeDevDriverConfig, vmName: string): Promise<void> {
   await runLifecycleCommand(config, `rm --json ${shellQuote(vmName)}`);
+}
+
+async function deleteAcquisitionVm(
+  config: ExeDevDriverConfig,
+  params: PluginEnvironmentReleaseLeaseParams,
+): Promise<void> {
+  if (!params.providerLeaseId) return;
+  if (!params.acquisitionId) {
+    await deleteVm(config, params.providerLeaseId);
+    return;
+  }
+  const vm = await lookupVm(config, params.providerLeaseId);
+  if (!vm) {
+    throw new Error(`exe.dev VM ${params.providerLeaseId} is not visible yet; cleanup must be retried.`);
+  }
+  assertAcquisitionVmOwnership(vm, params.acquisitionId);
+  await deleteVm(config, vm.name);
 }
 
 function buildSshDestination(config: ExeDevDriverConfig, vm: ExeDevVmRecord): string {
@@ -932,7 +980,7 @@ const plugin = definePlugin({
     if (!params.providerLeaseId) return;
     const config = parseDriverConfig(params.config);
     if (config.reuseLease) return;
-    await deleteVm(config, params.providerLeaseId);
+    await deleteAcquisitionVm(config, params);
   },
 
   async onEnvironmentDestroyLease(
@@ -940,7 +988,7 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const config = parseDriverConfig(params.config);
-    await deleteVm(config, params.providerLeaseId);
+    await deleteAcquisitionVm(config, params);
   },
 
   async onEnvironmentRealizeWorkspace(
