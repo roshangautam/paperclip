@@ -354,6 +354,41 @@ describe("Daytona sandbox provider plugin", () => {
     });
   });
 
+  it("hands off an existing acquisition sandbox when restarting it fails", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-replay-start-failed";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      id: "sandbox-replay-start-failed",
+      name: sandboxName,
+      state: "stopped",
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    sandbox.start.mockRejectedValue(new Error("restart failed"));
+    mockList.mockResolvedValue({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "restart failed",
+      data: { providerLeaseId: sandbox.id },
+    });
+
+    expect(sandbox.start).toHaveBeenCalledWith(300);
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
   it("creates a deterministic acquisition sandbox with an ownership label", async () => {
     process.env.DAYTONA_API_KEY = "host-key";
     const acquisitionId = "acquisition-create-1";
@@ -479,6 +514,45 @@ describe("Daytona sandbox provider plugin", () => {
 
     expect(mockList).toHaveBeenCalledTimes(2);
     expect(mockGet).not.toHaveBeenCalled();
+    expect(sandbox.delete).not.toHaveBeenCalled();
+  });
+
+  it("hands off a reconciled acquisition sandbox when restarting it fails", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-reconciled-start-failed";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      id: "sandbox-reconciled-start-failed",
+      name: sandboxName,
+      state: "stopped",
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    sandbox.start.mockRejectedValue(new Error("reconciled restart failed"));
+    mockList
+      .mockResolvedValueOnce({ items: [], total: 0, page: 1, totalPages: 0 })
+      .mockResolvedValueOnce({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
+    mockCreate.mockRejectedValue(new Error("create response lost"));
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "reconciled restart failed",
+      data: { providerLeaseId: sandbox.id },
+    });
+
+    expect(mockList).toHaveBeenCalledTimes(2);
+    expect(sandbox.start).toHaveBeenCalledWith(300);
     expect(sandbox.delete).not.toHaveBeenCalled();
   });
 

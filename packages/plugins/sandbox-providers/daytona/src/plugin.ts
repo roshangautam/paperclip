@@ -740,7 +740,11 @@ async function acquireSandbox(
   const existing = await findSandboxByNameOrNull(client, name);
   if (existing) {
     assertAcquisitionSandboxOwnership(existing, params.acquisitionId);
-    await ensureSandboxStarted(existing, toTimeoutSeconds(config.timeoutMs));
+    try {
+      await ensureSandboxStarted(existing, toTimeoutSeconds(config.timeoutMs));
+    } catch (error) {
+      throw acquisitionFailureWithLease(error, existing.id);
+    }
     return { sandbox: existing, created: false };
   }
 
@@ -761,7 +765,11 @@ async function acquireSandbox(
     const reconciled = await findSandboxByNameOrNull(client, name);
     if (!reconciled) throw error;
     assertAcquisitionSandboxOwnership(reconciled, params.acquisitionId);
-    await ensureSandboxStarted(reconciled, toTimeoutSeconds(config.timeoutMs));
+    try {
+      await ensureSandboxStarted(reconciled, toTimeoutSeconds(config.timeoutMs));
+    } catch (startError) {
+      throw acquisitionFailureWithLease(startError, reconciled.id);
+    }
     return { sandbox: reconciled, created: false };
   }
 }
