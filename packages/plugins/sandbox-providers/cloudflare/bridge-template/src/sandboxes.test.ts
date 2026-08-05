@@ -579,31 +579,47 @@ describe("durable lease ownership", () => {
     expect(await sandbox.readLeaseOwnership()).toEqual({ status: "missing" });
   });
 
-  it("caps destruction history at 32 acquisitions", async () => {
+  it("retains bounded destruction history through the maximum replay window", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime("2026-08-05T00:00:00.000Z");
     const { sandbox, records } = createOwnershipSandbox();
+    try {
+      for (let index = 0; index < 32; index += 1) {
+        const claim = {
+          providerLeaseId: "pc-env-shared",
+          acquisitionId: `acquisition-${index}`,
+          acquisitionFingerprint: `fingerprint-${index}`,
+        };
+        expect(await sandbox.claimLeaseOwnership(claim)).toMatchObject({ status: "claimed" });
+        expect(await sandbox.beginLeaseDestruction(claim, `destruction-${index}`)).toMatchObject({ status: "started" });
+        expect(await sandbox.completeLeaseDestruction(claim, `destruction-${index}`)).toEqual({ status: "completed" });
+      }
 
-    for (let index = 0; index < 40; index += 1) {
-      const claim = {
+      const delayedReplay = {
         providerLeaseId: "pc-env-shared",
-        acquisitionId: `acquisition-${index}`,
-        acquisitionFingerprint: `fingerprint-${index}`,
+        acquisitionId: "acquisition-0",
+        acquisitionFingerprint: "fingerprint-0",
       };
-      expect(await sandbox.claimLeaseOwnership(claim)).toMatchObject({ status: "claimed" });
-      expect(await sandbox.beginLeaseDestruction(claim, `destruction-${index}`)).toMatchObject({ status: "started" });
-      expect(await sandbox.completeLeaseDestruction(claim, `destruction-${index}`)).toEqual({ status: "completed" });
-    }
+      expect(await sandbox.claimLeaseOwnership(delayedReplay)).toEqual({ status: "completed" });
 
-    expect(records.size).toBe(1);
-    expect(records.get(LEASE_DESTRUCTION_STORAGE_KEY)).toMatchObject({
-      version: 2,
-      entries: expect.arrayContaining([
-        expect.objectContaining({ acquisitionId: "acquisition-39" }),
-        expect.objectContaining({ acquisitionId: "acquisition-8" }),
-      ]),
-    });
-    const history = records.get(LEASE_DESTRUCTION_STORAGE_KEY) as { entries: Array<{ acquisitionId: string }> };
-    expect(history.entries).toHaveLength(32);
-    expect(history.entries.map((entry) => entry.acquisitionId)).not.toContain("acquisition-7");
+      const laterClaim = {
+        providerLeaseId: "pc-env-shared",
+        acquisitionId: "acquisition-32",
+        acquisitionFingerprint: "fingerprint-32",
+      };
+      expect(await sandbox.claimLeaseOwnership(laterClaim)).toEqual({ status: "invalid" });
+
+      vi.advanceTimersByTime(25 * 60 * 60_000);
+      expect(await sandbox.claimLeaseOwnership(laterClaim)).toMatchObject({ status: "claimed" });
+      expect(await sandbox.beginLeaseDestruction(laterClaim, "destruction-32")).toMatchObject({ status: "started" });
+      expect(await sandbox.completeLeaseDestruction(laterClaim, "destruction-32")).toEqual({ status: "completed" });
+      expect(records.get(LEASE_DESTRUCTION_STORAGE_KEY)).toEqual({
+        version: 2,
+        entries: [expect.objectContaining({ acquisitionId: "acquisition-32" })],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps legacy singleton destruction tombstones replay-compatible", async () => {

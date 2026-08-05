@@ -367,7 +367,8 @@ const plugin = definePlugin({
     params: PluginEnvironmentResumeLeaseParams,
   ): Promise<PluginEnvironmentLease> {
     const { config, client } = bridgeClientFor(params.config);
-    const acquisitionId = readLeaseAcquisitionId(params.leaseMetadata);
+    const acquisitionId = readLeaseAcquisitionId(params.leaseMetadata)
+      ?? `legacy:${params.providerLeaseId}`;
     try {
       // Avoid a separate health request; the resume response itself proves
       // whether the bridge supports replay-safe ownership metadata.
@@ -397,7 +398,7 @@ const plugin = definePlugin({
       if (resumed.providerLeaseId !== params.providerLeaseId) {
         throw new Error("Cloudflare sandbox bridge resumed a different provider lease.");
       }
-      if (acquisitionId && resumedAcquisitionId !== acquisitionId) {
+      if (resumedAcquisitionId !== acquisitionId) {
         throw new Error("Cloudflare sandbox bridge resumed a different lease acquisition.");
       }
       return resumed;

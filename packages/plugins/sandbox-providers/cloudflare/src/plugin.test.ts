@@ -613,6 +613,38 @@ describe("Cloudflare sandbox provider plugin", () => {
     });
   });
 
+  it("derives the bridge legacy identity when resuming pre-ownership leases", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        providerLeaseId: "pc-env-env-1",
+        metadata: {
+          provider: "cloudflare",
+          acquisitionId: "legacy:pc-env-env-1",
+          remoteCwd: "/workspace/paperclip",
+          resumedLease: true,
+        },
+      }),
+    );
+
+    const lease = await plugin.definition.onEnvironmentResumeLease?.({
+      driverKey: "cloudflare",
+      companyId: "company-1",
+      environmentId: "env-1",
+      providerLeaseId: "pc-env-env-1",
+      leaseMetadata: { remoteCwd: "/workspace/paperclip" },
+      config: {
+        bridgeBaseUrl: "https://bridge.example.workers.dev",
+        bridgeAuthToken: "resolved-token",
+      },
+    });
+
+    expect(lease).toMatchObject({
+      providerLeaseId: "pc-env-env-1",
+      metadata: { acquisitionId: "legacy:pc-env-env-1" },
+    });
+    expect(requestBodyAt()).toMatchObject({ acquisitionId: "legacy:pc-env-env-1" });
+  });
+
   it("returns expired lease semantics when resume reports lost state", async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse(

@@ -4,6 +4,8 @@ import { buildLeaseSandboxId, buildSentinelPath, isTimeoutError } from "./helper
 export const LEASE_OWNERSHIP_STORAGE_KEY = "paperclip.leaseOwnership.v1";
 export const LEASE_DESTRUCTION_STORAGE_KEY = "paperclip.leaseDestruction.v1";
 const LEASE_DESTRUCTION_HISTORY_LIMIT = 32;
+// Host acquisition attempts are capped at 24 hours; retain a small skew buffer.
+const LEASE_DESTRUCTION_RETENTION_MS = 24 * 60 * 60_000 + 5 * 60_000;
 
 export interface LeaseOwnershipRecord {
   version: 1;
@@ -117,7 +119,7 @@ function isLeaseDestructionRecord(value: unknown): value is LeaseDestructionReco
     && typeof candidate.acquisitionId === "string"
     && candidate.acquisitionId.length > 0
     && typeof candidate.completedAt === "string"
-    && candidate.completedAt.length > 0;
+    && Number.isFinite(Date.parse(candidate.completedAt));
 }
 
 function isLeaseDestructionHistory(value: unknown): value is LeaseDestructionHistory {
@@ -134,6 +136,10 @@ function destructionMatches(record: LeaseDestructionRecord, identity: LeaseOwner
     && record.acquisitionId === identity.acquisitionId;
 }
 
+function isRetainedDestruction(record: LeaseDestructionRecord, now = Date.now()): boolean {
+  return Date.parse(record.completedAt) + LEASE_DESTRUCTION_RETENTION_MS > now;
+}
+
 function leaseDestructionStorageKey(identity: LeaseOwnershipIdentity): string {
   return `${LEASE_DESTRUCTION_STORAGE_KEY}:${JSON.stringify([
     identity.providerLeaseId,
@@ -148,7 +154,7 @@ interface LeaseDestructionStorageReader {
 async function readLeaseDestructionStatus(
   storage: LeaseDestructionStorageReader,
   identity: LeaseOwnershipIdentity,
-): Promise<"completed" | "missing" | "invalid"> {
+): Promise<"completed" | "missing" | "invalid" | "exhausted"> {
   const completed = await storage.get<unknown>(leaseDestructionStorageKey(identity));
   if (completed !== undefined) {
     return isLeaseDestructionRecord(completed) && destructionMatches(completed, identity)
@@ -162,7 +168,9 @@ async function readLeaseDestructionStatus(
     return destructionMatches(history, identity) ? "completed" : "missing";
   }
   if (!isLeaseDestructionHistory(history)) return "invalid";
-  return history.entries.some((record) => destructionMatches(record, identity)) ? "completed" : "missing";
+  const retained = history.entries.filter((record) => isRetainedDestruction(record));
+  if (retained.some((record) => destructionMatches(record, identity))) return "completed";
+  return retained.length === LEASE_DESTRUCTION_HISTORY_LIMIT ? "exhausted" : "missing";
 }
 
 function ownershipMatches(record: LeaseOwnershipRecord, identity: LeaseOwnershipIdentity): boolean {
@@ -250,6 +258,7 @@ export class Sandbox extends CloudflareSandbox {
         await transaction.put(LEASE_OWNERSHIP_STORAGE_KEY, ownership);
         return { status: "claimed", ownership };
       }
+      if (destruction === "exhausted") return { status: "invalid" };
 
       const ownership = newOwnershipRecord(claim);
       await transaction.put(LEASE_OWNERSHIP_STORAGE_KEY, ownership);
@@ -361,7 +370,7 @@ export class Sandbox extends CloudflareSandbox {
         if (destruction === "completed") return { status: "completed" };
 
         const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
-        if (stored === undefined) return { status: "missing" };
+        if (stored === undefined) return { status: destruction === "exhausted" ? "invalid" : "missing" };
         if (!isLeaseOwnershipRecord(stored) || !executionId || !destructionId) return { status: "invalid" };
         if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
         const executions = stored.activeExecutions ?? [];
@@ -455,7 +464,7 @@ export class Sandbox extends CloudflareSandbox {
       if (destruction === "completed") return { status: "completed" };
 
       const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
-      if (stored === undefined) return { status: "missing" };
+      if (stored === undefined) return { status: destruction === "exhausted" ? "invalid" : "missing" };
       if (!isLeaseOwnershipRecord(stored)) return { status: "invalid" };
       if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
       if (this.liveLeaseExecutions.size > 0) return { status: "in_progress", ownership: stored };
@@ -499,7 +508,7 @@ export class Sandbox extends CloudflareSandbox {
       const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
       if (stored === undefined) {
         const destruction = await readLeaseDestructionStatus(transaction, identity);
-        return { status: destruction };
+        return { status: destruction === "exhausted" ? "invalid" : destruction };
       }
       if (!isLeaseOwnershipRecord(stored)) return { status: "invalid" };
       if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
@@ -521,12 +530,13 @@ export class Sandbox extends CloudflareSandbox {
             ? storedHistory.entries
             : null;
       if (entries === null) return { status: "invalid" };
+      const retainedEntries = entries
+        .filter((record) => isRetainedDestruction(record))
+        .filter((record) => !destructionMatches(record, identity));
+      if (retainedEntries.length === LEASE_DESTRUCTION_HISTORY_LIMIT) return { status: "invalid" };
       const history: LeaseDestructionHistory = {
         version: 2,
-        entries: [
-          completed,
-          ...entries.filter((record) => !destructionMatches(record, identity)),
-        ].slice(0, LEASE_DESTRUCTION_HISTORY_LIMIT),
+        entries: [completed, ...retainedEntries],
       };
       await transaction.put(LEASE_DESTRUCTION_STORAGE_KEY, history);
       await transaction.delete(leaseDestructionStorageKey(identity));

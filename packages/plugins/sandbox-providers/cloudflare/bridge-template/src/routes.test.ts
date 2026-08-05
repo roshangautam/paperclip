@@ -397,6 +397,24 @@ describe("bridge routes", () => {
     expect(resolveSandbox).toHaveBeenCalledOnce();
   });
 
+  it("destroys a reusable legacy v1 acquisition when default-session setup times out", async () => {
+    const sessionExec = vi.fn().mockRejectedValue(new Error("command timed out"));
+    const { sandbox } = createSandbox({ sessionExec });
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
+    await expect(handleBridgeRequest(
+      bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
+        ...acquireBody(""),
+        reuseLease: true,
+        sessionStrategy: "default",
+      }),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    )).rejects.toThrow("ensure workspace /workspace/paperclip timed out");
+
+    expect(sandbox.destroy).toHaveBeenCalledOnce();
+    expect(sandbox.claimLeaseOwnership).not.toHaveBeenCalled();
+  });
+
   it("claims ownership before writing the filesystem mirror", async () => {
     const { sandbox, sessionExec } = createSandbox();
     vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
@@ -1427,6 +1445,26 @@ describe("bridge routes", () => {
       expect(sandbox.destroy).toHaveBeenCalledTimes(concurrent ? 0 : 1);
     },
   );
+
+  it("destroys a legacy v1 sandbox when default-session exec times out", async () => {
+    const sessionExec = vi.fn().mockRejectedValue(new Error("command timed out"));
+    const { sandbox } = createSandbox({ sessionExec });
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
+    const response = await handleBridgeRequest(
+      bridgeRequest("/api/paperclip-sandbox/v1/exec", {
+        providerLeaseId: "pc-acq-run-1",
+        command: "sleep",
+        sessionStrategy: "default",
+      }),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ timedOut: true });
+    expect(sandbox.destroy).toHaveBeenCalledOnce();
+    expect(sandbox.beginLeaseExecution).not.toHaveBeenCalled();
+  });
 
   it("destroys after a concurrent execution completes following a default-session timeout", async () => {
     let finishLongRunning!: () => void;
