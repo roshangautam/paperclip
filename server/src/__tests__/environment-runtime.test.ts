@@ -699,6 +699,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
               timeoutMs: 1234,
               reuseLease: false,
               remoteCwd: "/workspace",
+              sandboxAcquisitionId: "stale-provider-acquisition",
             },
           };
         }
@@ -761,6 +762,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       timeoutMs: 1000,
     });
 
+    const acquireParams = workerManager.call.mock.calls.find((call) => call[1] === "environmentAcquireLease")?.[2];
+    expect(acquired.lease.metadata).toMatchObject({
+      acquisitionId: acquireParams.acquisitionId,
+      sandboxAcquisitionId: acquireParams.acquisitionId,
+    });
+
     const {
       sandboxProviderConfig: _storedProviderConfig,
       leaseScopedSecretBindings: _leaseScopedSecretBindings,
@@ -790,7 +797,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(released).toHaveLength(1);
     expect(released[0]?.lease.status).toBe("released");
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.anything(), 91000);
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.anything(), 91234);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.objectContaining({
+      acquisitionId: acquireParams.acquisitionId,
+    }), 91234);
   });
 
   it("keeps plugin sandbox cleanup on its lease-scoped secret after the environment changes", async () => {

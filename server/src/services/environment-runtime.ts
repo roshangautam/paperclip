@@ -1447,6 +1447,7 @@ function createSandboxEnvironmentDriver(
             ...sanitizePluginSandboxConfigFromLeaseMetadata(storedConfig),
             ...sanitizedProviderMetadata,
             acquisitionId,
+            [SANDBOX_ACQUISITION_ID_KEY]: acquisitionId,
             [PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY]: providerConfigForLease,
             ...(reusableScope ? { reusableSandboxLease: reusableScope } : {}),
           },

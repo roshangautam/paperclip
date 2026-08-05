@@ -694,6 +694,13 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     const sessionId = readString(body.sessionId, DEFAULT_SESSION_ID);
     const timeoutMs = readInteger(body.timeoutMs, DEFAULT_TIMEOUT_MS);
     const reuseScopeId = readString(body.reuseScopeId, "") || null;
+    if (reuseLease && !/^[a-f0-9]{32}$/.test(reuseScopeId ?? "")) {
+      return toErrorResponse(
+        400,
+        "invalid_request",
+        "reuseScopeId must be a 32-character lowercase hex string when reuseLease is true.",
+      );
+    }
     const acquisitionFingerprint = buildAcquisitionFingerprint({
       environmentId,
       runId,

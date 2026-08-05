@@ -496,7 +496,11 @@ describe("bridge routes", () => {
   it("replays an acquisition and rejects a different acquisition for the same lease", async () => {
     const { sandbox } = createSandbox();
     vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
-    const reusable = { ...acquireBody(), reuseLease: true };
+    const reusable = {
+      ...acquireBody(),
+      reuseLease: true,
+      reuseScopeId: "0123456789abcdef0123456789abcdef",
+    };
 
     const first = await handleBridgeRequest(
       bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", reusable),
@@ -510,6 +514,7 @@ describe("bridge routes", () => {
       bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
         ...acquireBody("acquisition-2"),
         reuseLease: true,
+        reuseScopeId: reusable.reuseScopeId,
       }),
       { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
     );
@@ -519,6 +524,23 @@ describe("bridge routes", () => {
     expect(conflict.status).toBe(409);
     expect(await conflict.json()).toMatchObject({ error: "acquisition_conflict" });
     expect(sandbox.setKeepAlive).toHaveBeenCalledOnce();
+  });
+
+  it("rejects reusable acquisitions without a valid scope", async () => {
+    for (const reuseScopeId of [undefined, "not-a-scope"]) {
+      const response = await handleBridgeRequest(
+        bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
+          ...acquireBody(),
+          reuseLease: true,
+          reuseScopeId,
+        }),
+        { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+      );
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ error: "invalid_request" });
+    }
+    expect(resolveSandbox).not.toHaveBeenCalled();
   });
 
   it("rejects changed setup parameters when replaying an existing acquisition", async () => {
