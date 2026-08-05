@@ -30,6 +30,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { environmentRuntimeService, findReusableSandboxLeaseId } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import { secretService } from "../services/secrets.ts";
@@ -1073,6 +1074,177 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       }),
     ]);
     expect(workerManager.call).toHaveBeenCalledTimes(1);
+  });
+
+  it("cleans up a provider lease reported by a structured plugin acquisition error", async () => {
+    const pluginId = randomUUID();
+    const { companyId, environment: baseEnvironment, runId } = await seedEnvironment();
+    const providerConfig = {
+      provider: "structured-error-plugin",
+      image: "structured:test",
+      reuseLease: false,
+    };
+    const environment = {
+      ...baseEnvironment,
+      name: "Structured Error Plugin Sandbox",
+      driver: "sandbox",
+      config: providerConfig,
+    };
+    await environmentService(db).update(environment.id, {
+      driver: "sandbox",
+      name: environment.name,
+      config: providerConfig,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.structured-error-sandbox-provider",
+      packageName: "@acme/structured-error-sandbox-provider",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.structured-error-sandbox-provider",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Structured Error Sandbox Provider",
+        description: "Test structured acquisition failure cleanup",
+        author: "Paperclip",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{
+          driverKey: "structured-error-plugin",
+          kind: "sandbox_provider",
+          displayName: "Structured Error Plugin",
+          configSchema: { type: "object" },
+        }],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+    const acquisitionError = new JsonRpcCallError({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "provider setup failed after creation",
+      data: { providerLeaseId: "structured-failed-acquisition" },
+    });
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string, _params: any) => {
+        if (method === "environmentAcquireLease") throw acquisitionError;
+        if (method === "environmentReleaseLease") return undefined;
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    await expect(runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toBe(acquisitionError);
+
+    expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+    ]);
+    const acquireParams = workerManager.call.mock.calls[0]?.[2];
+    const releaseParams = workerManager.call.mock.calls[1]?.[2];
+    expect(releaseParams).toMatchObject({
+      providerLeaseId: "structured-failed-acquisition",
+      leaseMetadata: {
+        sandboxAcquisitionId: acquireParams.acquisitionId,
+      },
+    });
+    const [terminal] = await db.select().from(environmentLeases);
+    expect(terminal).toMatchObject({
+      status: "expired",
+      providerLeaseId: "structured-failed-acquisition",
+      cleanupStatus: "success",
+      metadata: {
+        sandboxAcquisitionId: acquireParams.acquisitionId,
+      },
+    });
+  });
+
+  it("still compensates a sandbox provider lease when recording the cleanup lease fails", async () => {
+    const pluginId = randomUUID();
+    const { companyId, environment: baseEnvironment, runId } = await seedEnvironment();
+    const environment = {
+      ...baseEnvironment,
+      name: "Unrecorded Sandbox Cleanup",
+      driver: "sandbox",
+      config: {
+        provider: "unrecorded-sandbox-provider",
+        reuseLease: false,
+      },
+    };
+    await environmentService(db).update(environment.id, {
+      driver: "sandbox",
+      name: environment.name,
+      config: environment.config,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.unrecorded-sandbox-provider",
+      packageName: "@acme/unrecorded-sandbox-provider",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.unrecorded-sandbox-provider",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Unrecorded Sandbox Provider",
+        description: "Test cleanup when sandbox lease persistence fails",
+        author: "Paperclip",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{
+          driverKey: "unrecorded-sandbox-provider",
+          kind: "sandbox_provider",
+          displayName: "Unrecorded Sandbox Provider",
+          configSchema: { type: "object" },
+        }],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+    const acquisitionError = new JsonRpcCallError({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "sandbox setup failed after creation",
+      data: { providerLeaseId: "unrecorded-sandbox-provider-lease" },
+    });
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentAcquireLease") {
+          await db.delete(environments).where(eq(environments.id, environment.id));
+          throw acquisitionError;
+        }
+        if (method === "environmentReleaseLease") throw new Error("provider cleanup unavailable");
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    await expect(runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toBe(acquisitionError);
+
+    expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+    ]);
+    await expect(db.select().from(environmentLeases)).resolves.toHaveLength(0);
   });
 
   it("falls back to current config when a lease-scoped sandbox secret is deleted", async () => {
@@ -3353,6 +3525,159 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       }),
     });
     expect(released[0]?.lease.status).toBe("released");
+  });
+
+  it("cleans up a generic plugin lease reported by a structured acquisition error", async () => {
+    const pluginId = randomUUID();
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "plugin",
+      name: "Structured Failure Plugin Environment",
+      config: {
+        pluginKey: "acme.structured-environments",
+        driverKey: "structured-driver",
+        driverConfig: { template: "base" },
+      },
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.structured-environments",
+      packageName: "@acme/structured-environments",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.structured-environments",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Structured Environments",
+        description: "Test structured plugin acquisition failure cleanup",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{
+          driverKey: "structured-driver",
+          displayName: "Structured driver",
+          configSchema: { type: "object" },
+        }],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+    const acquisitionError = new JsonRpcCallError({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "generic provider setup failed after creation",
+      data: { providerLeaseId: "structured-generic-acquisition" },
+    });
+    const workerManager = {
+      isRunning: vi.fn(() => true),
+      call: vi.fn(async (_pluginId: string, method: string, _params: any) => {
+        if (method === "environmentAcquireLease") throw acquisitionError;
+        if (method === "environmentReleaseLease") return undefined;
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    await expect(runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toBe(acquisitionError);
+
+    expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+    ]);
+    const acquireParams = workerManager.call.mock.calls[0]?.[2];
+    expect(workerManager.call.mock.calls[1]?.[2]).toMatchObject({
+      providerLeaseId: "structured-generic-acquisition",
+      leaseMetadata: {
+        sandboxAcquisitionId: acquireParams.acquisitionId,
+      },
+    });
+    const [terminal] = await db.select().from(environmentLeases);
+    expect(terminal).toMatchObject({
+      status: "expired",
+      providerLeaseId: "structured-generic-acquisition",
+      cleanupStatus: "success",
+      metadata: {
+        sandboxAcquisitionId: acquireParams.acquisitionId,
+      },
+    });
+  });
+
+  it("still compensates a generic plugin lease when recording the cleanup lease fails", async () => {
+    const pluginId = randomUUID();
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "plugin",
+      config: {
+        pluginKey: "acme.unrecorded-cleanup",
+        driverKey: "unrecorded-driver",
+        driverConfig: {},
+      },
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.unrecorded-cleanup",
+      packageName: "@acme/unrecorded-cleanup",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.unrecorded-cleanup",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Unrecorded cleanup",
+        description: "Test cleanup when lease persistence fails",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{
+          driverKey: "unrecorded-driver",
+          displayName: "Unrecorded driver",
+          configSchema: { type: "object" },
+        }],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+    const acquisitionError = new JsonRpcCallError({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "provider setup failed after creation",
+      data: { providerLeaseId: "unrecorded-provider-lease" },
+    });
+    const workerManager = {
+      isRunning: vi.fn(() => true),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentAcquireLease") {
+          await db.delete(environments).where(eq(environments.id, environment.id));
+          throw acquisitionError;
+        }
+        if (method === "environmentReleaseLease") throw new Error("provider cleanup unavailable");
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    await expect(runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toBe(acquisitionError);
+
+    expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+    ]);
+    await expect(db.select().from(environmentLeases)).resolves.toHaveLength(0);
   });
 
   it("delegates the full plugin environment lifecycle through the worker manager", async () => {

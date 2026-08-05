@@ -76,9 +76,7 @@ export async function cleanupTimedOutExecution(
     sessionId?: string;
   },
 ): Promise<void> {
-  if (options.sessionStrategy === "default") {
-    await sandbox.destroy().catch(() => undefined);
-    return;
+  if (options.sessionStrategy === "named") {
+    await sandbox.deleteSession(options.sessionId?.trim() || DEFAULT_SESSION_ID).catch(() => undefined);
   }
-  await sandbox.deleteSession(options.sessionId?.trim() || DEFAULT_SESSION_ID).catch(() => undefined);
 }

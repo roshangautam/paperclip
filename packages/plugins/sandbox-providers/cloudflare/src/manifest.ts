@@ -20,6 +20,8 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       driverKey: "cloudflare",
       kind: "sandbox_provider",
+      supportsReusableLeases: true,
+      supportsAcquisitionReplay: true,
       displayName: "Cloudflare Sandbox",
       description:
         "Runs Paperclip sandbox environments through a Cloudflare Worker bridge backed by the Sandbox SDK and Durable Objects.",

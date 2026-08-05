@@ -16,10 +16,12 @@ import type {
   SandboxEnvironmentConfig,
 } from "@paperclipai/shared";
 import type {
+  PluginEnvironmentAcquireLeaseErrorData,
   PluginEnvironmentExecuteResult,
   PluginEnvironmentLease,
   PluginEnvironmentRealizeWorkspaceResult,
 } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
 import { environmentService } from "./environments.js";
 import {
@@ -219,6 +221,26 @@ const SANDBOX_CLEANUP_RETRY_BATCH_SIZE = 10;
 const PENDING_CLEANUP_RELEASE_STATUS_KEY = "pendingCleanupReleaseStatus";
 const PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY = "sandboxProviderConfig";
 const LEASE_SCOPED_SECRET_BINDINGS_KEY = "leaseScopedSecretBindings";
+const SANDBOX_ACQUISITION_ID_KEY = "sandboxAcquisitionId";
+
+function readPluginAcquireLeaseErrorData(
+  error: unknown,
+): PluginEnvironmentAcquireLeaseErrorData | null {
+  if (
+    !(error instanceof JsonRpcCallError) ||
+    error.code !== PLUGIN_RPC_ERROR_CODES.WORKER_ERROR ||
+    !error.data ||
+    typeof error.data !== "object" ||
+    Array.isArray(error.data)
+  ) {
+    return null;
+  }
+
+  const providerLeaseId = (error.data as Partial<PluginEnvironmentAcquireLeaseErrorData>).providerLeaseId;
+  return typeof providerLeaseId === "string" && providerLeaseId.trim().length > 0
+    ? { providerLeaseId }
+    : null;
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -712,6 +734,91 @@ function createSandboxEnvironmentDriver(
     let cleanupLease: EnvironmentLease | null = null;
     try {
       cleanupLease = await environmentsSvc.acquireLease(input);
+    } catch (persistenceError) {
+      const now = new Date();
+      const unpersistedLease: EnvironmentLease = {
+        id: randomUUID(),
+        companyId: input.companyId,
+        environmentId: input.environmentId,
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        issueId: input.issueId ?? null,
+        heartbeatRunId: input.heartbeatRunId ?? null,
+        status: "active",
+        leasePolicy: input.leasePolicy ?? "ephemeral",
+        provider: input.provider ?? null,
+        providerLeaseId: input.providerLeaseId ?? null,
+        acquiredAt: now,
+        lastUsedAt: now,
+        expiresAt: input.expiresAt ?? null,
+        releasedAt: null,
+        failureReason: null,
+        cleanupStatus: null,
+        metadata: input.metadata ?? null,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      try {
+        const metadataConfig = sandboxConfigFromLeaseMetadata(unpersistedLease);
+        const looseConfig = metadataConfig ? null : sandboxConfigFromLeaseMetadataLoose(unpersistedLease);
+        const providerKey = readString(unpersistedLease.metadata?.provider) ?? metadataConfig?.provider;
+        if (!providerKey) throw new Error("Unpersisted sandbox lease has no provider.");
+        const config = await resolveSandboxRuntimeConfig({
+          environment,
+          lease: unpersistedLease,
+          provider: providerKey,
+        });
+
+        if (
+          unpersistedLease.metadata?.sandboxProviderPlugin ||
+          (looseConfig && !isBuiltinSandboxProvider(looseConfig.provider))
+        ) {
+          const pluginId = readString(unpersistedLease.metadata?.pluginId);
+          if (!pluginId || !pluginWorkerManager?.isRunning(pluginId)) {
+            throw new Error("Sandbox provider plugin worker is unavailable");
+          }
+          await pluginWorkerManager.call(
+            pluginId,
+            unpersistedLease.leasePolicy === "reuse_by_environment"
+              ? "environmentDestroyLease"
+              : "environmentReleaseLease",
+            {
+              driverKey: providerKey,
+              companyId: input.companyId,
+              environmentId: environment.id,
+              issueId: input.issueId,
+              config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
+              providerLeaseId: input.providerLeaseId ?? null,
+              leaseMetadata: input.metadata ?? undefined,
+            },
+            resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)),
+          );
+        } else if (unpersistedLease.leasePolicy === "reuse_by_environment") {
+          await destroySandboxProviderLease({
+            config: config as unknown as SandboxEnvironmentConfig,
+            providerLeaseId: input.providerLeaseId ?? null,
+          });
+        } else {
+          await releaseSandboxProviderLease({
+            config: config as unknown as SandboxEnvironmentConfig,
+            providerLeaseId: input.providerLeaseId ?? null,
+            status: "expired",
+          });
+        }
+      } catch (cleanupError) {
+        logger.error(
+          { err: cleanupError, environmentId: environment.id, providerLeaseId: input.providerLeaseId },
+          "failed to compensate unpersisted sandbox lease after acquisition handoff failure",
+        );
+      }
+      logger.error(
+        { err: persistenceError, environmentId: environment.id, providerLeaseId: input.providerLeaseId },
+        "failed to record sandbox lease for acquisition handoff cleanup",
+      );
+      return;
+    }
+
+    try {
       if (cleanupLease.leasePolicy === "reuse_by_environment") {
         await destroyReusableSandboxLease({
           environment,
@@ -1225,41 +1332,71 @@ function createSandboxEnvironmentDriver(
           }
         }
         const acquisitionId = randomUUID();
-        const acquiredLease = providerLease ?? await pluginWorkerManager.call(
-          pluginProvider.resolved.plugin.id,
-          "environmentAcquireLease",
-          {
-            acquisitionId,
-            driverKey: parsed.config.provider,
-            companyId: input.companyId,
-            environmentId: input.environment.id,
-            issueId: input.issueId,
-            config: workerConfig,
-            // Plugin SDK requires a string; ad-hoc test leases use a fresh
-            // UUID so providers that validate or persist the runId still see
-            // a well-formed identifier.
-            runId: input.heartbeatRunId ?? acquisitionId,
-            workspaceMode: input.executionWorkspaceMode ?? undefined,
-            agentId: input.agentId ?? undefined,
-            executionWorkspaceId: input.executionWorkspaceId ?? undefined,
-            // The agent's harness for THIS run, so the plugin picks the matching
-            // runtime image (per-run adapter, mixed-harness environments).
-            // NOTE: environment-runtime.ts has TWO drivers calling
-            // environmentAcquireLease; this plugin-sandbox one is the HEARTBEAT
-            // path. Omitting adapterType here silently falls back to the
-            // environment's default adapter image (a pi agent then runs in the
-            // opencode image and the harness binary is missing at exec time).
-            adapterType: input.adapterType ?? undefined,
-          },
-          resolvePluginSandboxRpcTimeoutMs(workerConfig),
-        );
-
         // Ad-hoc test leases are never publishable for reuse: storing them
         // as `reuse_by_environment` would let a concurrent heartbeat resume
         // the test's provider lease and lose its sandbox when the test ends.
         const resolvedLeasePolicy = supportsReusableLeases && parsed.config.reuseLease && input.heartbeatRunId !== null
           ? "reuse_by_environment"
           : "ephemeral";
+        let acquiredLease = providerLease;
+        if (!acquiredLease) {
+          try {
+            acquiredLease = await pluginWorkerManager.call(
+              pluginProvider.resolved.plugin.id,
+              "environmentAcquireLease",
+              {
+                acquisitionId,
+                driverKey: parsed.config.provider,
+                companyId: input.companyId,
+                environmentId: input.environment.id,
+                issueId: input.issueId,
+                config: workerConfig,
+                // Plugin SDK requires a string; ad-hoc test leases use a fresh
+                // UUID so providers that validate or persist the runId still see
+                // a well-formed identifier.
+                runId: input.heartbeatRunId ?? acquisitionId,
+                workspaceMode: input.executionWorkspaceMode ?? undefined,
+                agentId: input.agentId ?? undefined,
+                executionWorkspaceId: input.executionWorkspaceId ?? undefined,
+                // The agent's harness for THIS run, so the plugin picks the matching
+                // runtime image (per-run adapter, mixed-harness environments).
+                // NOTE: environment-runtime.ts has TWO drivers calling
+                // environmentAcquireLease; this plugin-sandbox one is the HEARTBEAT
+                // path. Omitting adapterType here silently falls back to the
+                // environment's default adapter image (a pi agent then runs in the
+                // opencode image and the harness binary is missing at exec time).
+                adapterType: input.adapterType ?? undefined,
+              },
+              resolvePluginSandboxRpcTimeoutMs(workerConfig),
+            );
+          } catch (error) {
+            const errorData = readPluginAcquireLeaseErrorData(error);
+            if (!errorData) throw error;
+
+            await compensateFailedSandboxLeaseAcquisition(input.environment, {
+              companyId: input.companyId,
+              environmentId: input.environment.id,
+              executionWorkspaceId: input.executionWorkspaceId,
+              issueId: input.issueId,
+              heartbeatRunId: input.heartbeatRunId,
+              leasePolicy: resolvedLeasePolicy,
+              provider: parsed.config.provider,
+              providerLeaseId: errorData.providerLeaseId,
+              metadata: {
+                ...(input.agentId ? { agentId: input.agentId } : {}),
+                driver: input.environment.driver,
+                executionWorkspaceMode: input.executionWorkspaceMode,
+                pluginId: pluginProvider.resolved.plugin.id,
+                pluginKey: pluginProvider.resolved.plugin.pluginKey,
+                sandboxProviderPlugin: true,
+                ...sanitizePluginSandboxConfigFromLeaseMetadata(storedConfig),
+                [PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY]: providerConfigForLease,
+                [SANDBOX_ACQUISITION_ID_KEY]: acquisitionId,
+              },
+            });
+            throw error;
+          }
+        }
         const sanitizedProviderMetadata = stripSecretRefValuesFromPluginLeaseMetadata({
           metadata: acquiredLease.metadata,
           schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
@@ -1760,6 +1897,7 @@ const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "pluginKey",
   "providerMetadata",
   PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY,
+  SANDBOX_ACQUISITION_ID_KEY,
   "sandboxProviderPlugin",
   "reusableSandboxLease",
   "workspaceRealization",
@@ -1884,19 +2022,94 @@ function createPluginEnvironmentDriver(
       }
       const { plugin } = await resolvePluginDriver(parsed.config);
       const acquisitionId = randomUUID();
-      const providerLease = await workerManager.call(plugin.id, "environmentAcquireLease", {
-        acquisitionId,
-        driverKey: parsed.config.driverKey,
-        companyId: input.companyId,
-        environmentId: input.environment.id,
-        issueId: input.issueId,
-        config: parsed.config.driverConfig,
-        runId: input.heartbeatRunId ?? acquisitionId,
-        workspaceMode: input.executionWorkspaceMode ?? undefined,
-        agentId: input.agentId ?? undefined,
-        executionWorkspaceId: input.executionWorkspaceId ?? undefined,
-        adapterType: input.adapterType ?? undefined,
-      });
+      let providerLease: PluginEnvironmentLease;
+      try {
+        providerLease = await workerManager.call(plugin.id, "environmentAcquireLease", {
+          acquisitionId,
+          driverKey: parsed.config.driverKey,
+          companyId: input.companyId,
+          environmentId: input.environment.id,
+          issueId: input.issueId,
+          config: parsed.config.driverConfig,
+          runId: input.heartbeatRunId ?? acquisitionId,
+          workspaceMode: input.executionWorkspaceMode ?? undefined,
+          agentId: input.agentId ?? undefined,
+          executionWorkspaceId: input.executionWorkspaceId ?? undefined,
+          adapterType: input.adapterType ?? undefined,
+        });
+      } catch (error) {
+        const errorData = readPluginAcquireLeaseErrorData(error);
+        if (!errorData) throw error;
+
+        const cleanupMetadata = {
+          ...(input.agentId ? { agentId: input.agentId } : {}),
+          providerMetadata: {},
+          driver: input.environment.driver,
+          executionWorkspaceMode: input.executionWorkspaceMode,
+          pluginId: plugin.id,
+          pluginKey: parsed.config.pluginKey,
+          driverKey: parsed.config.driverKey,
+          [SANDBOX_ACQUISITION_ID_KEY]: acquisitionId,
+        };
+        let cleanupLease: EnvironmentLease | null = null;
+        let cleanupError: unknown | null = null;
+        try {
+          cleanupLease = await environmentsSvc.acquireLease({
+            companyId: input.companyId,
+            environmentId: input.environment.id,
+            executionWorkspaceId: input.executionWorkspaceId,
+            issueId: input.issueId,
+            heartbeatRunId: input.heartbeatRunId,
+            leasePolicy: "ephemeral",
+            provider: `plugin:${parsed.config.pluginKey}:${parsed.config.driverKey}`,
+            providerLeaseId: errorData.providerLeaseId,
+            metadata: cleanupMetadata,
+          });
+        } catch (error) {
+          cleanupError = error;
+        }
+
+        try {
+          await workerManager.call(plugin.id, "environmentReleaseLease", {
+            driverKey: parsed.config.driverKey,
+            companyId: input.companyId,
+            environmentId: input.environment.id,
+            issueId: input.issueId,
+            config: parsed.config.driverConfig,
+            providerLeaseId: errorData.providerLeaseId,
+            leaseMetadata: cleanupMetadata,
+          });
+          if (cleanupLease) {
+            await environmentsSvc.releaseLease(cleanupLease.id, "expired", {
+              cleanupStatus: "success",
+            });
+          }
+        } catch (error) {
+          cleanupError = error;
+          if (cleanupLease) {
+            await environmentsSvc.releaseLease(cleanupLease.id, "pending_cleanup", {
+              failureReason: "acquire_handoff_failed",
+              cleanupStatus: "failed",
+              expectedStatus: "active",
+              metadata: {
+                ...(cleanupLease.metadata ?? {}),
+                [PENDING_CLEANUP_RELEASE_STATUS_KEY]: "expired",
+              },
+            }).catch(() => null);
+          }
+        }
+        if (cleanupError) {
+          logger.error(
+            {
+              err: cleanupError,
+              environmentId: input.environment.id,
+              providerLeaseId: errorData.providerLeaseId,
+            },
+            "failed to compensate plugin environment lease after acquisition failure",
+          );
+        }
+        throw error;
+      }
 
       return await environmentsSvc.acquireLease({
         companyId: input.companyId,

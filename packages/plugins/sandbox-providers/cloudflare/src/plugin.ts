@@ -1,4 +1,5 @@
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import { createHash } from "node:crypto";
+import { definePlugin, JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import type {
   PluginLogger,
   PluginEnvironmentAcquireLeaseParams,
@@ -23,11 +24,14 @@ import {
 
 const SANDBOX_EXEC_CHANNEL_ENV = "PAPERCLIP_SANDBOX_EXEC_CHANNEL";
 const SANDBOX_EXEC_CHANNEL_BRIDGE = "bridge";
+const SANDBOX_ACQUISITION_ID_KEY = "sandboxAcquisitionId";
 const CLOUDFLARE_EXEC_STDOUT_PREFIX = "[cloudflare exec stdout]";
 const CLOUDFLARE_EXEC_STDERR_PREFIX = "[cloudflare exec stderr]";
+const ACQUISITION_REPLAY_MAX_ATTEMPTS = 4;
+const ACQUISITION_IN_PROGRESS_RETRY_DELAY_MS = 250;
 
 function isLostLeaseError(error: unknown): boolean {
-  return error instanceof CloudflareBridgeError && (error.status === 404 || error.status === 409);
+  return error instanceof CloudflareBridgeError && error.status === 409;
 }
 
 function bridgeClientFor(rawConfig: Record<string, unknown>) {
@@ -53,6 +57,70 @@ function lostLeaseExecuteResult(error: CloudflareBridgeError): PluginEnvironment
 
 function readIssueId(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function shouldReplayAcquisition(error: unknown): boolean {
+  if (!(error instanceof CloudflareBridgeError)) return true;
+  if (error.code === "acquisition_in_progress") return true;
+  return error.status >= 500 && error.code !== "acquisition_failed";
+}
+
+async function waitForAcquisitionReplay(error: unknown): Promise<void> {
+  if (error instanceof CloudflareBridgeError && error.code === "acquisition_in_progress") {
+    await new Promise((resolve) => setTimeout(resolve, ACQUISITION_IN_PROGRESS_RETRY_DELAY_MS));
+  }
+}
+
+function readLeaseAcquisitionId(metadata: Record<string, unknown> | undefined): string | null {
+  return readNonEmptyString(metadata?.[SANDBOX_ACQUISITION_ID_KEY])
+    ?? readNonEmptyString(metadata?.acquisitionId);
+}
+
+function isReusableSandboxLeaseScope(
+  value: unknown,
+  params: Pick<PluginEnvironmentReleaseLeaseParams, "companyId" | "environmentId">,
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const scope = value as Record<string, unknown>;
+  return scope.version === 1
+    && scope.companyId === params.companyId
+    && scope.environmentId === params.environmentId
+    && scope.provider === "cloudflare"
+    && readNonEmptyString(scope.executionWorkspaceId) !== null
+    && readNonEmptyString(scope.agentId) !== null
+    && (scope.adapterType === null || readNonEmptyString(scope.adapterType) !== null)
+    && readNonEmptyString(scope.runtimeFingerprint) !== null;
+}
+
+function buildReuseScopeId(params: PluginEnvironmentAcquireLeaseParams): string {
+  const agentId = readNonEmptyString(params.agentId);
+  const executionWorkspaceId = readNonEmptyString(params.executionWorkspaceId);
+  const identity = agentId && executionWorkspaceId
+    ? {
+        agentId,
+        executionWorkspaceId,
+        workspaceMode: readNonEmptyString(params.workspaceMode),
+        adapterType: readNonEmptyString(params.adapterType),
+      }
+    : {
+        // Older hosts did not supply workspace identity. Keep those calls safe
+        // by sacrificing cross-acquisition reuse instead of sharing a sandbox
+        // across unrelated agents.
+        acquisitionId: params.acquisitionId,
+      };
+  return createHash("sha256")
+    .update(JSON.stringify({
+      provider: "cloudflare",
+      companyId: params.companyId,
+      environmentId: params.environmentId,
+      ...identity,
+    }))
+    .digest("hex")
+    .slice(0, 32);
 }
 
 function resolveWorkspaceIssueId(params: PluginEnvironmentRealizeWorkspaceParams): string | null {
@@ -187,32 +255,84 @@ const plugin = definePlugin({
     params: PluginEnvironmentAcquireLeaseParams,
   ): Promise<PluginEnvironmentLease> {
     const { config, client } = bridgeClientFor(params.config);
-    return await client.acquireLease(
-      {
-        environmentId: params.environmentId,
-        runId: params.runId,
-        issueId: params.issueId,
-        reuseLease: config.reuseLease,
-        keepAlive: config.keepAlive,
-        sleepAfter: config.sleepAfter,
-        normalizeId: config.normalizeId,
-        requestedCwd: params.requestedCwd?.trim() || config.requestedCwd,
-        sessionStrategy: config.sessionStrategy,
-        sessionId: config.sessionId,
-        timeoutMs: config.timeoutMs,
-      },
-      { environmentId: params.environmentId, runId: params.runId, issueId: params.issueId },
-    );
+    const health = await client.health({
+      acquisitionId: params.acquisitionId,
+      environmentId: params.environmentId,
+      runId: params.runId,
+      issueId: params.issueId,
+    });
+    if (health.capabilities?.acquisitionReplay !== true) {
+      throw new Error(
+        "Cloudflare sandbox bridge does not support replay-safe lease acquisition; deploy the current bridge before acquiring leases.",
+      );
+    }
+    if (config.reuseLease && health.capabilities?.scopedReuse !== true) {
+      throw new Error(
+        "Cloudflare sandbox bridge does not support workspace-scoped reusable leases; deploy the current bridge before enabling reuseLease.",
+      );
+    }
+    const reuseScopeId = config.reuseLease ? buildReuseScopeId(params) : undefined;
+    const acquisitionRequest = {
+      acquisitionId: params.acquisitionId,
+      environmentId: params.environmentId,
+      reuseScopeId,
+      runId: params.runId,
+      issueId: params.issueId,
+      reuseLease: config.reuseLease,
+      keepAlive: config.keepAlive,
+      sleepAfter: config.sleepAfter,
+      normalizeId: config.normalizeId,
+      requestedCwd: params.requestedCwd?.trim() || config.requestedCwd,
+      sessionStrategy: config.sessionStrategy,
+      sessionId: config.sessionId,
+      timeoutMs: config.timeoutMs,
+    };
+    const acquisitionHeaders = {
+      acquisitionId: params.acquisitionId,
+      environmentId: params.environmentId,
+      runId: params.runId,
+      issueId: params.issueId,
+    };
+    try {
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          return await client.acquireLease(acquisitionRequest, acquisitionHeaders);
+        } catch (error) {
+          if (attempt >= ACQUISITION_REPLAY_MAX_ATTEMPTS || !shouldReplayAcquisition(error)) {
+            throw error;
+          }
+          await waitForAcquisitionReplay(error);
+        }
+      }
+    } catch (error) {
+      if (error instanceof CloudflareBridgeError) {
+        const providerLeaseId = typeof (error.details as { providerLeaseId?: unknown } | null)?.providerLeaseId === "string"
+          ? (error.details as { providerLeaseId: string }).providerLeaseId.trim()
+          : "";
+        if (providerLeaseId) {
+          throw new JsonRpcCallError({
+            code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+            message: error.message,
+            data: { providerLeaseId },
+          });
+        }
+      }
+      throw error;
+    }
   },
 
   async onEnvironmentResumeLease(
     params: PluginEnvironmentResumeLeaseParams,
   ): Promise<PluginEnvironmentLease> {
     const { config, client } = bridgeClientFor(params.config);
+    const acquisitionId = readLeaseAcquisitionId(params.leaseMetadata);
     try {
-      return await client.resumeLease(
+      // Avoid a separate health request; the resume response itself proves
+      // whether the bridge supports replay-safe ownership metadata.
+      const resumed = await client.resumeLease(
         {
           providerLeaseId: params.providerLeaseId,
+          acquisitionId: acquisitionId ?? undefined,
           requestedCwd:
             typeof params.leaseMetadata?.remoteCwd === "string" && params.leaseMetadata.remoteCwd.trim().length > 0
               ? params.leaseMetadata.remoteCwd.trim()
@@ -226,6 +346,12 @@ const plugin = definePlugin({
         },
         { environmentId: params.environmentId, issueId: params.issueId },
       );
+      if (!readLeaseAcquisitionId(resumed.metadata)) {
+        throw new Error(
+          "Cloudflare sandbox bridge resume response is missing lease ownership metadata; deploy the current bridge before resuming leases.",
+        );
+      }
+      return resumed;
     } catch (error) {
       if (isLostLeaseError(error)) {
         return {
@@ -245,13 +371,23 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const { config, client } = bridgeClientFor(params.config);
+    const reuseLease = isReusableSandboxLeaseScope(params.leaseMetadata?.reusableSandboxLease, params);
+    if (reuseLease) return;
+    const acquisitionId = readLeaseAcquisitionId(params.leaseMetadata);
     await client.releaseLease(
       {
         providerLeaseId: params.providerLeaseId,
-        reuseLease: config.reuseLease,
+        acquisitionId: acquisitionId ?? undefined,
+        reuseLease,
         keepAlive: config.keepAlive,
+        requestedCwd: readNonEmptyString(params.leaseMetadata?.remoteCwd) ?? config.requestedCwd,
+        sessionStrategy: params.leaseMetadata?.sessionStrategy === "default" || params.leaseMetadata?.sessionStrategy === "named"
+          ? params.leaseMetadata.sessionStrategy
+          : config.sessionStrategy,
+        sessionId: readNonEmptyString(params.leaseMetadata?.sessionId) ?? config.sessionId,
+        timeoutMs: config.timeoutMs,
       },
-      { environmentId: params.environmentId, issueId: params.issueId },
+      { acquisitionId: acquisitionId ?? undefined, environmentId: params.environmentId, issueId: params.issueId },
     );
   },
 
@@ -259,8 +395,19 @@ const plugin = definePlugin({
     params: PluginEnvironmentDestroyLeaseParams,
   ): Promise<void> {
     if (!params.providerLeaseId) return;
-    const { client } = bridgeClientFor(params.config);
-    await client.destroyLease(params.providerLeaseId, {
+    const { config, client } = bridgeClientFor(params.config);
+    const acquisitionId = readLeaseAcquisitionId(params.leaseMetadata);
+    await client.destroyLease({
+      providerLeaseId: params.providerLeaseId,
+      acquisitionId: acquisitionId ?? undefined,
+      requestedCwd: readNonEmptyString(params.leaseMetadata?.remoteCwd) ?? config.requestedCwd,
+      sessionStrategy: params.leaseMetadata?.sessionStrategy === "default" || params.leaseMetadata?.sessionStrategy === "named"
+        ? params.leaseMetadata.sessionStrategy
+        : config.sessionStrategy,
+      sessionId: readNonEmptyString(params.leaseMetadata?.sessionId) ?? config.sessionId,
+      timeoutMs: config.timeoutMs,
+    }, {
+      acquisitionId: acquisitionId ?? undefined,
       environmentId: params.environmentId,
       issueId: params.issueId,
     });
@@ -274,10 +421,18 @@ const plugin = definePlugin({
     const issueId = resolveWorkspaceIssueId(params);
 
     if (params.lease.providerLeaseId) {
+      const acquisitionId = readLeaseAcquisitionId(params.lease.metadata);
+      if (!acquisitionId) {
+        throw wrapWorkspacePreparationError(
+          remoteCwd,
+          new Error("Cloudflare sandbox lease ownership metadata is missing."),
+        );
+      }
       try {
         await client.execute(
           {
             providerLeaseId: params.lease.providerLeaseId,
+            acquisitionId,
             command: "mkdir",
             args: ["-p", remoteCwd],
             cwd: "/",
@@ -285,7 +440,7 @@ const plugin = definePlugin({
             sessionStrategy: config.sessionStrategy,
             sessionId: config.sessionId,
           },
-          { environmentId: params.environmentId, issueId },
+          { acquisitionId, environmentId: params.environmentId, issueId },
         );
       } catch (error) {
         throw wrapWorkspacePreparationError(remoteCwd, error);
@@ -313,6 +468,16 @@ const plugin = definePlugin({
         stderr: "No provider lease ID available for execution.\n",
       };
     }
+    const acquisitionId = readLeaseAcquisitionId(params.lease.metadata);
+    if (!acquisitionId) {
+      return {
+        exitCode: 1,
+        timedOut: false,
+        signal: null,
+        stdout: "",
+        stderr: "Cloudflare sandbox lease ownership metadata is missing.\n",
+      };
+    }
 
     const { config, client } = bridgeClientFor(params.config);
     const session = resolveExecuteSession(config, params.env);
@@ -333,6 +498,7 @@ const plugin = definePlugin({
       return await client.execute(
         {
           providerLeaseId: params.lease.providerLeaseId,
+          acquisitionId,
           command: params.command,
           args: params.args,
           cwd: params.cwd,
@@ -342,7 +508,7 @@ const plugin = definePlugin({
           sessionStrategy: session.sessionStrategy,
           sessionId: session.sessionId,
         },
-        { environmentId: params.environmentId, issueId: params.issueId },
+        { acquisitionId, environmentId: params.environmentId, issueId: params.issueId },
         streamingOptions,
       );
     } catch (error) {
