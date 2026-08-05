@@ -214,7 +214,10 @@ export class Sandbox extends CloudflareSandbox {
         if (stored.setupComplete !== false) return { status: "replayed", ownership: stored };
         const now = Date.now();
         const executions = stored.activeExecutions ?? [];
-        const activeExecutions = executions.filter((execution) => Date.parse(execution.expiresAt) > now);
+        const activeExecutions = executions.filter((execution) =>
+          Date.parse(execution.expiresAt) > now
+          || this.liveLeaseExecutions.has(execution.executionId)
+        );
         if (activeExecutions.length > 0 || !hasSetupExecution) {
           if (activeExecutions.length === executions.length) return { status: "in_progress", ownership: stored };
           const ownership = { ...stored, activeExecutions, updatedAt: new Date(now).toISOString() };
@@ -272,7 +275,10 @@ export class Sandbox extends CloudflareSandbox {
 
       const now = Date.now();
       const activeExecutions = (stored.activeExecutions ?? [])
-        .filter((execution) => Date.parse(execution.expiresAt) > now);
+        .filter((execution) =>
+          Date.parse(execution.expiresAt) > now
+          || this.liveLeaseExecutions.has(execution.executionId)
+        );
       if (activeExecutions.some((execution) => execution.executionId === executionId)) {
         return { status: "replayed", ownership: stored };
       }

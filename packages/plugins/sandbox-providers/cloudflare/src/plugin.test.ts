@@ -419,7 +419,7 @@ describe("Cloudflare sandbox provider plugin", () => {
     }
   });
 
-  it("shares one timeout budget across health and provider acquisition", async () => {
+  it("reserves enough shared timeout budget to replay an ambiguous provider acquisition", async () => {
     vi.useFakeTimers();
     try {
       fetchMock
@@ -439,7 +439,13 @@ describe("Cloudflare sandbox provider plugin", () => {
               () => reject(new DOMException("Aborted", "AbortError")),
               { once: true },
             );
-          }));
+          }))
+        .mockResolvedValueOnce(
+          jsonResponse({
+            providerLeaseId: "pc-acq-acquisition-1",
+            metadata: { acquisitionId: "acquisition-1", provider: "cloudflare" },
+          }),
+        );
 
       const acquisition = plugin.definition.onEnvironmentAcquireLease?.({
         driverKey: "cloudflare",
@@ -455,13 +461,13 @@ describe("Cloudflare sandbox provider plugin", () => {
         },
       });
 
-      const rejected = expect(acquisition).rejects.toThrow(
-        "Cloudflare sandbox bridge request timed out after 500ms.",
-      );
       await vi.advanceTimersByTimeAsync(2_000);
-      await rejected;
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await expect(acquisition).resolves.toMatchObject({
+        providerLeaseId: "pc-acq-acquisition-1",
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
       expect(requestBodyAt(1)).toMatchObject({ timeoutMs: 500 });
+      expect(requestBodyAt(2)).toMatchObject({ timeoutMs: 125 });
     } finally {
       vi.useRealTimers();
     }

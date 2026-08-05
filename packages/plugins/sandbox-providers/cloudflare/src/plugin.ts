@@ -309,6 +309,9 @@ const plugin = definePlugin({
         if (remainingMs <= 0) {
           throw new Error("Cloudflare sandbox lease acquisition exceeded its setup deadline.");
         }
+        const requestTimeoutMs = attempt === 1
+          ? Math.max(1, Math.floor((remainingMs - ACQUISITION_REPLAY_INITIAL_DELAY_MS) / 2))
+          : remainingMs;
         let lease: PluginEnvironmentLease;
         try {
           lease = await client.acquireLease(
@@ -317,7 +320,7 @@ const plugin = definePlugin({
               timeoutMs: Math.min(acquisitionRequest.timeoutMs, remainingMs),
             },
             acquisitionHeaders,
-            { timeoutMs: remainingMs },
+            { timeoutMs: requestTimeoutMs },
           );
         } catch (error) {
           if (error instanceof CloudflareBridgeError) {

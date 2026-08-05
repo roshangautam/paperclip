@@ -1779,6 +1779,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
+    const staleAcquisitionId = randomUUID();
     const staleLease = await environmentService(db).acquireLease({
       companyId,
       environmentId: environment.id,
@@ -1793,6 +1794,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         pluginId,
         pluginKey: "acme.fake-sandbox-provider",
         sandboxProviderPlugin: true,
+        acquisitionId: staleAcquisitionId,
         provider: "fake-plugin",
         image: "fake:test",
         timeoutMs: 1234,
@@ -1862,6 +1864,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       providerLeaseId: "stale-plugin-lease",
     }), 91234);
     expect(workerManager.call).toHaveBeenNthCalledWith(3, pluginId, "environmentAcquireLease", expect.objectContaining({
+      acquisitionId: expect.any(String),
       driverKey: "fake-plugin",
       config: {
         image: "fake:test",
@@ -1872,6 +1875,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       executionWorkspaceId,
       runId,
     }), 91234);
+    const fallbackAcquireParams = workerManager.call.mock.calls[2]?.[2];
+    expect(fallbackAcquireParams.acquisitionId).not.toBe(staleAcquisitionId);
+    expect(acquired.lease.metadata?.acquisitionId).toBe(fallbackAcquireParams.acquisitionId);
     await expect(environmentService(db).getLeaseById(staleLease.id)).resolves.toMatchObject({
       status: "expired",
       cleanupStatus: "success",

@@ -197,6 +197,38 @@ describe("durable lease ownership", () => {
     });
   });
 
+  it("keeps a live acquisition setup fence after durable expiry", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T00:00:00.000Z"));
+      const { sandbox } = createOwnershipSandbox();
+      const claim = {
+        providerLeaseId: "pc-acq-one",
+        acquisitionId: "acquisition-one",
+        acquisitionFingerprint: "fingerprint-one",
+      };
+      const setupExpiresAt = new Date(Date.now() + 1_000).toISOString();
+
+      expect(await sandbox.claimLeaseOwnership({
+        ...claim,
+        setupExecutionId: "setup-one",
+        setupExpiresAt,
+      })).toMatchObject({ status: "claimed" });
+      vi.advanceTimersByTime(1_000);
+
+      expect(await sandbox.claimLeaseOwnership({
+        ...claim,
+        setupExecutionId: "setup-two",
+        setupExpiresAt: new Date(Date.now() + 1_000).toISOString(),
+      })).toMatchObject({
+        status: "in_progress",
+        ownership: { activeExecutions: [{ executionId: "setup-one", expiresAt: setupExpiresAt }] },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("fences destruction while an execution is active and releases it afterward", async () => {
     const record = ownership();
     const { sandbox } = createOwnershipSandbox(record);
@@ -266,6 +298,37 @@ describe("durable lease ownership", () => {
       status: "started",
       ownership: { activeExecutions: [activeExecution, { executionId: "execution-new", expiresAt }] },
     });
+  });
+
+  it("keeps a live execution fenced when a newer execution destroys its lease", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T00:00:00.000Z"));
+      const record = ownership();
+      const { sandbox, destroy } = createOwnershipSandbox(record);
+      const identity = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
+      const firstExpiresAt = new Date(Date.now() + 1_000).toISOString();
+
+      expect(await sandbox.beginLeaseExecution(identity, "execution-one", firstExpiresAt)).toMatchObject({
+        status: "started",
+      });
+      vi.advanceTimersByTime(1_000);
+
+      expect(await sandbox.beginLeaseExecution(
+        identity,
+        "execution-two",
+        new Date(Date.now() + 1_000).toISOString(),
+      )).toMatchObject({ status: "started" });
+      expect(await sandbox.destroyLease(identity, "destruction-two", "execution-two")).toMatchObject({
+        status: "in_progress",
+        ownership: {
+          activeExecutions: [{ executionId: "execution-one", expiresAt: firstExpiresAt }],
+        },
+      });
+      expect(destroy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("atomically completes an execution fence and begins lease destruction", async () => {

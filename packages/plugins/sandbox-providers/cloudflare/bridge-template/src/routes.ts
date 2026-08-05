@@ -1,6 +1,6 @@
 import { isAuthorizedRequest } from "./auth.js";
 import { executeInSandbox } from "./exec.js";
-import { shellQuote } from "./helpers.js";
+import { isTimeoutError, shellQuote } from "./helpers.js";
 import {
   buildLeaseSandboxId,
   buildSentinelPath,
@@ -530,7 +530,7 @@ async function runFencedOperation<T>(
   operation: () => Promise<T>,
   options?: {
     destroyAfterExecution?: (result: T) => boolean;
-    destroyOnError?: boolean;
+    destroyOnError?: boolean | ((error: unknown) => boolean);
     completeSetupOnSuccess?: boolean;
   },
 ): Promise<T> {
@@ -579,7 +579,9 @@ async function runFencedOperation<T>(
         renewalFailed
           ? { ...renewal, stop: async () => { await renewal.stop().catch(() => undefined); } }
           : renewal,
-        (options?.destroyOnError ?? false) || renewalFailed,
+        (typeof options?.destroyOnError === "function"
+          ? options.destroyOnError(error)
+          : options?.destroyOnError ?? false) || renewalFailed,
       );
     } catch (cleanupError) {
       const operationMessage = error instanceof Error ? error.message : String(error);
@@ -908,6 +910,7 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
           },
         });
       },
+      { destroyOnError: (error) => sessionStrategy === "default" && isTimeoutError(error) },
     );
   }
 

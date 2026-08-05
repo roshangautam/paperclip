@@ -928,6 +928,40 @@ describe("bridge routes", () => {
     expect(retryDestroy.status).toBe(200);
   });
 
+  it("destroys a reusable lease when default-session resume setup times out", async () => {
+    const sessionExec = vi.fn(async (command: string) => {
+      if (command.includes("test ! -e")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            providerLeaseId: "pc-acq-acquisition-1",
+            acquisitionId: "acquisition-1",
+            acquisitionFingerprint: "fingerprint-one",
+            remoteCwd: DEFAULT_REMOTE_CWD,
+          }),
+          stderr: "",
+        };
+      }
+      throw new Error("command timed out");
+    });
+    const { sandbox } = createSandbox({ ownership: ownership(), sessionExec });
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
+    const response = await bridgeWorker.fetch(
+      bridgeRequest("/api/paperclip-sandbox/v1/leases/resume", {
+        providerLeaseId: "pc-acq-acquisition-1",
+        acquisitionId: "acquisition-1",
+        sessionStrategy: "default",
+      }),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
+
+    expect(response.status).toBe(500);
+    expect(sandbox.beginLeaseDestructionAfterExecution).toHaveBeenCalledOnce();
+    expect(sandbox.completeLeaseExecution).not.toHaveBeenCalled();
+    expect(sandbox.destroy).toHaveBeenCalledOnce();
+  });
+
   it("rejects a mismatched acquisition before mutating or touching the sandbox filesystem", async () => {
     const { sandbox, sessionExec } = createSandbox({
       ownership: ownership("pc-acq-acquisition-1", "acquisition-owner"),

@@ -1338,9 +1338,12 @@ function createSandboxEnvironmentDriver(
             });
           }
         }
-        const acquisitionId = readPersistedAcquisitionId(reusableLease?.metadata)
-          ?? readPersistedAcquisitionId(providerLease?.metadata)
-          ?? randomUUID();
+        const acquisitionId = supersededLease
+          ? readPersistedAcquisitionId(reusableLease?.metadata)
+            ?? readPersistedAcquisitionId(providerLease?.metadata)
+            ?? randomUUID()
+          : readPersistedAcquisitionId(providerLease?.metadata)
+            ?? randomUUID();
         // Ad-hoc test leases are never publishable for reuse: storing them
         // as `reuse_by_environment` would let a concurrent heartbeat resume
         // the test's provider lease and lose its sandbox when the test ends.
