@@ -360,6 +360,43 @@ describe("exe.dev sandbox provider plugin", () => {
     });
   });
 
+  it("preserves the acquisition lease ID when SSH setup and cleanup both fail", async () => {
+    const acquisitionId = "acquisition-cleanup-failure-1";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        vm_name: vmName,
+        ssh_dest: `${vmName}.exe.xyz`,
+        status: "running",
+        tags: [`paperclip-acquisition-${digest}`],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response("delete failed", { status: 500 }));
+    queueSpawnResult({ code: 1, stderr: "ssh setup failed" });
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        apiKey: "api-key",
+        namePrefix: "paperclip",
+        timeoutMs: 300000,
+      },
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: expect.stringContaining("ssh setup failed"),
+      data: { providerLeaseId: vmName },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(String(fetchMock.mock.calls[2]?.[1]?.body ?? "")).toBe(`rm --json '${vmName}'`);
+  });
+
   it("adopts an exactly-owned exe.dev VM on acquisition replay", async () => {
     const acquisitionId = "acquisition-replay-1";
     const digest = createHash("sha256").update(acquisitionId).digest("hex");
