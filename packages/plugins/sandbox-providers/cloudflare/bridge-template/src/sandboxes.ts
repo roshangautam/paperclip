@@ -174,6 +174,7 @@ function newOwnershipRecord(claim: LeaseOwnershipClaim): LeaseOwnershipRecord {
  * SDK's typed RPC proxy returned from getSandbox().
  */
 export class Sandbox extends CloudflareSandbox {
+  private readonly liveLeaseExecutions = new Set<string>();
   private leaseDestruction?: {
     key: string;
     promise: Promise<LeaseOwnershipDestroyResult>;
@@ -198,7 +199,7 @@ export class Sandbox extends CloudflareSandbox {
     if (Boolean(claim.setupExecutionId) !== Boolean(claim.setupExpiresAt) || (claim.setupExecutionId && !hasSetupExecution)) {
       return { status: "invalid" };
     }
-    return await this.ctx.storage.transaction(async (transaction) => {
+    const result: LeaseOwnershipClaimResult = await this.ctx.storage.transaction(async (transaction) => {
       const destruction = await readLeaseDestructionStatus(transaction, claim);
       if (destruction === "invalid") return { status: "invalid" };
       if (destruction === "completed") return { status: "completed" };
@@ -233,6 +234,10 @@ export class Sandbox extends CloudflareSandbox {
       await transaction.put(LEASE_OWNERSHIP_STORAGE_KEY, ownership);
       return { status: "claimed", ownership };
     });
+    if (result.status === "claimed" && claim.setupExecutionId) {
+      this.liveLeaseExecutions.add(claim.setupExecutionId);
+    }
+    return result;
   }
 
   async updateLeaseOwnership(identity: LeaseOwnershipIdentity): Promise<LeaseOwnershipUpdateResult> {
@@ -258,7 +263,7 @@ export class Sandbox extends CloudflareSandbox {
     if (!executionId || !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
       return { status: "invalid" };
     }
-    return await this.ctx.storage.transaction(async (transaction) => {
+    const result: LeaseOwnershipExecutionResult = await this.ctx.storage.transaction(async (transaction) => {
       const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
       if (stored === undefined) return { status: "missing" };
       if (!isLeaseOwnershipRecord(stored)) return { status: "invalid" };
@@ -282,6 +287,10 @@ export class Sandbox extends CloudflareSandbox {
       await transaction.put(LEASE_OWNERSHIP_STORAGE_KEY, ownership);
       return { status: "started", ownership };
     });
+    if (result.status === "started" || result.status === "replayed") {
+      this.liveLeaseExecutions.add(executionId);
+    }
+    return result;
   }
 
   async completeLeaseExecution(
@@ -289,27 +298,31 @@ export class Sandbox extends CloudflareSandbox {
     executionId: string,
     completeSetup = false,
   ): Promise<LeaseOwnershipExecutionResult> {
-    return await this.ctx.storage.transaction(async (transaction) => {
-      const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
-      if (stored === undefined) return { status: "missing" };
-      if (!isLeaseOwnershipRecord(stored) || !executionId) return { status: "invalid" };
-      if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
-      const executions = stored.activeExecutions ?? [];
-      if (!executions.some((execution) => execution.executionId === executionId)) {
-        return { status: "missing" };
-      }
-      const activeExecutions = executions.filter((execution) => execution.executionId !== executionId);
-      const ownership = {
-        ...stored,
-        activeExecutions,
-        setupComplete: completeSetup ? true : stored.setupComplete,
-        updatedAt: new Date().toISOString(),
-      };
-      await transaction.put(LEASE_OWNERSHIP_STORAGE_KEY, ownership);
-      return stored.state === "destroying" && activeExecutions.length === 0
-        ? { status: "destruction_started", ownership }
-        : { status: "completed", ownership };
-    });
+    try {
+      return await this.ctx.storage.transaction(async (transaction) => {
+        const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
+        if (stored === undefined) return { status: "missing" };
+        if (!isLeaseOwnershipRecord(stored) || !executionId) return { status: "invalid" };
+        if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
+        const executions = stored.activeExecutions ?? [];
+        if (!executions.some((execution) => execution.executionId === executionId)) {
+          return { status: "missing" };
+        }
+        const activeExecutions = executions.filter((execution) => execution.executionId !== executionId);
+        const ownership = {
+          ...stored,
+          activeExecutions,
+          setupComplete: completeSetup ? true : stored.setupComplete,
+          updatedAt: new Date().toISOString(),
+        };
+        await transaction.put(LEASE_OWNERSHIP_STORAGE_KEY, ownership);
+        return stored.state === "destroying" && activeExecutions.length === 0
+          ? { status: "destruction_started", ownership }
+          : { status: "completed", ownership };
+      });
+    } finally {
+      this.liveLeaseExecutions.delete(executionId);
+    }
   }
 
   async beginLeaseDestructionAfterExecution(
@@ -317,35 +330,39 @@ export class Sandbox extends CloudflareSandbox {
     executionId: string,
     destructionId: string,
   ): Promise<LeaseOwnershipDestroyResult> {
-    return await this.ctx.storage.transaction(async (transaction) => {
-      const destruction = await readLeaseDestructionStatus(transaction, identity);
-      if (destruction === "invalid") return { status: "invalid" };
-      if (destruction === "completed") return { status: "completed" };
+    try {
+      return await this.ctx.storage.transaction(async (transaction) => {
+        const destruction = await readLeaseDestructionStatus(transaction, identity);
+        if (destruction === "invalid") return { status: "invalid" };
+        if (destruction === "completed") return { status: "completed" };
 
-      const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
-      if (stored === undefined) return { status: "missing" };
-      if (!isLeaseOwnershipRecord(stored) || !executionId || !destructionId) return { status: "invalid" };
-      if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
-      const executions = stored.activeExecutions ?? [];
-      if (!executions.some((execution) => execution.executionId === executionId)) {
-        return stored.state === "destroying"
-          ? { status: "in_progress", ownership: stored }
-          : { status: "missing" };
-      }
+        const stored = await transaction.get<unknown>(LEASE_OWNERSHIP_STORAGE_KEY);
+        if (stored === undefined) return { status: "missing" };
+        if (!isLeaseOwnershipRecord(stored) || !executionId || !destructionId) return { status: "invalid" };
+        if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
+        const executions = stored.activeExecutions ?? [];
+        if (!executions.some((execution) => execution.executionId === executionId)) {
+          return stored.state === "destroying"
+            ? { status: "in_progress", ownership: stored }
+            : { status: "missing" };
+        }
 
-      const activeExecutions = executions.filter((execution) => execution.executionId !== executionId);
-      const ownership: LeaseOwnershipRecord = {
-        ...stored,
-        state: "destroying",
-        destructionId: stored.state === "destroying" ? stored.destructionId : destructionId,
-        activeExecutions,
-        updatedAt: new Date().toISOString(),
-      };
-      await transaction.put(LEASE_OWNERSHIP_STORAGE_KEY, ownership);
-      return activeExecutions.length > 0
-        ? { status: "in_progress", ownership }
-        : { status: "started", ownership };
-    });
+        const activeExecutions = executions.filter((execution) => execution.executionId !== executionId);
+        const ownership: LeaseOwnershipRecord = {
+          ...stored,
+          state: "destroying",
+          destructionId: stored.state === "destroying" ? stored.destructionId : destructionId,
+          activeExecutions,
+          updatedAt: new Date().toISOString(),
+        };
+        await transaction.put(LEASE_OWNERSHIP_STORAGE_KEY, ownership);
+        return activeExecutions.length > 0
+          ? { status: "in_progress", ownership }
+          : { status: "started", ownership };
+      });
+    } finally {
+      this.liveLeaseExecutions.delete(executionId);
+    }
   }
 
   async renewLeaseExecution(
@@ -417,6 +434,7 @@ export class Sandbox extends CloudflareSandbox {
       if (stored === undefined) return { status: "missing" };
       if (!isLeaseOwnershipRecord(stored)) return { status: "invalid" };
       if (!ownershipMatches(stored, identity)) return { status: "conflict", ownership: stored };
+      if (this.liveLeaseExecutions.size > 0) return { status: "in_progress", ownership: stored };
       const now = Date.now();
       const executions = stored.activeExecutions ?? [];
       const activeExecutions = executions.filter((execution) => Date.parse(execution.expiresAt) > now);

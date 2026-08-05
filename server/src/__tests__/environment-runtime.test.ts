@@ -789,8 +789,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(executed.stdout).toBe("ok\n");
     expect(released).toHaveLength(1);
     expect(released[0]?.lease.status).toBe("released");
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.anything(), 31000);
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.anything(), 31234);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.anything(), 91000);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.anything(), 91234);
   });
 
   it("keeps plugin sandbox cleanup on its lease-scoped secret after the environment changes", async () => {
@@ -949,12 +949,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       config: expect.objectContaining({
         apiKey: "resolved-provider-key",
       }),
-    }), 31234);
+    }), 91234);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.objectContaining({
       config: expect.objectContaining({
         apiKey: "resolved-provider-key",
       }),
-    }), 31234);
+    }), 91234);
     await expect(db
       .select()
       .from(companySecretBindings)
@@ -1379,7 +1379,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       config: expect.objectContaining({
         apiKey: "current-provider-key",
       }),
-    }), 31234);
+    }), 91234);
   });
 
   it("waits briefly for a ready sandbox provider plugin worker to come online", async () => {
@@ -1471,7 +1471,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
     expect(acquired.lease.providerLeaseId).toBe("sandbox-1");
     expect(workerManager.isRunning).toHaveBeenCalledTimes(3);
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.anything(), 31234);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.anything(), 91234);
   });
 
   it("extends plugin-backed sandbox lease RPC timeouts from provider config", async () => {
@@ -1567,7 +1567,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           reuseLease: false,
         },
       }),
-      70_000,
+      130_000,
     );
   });
 
@@ -1678,14 +1678,14 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       pluginId,
       "environmentResumeLease",
       expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
-      31234,
+      91234,
     );
     expect(workerManager.call).toHaveBeenNthCalledWith(
       2,
       pluginId,
       "environmentDestroyLease",
       expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
-      31234,
+      91234,
     );
     await expect(environmentService(db).getLeaseById(acquired.lease.id)).resolves.toMatchObject({
       status: "active",
@@ -1856,11 +1856,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(workerManager.call).toHaveBeenNthCalledWith(1, pluginId, "environmentResumeLease", expect.objectContaining({
       driverKey: "fake-plugin",
       providerLeaseId: "stale-plugin-lease",
-    }), 31234);
+    }), 91234);
     expect(workerManager.call).toHaveBeenNthCalledWith(2, pluginId, "environmentDestroyLease", expect.objectContaining({
       driverKey: "fake-plugin",
       providerLeaseId: "stale-plugin-lease",
-    }), 31234);
+    }), 91234);
     expect(workerManager.call).toHaveBeenNthCalledWith(3, pluginId, "environmentAcquireLease", expect.objectContaining({
       driverKey: "fake-plugin",
       config: {
@@ -1871,7 +1871,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       agentId,
       executionWorkspaceId,
       runId,
-    }), 31234);
+    }), 91234);
     await expect(environmentService(db).getLeaseById(staleLease.id)).resolves.toMatchObject({
       status: "expired",
       cleanupStatus: "success",
@@ -2044,7 +2044,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     );
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.objectContaining({
       providerLeaseId: "lease-template-a",
-    }), 31234);
+    }), 91234);
     await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
       status: "expired",
       cleanupStatus: "success",
@@ -2338,7 +2338,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     );
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.objectContaining({
       providerLeaseId: "lease-resolved-provider-key",
-    }), 31234);
+    }), 91234);
     await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
       status: "expired",
       cleanupStatus: "success",
@@ -2400,7 +2400,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       agentId,
       executionWorkspaceId,
       runId: nextRunId,
-    }), 31234);
+    }), 91234);
     await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
       status: "active",
       cleanupStatus: null,
@@ -2545,7 +2545,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(acquired.lease.providerLeaseId).toBe("fresh-plugin-lease");
     expect(acquired.lease.leasePolicy).toBe("ephemeral");
     expect(workerManager.call).toHaveBeenCalledTimes(1);
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.anything(), 31234);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.anything(), 91234);
   });
 
   it("destroys scoped reusable plugin-backed sandbox leases", async () => {
@@ -2579,7 +2579,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         driverKey: "fake-plugin",
         providerLeaseId: "reusable-plugin-lease",
       }),
-      31234,
+      91234,
     );
     await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
       status: "expired",
@@ -2699,7 +2699,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           pluginId,
           "environmentDestroyLease",
           expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
-          31234,
+          91234,
         );
       }
       await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
@@ -2883,7 +2883,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       pluginId,
       "environmentReleaseLease",
       expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
-      31234,
+      91234,
     );
     expect(recoveredWorkerManager.call).not.toHaveBeenCalledWith(
       pluginId,
@@ -2920,7 +2920,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       pluginId,
       "environmentDestroyLease",
       expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
-      31234,
+      91234,
     );
   });
 
@@ -2954,7 +2954,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       pluginId,
       "environmentDestroyLease",
       expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
-      31234,
+      91234,
     );
   });
 
@@ -3231,7 +3231,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         driverKey: "fake-plugin",
         providerLeaseId: "reusable-plugin-lease",
       }),
-      31234,
+      91234,
     );
     await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
       status: "expired",
@@ -3860,7 +3860,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       args: ["ok"],
       cwd: "/workspace/project",
       env: { FOO: "bar" },
-    }), 31000);
+    }), 91000);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", {
       driverKey: "fake-plugin",
       companyId,

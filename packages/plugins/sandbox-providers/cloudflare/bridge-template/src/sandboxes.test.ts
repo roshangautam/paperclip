@@ -48,6 +48,7 @@ function createOwnershipSandbox(
   const sandbox = Object.create(Sandbox.prototype) as Sandbox;
   Object.defineProperty(sandbox, "ctx", { value: { storage } });
   Object.defineProperty(sandbox, "destroy", { value: destroy });
+  Object.defineProperty(sandbox, "liveLeaseExecutions", { value: new Set<string>() });
   return { sandbox, storage, transaction, records, destroy };
 }
 
@@ -218,6 +219,31 @@ describe("durable lease ownership", () => {
       status: "started",
       ownership: { state: "destroying", destructionId: "destruction-two" },
     });
+  });
+
+  it("fences destruction while the same instance is still executing after durable expiry", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-04T00:00:00.000Z"));
+      const record = ownership();
+      const { sandbox } = createOwnershipSandbox(record);
+      const identity = { providerLeaseId: record.providerLeaseId, acquisitionId: record.acquisitionId };
+
+      await sandbox.beginLeaseExecution(identity, "execution-one", new Date(Date.now() + 1_000).toISOString());
+      vi.advanceTimersByTime(1_000);
+
+      expect(await sandbox.beginLeaseDestruction(identity, "destruction-one")).toMatchObject({
+        status: "in_progress",
+        ownership: { state: "owned" },
+      });
+      await sandbox.completeLeaseExecution(identity, "execution-one");
+      expect(await sandbox.beginLeaseDestruction(identity, "destruction-two")).toMatchObject({
+        status: "started",
+        ownership: { state: "destroying", destructionId: "destruction-two" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("prunes expired execution fences when a new execution starts", async () => {

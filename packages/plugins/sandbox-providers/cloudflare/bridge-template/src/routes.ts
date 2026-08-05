@@ -333,10 +333,14 @@ async function resolveOwnedLease(
 ): Promise<{ status: "owned"; ownership: LeaseOwnershipRecord } | { status: "conflict" }> {
   const ownership = await sandbox.readLeaseOwnership();
   if (ownership.status === "owned" || (input.allowDestroying && ownership.status === "destroying")) {
+    const legacyAcquisitionId = `legacy:${input.providerLeaseId}`;
+    const expectedAcquisitionId = input.requestedAcquisitionId
+      || (input.allowSentinelMigration && ownership.ownership.acquisitionFingerprint === legacyAcquisitionId
+        ? legacyAcquisitionId
+        : "");
     if (
       ownership.ownership.providerLeaseId !== input.providerLeaseId
-      || !input.requestedAcquisitionId
-      || ownership.ownership.acquisitionId !== input.requestedAcquisitionId
+      || ownership.ownership.acquisitionId !== expectedAcquisitionId
     ) {
       return { status: "conflict" };
     }

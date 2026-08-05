@@ -59,6 +59,7 @@ function createSandbox(options: {
 } = {}) {
   let current = options.ownership ?? null;
   const completed = new Set<string>();
+  const liveLeaseExecutions = new Set<string>();
   let destructionInFlight: Promise<unknown> | null = null;
   const identityKey = (identity: LeaseOwnershipIdentity) => `${identity.providerLeaseId}:${identity.acquisitionId}`;
   const sessionExec = options.sessionExec ?? vi.fn().mockImplementation(async (command: string) => ({
@@ -103,6 +104,7 @@ function createSandbox(options: {
           activeExecutions: setupExecution,
           updatedAt: new Date().toISOString(),
         };
+        if (claim.setupExecutionId) liveLeaseExecutions.add(claim.setupExecutionId);
         return { status: "claimed", ownership: current } as const;
       }
       if (current.state === "destroying") return { status: "destroying", ownership: current } as const;
@@ -110,7 +112,8 @@ function createSandbox(options: {
         return { status: "conflict", ownership: current } as const;
       }
       if (current.setupComplete !== false) return { status: "replayed", ownership: current } as const;
-      const activeExecutions = current.activeExecutions ?? [];
+      const activeExecutions = (current.activeExecutions ?? [])
+        .filter((execution) => Date.parse(execution.expiresAt) > Date.now());
       if (activeExecutions.length > 0 || !claim.setupExecutionId || !claim.setupExpiresAt) {
         return { status: "in_progress", ownership: { ...current, activeExecutions } } as const;
       }
@@ -119,6 +122,7 @@ function createSandbox(options: {
         activeExecutions: [{ executionId: claim.setupExecutionId, expiresAt: claim.setupExpiresAt }],
         updatedAt: new Date().toISOString(),
       };
+      liveLeaseExecutions.add(claim.setupExecutionId);
       return { status: "claimed", ownership: current } as const;
     }),
     updateLeaseOwnership: vi.fn(async (identity: LeaseOwnershipIdentity) => {
@@ -134,8 +138,10 @@ function createSandbox(options: {
       if (current === "invalid") return { status: "invalid" } as const;
       if (!matches(current, identity)) return { status: "conflict", ownership: current } as const;
       if (current.state === "destroying") return { status: "destroying", ownership: current } as const;
-      const activeExecutions = current.activeExecutions ?? [];
+      const activeExecutions = (current.activeExecutions ?? [])
+        .filter((execution) => Date.parse(execution.expiresAt) > Date.now());
       if (activeExecutions.some((execution) => execution.executionId === executionId)) {
+        liveLeaseExecutions.add(executionId);
         return { status: "replayed", ownership: current } as const;
       }
       if (current.setupComplete === false) {
@@ -146,6 +152,7 @@ function createSandbox(options: {
         activeExecutions: [...activeExecutions, { executionId, expiresAt }],
         updatedAt: new Date().toISOString(),
       };
+      liveLeaseExecutions.add(executionId);
       return { status: "started", ownership: current } as const;
     }),
     renewLeaseExecution: vi.fn(async (identity: LeaseOwnershipIdentity, executionId: string, expiresAt: string) => {
@@ -189,63 +196,78 @@ function createSandbox(options: {
       executionId: string,
       completeSetup = false,
     ) => {
-      if (current === null) return { status: "missing" } as const;
-      if (current === "invalid") return { status: "invalid" } as const;
-      if (!matches(current, identity)) return { status: "conflict", ownership: current } as const;
-      const executions = current.activeExecutions ?? [];
-      if (!executions.some((execution) => execution.executionId === executionId)) {
-        return { status: "missing" } as const;
+      try {
+        if (current === null) return { status: "missing" } as const;
+        if (current === "invalid") return { status: "invalid" } as const;
+        if (!matches(current, identity)) return { status: "conflict", ownership: current } as const;
+        const executions = current.activeExecutions ?? [];
+        if (!executions.some((execution) => execution.executionId === executionId)) {
+          return { status: "missing" } as const;
+        }
+        const activeExecutions = executions
+          .filter((execution) => execution.executionId !== executionId);
+        current = {
+          ...current,
+          activeExecutions,
+          setupComplete: completeSetup ? true : current.setupComplete,
+          updatedAt: new Date().toISOString(),
+        };
+        if (current.state === "destroying" && activeExecutions.length === 0) {
+          return { status: "destruction_started", ownership: current } as const;
+        }
+        return { status: "completed", ownership: current } as const;
+      } finally {
+        liveLeaseExecutions.delete(executionId);
       }
-      const activeExecutions = executions
-        .filter((execution) => execution.executionId !== executionId);
-      current = {
-        ...current,
-        activeExecutions,
-        setupComplete: completeSetup ? true : current.setupComplete,
-        updatedAt: new Date().toISOString(),
-      };
-      if (current.state === "destroying" && activeExecutions.length === 0) {
-        return { status: "destruction_started", ownership: current } as const;
-      }
-      return { status: "completed", ownership: current } as const;
     }),
     beginLeaseDestructionAfterExecution: vi.fn(async (
       identity: LeaseOwnershipIdentity,
       executionId: string,
       destructionId: string,
     ) => {
-      if (completed.has(identityKey(identity))) return { status: "completed" } as const;
-      if (current === null) return { status: "missing" } as const;
-      if (current === "invalid") return { status: "invalid" } as const;
-      if (!matches(current, identity)) return { status: "conflict", ownership: current } as const;
-      if (!(current.activeExecutions ?? []).some((execution) => execution.executionId === executionId)) {
-        return current.state === "destroying"
+      try {
+        if (completed.has(identityKey(identity))) return { status: "completed" } as const;
+        if (current === null) return { status: "missing" } as const;
+        if (current === "invalid") return { status: "invalid" } as const;
+        if (!matches(current, identity)) return { status: "conflict", ownership: current } as const;
+        if (!(current.activeExecutions ?? []).some((execution) => execution.executionId === executionId)) {
+          return current.state === "destroying"
+            ? { status: "in_progress", ownership: current } as const
+            : { status: "missing" } as const;
+        }
+        const activeExecutions = (current.activeExecutions ?? [])
+          .filter((execution) => execution.executionId !== executionId);
+        current = {
+          ...current,
+          state: "destroying",
+          destructionId: current.state === "destroying" ? current.destructionId : destructionId,
+          activeExecutions,
+          updatedAt: new Date().toISOString(),
+        };
+        return activeExecutions.length > 0
           ? { status: "in_progress", ownership: current } as const
-          : { status: "missing" } as const;
+          : { status: "started", ownership: current } as const;
+      } finally {
+        liveLeaseExecutions.delete(executionId);
       }
-      const activeExecutions = (current.activeExecutions ?? [])
-        .filter((execution) => execution.executionId !== executionId);
-      current = {
-        ...current,
-        state: "destroying",
-        destructionId: current.state === "destroying" ? current.destructionId : destructionId,
-        activeExecutions,
-        updatedAt: new Date().toISOString(),
-      };
-      return activeExecutions.length > 0
-        ? { status: "in_progress", ownership: current } as const
-        : { status: "started", ownership: current } as const;
     }),
     beginLeaseDestruction: vi.fn(async (identity: LeaseOwnershipIdentity, destructionId: string) => {
       if (completed.has(identityKey(identity))) return { status: "completed" } as const;
       if (current === null) return { status: "missing" } as const;
       if (current === "invalid") return { status: "invalid" } as const;
       if (!matches(current, identity)) return { status: "conflict", ownership: current } as const;
-      if (current.state === "destroying") return { status: "in_progress", ownership: current } as const;
-      if ((current.activeExecutions ?? []).length > 0) {
+      if (liveLeaseExecutions.size > 0) return { status: "in_progress", ownership: current } as const;
+      const executions = current.activeExecutions ?? [];
+      const activeExecutions = executions.filter((execution) => Date.parse(execution.expiresAt) > Date.now());
+      if (current.state === "destroying") {
+        current = { ...current, activeExecutions, updatedAt: new Date().toISOString() };
         return { status: "in_progress", ownership: current } as const;
       }
-      current = { ...current, state: "destroying", destructionId, updatedAt: new Date().toISOString() };
+      if (activeExecutions.length > 0) {
+        current = { ...current, activeExecutions, updatedAt: new Date().toISOString() };
+        return { status: "in_progress", ownership: current } as const;
+      }
+      current = { ...current, activeExecutions, state: "destroying", destructionId, updatedAt: new Date().toISOString() };
       return { status: "started", ownership: current } as const;
     }),
     completeLeaseDestruction: vi.fn(async (identity: LeaseOwnershipIdentity, destructionId: string) => {
@@ -743,16 +765,21 @@ describe("bridge routes", () => {
     const { sandbox } = createSandbox({ sessionExec });
     vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
 
-    const response = await handleBridgeRequest(
+    const resume = () => handleBridgeRequest(
       bridgeRequest("/api/paperclip-sandbox/v1/leases/resume", {
         providerLeaseId: "pc-acq-acquisition-1",
         requestedCwd: "/workspace/paperclip",
       }),
       { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
     );
+    const response = await resume();
+    const replay = await resume();
 
-    expect(response.status).toBe(200);
+    expect([response.status, replay.status]).toEqual([200, 200]);
     expect(await response.json()).toMatchObject({
+      metadata: { acquisitionId: "legacy:pc-acq-acquisition-1" },
+    });
+    expect(await replay.json()).toMatchObject({
       metadata: { acquisitionId: "legacy:pc-acq-acquisition-1" },
     });
     expect(sandbox.claimLeaseOwnership).toHaveBeenCalledWith({
@@ -760,6 +787,8 @@ describe("bridge routes", () => {
       acquisitionId: "legacy:pc-acq-acquisition-1",
       acquisitionFingerprint: "legacy:pc-acq-acquisition-1",
     });
+    expect(sandbox.claimLeaseOwnership).toHaveBeenCalledOnce();
+    expect(sandbox.beginLeaseExecution).toHaveBeenCalledTimes(2);
     expect(sandbox.beginLeaseExecution).toHaveBeenCalledWith(
       expect.objectContaining({
         providerLeaseId: "pc-acq-acquisition-1",

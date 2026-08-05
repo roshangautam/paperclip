@@ -451,7 +451,7 @@ export async function deletePluginEnvironmentTemplate(input: {
   }));
 }
 
-const RPC_OVERHEAD_BUFFER_MS = 30_000;
+const RPC_OVERHEAD_BUFFER_MS = 90_000;
 
 export function resolvePluginExecuteRpcTimeoutMs(input: {
   requestedTimeoutMs?: number;
