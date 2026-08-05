@@ -743,10 +743,19 @@ function isAmbiguousDaytonaCreateError(error: unknown): boolean {
     || (statusCode != null && statusCode >= 500);
 }
 
-async function reconcileAcquisitionSandbox(client: Daytona, name: string): Promise<Sandbox | null> {
+async function reconcileAcquisitionSandbox(
+  client: Daytona,
+  name: string,
+  acquisitionId: string,
+): Promise<Sandbox | null> {
   for (let attempt = 0; attempt < ACQUISITION_RECONCILE_ATTEMPTS; attempt += 1) {
     try {
-      const sandbox = await findSandboxByNameOrNull(client, name);
+      const sandbox = await findSandboxByNameOrNull(
+        client,
+        name,
+        acquisitionId,
+        attempt === ACQUISITION_RECONCILE_ATTEMPTS - 1,
+      );
       if (sandbox) return sandbox;
     } catch (error) {
       if (!isAmbiguousDaytonaCreateError(error)) throw error;
@@ -772,7 +781,7 @@ async function acquireSandbox(
 
   const client = createDaytonaClient(config);
   const name = acquisitionSandboxName(params.acquisitionId);
-  const existing = await findSandboxByNameOrNull(client, name);
+  const existing = await findSandboxByNameOrNull(client, name, params.acquisitionId);
   if (existing) {
     assertAcquisitionSandboxOwnership(existing, params.acquisitionId);
     try {
@@ -798,7 +807,7 @@ async function acquireSandbox(
     return { sandbox, created: true };
   } catch (error) {
     if (!isAmbiguousDaytonaCreateError(error)) throw error;
-    const reconciled = await reconcileAcquisitionSandbox(client, name);
+    const reconciled = await reconcileAcquisitionSandbox(client, name, params.acquisitionId);
     if (!reconciled) throw acquisitionFailureWithLease(error, name);
     assertAcquisitionSandboxOwnership(reconciled, params.acquisitionId);
     try {
@@ -810,19 +819,27 @@ async function acquireSandbox(
   }
 }
 
-async function findSandboxByNameOrNull(client: Daytona, name: string): Promise<Sandbox | null> {
-  const matches: Sandbox[] = [];
-
-  for (let page = 1; ; page += 1) {
-    const result = await client.list(undefined, page, DAYTONA_SANDBOX_LIST_PAGE_SIZE);
-    matches.push(...result.items.filter((sandbox) => sandbox.name === name));
-    if (matches.length > 1) {
-      throw new Error(`Refusing to reconcile multiple Daytona sandboxes named ${name}.`);
+async function findSandboxByNameOrNull(
+  client: Daytona,
+  name: string,
+  acquisitionId: string,
+  includeOwnershipConflicts = false,
+): Promise<Sandbox | null> {
+  const findMatch = async (labels?: Record<string, string>): Promise<Sandbox | null> => {
+    const matches: Sandbox[] = [];
+    for (let page = 1; ; page += 1) {
+      const result = await client.list(labels, page, DAYTONA_SANDBOX_LIST_PAGE_SIZE);
+      matches.push(...result.items.filter((sandbox) => sandbox.name === name));
+      if (matches.length > 1) {
+        throw new Error(`Refusing to reconcile multiple Daytona sandboxes named ${name}.`);
+      }
+      if (page >= result.totalPages) break;
     }
-    if (page >= result.totalPages) break;
-  }
+    return matches[0] ?? null;
+  };
 
-  return matches[0] ?? null;
+  const owned = await findMatch({ "paperclip-acquisition-id": acquisitionId });
+  return owned ?? (includeOwnershipConflicts ? await findMatch() : null);
 }
 
 async function getSandbox(config: DaytonaDriverConfig, sandboxId: string): Promise<Sandbox> {
@@ -850,7 +867,12 @@ async function getSandboxForCleanup(
     ? acquisitionSandboxName(params.acquisitionId)
     : null;
   const sandbox = params.providerLeaseId === acquisitionName
-    ? await findSandboxByNameOrNull(createDaytonaClient(config), params.providerLeaseId)
+    ? await findSandboxByNameOrNull(
+      createDaytonaClient(config),
+      params.providerLeaseId,
+      params.acquisitionId!,
+      true,
+    )
     : await getSandboxOrNull(config, params.providerLeaseId);
   if (!sandbox) {
     if (params.providerLeaseId === acquisitionName) {
@@ -1068,7 +1090,7 @@ const plugin = definePlugin({
         }),
       };
     } catch (error) {
-      if (created) {
+      if (created && !params.acquisitionId) {
         try {
           await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
         } catch {

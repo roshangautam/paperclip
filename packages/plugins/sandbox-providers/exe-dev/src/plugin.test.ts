@@ -360,7 +360,7 @@ describe("exe.dev sandbox provider plugin", () => {
     });
   });
 
-  it("preserves the acquisition lease ID when SSH setup and cleanup both fail", async () => {
+  it("preserves the acquisition lease ID without deleting the VM when SSH setup fails", async () => {
     const acquisitionId = "acquisition-cleanup-failure-1";
     const digest = createHash("sha256").update(acquisitionId).digest("hex");
     const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
@@ -371,8 +371,7 @@ describe("exe.dev sandbox provider plugin", () => {
         ssh_dest: `${vmName}.exe.xyz`,
         status: "running",
         tags: [`paperclip-acquisition-${digest}`],
-      }), { status: 200 }))
-      .mockResolvedValueOnce(new Response("delete failed", { status: 500 }));
+      }), { status: 200 }));
     queueSpawnResult({ code: 1, stderr: "ssh setup failed" });
 
     await expect(plugin.definition.onEnvironmentAcquireLease?.({
@@ -393,8 +392,10 @@ describe("exe.dev sandbox provider plugin", () => {
       data: { providerLeaseId: vmName },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(String(fetchMock.mock.calls[2]?.[1]?.body ?? "")).toBe(`rm --json '${vmName}'`);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map((call) => String(call[1]?.body ?? ""))).not.toContain(
+      `rm --json '${vmName}'`,
+    );
   });
 
   it("adopts an exactly-owned exe.dev VM on acquisition replay", async () => {

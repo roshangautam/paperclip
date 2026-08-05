@@ -950,7 +950,7 @@ const plugin = definePlugin({
     try {
       return await buildLease(config, vm, params.requestedCwd, false, params.acquisitionId);
     } catch (error) {
-      if (created) {
+      if (created && !params.acquisitionId) {
         try {
           await deleteVm(config, vm.name);
         } catch {
