@@ -902,6 +902,7 @@ describe("bridge routes", () => {
             providerLeaseId: "pc-acq-acquisition-1",
             acquisitionId: "acquisition-1",
             acquisitionFingerprint: "fingerprint-one",
+            remoteCwd: DEFAULT_REMOTE_CWD,
           })
         : "",
       stderr: "",
@@ -919,6 +920,51 @@ describe("bridge routes", () => {
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ error: "sandbox_state_lost" });
     expect(sandbox.claimLeaseOwnership).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { operation: "resume", storedState: "durable ownership" },
+    { operation: "resume", storedState: "modern sentinel" },
+    { operation: "release", storedState: "durable ownership" },
+    { operation: "release", storedState: "modern sentinel" },
+    { operation: "destroy", storedState: "durable ownership" },
+    { operation: "destroy", storedState: "modern sentinel" },
+  ] as const)("rejects v2 $operation without acquisitionId against $storedState", async ({
+    operation,
+    storedState,
+  }) => {
+    const sessionExec = vi.fn().mockImplementation(async (command: string) => ({
+      exitCode: 0,
+      stdout: command.includes("test ! -e")
+        ? JSON.stringify({
+            providerLeaseId: "pc-acq-acquisition-1",
+            acquisitionId: "acquisition-1",
+            acquisitionFingerprint: "fingerprint-one",
+            remoteCwd: DEFAULT_REMOTE_CWD,
+          })
+        : "",
+      stderr: "",
+    }));
+    const { sandbox } = createSandbox({
+      ownership: storedState === "durable ownership" ? ownership() : undefined,
+      sessionExec,
+    });
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
+    const path = operation === "destroy"
+      ? "/api/paperclip-sandbox/v2/leases/pc-acq-acquisition-1"
+      : `/api/paperclip-sandbox/v2/leases/${operation}`;
+    const body = operation === "destroy"
+      ? { requestedCwd: DEFAULT_REMOTE_CWD }
+      : { providerLeaseId: "pc-acq-acquisition-1", requestedCwd: DEFAULT_REMOTE_CWD };
+    const response = await handleBridgeRequest(
+      bridgeRequest(path, body, operation === "destroy" ? "DELETE" : "POST"),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
+
+    expect(response.status).toBe(409);
+    expect(sandbox.claimLeaseOwnership).not.toHaveBeenCalled();
+    expect(sandbox.destroy).not.toHaveBeenCalled();
   });
 
   it("preserves authoritative ownership across resume and replay", async () => {
