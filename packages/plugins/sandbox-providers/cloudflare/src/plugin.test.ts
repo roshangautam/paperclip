@@ -121,6 +121,7 @@ describe("Cloudflare sandbox provider plugin", () => {
       jsonResponse({
         providerLeaseId: "pc-run-1-abcd1234",
         metadata: {
+          acquisitionId: "acquisition-1",
           provider: "cloudflare",
           remoteCwd: "/workspace/paperclip",
           resumedLease: false,
@@ -145,9 +146,11 @@ describe("Cloudflare sandbox provider plugin", () => {
     expect(lease).toEqual({
       providerLeaseId: "pc-run-1-abcd1234",
       metadata: {
+        acquisitionId: "acquisition-1",
         provider: "cloudflare",
         remoteCwd: "/workspace/paperclip",
         resumedLease: false,
+        sandboxAcquisitionId: "acquisition-1",
       },
     });
     expect(fetchMock).toHaveBeenCalledWith(
@@ -171,6 +174,38 @@ describe("Cloudflare sandbox provider plugin", () => {
     expect(requestBodyAt(1)).not.toHaveProperty("reuseScopeId");
   });
 
+  it.each([
+    [{}, "did not echo acquisition acquisition-1"],
+    [{ acquisitionId: "acquisition-2" }, "returned acquisition acquisition-2 for acquisition-1"],
+  ])("rejects acquire responses with invalid ownership metadata", async (metadata, message) => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        ok: true,
+        provider: "cloudflare",
+        bridgeVersion: "0.1.0",
+        capabilities: { acquisitionReplay: true },
+      }))
+      .mockResolvedValueOnce(jsonResponse({ providerLeaseId: "pc-acquisition-1", metadata }));
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "cloudflare",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId: "acquisition-1",
+      runId: "run-1",
+      config: {
+        bridgeBaseUrl: "https://bridge.example.workers.dev",
+        bridgeAuthToken: "resolved-token",
+      },
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: -32002,
+      message: expect.stringContaining(message),
+      data: { providerLeaseId: "pc-acquisition-1" },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("scopes reusable sandboxes to the execution workspace and agent", async () => {
     const health = {
       ok: true,
@@ -186,9 +221,9 @@ describe("Cloudflare sandbox provider plugin", () => {
     };
     fetchMock
       .mockResolvedValueOnce(jsonResponse(health))
-      .mockResolvedValueOnce(jsonResponse({ providerLeaseId: "pc-scope-one", metadata: {} }))
+      .mockResolvedValueOnce(jsonResponse({ providerLeaseId: "pc-scope-one", metadata: { acquisitionId: "acquisition-1" } }))
       .mockResolvedValueOnce(jsonResponse(health))
-      .mockResolvedValueOnce(jsonResponse({ providerLeaseId: "pc-scope-two", metadata: {} }));
+      .mockResolvedValueOnce(jsonResponse({ providerLeaseId: "pc-scope-two", metadata: { acquisitionId: "acquisition-2" } }));
 
     const acquire = (agentId: string, acquisitionId: string) => plugin.definition.onEnvironmentAcquireLease?.({
       driverKey: "cloudflare",
@@ -259,7 +294,12 @@ describe("Cloudflare sandbox provider plugin", () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
         providerLeaseId: "pc-run-1-abcd1234",
-        metadata: { provider: "cloudflare", remoteCwd: "/workspace/paperclip", resumedLease: false },
+        metadata: {
+          acquisitionId: "acquisition-1",
+          provider: "cloudflare",
+          remoteCwd: "/workspace/paperclip",
+          resumedLease: false,
+        },
       }),
     );
 
@@ -471,6 +511,60 @@ describe("Cloudflare sandbox provider plugin", () => {
       await vi.advanceTimersByTimeAsync(1_000);
       await rejected;
       expect(fetchMock).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains cleanup ownership when a later acquisition replay times out", async () => {
+    vi.useFakeTimers();
+    try {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({
+          ok: true,
+          provider: "cloudflare",
+          bridgeVersion: "0.1.0",
+          capabilities: { acquisitionReplay: true },
+        }))
+        .mockResolvedValueOnce(jsonResponse(
+          {
+            error: "acquisition_in_progress",
+            message: "Cloudflare sandbox setup is still in progress.",
+            details: { providerLeaseId: "pc-acq-acquisition-1" },
+          },
+          503,
+        ))
+        .mockImplementationOnce(async (_url: string, init: RequestInit) =>
+          await new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("Aborted", "AbortError")),
+              { once: true },
+            );
+          }));
+
+      const acquisition = plugin.definition.onEnvironmentAcquireLease?.({
+        driverKey: "cloudflare",
+        companyId: "company-1",
+        environmentId: "env-1",
+        acquisitionId: "acquisition-1",
+        runId: "run-1",
+        config: {
+          bridgeBaseUrl: "https://bridge.example.workers.dev",
+          bridgeAuthToken: "resolved-token",
+          timeoutMs: 1_000,
+          bridgeRequestTimeoutMs: 1_000,
+        },
+      });
+
+      const rejected = expect(acquisition).rejects.toMatchObject({
+        name: "JsonRpcCallError",
+        code: -32002,
+        data: { providerLeaseId: "pc-acq-acquisition-1" },
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await rejected;
+      expect(fetchMock).toHaveBeenCalledTimes(3);
     } finally {
       vi.useRealTimers();
     }

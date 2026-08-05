@@ -63,6 +63,12 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function readProviderLeaseId(value: unknown): string | null {
+  return value && typeof value === "object"
+    ? readNonEmptyString((value as Record<string, unknown>).providerLeaseId)
+    : null;
+}
+
 function shouldReplayAcquisition(error: unknown): boolean {
   if (!(error instanceof CloudflareBridgeError)) return true;
   if (error.code === "acquisition_in_progress") return true;
@@ -296,14 +302,16 @@ const plugin = definePlugin({
       sessionId: config.sessionId,
       timeoutMs: config.timeoutMs,
     };
+    let providerLeaseId: string | null = null;
     try {
       for (let attempt = 1; ; attempt += 1) {
         const remainingMs = acquisitionDeadline - Date.now();
         if (remainingMs <= 0) {
           throw new Error("Cloudflare sandbox lease acquisition exceeded its setup deadline.");
         }
+        let lease: PluginEnvironmentLease;
         try {
-          return await client.acquireLease(
+          lease = await client.acquireLease(
             {
               ...acquisitionRequest,
               timeoutMs: Math.min(acquisitionRequest.timeoutMs, remainingMs),
@@ -312,26 +320,41 @@ const plugin = definePlugin({
             { timeoutMs: remainingMs },
           );
         } catch (error) {
+          if (error instanceof CloudflareBridgeError) {
+            providerLeaseId = readProviderLeaseId(error.details) ?? providerLeaseId;
+          }
           if (!shouldReplayAcquisition(error)) {
             throw error;
           }
           if (Date.now() >= acquisitionDeadline) throw error;
           await waitForAcquisitionReplay(attempt, acquisitionDeadline);
           if (Date.now() >= acquisitionDeadline) throw error;
+          continue;
         }
+        providerLeaseId = readNonEmptyString(lease.providerLeaseId) ?? providerLeaseId;
+        const returnedAcquisitionId = readNonEmptyString(lease.metadata?.acquisitionId);
+        if (returnedAcquisitionId !== params.acquisitionId) {
+          throw new Error(
+            returnedAcquisitionId
+              ? `Cloudflare sandbox bridge returned acquisition ${returnedAcquisitionId} for ${params.acquisitionId}.`
+              : `Cloudflare sandbox bridge did not echo acquisition ${params.acquisitionId}.`,
+          );
+        }
+        return {
+          ...lease,
+          metadata: {
+            ...lease.metadata,
+            [SANDBOX_ACQUISITION_ID_KEY]: params.acquisitionId,
+          },
+        };
       }
     } catch (error) {
-      if (error instanceof CloudflareBridgeError) {
-        const providerLeaseId = typeof (error.details as { providerLeaseId?: unknown } | null)?.providerLeaseId === "string"
-          ? (error.details as { providerLeaseId: string }).providerLeaseId.trim()
-          : "";
-        if (providerLeaseId) {
-          throw new JsonRpcCallError({
-            code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
-            message: error.message,
-            data: { providerLeaseId },
-          });
-        }
+      if (providerLeaseId) {
+        throw new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+          message: error instanceof Error ? error.message : String(error),
+          data: { providerLeaseId },
+        });
       }
       throw error;
     }
