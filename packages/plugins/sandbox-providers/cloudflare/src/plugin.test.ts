@@ -576,6 +576,68 @@ describe("Cloudflare sandbox provider plugin", () => {
     }
   });
 
+  it.each([15 * 60 * 1_000, 86_400_000])(
+    "bounds a %ims acquisition below the host RPC deadline and preserves cleanup ownership",
+    async (configuredTimeoutMs) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      try {
+        fetchMock
+          .mockResolvedValueOnce(jsonResponse({
+            ok: true,
+            provider: "cloudflare",
+            bridgeVersion: "0.1.0",
+            capabilities: { acquisitionReplay: true },
+          }))
+          .mockResolvedValueOnce(jsonResponse(
+            {
+              error: "acquisition_in_progress",
+              message: "Cloudflare sandbox setup is still in progress.",
+              details: { providerLeaseId: "pc-acq-acquisition-1" },
+            },
+            503,
+          ))
+          .mockImplementationOnce(async (_url: string, init: RequestInit) =>
+            await new Promise<Response>((_resolve, reject) => {
+              init.signal?.addEventListener(
+                "abort",
+                () => reject(new DOMException("Aborted", "AbortError")),
+                { once: true },
+              );
+            }));
+
+        const acquisition = plugin.definition.onEnvironmentAcquireLease?.({
+          driverKey: "cloudflare",
+          companyId: "company-1",
+          environmentId: "env-1",
+          acquisitionId: "acquisition-1",
+          runId: "run-1",
+          config: {
+            bridgeBaseUrl: "https://bridge.example.workers.dev",
+            bridgeAuthToken: "resolved-token",
+            timeoutMs: configuredTimeoutMs,
+            bridgeRequestTimeoutMs: configuredTimeoutMs,
+          },
+        });
+
+        const rejected = expect(acquisition).rejects.toMatchObject({
+          name: "JsonRpcCallError",
+          code: -32002,
+          data: { providerLeaseId: "pc-acq-acquisition-1" },
+        });
+        await vi.advanceTimersByTimeAsync(13.5 * 60 * 1_000);
+        await rejected;
+
+        expect(Date.now()).toBe(13.5 * 60 * 1_000);
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+        expect(requestBodyAt(1)).toMatchObject({ timeoutMs: 13.5 * 60 * 1_000 });
+        expect(requestBodyAt(2)).toMatchObject({ timeoutMs: 13.5 * 60 * 1_000 - 250 });
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("propagates a surviving sandbox ID through a structured acquisition error", async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({

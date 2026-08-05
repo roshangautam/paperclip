@@ -29,6 +29,22 @@ const CLOUDFLARE_EXEC_STDOUT_PREFIX = "[cloudflare exec stdout]";
 const CLOUDFLARE_EXEC_STDERR_PREFIX = "[cloudflare exec stderr]";
 const ACQUISITION_REPLAY_INITIAL_DELAY_MS = 250;
 const ACQUISITION_REPLAY_MAX_DELAY_MS = 5_000;
+// PluginWorkerManager clamps every RPC to 15 minutes. Match the host's
+// standard 90-second RPC overhead so a timed-out acquisition can still return
+// its surviving provider lease ID and let the host run compensating cleanup.
+const PLUGIN_RPC_MAX_TIMEOUT_MS = 15 * 60 * 1_000;
+const ACQUISITION_CLEANUP_HANDOFF_GRACE_MS = 90_000;
+const ACQUISITION_REPLAY_MAX_BUDGET_MS =
+  PLUGIN_RPC_MAX_TIMEOUT_MS - ACQUISITION_CLEANUP_HANDOFF_GRACE_MS;
+
+function resolveAcquisitionReplayBudgetMs(
+  config: ReturnType<typeof parseCloudflareDriverConfig>,
+): number {
+  return Math.min(
+    Math.max(config.timeoutMs, config.bridgeRequestTimeoutMs),
+    ACQUISITION_REPLAY_MAX_BUDGET_MS,
+  );
+}
 
 function isLostLeaseError(error: unknown): boolean {
   return error instanceof CloudflareBridgeError && error.status === 409;
@@ -265,7 +281,7 @@ const plugin = definePlugin({
     params: PluginEnvironmentAcquireLeaseParams,
   ): Promise<PluginEnvironmentLease> {
     const { config, client } = bridgeClientFor(params.config);
-    const acquisitionDeadline = Date.now() + Math.max(config.timeoutMs, config.bridgeRequestTimeoutMs);
+    const acquisitionDeadline = Date.now() + resolveAcquisitionReplayBudgetMs(config);
     const acquisitionHeaders = {
       acquisitionId: params.acquisitionId,
       environmentId: params.environmentId,
