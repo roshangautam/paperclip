@@ -1,26 +1,42 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import {
+  JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 
-const { MockNotFoundError, MockTimeoutError, MockSandboxTimeoutError } = vi.hoisted(() => {
+const { MockInvalidError, MockNotFoundError, MockTimeoutError, MockSandboxTimeoutError } = vi.hoisted(() => {
+  class MockInvalidError extends Error {}
   class MockNotFoundError extends Error {}
   class MockTimeoutError extends Error {}
   class MockSandboxTimeoutError extends Error {}
-  return { MockNotFoundError, MockTimeoutError, MockSandboxTimeoutError };
+  return { MockInvalidError, MockNotFoundError, MockTimeoutError, MockSandboxTimeoutError };
 });
 
 const mockAppFromName = vi.hoisted(() => vi.fn());
-const mockImageFromRegistry = vi.hoisted(() => vi.fn(() => ({ kind: "image" })));
+const mockImageBuild = vi.hoisted(() => vi.fn());
+const mockImageFromRegistry = vi.hoisted(() =>
+  vi.fn(() => ({ kind: "image", build: mockImageBuild })),
+);
 const mockSandboxesCreate = vi.hoisted(() => vi.fn());
 const mockSandboxesFromId = vi.hoisted(() => vi.fn());
+const mockSandboxesFromName = vi.hoisted(() => vi.fn());
 const mockClientClose = vi.hoisted(() => vi.fn());
 
 vi.mock("modal", () => ({
   ModalClient: class MockModalClient {
     apps = { fromName: mockAppFromName };
     images = { fromRegistry: mockImageFromRegistry };
-    sandboxes = { create: mockSandboxesCreate, fromId: mockSandboxesFromId };
+    sandboxes = {
+      create: mockSandboxesCreate,
+      fromId: mockSandboxesFromId,
+      fromName: mockSandboxesFromName,
+    };
     close = mockClientClose;
     constructor(_params?: unknown) {}
   },
+  InvalidError: MockInvalidError,
   NotFoundError: MockNotFoundError,
   TimeoutError: MockTimeoutError,
   SandboxTimeoutError: MockSandboxTimeoutError,
@@ -30,6 +46,7 @@ import plugin from "./plugin.js";
 
 interface FakeSandboxOverrides {
   id?: string;
+  tags?: Record<string, string>;
   execImpl?: (argv: string[], params?: unknown) => Promise<FakeProcess>;
 }
 
@@ -70,6 +87,9 @@ function createFakeSandbox(overrides: FakeSandboxOverrides = {}) {
     execCalls,
     openedFiles,
     setTags: vi.fn().mockResolvedValue(undefined),
+    getTags: vi.fn().mockResolvedValue(overrides.tags ?? {
+      "paperclip-acquisition-id": "acquisition-1",
+    }),
     terminate: vi.fn().mockResolvedValue(undefined),
     detach: vi.fn(),
     poll: vi.fn().mockResolvedValue(null),
@@ -98,6 +118,7 @@ const baseAcquireParams = {
   driverKey: "modal",
   companyId: "company-1",
   environmentId: "env-1",
+  acquisitionId: "acquisition-1",
   runId: "run-1",
 };
 
@@ -115,14 +136,22 @@ const baseConfigWithTokens = {
   tokenSecret: "config-secret",
 };
 
+function acquisitionSandboxName(acquisitionId: string): string {
+  return `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+}
+
 beforeEach(() => {
+  vi.restoreAllMocks();
   mockAppFromName.mockReset();
+  mockImageBuild.mockReset();
+  mockImageBuild.mockResolvedValue(undefined);
   mockImageFromRegistry.mockReset();
-  mockImageFromRegistry.mockReturnValue({ kind: "image" });
+  mockImageFromRegistry.mockReturnValue({ kind: "image", build: mockImageBuild });
   mockSandboxesCreate.mockReset();
   mockSandboxesFromId.mockReset();
+  mockSandboxesFromName.mockReset();
+  mockSandboxesFromName.mockRejectedValue(new MockNotFoundError("not found"));
   mockClientClose.mockReset();
-  vi.restoreAllMocks();
   delete process.env.MODAL_TOKEN_ID;
   delete process.env.MODAL_TOKEN_SECRET;
 });
@@ -198,6 +227,7 @@ describe("Modal sandbox provider plugin", () => {
       config: {
         appName: "",
         image: "",
+        workdir: "relative/workdir",
         sandboxTimeoutMs: 1500,
         idleTimeoutMs: 1500,
         execTimeoutMs: 0,
@@ -212,6 +242,7 @@ describe("Modal sandbox provider plugin", () => {
       errors: [
         "Modal sandbox environments require an appName.",
         "Modal sandbox environments require an image reference.",
+        "workdir must be an absolute path, got: relative/workdir",
         "sandboxTimeoutMs must be a positive multiple of 1000 between 1000 and 86400000.",
         "idleTimeoutMs must be a positive multiple of 1000 when provided.",
         "execTimeoutMs must be a positive multiple of 1000.",
@@ -249,10 +280,16 @@ describe("Modal sandbox provider plugin", () => {
       environment: undefined,
     });
     expect(mockImageFromRegistry).toHaveBeenCalledWith("node:20");
-    expect(sandbox.setTags).toHaveBeenCalledWith(expect.objectContaining({
-      "paperclip-provider": "modal",
-      "paperclip-company-id": "c-1",
-    }));
+    expect(mockSandboxesCreate).toHaveBeenCalledWith(
+      { appId: "ap-1" },
+      expect.objectContaining({ kind: "image" }),
+      expect.objectContaining({
+        tags: expect.objectContaining({
+          "paperclip-provider": "modal",
+          "paperclip-company-id": "c-1",
+        }),
+      }),
+    );
     // First exec is the mkdir for the workspace, second is the probe command.
     expect(sandbox.execCalls[0]?.argv).toEqual([
       "sh",
@@ -340,18 +377,314 @@ describe("Modal sandbox provider plugin", () => {
         resumedLease: false,
       }),
     });
-    expect(sandbox.setTags).toHaveBeenCalledWith(expect.objectContaining({
-      "paperclip-run-id": "run-1",
-      "paperclip-reuse-lease": "true",
-    }));
+    expect(mockSandboxesFromName).toHaveBeenCalledWith(
+      "paperclip-app",
+      expect.stringMatching(/^pc-acq-[a-f0-9]{32}$/),
+      { environment: undefined },
+    );
+    expect(mockSandboxesCreate).toHaveBeenCalledWith(
+      { appId: "ap-1" },
+      expect.objectContaining({ kind: "image" }),
+      expect.objectContaining({
+        name: expect.stringMatching(/^pc-acq-[a-f0-9]{32}$/),
+        tags: expect.objectContaining({
+          "paperclip-acquisition-id": "acquisition-1",
+          "paperclip-run-id": "run-1",
+          "paperclip-reuse-lease": "true",
+        }),
+      }),
+    );
     expect(sandbox.execCalls[0]?.argv).toEqual(["sh", "-lc", "mkdir -p '/srv/work'"]);
   });
 
+  it("replays an acquisition by exact name without creating a second sandbox", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-existing" });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+
+    const lease = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    });
+
+    expect(lease).toMatchObject({
+      providerLeaseId: "sb-existing",
+      metadata: {
+        acquisitionId: "acquisition-1",
+        resumedLease: false,
+      },
+    });
+    expect(mockSandboxesCreate).not.toHaveBeenCalled();
+    expect(sandbox.setTags).not.toHaveBeenCalled();
+    expect(sandbox.terminate).not.toHaveBeenCalled();
+  });
+
+  it("rejects an untagged sandbox after an ambiguous create error", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-reconciled", tags: {} });
+    let rejectCreate!: (error: Error) => void;
+    const pendingCreate = new Promise<never>((_resolve, reject) => {
+      rejectCreate = reject;
+    });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesCreate.mockReturnValue(pendingCreate);
+
+    const acquisition = plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    });
+    await vi.waitFor(() => expect(mockSandboxesCreate).toHaveBeenCalledTimes(1));
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+    rejectCreate(new Error("create response lost"));
+
+    await expect(acquisition).rejects.toThrow("Refusing to adopt unowned Modal sandbox");
+    expect(mockSandboxesCreate).toHaveBeenCalledTimes(1);
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(2);
+    expect(sandbox.setTags).not.toHaveBeenCalled();
+    expect(sandbox.terminate).not.toHaveBeenCalled();
+  });
+
+  it("hands off a deterministic cleanup lease when an ambiguous create remains invisible", async () => {
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesCreate.mockRejectedValue(new Error("create response lost"));
+
+    const error = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(JsonRpcCallError);
+    expect(error).toMatchObject({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "create response lost",
+      data: {
+        providerLeaseId: expect.stringMatching(/^pc-acq-[a-f0-9]{32}$/),
+      },
+    });
+    expect(mockSandboxesCreate).toHaveBeenCalledTimes(1);
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects image build failures before entering the ambiguous create boundary", async () => {
+    const buildError = new Error("image build failed");
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockImageBuild.mockRejectedValue(buildError);
+
+    const error = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBe(buildError);
+    expect(error).not.toBeInstanceOf(JsonRpcCallError);
+    expect(mockImageBuild).toHaveBeenCalledWith({ appId: "ap-1" });
+    expect(mockSandboxesCreate).not.toHaveBeenCalled();
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["Modal validation", new MockInvalidError("invalid sandbox create request")],
+    [
+      "gRPC authentication",
+      Object.assign(new Error("invalid authentication credentials"), {
+        name: "ClientError",
+        code: 16,
+        details: "invalid authentication credentials",
+        "@@nice-grpc": true,
+        "@@nice-grpc:ClientError": true,
+      }),
+    ],
+  ])("passes through definite %s failures without reconciliation or cleanup metadata", async (_kind, createError) => {
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesCreate.mockRejectedValue(createError);
+
+    const error = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBe(createError);
+    expect(error).not.toBeInstanceOf(JsonRpcCallError);
+    expect(error).not.toHaveProperty("data");
+    expect(mockSandboxesCreate).toHaveBeenCalledTimes(1);
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves the deterministic cleanup lease when reconciliation lookup fails", async () => {
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName
+      .mockRejectedValueOnce(new MockNotFoundError("not found"))
+      .mockRejectedValueOnce(new Error("reconciliation lookup failed"));
+    mockSandboxesCreate.mockRejectedValue(new Error("create response lost"));
+
+    const error = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "create response lost",
+      data: {
+        providerLeaseId: acquisitionSandboxName("acquisition-1"),
+      },
+    });
+    expect(mockSandboxesCreate).toHaveBeenCalledTimes(1);
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves the deterministic cleanup lease when reconciliation tag lookup fails", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-reconciled" });
+    sandbox.getTags.mockRejectedValue(new Error("tag lookup failed"));
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName
+      .mockRejectedValueOnce(new MockNotFoundError("not found"))
+      .mockResolvedValueOnce(sandbox);
+    mockSandboxesCreate.mockRejectedValue(new Error("create response lost"));
+
+    const error = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "create response lost",
+      data: {
+        providerLeaseId: acquisitionSandboxName("acquisition-1"),
+      },
+    });
+    expect(sandbox.getTags).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles a successful ambiguous create by its verified deterministic name", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-reconciled" });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName
+      .mockRejectedValueOnce(new MockNotFoundError("not found"))
+      .mockResolvedValueOnce(sandbox);
+    mockSandboxesCreate.mockRejectedValue(new Error("create response lost"));
+
+    const lease = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    });
+
+    expect(lease).toMatchObject({
+      providerLeaseId: "sb-reconciled",
+      metadata: {
+        acquisitionId: "acquisition-1",
+        resumedLease: false,
+      },
+    });
+    expect(mockSandboxesCreate).toHaveBeenCalledTimes(1);
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(2);
+    expect(sandbox.terminate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a wrong-owner sandbox after an ambiguous create error", async () => {
+    const sandbox = createFakeSandbox({
+      id: "sb-conflict",
+      tags: { "paperclip-acquisition-id": "different-acquisition" },
+    });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName
+      .mockRejectedValueOnce(new MockNotFoundError("not found"))
+      .mockResolvedValueOnce(sandbox);
+    mockSandboxesCreate.mockRejectedValue(new Error("create response lost"));
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    })).rejects.toThrow("acquisition ownership does not match acquisition-1");
+    expect(mockSandboxesCreate).toHaveBeenCalledTimes(1);
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(2);
+    expect(sandbox.terminate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a deterministic-name sandbox owned by another acquisition", async () => {
+    const sandbox = createFakeSandbox({
+      id: "sb-conflict",
+      tags: { "paperclip-acquisition-id": "different-acquisition" },
+    });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    })).rejects.toThrow("acquisition ownership does not match acquisition-1");
+    expect(mockSandboxesCreate).not.toHaveBeenCalled();
+    expect(sandbox.terminate).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unowned deterministic-name sandbox before creating", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-unowned", tags: {} });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    })).rejects.toThrow("Refusing to adopt unowned Modal sandbox");
+    expect(mockSandboxesCreate).not.toHaveBeenCalled();
+    expect(sandbox.setTags).not.toHaveBeenCalled();
+  });
+
+  it("does not terminate an adopted sandbox when workspace setup fails", async () => {
+    const sandbox = createFakeSandbox({
+      id: "sb-adopted",
+      execImpl: async () => makeFakeProcess({ throwOnWait: new Error("mkdir failed") }),
+    });
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "mkdir failed",
+      data: {
+        providerLeaseId: "sb-adopted",
+        cleanupVerifiedAcquisitionId: "acquisition-1",
+      },
+    });
+    expect(sandbox.terminate).not.toHaveBeenCalled();
+  });
+
+  it("hands off a created sandbox when acquire cleanup also fails", async () => {
+    const sandbox = createFakeSandbox({
+      id: "sb-terminate-failed",
+      execImpl: async () => makeFakeProcess({ throwOnWait: new Error("mkdir failed") }),
+    });
+    sandbox.terminate.mockRejectedValue(new Error("terminate failed"));
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesCreate.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "mkdir failed",
+      data: {
+        providerLeaseId: "sb-terminate-failed",
+        cleanupVerifiedAcquisitionId: "acquisition-1",
+      },
+    });
+    expect(sandbox.terminate).toHaveBeenCalledTimes(1);
+  });
+
   it("terminates the sandbox if acquire workspace setup throws", async () => {
+    const setupError = new Error("mkdir failed");
     const sandbox = createFakeSandbox({
       execImpl: async (argv: string[]) => {
         if (argv[2]?.startsWith("mkdir -p")) {
-          return makeFakeProcess({ throwOnWait: new Error("mkdir failed") });
+          return makeFakeProcess({ throwOnWait: setupError });
         }
         return makeFakeProcess({ exitCode: 0 });
       },
@@ -359,12 +692,20 @@ describe("Modal sandbox provider plugin", () => {
     mockAppFromName.mockResolvedValue({ appId: "ap-1" });
     mockSandboxesCreate.mockResolvedValue(sandbox);
 
-    await expect(
-      plugin.definition.onEnvironmentAcquireLease?.({
-        ...baseAcquireParams,
-        config: baseConfig,
-      }),
-    ).rejects.toThrow("mkdir failed");
+    const error = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(JsonRpcCallError);
+    expect(error).toMatchObject({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "mkdir failed",
+      data: {
+        providerLeaseId: sandbox.sandboxId,
+        cleanupVerifiedAcquisitionId: "acquisition-1",
+      },
+    });
     expect(sandbox.terminate).toHaveBeenCalledTimes(1);
   });
 
@@ -401,6 +742,21 @@ describe("Modal sandbox provider plugin", () => {
       }),
     ).rejects.toThrow("app lookup failed");
     expect(mockClientClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a relative acquire workdir before any Modal activity", async () => {
+    await expect(
+      plugin.definition.onEnvironmentAcquireLease?.({
+        ...baseAcquireParams,
+        config: { ...baseConfig, workdir: "relative/workdir" },
+      }),
+    ).rejects.toThrow("workdir must be an absolute path, got: relative/workdir");
+
+    expect(mockAppFromName).not.toHaveBeenCalled();
+    expect(mockSandboxesFromName).not.toHaveBeenCalled();
+    expect(mockSandboxesCreate).not.toHaveBeenCalled();
+    expect(mockImageFromRegistry).not.toHaveBeenCalled();
+    expect(mockClientClose).not.toHaveBeenCalled();
   });
 
   it("treats missing leases as expired on resume", async () => {
@@ -472,7 +828,9 @@ describe("Modal sandbox provider plugin", () => {
       driverKey: "modal",
       companyId: "c-1",
       environmentId: "e-1",
+      acquisitionId: "acquisition-1",
       providerLeaseId: "sb-reuse",
+      leaseMetadata: { sandboxId: "sb-reuse" },
       config: { ...baseConfig, reuseLease: true },
     });
     await plugin.definition.onEnvironmentReleaseLease?.({
@@ -487,6 +845,129 @@ describe("Modal sandbox provider plugin", () => {
     expect(reusable.terminate).not.toHaveBeenCalled();
     expect(ephemeral.terminate).toHaveBeenCalled();
     expect(ephemeral.detach).not.toHaveBeenCalled();
+  });
+
+  it("terminates acquisition compensation even when reusable leases normally detach", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-failed-acquire" });
+    mockSandboxesFromId.mockResolvedValue(sandbox);
+
+    await plugin.definition.onEnvironmentReleaseLease?.({
+      driverKey: "modal",
+      companyId: "c-1",
+      environmentId: "e-1",
+      acquisitionId: "acquisition-1",
+      providerLeaseId: "sb-failed-acquire",
+      leaseMetadata: { acquisitionId: "acquisition-1" },
+      config: { ...baseConfig, reuseLease: true },
+    });
+
+    expect(sandbox.terminate).toHaveBeenCalledTimes(1);
+    expect(sandbox.detach).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["release", plugin.definition.onEnvironmentReleaseLease],
+    ["destroy", plugin.definition.onEnvironmentDestroyLease],
+  ])("reconciles and terminates a deterministic cleanup lease on %s", async (_operation, handler) => {
+    const sandbox = createFakeSandbox({ id: "sb-reconciled" });
+    const providerLeaseId = acquisitionSandboxName("acquisition-1");
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+
+    await handler?.({
+      driverKey: "modal",
+      companyId: "c-1",
+      environmentId: "e-1",
+      acquisitionId: "acquisition-1",
+      providerLeaseId,
+      config: baseConfig,
+    });
+
+    expect(mockSandboxesFromName).toHaveBeenCalledWith(
+      "paperclip-app",
+      providerLeaseId,
+      { environment: undefined },
+    );
+    expect(mockSandboxesFromId).not.toHaveBeenCalled();
+    expect(sandbox.terminate).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires deterministic cleanup to be retried while the sandbox is not visible", async () => {
+    const providerLeaseId = acquisitionSandboxName("acquisition-1");
+
+    await expect(plugin.definition.onEnvironmentReleaseLease?.({
+      driverKey: "modal",
+      companyId: "c-1",
+      environmentId: "e-1",
+      acquisitionId: "acquisition-1",
+      providerLeaseId,
+      config: baseConfig,
+    })).rejects.toThrow(
+      `Modal sandbox ${providerLeaseId} is not visible yet; cleanup must be retried.`,
+    );
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(1);
+    expect(mockSandboxesFromId).not.toHaveBeenCalled();
+  });
+
+  it("accepts an absent deterministic cleanup lease after verified cleanup", async () => {
+    const providerLeaseId = acquisitionSandboxName("acquisition-1");
+
+    await expect(plugin.definition.onEnvironmentReleaseLease?.({
+      driverKey: "modal",
+      companyId: "c-1",
+      environmentId: "e-1",
+      acquisitionId: "acquisition-1",
+      providerLeaseId,
+      leaseMetadata: {
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: "acquisition-1",
+      },
+      config: baseConfig,
+    })).resolves.toBeUndefined();
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(1);
+    expect(mockSandboxesFromId).not.toHaveBeenCalled();
+  });
+
+  it("returns a verified cleanup lease when deterministic termination fails", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-reconciled" });
+    sandbox.terminate.mockRejectedValue(new Error("terminate failed"));
+    const providerLeaseId = acquisitionSandboxName("acquisition-1");
+    mockSandboxesFromName.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentDestroyLease?.({
+      driverKey: "modal",
+      companyId: "c-1",
+      environmentId: "e-1",
+      acquisitionId: "acquisition-1",
+      providerLeaseId,
+      config: baseConfig,
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "terminate failed",
+      data: {
+        providerLeaseId,
+        cleanupVerifiedAcquisitionId: "acquisition-1",
+      },
+    });
+  });
+
+  it("refuses cleanup by provider ID when acquisition ownership does not match", async () => {
+    const sandbox = createFakeSandbox({
+      id: "sb-wrong-owner",
+      tags: { "paperclip-acquisition-id": "different-acquisition" },
+    });
+    mockSandboxesFromId.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentDestroyLease?.({
+      driverKey: "modal",
+      companyId: "c-1",
+      environmentId: "e-1",
+      acquisitionId: "acquisition-1",
+      providerLeaseId: "sb-wrong-owner",
+      config: baseConfig,
+    })).rejects.toThrow(
+      "Refusing to adopt Modal sandbox sb-wrong-owner: acquisition ownership does not match acquisition-1.",
+    );
+    expect(sandbox.terminate).not.toHaveBeenCalled();
   });
 
   it("destroys leases by terminating, ignoring missing sandboxes", async () => {
