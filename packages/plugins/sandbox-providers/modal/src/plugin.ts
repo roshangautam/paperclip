@@ -720,7 +720,14 @@ const plugin = definePlugin({
     try {
       const sandbox = await getSandboxForCleanup(client, config, params);
       if (!sandbox) return;
-      if (config.reuseLease) {
+      // Acquisition compensation carries the host acquisition id but cannot
+      // carry Modal lease metadata because acquire never returned successfully.
+      // Only detach a published lease whose metadata proves this sandbox id;
+      // legacy releases without an acquisition id keep their prior behavior.
+      const isAcquisitionCompensation =
+        Boolean(params.acquisitionId) &&
+        params.leaseMetadata?.sandboxId !== params.providerLeaseId;
+      if (config.reuseLease && !isAcquisitionCompensation) {
         // Modal has no separate pause primitive. Detaching releases the local
         // grpc connection but leaves the sandbox running on Modal until its
         // configured sandboxTimeoutMs or idleTimeoutMs expires. The next

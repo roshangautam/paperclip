@@ -828,7 +828,9 @@ describe("Modal sandbox provider plugin", () => {
       driverKey: "modal",
       companyId: "c-1",
       environmentId: "e-1",
+      acquisitionId: "acquisition-1",
       providerLeaseId: "sb-reuse",
+      leaseMetadata: { sandboxId: "sb-reuse" },
       config: { ...baseConfig, reuseLease: true },
     });
     await plugin.definition.onEnvironmentReleaseLease?.({
@@ -843,6 +845,24 @@ describe("Modal sandbox provider plugin", () => {
     expect(reusable.terminate).not.toHaveBeenCalled();
     expect(ephemeral.terminate).toHaveBeenCalled();
     expect(ephemeral.detach).not.toHaveBeenCalled();
+  });
+
+  it("terminates acquisition compensation even when reusable leases normally detach", async () => {
+    const sandbox = createFakeSandbox({ id: "sb-failed-acquire" });
+    mockSandboxesFromId.mockResolvedValue(sandbox);
+
+    await plugin.definition.onEnvironmentReleaseLease?.({
+      driverKey: "modal",
+      companyId: "c-1",
+      environmentId: "e-1",
+      acquisitionId: "acquisition-1",
+      providerLeaseId: "sb-failed-acquire",
+      leaseMetadata: { acquisitionId: "acquisition-1" },
+      config: { ...baseConfig, reuseLease: true },
+    });
+
+    expect(sandbox.terminate).toHaveBeenCalledTimes(1);
+    expect(sandbox.detach).not.toHaveBeenCalled();
   });
 
   it.each([
