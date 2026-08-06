@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  InvalidError,
   ModalClient,
   NotFoundError,
   SandboxTimeoutError,
@@ -198,6 +199,27 @@ function acquisitionSandboxName(acquisitionId: string): string {
 
 class AcquisitionOwnershipError extends Error {}
 
+const DEFINITE_CREATE_GRPC_STATUS_CODES = new Set([
+  3, // INVALID_ARGUMENT
+  7, // PERMISSION_DENIED
+  16, // UNAUTHENTICATED
+]);
+
+function isDefiniteSandboxCreateFailure(error: unknown): boolean {
+  if (error instanceof InvalidError) return true;
+  if (typeof error !== "object" || error === null) return false;
+
+  const candidate = error as Record<string, unknown>;
+  const isNiceGrpcClientError =
+    candidate["@@nice-grpc:ClientError"] === true ||
+    (candidate.name === "ClientError" && candidate["@@nice-grpc"] === true);
+  return (
+    isNiceGrpcClientError &&
+    typeof candidate.code === "number" &&
+    DEFINITE_CREATE_GRPC_STATUS_CODES.has(candidate.code)
+  );
+}
+
 async function findAcquiredSandbox(
   client: ModalClient,
   config: ModalDriverConfig,
@@ -263,6 +285,7 @@ async function acquireSandbox(
       created: true,
     };
   } catch (createError) {
+    if (isDefiniteSandboxCreateFailure(createError)) throw createError;
     try {
       const reconciled = await findAcquiredSandbox(client, config, name, params.acquisitionId);
       if (reconciled) return { sandbox: reconciled, created: false };

@@ -6,11 +6,12 @@ import {
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
 
-const { MockNotFoundError, MockTimeoutError, MockSandboxTimeoutError } = vi.hoisted(() => {
+const { MockInvalidError, MockNotFoundError, MockTimeoutError, MockSandboxTimeoutError } = vi.hoisted(() => {
+  class MockInvalidError extends Error {}
   class MockNotFoundError extends Error {}
   class MockTimeoutError extends Error {}
   class MockSandboxTimeoutError extends Error {}
-  return { MockNotFoundError, MockTimeoutError, MockSandboxTimeoutError };
+  return { MockInvalidError, MockNotFoundError, MockTimeoutError, MockSandboxTimeoutError };
 });
 
 const mockAppFromName = vi.hoisted(() => vi.fn());
@@ -35,6 +36,7 @@ vi.mock("modal", () => ({
     close = mockClientClose;
     constructor(_params?: unknown) {}
   },
+  InvalidError: MockInvalidError,
   NotFoundError: MockNotFoundError,
   TimeoutError: MockTimeoutError,
   SandboxTimeoutError: MockSandboxTimeoutError,
@@ -476,6 +478,34 @@ describe("Modal sandbox provider plugin", () => {
     expect(error).not.toBeInstanceOf(JsonRpcCallError);
     expect(mockImageBuild).toHaveBeenCalledWith({ appId: "ap-1" });
     expect(mockSandboxesCreate).not.toHaveBeenCalled();
+    expect(mockSandboxesFromName).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["Modal validation", new MockInvalidError("invalid sandbox create request")],
+    [
+      "gRPC authentication",
+      Object.assign(new Error("invalid authentication credentials"), {
+        name: "ClientError",
+        code: 16,
+        details: "invalid authentication credentials",
+        "@@nice-grpc": true,
+        "@@nice-grpc:ClientError": true,
+      }),
+    ],
+  ])("passes through definite %s failures without reconciliation or cleanup metadata", async (_kind, createError) => {
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesCreate.mockRejectedValue(createError);
+
+    const error = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBe(createError);
+    expect(error).not.toBeInstanceOf(JsonRpcCallError);
+    expect(error).not.toHaveProperty("data");
+    expect(mockSandboxesCreate).toHaveBeenCalledTimes(1);
     expect(mockSandboxesFromName).toHaveBeenCalledTimes(1);
   });
 
