@@ -30,7 +30,11 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import {
+  JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import { environmentRuntimeService, findReusableSandboxLeaseId } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import { secretService } from "../services/secrets.ts";
@@ -1140,8 +1144,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
     const workerManager = {
       isRunning: vi.fn((id: string) => id === pluginId),
-      call: vi.fn(async (_pluginId: string, method: string, _params: any) => {
-        if (method === "environmentAcquireLease") throw acquisitionError;
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        if (method === "environmentAcquireLease") {
+          (acquisitionError.data as Record<string, unknown>)[
+            PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY
+          ] = params.acquisitionId;
+          throw acquisitionError;
+        }
         if (method === "environmentReleaseLease") return undefined;
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
@@ -1165,6 +1174,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(releaseParams).toMatchObject({
       acquisitionId: acquireParams.acquisitionId,
       providerLeaseId: "structured-failed-acquisition",
+      leaseMetadata: {
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquireParams.acquisitionId,
+      },
     });
     const [terminal] = await db.select().from(environmentLeases);
     expect(terminal).toMatchObject({
@@ -1173,6 +1185,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       cleanupStatus: "success",
       metadata: {
         acquisitionId: acquireParams.acquisitionId,
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquireParams.acquisitionId,
       },
     });
   });
@@ -3595,8 +3608,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
     const workerManager = {
       isRunning: vi.fn(() => true),
-      call: vi.fn(async (_pluginId: string, method: string, _params: any) => {
-        if (method === "environmentAcquireLease") throw acquisitionError;
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        if (method === "environmentAcquireLease") {
+          (acquisitionError.data as Record<string, unknown>)[
+            PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY
+          ] = params.acquisitionId;
+          throw acquisitionError;
+        }
         if (method === "environmentReleaseLease") return undefined;
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
@@ -3619,6 +3637,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(workerManager.call.mock.calls[1]?.[2]).toMatchObject({
       acquisitionId: acquireParams.acquisitionId,
       providerLeaseId: "structured-generic-acquisition",
+      leaseMetadata: {
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquireParams.acquisitionId,
+      },
     });
     const [terminal] = await db.select().from(environmentLeases);
     expect(terminal).toMatchObject({
@@ -3627,6 +3648,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       cleanupStatus: "success",
       metadata: {
         acquisitionId: acquireParams.acquisitionId,
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquireParams.acquisitionId,
       },
     });
   });

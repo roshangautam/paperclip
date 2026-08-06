@@ -127,7 +127,8 @@ export type {
   HostClientHandlers,
 } from "./host-client-factory.js";
 
-// JSON-RPC protocol types
+// JSON-RPC protocol values and types
+export { PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY } from "./protocol.js";
 export type {
   JsonRpcId,
   JsonRpcInvocationScope,

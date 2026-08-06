@@ -598,7 +598,12 @@ export interface PluginEnvironmentLease {
  */
 export interface PluginEnvironmentAcquireLeaseErrorData {
   providerLeaseId: string;
+  /** Acquisition whose ownership the provider verified before handing off cleanup. */
+  cleanupVerifiedAcquisitionId?: string;
 }
+
+/** Lease metadata proving acquisition ownership before cleanup starts. */
+export const PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY = "cleanupVerifiedAcquisitionId";
 
 export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDriverBaseParams {
   /**

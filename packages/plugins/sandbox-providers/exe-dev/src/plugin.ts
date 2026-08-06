@@ -7,6 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   definePlugin,
   JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
 import type {
@@ -294,11 +295,18 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function acquisitionFailureWithLease(error: unknown, providerLeaseId: string): JsonRpcCallError {
+function acquisitionFailureWithLease(
+  error: unknown,
+  providerLeaseId: string,
+  acquisitionId?: string,
+): JsonRpcCallError {
   return new JsonRpcCallError({
     code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
     message: formatErrorMessage(error),
-    data: { providerLeaseId },
+    data: {
+      providerLeaseId,
+      ...(acquisitionId ? { cleanupVerifiedAcquisitionId: acquisitionId } : {}),
+    },
   });
 }
 
@@ -461,7 +469,7 @@ async function lookupVm(config: ExeDevDriverConfig, vmName: string): Promise<Exe
         : [];
   for (const candidate of list) {
     const parsed = parseVmRecord(candidate);
-    if (parsed?.name === vmName || parsed?.sshDest === vmName) {
+    if (parsed?.name === vmName) {
       return parsed;
     }
   }
@@ -511,8 +519,12 @@ async function createVm(
   return created;
 }
 
-function assertAcquisitionVmOwnership(vm: ExeDevVmRecord, acquisitionId: string): void {
-  if (!vm.tags.includes(acquisitionTag(acquisitionId))) {
+function assertAcquisitionVmOwnership(
+  vm: ExeDevVmRecord,
+  vmName: string,
+  acquisitionId: string,
+): void {
+  if (vm.name !== vmName || !vm.tags.includes(acquisitionTag(acquisitionId))) {
     throw new Error(
       `Refusing to adopt exe.dev VM ${vm.name}: acquisition ownership does not match ${acquisitionId}.`,
     );
@@ -533,7 +545,7 @@ async function acquireVm(
   const vmName = buildVmName(config, params);
   const existing = await lookupVm(config, vmName);
   if (existing) {
-    assertAcquisitionVmOwnership(existing, params.acquisitionId);
+    assertAcquisitionVmOwnership(existing, vmName, params.acquisitionId);
     return { vm: existing, created: false };
   }
 
@@ -544,12 +556,13 @@ async function acquireVm(
     if (!created) {
       throw new Error(`exe.dev did not return VM metadata for ${vmName}.`);
     }
+    assertAcquisitionVmOwnership(created, vmName, params.acquisitionId);
     return { vm: created, created: true };
   } catch (error) {
     if (!isAmbiguousCreateError(error)) throw error;
     const reconciled = await reconcileAcquisitionVm(config, vmName);
     if (!reconciled) throw acquisitionFailureWithLease(error, vmName);
-    assertAcquisitionVmOwnership(reconciled, params.acquisitionId);
+    assertAcquisitionVmOwnership(reconciled, vmName, params.acquisitionId);
     return { vm: reconciled, created: false };
   }
 }
@@ -569,9 +582,12 @@ async function deleteAcquisitionVm(
   }
   const vm = await lookupVm(config, params.providerLeaseId);
   if (!vm) {
+    if (
+      params.leaseMetadata?.[PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY] === params.acquisitionId
+    ) return;
     throw new Error(`exe.dev VM ${params.providerLeaseId} is not visible yet; cleanup must be retried.`);
   }
-  assertAcquisitionVmOwnership(vm, params.acquisitionId);
+  assertAcquisitionVmOwnership(vm, params.providerLeaseId, params.acquisitionId);
   await deleteVm(config, vm.name);
 }
 
@@ -806,7 +822,10 @@ async function buildLease(
     metadata: {
       provider: "exe-dev",
       vmName: vm.name,
-      ...(acquisitionId ? { acquisitionId } : {}),
+      ...(acquisitionId ? {
+        acquisitionId,
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
+      } : {}),
       sshDest: vm.sshDest,
       httpsUrl: vm.httpsUrl,
       region: vm.region,
@@ -954,11 +973,11 @@ const plugin = definePlugin({
         try {
           await deleteVm(config, vm.name);
         } catch {
-          throw acquisitionFailureWithLease(error, vm.name);
+          throw acquisitionFailureWithLease(error, vm.name, params.acquisitionId);
         }
         throw error;
       }
-      throw acquisitionFailureWithLease(error, vm.name);
+      throw acquisitionFailureWithLease(error, vm.name, params.acquisitionId);
     }
   },
 

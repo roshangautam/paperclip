@@ -18,6 +18,7 @@ import type {
 import {
   definePlugin,
   JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
 import type {
@@ -280,11 +281,18 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function acquisitionFailureWithLease(error: unknown, providerLeaseId: string): JsonRpcCallError {
+function acquisitionFailureWithLease(
+  error: unknown,
+  providerLeaseId: string,
+  acquisitionId?: string,
+): JsonRpcCallError {
   return new JsonRpcCallError({
     code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
     message: formatErrorMessage(error),
-    data: { providerLeaseId },
+    data: {
+      providerLeaseId,
+      ...(acquisitionId ? { cleanupVerifiedAcquisitionId: acquisitionId } : {}),
+    },
   });
 }
 
@@ -464,7 +472,10 @@ function leaseMetadata(input: {
     sandboxId: input.sandbox.id,
     sandboxName: input.sandbox.name,
     sandboxState: input.sandbox.state ?? null,
-    ...(input.acquisitionId ? { acquisitionId: input.acquisitionId } : {}),
+    ...(input.acquisitionId ? {
+      acquisitionId: input.acquisitionId,
+      [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: input.acquisitionId,
+    } : {}),
     image: input.config.image,
     snapshot: input.config.snapshot,
     target: input.sandbox.target,
@@ -725,7 +736,10 @@ function acquisitionSandboxName(acquisitionId: string): string {
 
 function assertAcquisitionSandboxOwnership(sandbox: Sandbox, acquisitionId: string): void {
   const labels = (sandbox as Sandbox & { labels?: Record<string, string> }).labels;
-  if (labels?.["paperclip-acquisition-id"] !== acquisitionId) {
+  if (
+    sandbox.name !== acquisitionSandboxName(acquisitionId)
+    || labels?.["paperclip-acquisition-id"] !== acquisitionId
+  ) {
     throw new Error(
       `Refusing to adopt Daytona sandbox ${sandbox.name}: acquisition ownership does not match ${acquisitionId}.`,
     );
@@ -754,7 +768,6 @@ async function reconcileAcquisitionSandbox(
         client,
         name,
         acquisitionId,
-        attempt === ACQUISITION_RECONCILE_ATTEMPTS - 1,
       );
       if (sandbox) return sandbox;
     } catch (error) {
@@ -787,7 +800,7 @@ async function acquireSandbox(
     try {
       await ensureSandboxStarted(existing, toTimeoutSeconds(config.timeoutMs));
     } catch (error) {
-      throw acquisitionFailureWithLease(error, existing.id);
+      throw acquisitionFailureWithLease(error, existing.id, params.acquisitionId);
     }
     return { sandbox: existing, created: false };
   }
@@ -804,6 +817,11 @@ async function acquireSandbox(
     const sandbox = await client.create(createParams, {
       timeout: toTimeoutSeconds(config.timeoutMs),
     });
+    try {
+      assertAcquisitionSandboxOwnership(sandbox, params.acquisitionId);
+    } catch (error) {
+      throw acquisitionFailureWithLease(error, name);
+    }
     return { sandbox, created: true };
   } catch (error) {
     if (!isAmbiguousDaytonaCreateError(error)) throw error;
@@ -813,7 +831,7 @@ async function acquireSandbox(
     try {
       await ensureSandboxStarted(reconciled, toTimeoutSeconds(config.timeoutMs));
     } catch (startError) {
-      throw acquisitionFailureWithLease(startError, reconciled.id);
+      throw acquisitionFailureWithLease(startError, reconciled.id, params.acquisitionId);
     }
     return { sandbox: reconciled, created: false };
   }
@@ -823,23 +841,17 @@ async function findSandboxByNameOrNull(
   client: Daytona,
   name: string,
   acquisitionId: string,
-  includeOwnershipConflicts = false,
 ): Promise<Sandbox | null> {
-  const findMatch = async (labels?: Record<string, string>): Promise<Sandbox | null> => {
-    const matches: Sandbox[] = [];
-    for (let page = 1; ; page += 1) {
-      const result = await client.list(labels, page, DAYTONA_SANDBOX_LIST_PAGE_SIZE);
-      matches.push(...result.items.filter((sandbox) => sandbox.name === name));
-      if (matches.length > 1) {
-        throw new Error(`Refusing to reconcile multiple Daytona sandboxes named ${name}.`);
-      }
-      if (page >= result.totalPages) break;
-    }
-    return matches[0] ?? null;
-  };
-
-  const owned = await findMatch({ "paperclip-acquisition-id": acquisitionId });
-  return owned ?? (includeOwnershipConflicts ? await findMatch() : null);
+  const result = await client.list(
+    { "paperclip-acquisition-id": acquisitionId },
+    1,
+    DAYTONA_SANDBOX_LIST_PAGE_SIZE,
+  );
+  const matches = result.items.filter((sandbox) => sandbox.name === name);
+  if (matches.length > 1) {
+    throw new Error(`Refusing to reconcile multiple Daytona sandboxes named ${name}.`);
+  }
+  return matches[0] ?? null;
 }
 
 async function getSandbox(config: DaytonaDriverConfig, sandboxId: string): Promise<Sandbox> {
@@ -871,10 +883,15 @@ async function getSandboxForCleanup(
       createDaytonaClient(config),
       params.providerLeaseId,
       params.acquisitionId!,
-      true,
     )
     : await getSandboxOrNull(config, params.providerLeaseId);
   if (!sandbox) {
+    if (
+      params.acquisitionId &&
+      params.leaseMetadata?.[PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY] === params.acquisitionId
+    ) {
+      return null;
+    }
     if (params.providerLeaseId === acquisitionName) {
       throw new Error(`Daytona sandbox ${params.providerLeaseId} is not visible yet; cleanup must be retried.`);
     }
@@ -1094,11 +1111,11 @@ const plugin = definePlugin({
         try {
           await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
         } catch {
-          throw acquisitionFailureWithLease(error, sandbox.id);
+          throw acquisitionFailureWithLease(error, sandbox.id, params.acquisitionId);
         }
         throw error;
       }
-      throw acquisitionFailureWithLease(error, sandbox.id);
+      throw acquisitionFailureWithLease(error, sandbox.id, params.acquisitionId);
     }
   },
 

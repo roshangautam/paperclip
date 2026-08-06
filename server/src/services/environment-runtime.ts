@@ -21,7 +21,11 @@ import type {
   PluginEnvironmentLease,
   PluginEnvironmentRealizeWorkspaceResult,
 } from "@paperclipai/plugin-sdk";
-import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import {
+  JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
 import { environmentService } from "./environments.js";
 import {
@@ -237,9 +241,15 @@ function readPluginAcquireLeaseErrorData(
   }
 
   const providerLeaseId = (error.data as Partial<PluginEnvironmentAcquireLeaseErrorData>).providerLeaseId;
-  return typeof providerLeaseId === "string" && providerLeaseId.trim().length > 0
-    ? { providerLeaseId }
-    : null;
+  if (typeof providerLeaseId !== "string" || providerLeaseId.trim().length === 0) return null;
+  const cleanupVerifiedAcquisitionId =
+    (error.data as Partial<PluginEnvironmentAcquireLeaseErrorData>).cleanupVerifiedAcquisitionId;
+  return {
+    providerLeaseId,
+    ...(typeof cleanupVerifiedAcquisitionId === "string"
+      ? { cleanupVerifiedAcquisitionId }
+      : {}),
+  };
 }
 
 function delay(ms: number): Promise<void> {
@@ -1404,6 +1414,9 @@ function createSandboxEnvironmentDriver(
                 ...sanitizePluginSandboxConfigFromLeaseMetadata(storedConfig),
                 [PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY]: providerConfigForLease,
                 acquisitionId,
+                ...(errorData.cleanupVerifiedAcquisitionId === acquisitionId
+                  ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+                  : {}),
               },
             }, acquisitionId);
             throw error;
@@ -1922,6 +1935,7 @@ const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "driver",
   "executionWorkspaceMode",
   PENDING_CLEANUP_RELEASE_STATUS_KEY,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   "pluginId",
   "pluginKey",
   "providerMetadata",
@@ -2079,6 +2093,9 @@ function createPluginEnvironmentDriver(
           pluginKey: parsed.config.pluginKey,
           driverKey: parsed.config.driverKey,
           acquisitionId,
+          ...(errorData.cleanupVerifiedAcquisitionId === acquisitionId
+            ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+            : {}),
         };
         let cleanupLease: EnvironmentLease | null = null;
         let cleanupError: unknown | null = null;
@@ -2161,6 +2178,9 @@ function createPluginEnvironmentDriver(
           pluginKey: parsed.config.pluginKey,
           driverKey: parsed.config.driverKey,
           acquisitionId,
+          ...(providerLease.metadata?.[PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY] === acquisitionId
+            ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+            : {}),
         },
       });
     },
