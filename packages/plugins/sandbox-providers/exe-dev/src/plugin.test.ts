@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import {
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const fetchMock = vi.fn();
@@ -351,13 +354,87 @@ describe("exe.dev sandbox provider plugin", () => {
       },
     });
 
-    expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toBe(`ls --json '${vmName}'`);
+    expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toBe(`ls -l --json '${vmName}'`);
     expect(String(fetchMock.mock.calls[1]?.[1]?.body ?? "")).toContain(`--name='${vmName}'`);
     expect(String(fetchMock.mock.calls[1]?.[1]?.body ?? "")).toContain(`--tag='${ownershipTag}'`);
     expect(lease).toMatchObject({
       providerLeaseId: vmName,
-      metadata: { acquisitionId },
+      metadata: {
+        acquisitionId,
+      },
     });
+    expect(lease?.metadata).not.toHaveProperty(
+      PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+    );
+  });
+
+  it.each(["name", "tag"] as const)(
+    "rejects a successful exe.dev create response with the wrong %s",
+    async (mismatch) => {
+      const acquisitionId = `acquisition-create-wrong-${mismatch}`;
+      const digest = createHash("sha256").update(acquisitionId).digest("hex");
+      const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
+      fetchMock
+        .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          vm_name: mismatch === "name" ? `${vmName}-other` : vmName,
+          ssh_dest: `${vmName}.exe.xyz`,
+          status: "running",
+          tags: [mismatch === "tag" ? "paperclip-acquisition-other" : `paperclip-acquisition-${digest}`],
+        }), { status: 200 }));
+
+      await expect(plugin.definition.onEnvironmentAcquireLease?.({
+        driverKey: "exe-dev",
+        companyId: "company-1",
+        environmentId: "env-1",
+        acquisitionId,
+        runId: "run-1",
+        config: { apiKey: "api-key", namePrefix: "paperclip", timeoutMs: 300000 },
+      })).rejects.toThrow("acquisition ownership does not match");
+
+      expect(spawnMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves the acquisition lease ID without deleting the VM when SSH setup fails", async () => {
+    const acquisitionId = "acquisition-cleanup-failure-1";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        vm_name: vmName,
+        ssh_dest: `${vmName}.exe.xyz`,
+        status: "running",
+        tags: [`paperclip-acquisition-${digest}`],
+      }), { status: 200 }));
+    queueSpawnResult({ code: 1, stderr: "ssh setup failed" });
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        apiKey: "api-key",
+        namePrefix: "paperclip",
+        timeoutMs: 300000,
+      },
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: expect.stringContaining("ssh setup failed"),
+      data: {
+        providerLeaseId: vmName,
+        cleanupVerifiedAcquisitionId: acquisitionId,
+      },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map((call) => String(call[1]?.body ?? ""))).not.toContain(
+      `rm --json '${vmName}'`,
+    );
   });
 
   it("adopts an exactly-owned exe.dev VM on acquisition replay", async () => {
@@ -389,6 +466,7 @@ describe("exe.dev sandbox provider plugin", () => {
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toBe(`ls -l --json '${vmName}'`);
     expect(lease).toMatchObject({
       providerLeaseId: vmName,
       metadata: { acquisitionId },
@@ -432,6 +510,7 @@ describe("exe.dev sandbox provider plugin", () => {
     fetchMock
       .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }))
       .mockResolvedValueOnce(new Response("response lost", { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         vms: [{
           vm_name: vmName,
@@ -460,10 +539,103 @@ describe("exe.dev sandbox provider plugin", () => {
       data: { providerLeaseId: vmName },
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(String(fetchMock.mock.calls[2]?.[1]?.body ?? "")).toBe(`ls -l --json '${vmName}'`);
+    expect(String(fetchMock.mock.calls[3]?.[1]?.body ?? "")).toBe(`ls -l --json '${vmName}'`);
     expect(fetchMock.mock.calls.map((call) => String(call[1]?.body ?? ""))).not.toContain(
       `rm --json '${vmName}'`,
     );
+  });
+
+  it("rejects a foreign-owned VM found during ambiguous exe.dev reconciliation", async () => {
+    const acquisitionId = "acquisition-ambiguous-foreign";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response("response lost", { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        vms: [{
+          vm_name: vmName,
+          ssh_dest: `${vmName}.exe.xyz`,
+          tags: ["paperclip-acquisition-other"],
+        }],
+      }), { status: 200 }));
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: { apiKey: "api-key", namePrefix: "paperclip", timeoutMs: 300000 },
+    })).rejects.toThrow("acquisition ownership does not match");
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves the deterministic lease ID when ambiguous-create reconciliation is exhausted", async () => {
+    const acquisitionId = "acquisition-ambiguous-missing-1";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response("response lost", { status: 500 }))
+      .mockResolvedValue(new Response(JSON.stringify({ vms: [] }), { status: 200 }));
+
+    const error = await plugin.definition.onEnvironmentAcquireLease!({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        apiKey: "api-key",
+        namePrefix: "paperclip",
+        timeoutMs: 300000,
+      },
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: expect.stringContaining("exe.dev API command failed (500)"),
+    });
+    expect((error as { data: unknown }).data).toEqual({ providerLeaseId: vmName });
+
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock.mock.calls.slice(2).map((call) => String(call[1]?.body ?? ""))).toEqual([
+      `ls -l --json '${vmName}'`,
+      `ls -l --json '${vmName}'`,
+      `ls -l --json '${vmName}'`,
+    ]);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it.each([400, 403])("does not create a cleanup lease for a definitive %i response", async (status) => {
+    const acquisitionId = `acquisition-definitive-${status}`;
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response("request rejected", { status }));
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        apiKey: "api-key",
+        namePrefix: "paperclip",
+        timeoutMs: 300000,
+      },
+    })).rejects.toMatchObject({
+      name: "ExeDevApiError",
+      status,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   it("uses a pasted sshPrivateKey when connecting to the VM", async () => {
@@ -880,6 +1052,183 @@ describe("exe.dev sandbox provider plugin", () => {
 
     expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toBe("rm --json 'vm-1'");
   });
+
+  it("fails closed when release cannot confirm deletion", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("temporarily not found", { status: 404 }));
+
+    await expect(plugin.definition.onEnvironmentReleaseLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      providerLeaseId: "eventually-visible-vm",
+      config: {
+        apiKey: "api-key",
+        reuseLease: false,
+      },
+      leaseMetadata: {},
+    })).rejects.toMatchObject({
+      name: "ExeDevApiError",
+      status: 404,
+      body: "temporarily not found",
+    });
+
+    expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toBe(
+      "rm --json 'eventually-visible-vm'",
+    );
+  });
+
+  it("preserves verified acquisition cleanup state after an ambiguous delete so retry can terminate", async () => {
+    const acquisitionId = "acquisition-cleanup-ambiguous-delete";
+    const vmName = "ambiguous-delete-vm";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        vms: [{
+          vm_name: vmName,
+          ssh_dest: `${vmName}.exe.xyz`,
+          tags: [`paperclip-acquisition-${digest}`],
+        }],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response("response lost", { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }));
+
+    const error = await plugin.definition.onEnvironmentReleaseLease!({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: vmName,
+      config: { apiKey: "api-key", reuseLease: false },
+      leaseMetadata: {},
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      data: {
+        providerLeaseId: vmName,
+        cleanupVerifiedAcquisitionId: acquisitionId,
+      },
+    });
+
+    await expect(plugin.definition.onEnvironmentReleaseLease!({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: vmName,
+      config: { apiKey: "api-key", reuseLease: false },
+      leaseMetadata: (error as { data: Record<string, unknown> }).data,
+    })).resolves.toBeUndefined();
+
+    expect(fetchMock.mock.calls.map((call) => String(call[1]?.body ?? ""))).toEqual([
+      `ls -l --json '${vmName}'`,
+      `rm --json '${vmName}'`,
+      `ls -l --json '${vmName}'`,
+    ]);
+  });
+
+  it.each([undefined, "another-acquisition"])(
+    "keeps missing acquisition cleanup retryable without matching verification (%s)",
+    async (cleanupVerifiedAcquisitionId) => {
+      const acquisitionId = "acquisition-cleanup-missing";
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }));
+
+      await expect(plugin.definition.onEnvironmentReleaseLease?.({
+        driverKey: "exe-dev",
+        companyId: "company-1",
+        environmentId: "env-1",
+        acquisitionId,
+        providerLeaseId: "missing-vm",
+        config: {
+          apiKey: "api-key",
+          reuseLease: false,
+        },
+        leaseMetadata: cleanupVerifiedAcquisitionId
+          ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: cleanupVerifiedAcquisitionId }
+          : {},
+      })).rejects.toThrow("cleanup must be retried");
+    },
+  );
+
+  it("does not adopt a different exe.dev VM whose SSH destination matches the requested name", async () => {
+    const acquisitionId = "acquisition-cleanup-wrong-name";
+    const vmName = "requested-vm";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      vms: [{
+        vm_name: "another-vm",
+        ssh_dest: vmName,
+        tags: [`paperclip-acquisition-${digest}`],
+      }],
+    }), { status: 200 }));
+
+    await expect(plugin.definition.onEnvironmentReleaseLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: vmName,
+      config: { apiKey: "api-key", reuseLease: false },
+      leaseMetadata: {},
+    })).rejects.toThrow("cleanup must be retried");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a missing exe.dev VM after verified acquisition", async () => {
+    const acquisitionId = "acquisition-cleanup-already-deleted";
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }));
+
+    await expect(plugin.definition.onEnvironmentReleaseLease?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: "missing-vm",
+      config: {
+        apiKey: "api-key",
+        reuseLease: false,
+      },
+      leaseMetadata: {
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
+      },
+    })).resolves.toBeUndefined();
+  });
+
+  it.each(["release", "destroy"] as const)(
+    "refuses to %s an exe.dev VM owned by another acquisition",
+    async (lifecycle) => {
+      const acquisitionId = `acquisition-cleanup-${lifecycle}`;
+      const digest = createHash("sha256").update(acquisitionId).digest("hex");
+      const vmName = `paperclip-env1-${digest.slice(0, 32)}`;
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+        vms: [{
+          vm_name: vmName,
+          ssh_dest: `${vmName}.exe.xyz`,
+          tags: ["paperclip-acquisition-someone-else"],
+        }],
+      }), { status: 200 }));
+      const handler = lifecycle === "release"
+        ? plugin.definition.onEnvironmentReleaseLease
+        : plugin.definition.onEnvironmentDestroyLease;
+
+      await expect(handler?.({
+        driverKey: "exe-dev",
+        companyId: "company-1",
+        environmentId: "env-1",
+        acquisitionId,
+        providerLeaseId: vmName,
+        config: {
+          apiKey: "api-key",
+          reuseLease: false,
+        },
+      })).rejects.toThrow("acquisition ownership does not match");
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0]?.[1]?.body ?? "")).toBe(`ls -l --json '${vmName}'`);
+    },
+  );
 
   it("destroys leases on demand", async () => {
     fetchMock.mockResolvedValueOnce(new Response("{}", { status: 200 }));

@@ -1,5 +1,6 @@
 import type {
   CloudflareBridgeAcquireLeaseRequest,
+  CloudflareBridgeDestroyLeaseRequest,
   CloudflareBridgeExecuteRequest,
   CloudflareBridgeExecuteResponse,
   CloudflareBridgeHealthResponse,
@@ -26,11 +27,19 @@ interface BridgeExecuteOptions {
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
 }
 
+interface BridgeRequestOptions {
+  timeoutMs?: number;
+}
+
 interface BridgeErrorBody {
   error?: string;
   message?: string;
   details?: unknown;
 }
+
+const API_PREFIX = "/api/paperclip-sandbox/v1";
+const OWNERSHIP_API_PREFIX = "/api/paperclip-sandbox/v2";
+const EXEC_REQUEST_CLEANUP_GRACE_MS = 60_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -98,7 +107,10 @@ export function resolveRequestTimeoutMs(
   const requestedTimeoutMs = parseExecuteTimeoutMs(init.body);
   return requestedTimeoutMs === null
     ? config.bridgeRequestTimeoutMs
-    : Math.max(config.bridgeRequestTimeoutMs, requestedTimeoutMs);
+    : Math.max(
+        config.bridgeRequestTimeoutMs,
+        requestedTimeoutMs + EXEC_REQUEST_CLEANUP_GRACE_MS,
+      );
 }
 
 async function requestJson<T>(
@@ -106,9 +118,13 @@ async function requestJson<T>(
   path: string,
   init: RequestInit,
   extraHeaders: BridgeClientHeaders = {},
+  options: BridgeRequestOptions = {},
 ): Promise<T> {
   const controller = new AbortController();
-  const requestTimeoutMs = resolveRequestTimeoutMs(config, path, init);
+  const defaultRequestTimeoutMs = resolveRequestTimeoutMs(config, path, init);
+  const requestTimeoutMs = options.timeoutMs === undefined
+    ? defaultRequestTimeoutMs
+    : Math.max(1, Math.min(defaultRequestTimeoutMs, Math.trunc(options.timeoutMs)));
   const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
   const baseUrl = config.bridgeBaseUrl.replace(/\/+$/, "");
 
@@ -125,7 +141,9 @@ async function requestJson<T>(
         status: response.status,
         code: typeof errorBody.error === "string" ? errorBody.error : null,
         message:
-          typeof errorBody.message === "string" && errorBody.message.trim().length > 0
+          response.status === 404 && path.startsWith(`${OWNERSHIP_API_PREFIX}/`)
+            ? "Cloudflare sandbox bridge does not support ownership API v2; deploy the current bridge before using leases."
+            : typeof errorBody.message === "string" && errorBody.message.trim().length > 0
             ? errorBody.message
             : `Cloudflare sandbox bridge request failed with HTTP ${response.status}.`,
         details: errorBody.details,
@@ -145,12 +163,13 @@ async function requestJson<T>(
   }
 }
 
-async function requestResponse(
+async function requestResponse<T>(
   config: CloudflareDriverConfig,
   path: string,
   init: RequestInit,
+  consume: (response: Response) => Promise<T>,
   extraHeaders: BridgeClientHeaders = {},
-): Promise<Response> {
+): Promise<T> {
   const controller = new AbortController();
   const requestTimeoutMs = resolveRequestTimeoutMs(config, path, init);
   const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
@@ -169,13 +188,15 @@ async function requestResponse(
         status: response.status,
         code: typeof errorBody.error === "string" ? errorBody.error : null,
         message:
-          typeof errorBody.message === "string" && errorBody.message.trim().length > 0
+          response.status === 404 && path.startsWith(`${OWNERSHIP_API_PREFIX}/`)
+            ? "Cloudflare sandbox bridge does not support ownership API v2; deploy the current bridge before using leases."
+            : typeof errorBody.message === "string" && errorBody.message.trim().length > 0
             ? errorBody.message
             : `Cloudflare sandbox bridge request failed with HTTP ${response.status}.`,
         details: errorBody.details,
       });
     }
-    return response;
+    return await consume(response);
   } catch (error) {
     if (error instanceof CloudflareBridgeError) throw error;
     if ((error as { name?: string } | null)?.name === "AbortError") {
@@ -273,17 +294,25 @@ async function consumeExecuteEventStream(
 
 export function createCloudflareBridgeClient(options: BridgeClientOptions) {
   const { config } = options;
-  const apiPrefix = "/api/paperclip-sandbox/v1";
 
   return {
-    health(extraHeaders?: BridgeClientHeaders): Promise<CloudflareBridgeHealthResponse> {
-      return requestJson<CloudflareBridgeHealthResponse>(config, `${apiPrefix}/health`, { method: "GET" }, extraHeaders);
+    health(
+      extraHeaders?: BridgeClientHeaders,
+      options?: BridgeRequestOptions,
+    ): Promise<CloudflareBridgeHealthResponse> {
+      return requestJson<CloudflareBridgeHealthResponse>(
+        config,
+        `${API_PREFIX}/health`,
+        { method: "GET" },
+        extraHeaders,
+        options,
+      );
     },
 
     probe(body: CloudflareBridgeProbeRequest, extraHeaders?: BridgeClientHeaders): Promise<CloudflareBridgeProbeResponse> {
       return requestJson<CloudflareBridgeProbeResponse>(
         config,
-        `${apiPrefix}/probe`,
+        `${API_PREFIX}/probe`,
         { method: "POST", body: JSON.stringify(body) },
         extraHeaders,
       );
@@ -292,12 +321,14 @@ export function createCloudflareBridgeClient(options: BridgeClientOptions) {
     acquireLease(
       body: CloudflareBridgeAcquireLeaseRequest,
       extraHeaders?: BridgeClientHeaders,
+      options?: BridgeRequestOptions,
     ): Promise<CloudflareBridgeLeaseResponse> {
       return requestJson<CloudflareBridgeLeaseResponse>(
         config,
-        `${apiPrefix}/leases/acquire`,
+        `${OWNERSHIP_API_PREFIX}/leases/acquire`,
         { method: "POST", body: JSON.stringify(body) },
         extraHeaders,
+        options,
       );
     },
 
@@ -307,7 +338,7 @@ export function createCloudflareBridgeClient(options: BridgeClientOptions) {
     ): Promise<CloudflareBridgeLeaseResponse> {
       return requestJson<CloudflareBridgeLeaseResponse>(
         config,
-        `${apiPrefix}/leases/resume`,
+        `${OWNERSHIP_API_PREFIX}/leases/resume`,
         { method: "POST", body: JSON.stringify(body) },
         extraHeaders,
       );
@@ -319,17 +350,20 @@ export function createCloudflareBridgeClient(options: BridgeClientOptions) {
     ): Promise<{ ok: true }> {
       return requestJson<{ ok: true }>(
         config,
-        `${apiPrefix}/leases/release`,
+        `${OWNERSHIP_API_PREFIX}/leases/release`,
         { method: "POST", body: JSON.stringify(body) },
         extraHeaders,
       );
     },
 
-    destroyLease(providerLeaseId: string, extraHeaders?: BridgeClientHeaders): Promise<{ ok: true }> {
+    destroyLease(
+      body: CloudflareBridgeDestroyLeaseRequest,
+      extraHeaders?: BridgeClientHeaders,
+    ): Promise<{ ok: true }> {
       return requestJson<{ ok: true }>(
         config,
-        `${apiPrefix}/leases/${encodeURIComponent(providerLeaseId)}`,
-        { method: "DELETE" },
+        `${OWNERSHIP_API_PREFIX}/leases/${encodeURIComponent(body.providerLeaseId)}`,
+        { method: "DELETE", body: JSON.stringify(body) },
         extraHeaders,
       );
     },
@@ -343,14 +377,15 @@ export function createCloudflareBridgeClient(options: BridgeClientOptions) {
       if (typeof options?.onOutput === "function") {
         return requestResponse(
           config,
-          `${apiPrefix}/exec`,
+          `${OWNERSHIP_API_PREFIX}/exec`,
           { method: "POST", body: encodedBody },
+          (response) => consumeExecuteEventStream(response, options),
           extraHeaders,
-        ).then((response) => consumeExecuteEventStream(response, options));
+        );
       }
       return requestJson<CloudflareBridgeExecuteResponse>(
         config,
-        `${apiPrefix}/exec`,
+        `${OWNERSHIP_API_PREFIX}/exec`,
         { method: "POST", body: encodedBody },
         extraHeaders,
       );

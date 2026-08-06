@@ -29,22 +29,25 @@ describe("Cloudflare bridge client timeouts", () => {
     })).toBe(30_000);
   });
 
-  it("extends exec requests to the command timeout when needed", () => {
+  it("keeps exec requests alive for timeout cleanup", () => {
     expect(resolveRequestTimeoutMs(baseConfig, "/api/paperclip-sandbox/v1/exec", {
       method: "POST",
       body: JSON.stringify({ command: "opencode", timeoutMs: 270_000 }),
-    })).toBe(270_000);
+    })).toBe(330_000);
   });
 
-  it("falls back to the configured timeout when exec timeout is missing or smaller", () => {
+  it("falls back to the configured timeout when exec timeout is missing", () => {
     expect(resolveRequestTimeoutMs(baseConfig, "/api/paperclip-sandbox/v1/exec", {
       method: "POST",
       body: JSON.stringify({ command: "pwd" }),
     })).toBe(30_000);
+  });
+
+  it("adds cleanup grace even when the command timeout is smaller", () => {
     expect(resolveRequestTimeoutMs(baseConfig, "/api/paperclip-sandbox/v1/exec", {
       method: "POST",
       body: JSON.stringify({ command: "pwd", timeoutMs: 5_000 }),
-    })).toBe(30_000);
+    })).toBe(65_000);
   });
 
   it("consumes streamed exec output and returns the final result", async () => {
@@ -69,6 +72,7 @@ describe("Cloudflare bridge client timeouts", () => {
     const result = await client.execute(
       {
         providerLeaseId: "lease-1",
+        acquisitionId: "acquisition-1",
         command: "echo",
         args: ["hello"],
         sessionStrategy: "named",
@@ -87,6 +91,46 @@ describe("Cloudflare bridge client timeouts", () => {
     });
     expect(onOutput).toHaveBeenCalledWith("stdout", "hello\n");
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
-    expect(JSON.parse(String(init.body))).toMatchObject({ streamOutput: true });
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      acquisitionId: "acquisition-1",
+      streamOutput: true,
+    });
+  });
+
+  it("times out when a streamed response body stalls", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => new Response(
+        new ReadableStream({
+          start(controller) {
+            init.signal?.addEventListener("abort", () => {
+              controller.error(new DOMException("Aborted", "AbortError"));
+            }, { once: true });
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      )));
+      const client = createCloudflareBridgeClient({ config: baseConfig });
+      const execution = client.execute(
+        {
+          providerLeaseId: "lease-1",
+          acquisitionId: "acquisition-1",
+          command: "sleep",
+          args: ["forever"],
+          sessionStrategy: "named",
+          sessionId: "paperclip",
+        },
+        {},
+        { onOutput: vi.fn() },
+      );
+      const timedOut = expect(execution).rejects.toThrow(
+        "Cloudflare sandbox bridge request timed out after 30000ms.",
+      );
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await timedOut;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

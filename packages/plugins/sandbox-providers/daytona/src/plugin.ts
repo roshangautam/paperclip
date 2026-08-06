@@ -1,6 +1,12 @@
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { Daytona, DaytonaNotFoundError, DaytonaTimeoutError } from "@daytonaio/sdk";
+import {
+  Daytona,
+  DaytonaConnectionError,
+  DaytonaConflictError,
+  DaytonaNotFoundError,
+  DaytonaTimeoutError,
+} from "@daytonaio/sdk";
 import type {
   CreateSandboxBaseParams,
   CreateSandboxFromImageParams,
@@ -12,6 +18,7 @@ import type {
 import {
   definePlugin,
   JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
 import type {
@@ -109,6 +116,9 @@ const ARCHIVE_ON_RELEASE_AUTO_DELETE_MINUTES = 60;
 // RPC ceiling; callers always see an actionable error within this window.
 const GIT_NETWORK_TIMEOUT_MS = 120_000;
 
+const ACQUISITION_RECONCILE_ATTEMPTS = 5;
+const ACQUISITION_RECONCILE_DELAY_MS = 250;
+
 // Noninteractive git credential defaults injected into every Daytona one-shot
 // command so that git operations never stall waiting for a terminal prompt.
 // Callers can override any of these via the env parameter.
@@ -121,6 +131,7 @@ const NONINTERACTIVE_GIT_ENV: Record<string, string> = {
 };
 const DEFAULT_SSH_ACCESS_MINUTES = 60;
 const DAYTONA_SSH_GATEWAY_HOST = "ssh.app.daytona.io";
+const DAYTONA_SANDBOX_LIST_PAGE_SIZE = 100;
 
 function parseOptionalString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -270,11 +281,20 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function acquisitionFailureWithLease(error: unknown, providerLeaseId: string): JsonRpcCallError {
+function acquisitionFailureWithLease(
+  error: unknown,
+  providerLeaseId: string,
+  acquisitionId?: string,
+): JsonRpcCallError {
   return new JsonRpcCallError({
     code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
     message: formatErrorMessage(error),
-    data: { providerLeaseId },
+    data: {
+      providerLeaseId,
+      ...(acquisitionId
+        ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+        : {}),
+    },
   });
 }
 
@@ -715,11 +735,48 @@ function acquisitionSandboxName(acquisitionId: string): string {
 
 function assertAcquisitionSandboxOwnership(sandbox: Sandbox, acquisitionId: string): void {
   const labels = (sandbox as Sandbox & { labels?: Record<string, string> }).labels;
-  if (labels?.["paperclip-acquisition-id"] !== acquisitionId) {
+  if (
+    sandbox.name !== acquisitionSandboxName(acquisitionId)
+    || labels?.["paperclip-acquisition-id"] !== acquisitionId
+  ) {
     throw new Error(
       `Refusing to adopt Daytona sandbox ${sandbox.name}: acquisition ownership does not match ${acquisitionId}.`,
     );
   }
+}
+
+function isAmbiguousDaytonaCreateError(error: unknown): boolean {
+  const statusCode = isRecord(error) && typeof error.statusCode === "number"
+    ? error.statusCode
+    : null;
+  return error instanceof DaytonaConflictError
+    || error instanceof DaytonaTimeoutError
+    || error instanceof DaytonaConnectionError
+    || statusCode === 408
+    || (statusCode != null && statusCode >= 500);
+}
+
+async function reconcileAcquisitionSandbox(
+  client: Daytona,
+  name: string,
+  acquisitionId: string,
+): Promise<Sandbox | null> {
+  for (let attempt = 0; attempt < ACQUISITION_RECONCILE_ATTEMPTS; attempt += 1) {
+    try {
+      const sandbox = await findSandboxByNameOrNull(
+        client,
+        name,
+        acquisitionId,
+      );
+      if (sandbox) return sandbox;
+    } catch (error) {
+      if (!isAmbiguousDaytonaCreateError(error)) throw error;
+    }
+    if (attempt < ACQUISITION_RECONCILE_ATTEMPTS - 1) {
+      await new Promise((resolve) => setTimeout(resolve, ACQUISITION_RECONCILE_DELAY_MS));
+    }
+  }
+  return null;
 }
 
 async function acquireSandbox(
@@ -736,10 +793,14 @@ async function acquireSandbox(
 
   const client = createDaytonaClient(config);
   const name = acquisitionSandboxName(params.acquisitionId);
-  const existing = await getSandboxOrNull(config, name);
+  const existing = await findSandboxByNameOrNull(client, name, params.acquisitionId);
   if (existing) {
     assertAcquisitionSandboxOwnership(existing, params.acquisitionId);
-    await ensureSandboxStarted(existing, toTimeoutSeconds(config.timeoutMs));
+    try {
+      await ensureSandboxStarted(existing, toTimeoutSeconds(config.timeoutMs));
+    } catch (error) {
+      throw acquisitionFailureWithLease(error, existing.id, params.acquisitionId);
+    }
     return { sandbox: existing, created: false };
   }
 
@@ -755,14 +816,48 @@ async function acquireSandbox(
     const sandbox = await client.create(createParams, {
       timeout: toTimeoutSeconds(config.timeoutMs),
     });
+    try {
+      assertAcquisitionSandboxOwnership(sandbox, params.acquisitionId);
+    } catch (error) {
+      throw acquisitionFailureWithLease(error, name);
+    }
     return { sandbox, created: true };
   } catch (error) {
-    const reconciled = await getSandboxOrNull(config, name);
-    if (!reconciled) throw error;
+    if (!isAmbiguousDaytonaCreateError(error)) throw error;
+    const reconciled = await reconcileAcquisitionSandbox(client, name, params.acquisitionId);
+    if (!reconciled) throw acquisitionFailureWithLease(error, name);
     assertAcquisitionSandboxOwnership(reconciled, params.acquisitionId);
-    await ensureSandboxStarted(reconciled, toTimeoutSeconds(config.timeoutMs));
+    try {
+      await ensureSandboxStarted(reconciled, toTimeoutSeconds(config.timeoutMs));
+    } catch (startError) {
+      throw acquisitionFailureWithLease(startError, reconciled.id, params.acquisitionId);
+    }
     return { sandbox: reconciled, created: false };
   }
+}
+
+async function findSandboxByNameOrNull(
+  client: Daytona,
+  name: string,
+  acquisitionId: string,
+): Promise<Sandbox | null> {
+  const matches: Sandbox[] = [];
+  let page = 1;
+  let totalPages = 1;
+  do {
+    const result = await client.list(
+      { "paperclip-acquisition-id": acquisitionId },
+      page,
+      DAYTONA_SANDBOX_LIST_PAGE_SIZE,
+    );
+    matches.push(...result.items.filter((sandbox) => sandbox.name === name));
+    totalPages = result.totalPages;
+    page += 1;
+  } while (page <= totalPages);
+  if (matches.length > 1) {
+    throw new Error(`Refusing to reconcile multiple Daytona sandboxes named ${name}.`);
+  }
+  return matches[0] ?? null;
 }
 
 async function getSandbox(config: DaytonaDriverConfig, sandboxId: string): Promise<Sandbox> {
@@ -779,6 +874,37 @@ async function getSandboxOrNull(config: DaytonaDriverConfig, sandboxId: string):
     }
     throw error;
   }
+}
+
+async function getSandboxForCleanup(
+  config: DaytonaDriverConfig,
+  params: PluginEnvironmentReleaseLeaseParams,
+): Promise<Sandbox | null> {
+  if (!params.providerLeaseId) return null;
+  const acquisitionName = params.acquisitionId
+    ? acquisitionSandboxName(params.acquisitionId)
+    : null;
+  const sandbox = params.providerLeaseId === acquisitionName
+    ? await findSandboxByNameOrNull(
+      createDaytonaClient(config),
+      params.providerLeaseId,
+      params.acquisitionId!,
+    )
+    : await getSandboxOrNull(config, params.providerLeaseId);
+  if (!sandbox) {
+    if (
+      params.acquisitionId &&
+      params.leaseMetadata?.[PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY] === params.acquisitionId
+    ) {
+      return null;
+    }
+    if (params.providerLeaseId === acquisitionName) {
+      throw new Error(`Daytona sandbox ${params.providerLeaseId} is not visible yet; cleanup must be retried.`);
+    }
+    return null;
+  }
+  if (params.acquisitionId) assertAcquisitionSandboxOwnership(sandbox, params.acquisitionId);
+  return sandbox;
 }
 
 // One-shot command execution via Daytona's `process.executeCommand`. The
@@ -987,15 +1113,15 @@ const plugin = definePlugin({
         }),
       };
     } catch (error) {
-      if (created) {
+      if (created && !params.acquisitionId) {
         try {
           await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
         } catch {
-          throw acquisitionFailureWithLease(error, sandbox.id);
+          throw acquisitionFailureWithLease(error, sandbox.id, params.acquisitionId);
         }
         throw error;
       }
-      throw acquisitionFailureWithLease(error, sandbox.id);
+      throw acquisitionFailureWithLease(error, sandbox.id, params.acquisitionId);
     }
   },
 
@@ -1043,7 +1169,7 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const config = parseDriverConfig(params.config);
-    const sandbox = await getSandboxOrNull(config, params.providerLeaseId);
+    const sandbox = await getSandboxForCleanup(config, params);
     if (!sandbox) return;
 
     if (config.reuseLease) {
@@ -1057,6 +1183,11 @@ const plugin = definePlugin({
           await sandbox.delete(toTimeoutSeconds(config.timeoutMs)).catch((deleteError) => {
             console.warn(
               `Failed to delete Daytona sandbox after stop failure: ${formatErrorMessage(deleteError)}`,
+            );
+            throw acquisitionFailureWithLease(
+              deleteError,
+              params.providerLeaseId!,
+              params.acquisitionId,
             );
           });
         }
@@ -1079,7 +1210,11 @@ const plugin = definePlugin({
       }
     }
 
-    await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
+    try {
+      await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
+    } catch (error) {
+      throw acquisitionFailureWithLease(error, params.providerLeaseId, params.acquisitionId);
+    }
   },
 
   async onEnvironmentDestroyLease(
@@ -1087,9 +1222,13 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const config = parseDriverConfig(params.config);
-    const sandbox = await getSandboxOrNull(config, params.providerLeaseId);
+    const sandbox = await getSandboxForCleanup(config, params);
     if (!sandbox) return;
-    await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
+    try {
+      await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
+    } catch (error) {
+      throw acquisitionFailureWithLease(error, params.providerLeaseId, params.acquisitionId);
+    }
   },
 
   async onEnvironmentRealizeWorkspace(

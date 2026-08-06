@@ -10,11 +10,16 @@ export function normalizeLeaseIdPart(input: string): string {
 export function buildLeaseSandboxId(input: {
   acquisitionId?: string;
   environmentId: string;
+  reuseScopeId?: string;
   runId: string;
   reuseLease: boolean;
   normalizeId: boolean;
 }): string {
-  const base = `pc-acq-${input.acquisitionId ?? input.runId}`;
+  const base = input.reuseLease
+    ? input.reuseScopeId
+      ? `pc-scope-${input.reuseScopeId}`
+      : `pc-env-${input.environmentId}`
+    : `pc-acq-${input.acquisitionId ?? input.runId}`;
   return input.normalizeId ? normalizeLeaseIdPart(base) : base;
 }
 

@@ -19,6 +19,7 @@ export interface CloudflareBridgeHealthResponse {
   bridgeVersion: string;
   capabilities: {
     acquisitionReplay?: boolean;
+    scopedReuse?: boolean;
     reuseLease: boolean;
     namedSessions: boolean;
     previewUrls: boolean;
@@ -44,6 +45,7 @@ export interface CloudflareBridgeProbeResponse {
 export interface CloudflareBridgeAcquireLeaseRequest {
   acquisitionId: string;
   environmentId: string;
+  reuseScopeId?: string;
   runId: string;
   issueId?: string | null;
   reuseLease: boolean;
@@ -58,6 +60,7 @@ export interface CloudflareBridgeAcquireLeaseRequest {
 
 export interface CloudflareBridgeResumeLeaseRequest {
   providerLeaseId: string;
+  acquisitionId?: string;
   requestedCwd: string;
   sessionStrategy: CloudflareDriverConfig["sessionStrategy"];
   sessionId: string;
@@ -67,10 +70,24 @@ export interface CloudflareBridgeResumeLeaseRequest {
   timeoutMs: number;
 }
 
+export interface CloudflareBridgeDestroyLeaseRequest {
+  providerLeaseId: string;
+  acquisitionId?: string;
+  requestedCwd: string;
+  sessionStrategy: CloudflareDriverConfig["sessionStrategy"];
+  sessionId: string;
+  timeoutMs: number;
+}
+
 export interface CloudflareBridgeReleaseLeaseRequest {
   providerLeaseId: string;
+  acquisitionId?: string;
   reuseLease: boolean;
   keepAlive: boolean;
+  requestedCwd: string;
+  sessionStrategy: CloudflareDriverConfig["sessionStrategy"];
+  sessionId: string;
+  timeoutMs: number;
 }
 
 export interface CloudflareBridgeLeaseResponse {
@@ -80,6 +97,7 @@ export interface CloudflareBridgeLeaseResponse {
 
 export interface CloudflareBridgeExecuteRequest {
   providerLeaseId: string;
+  acquisitionId: string;
   command: string;
   args?: string[];
   cwd?: string;

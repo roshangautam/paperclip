@@ -3,9 +3,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   definePlugin,
   JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
 import type {
@@ -71,6 +73,8 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 const EXE_DEV_API_MAX_TIMEOUT_MS = 29_000;
 const SSH_SIGKILL_GRACE_MS = 250;
 const MAX_VM_RECORD_DEPTH = 4;
+const ACQUISITION_RECONCILIATION_ATTEMPTS = 3;
+const ACQUISITION_RECONCILIATION_DELAY_MS = 100;
 const EXE_DEV_SSH_ONBOARDING_MARKER = "Please complete registration by running: ssh exe.dev";
 const EXE_DEV_SSH_EMAIL_PROMPT = "Please enter your email address:";
 const EXE_DEV_SSH_INVALID_KEY_FORMAT = /Load key [^\n]*invalid format/i;
@@ -291,11 +295,20 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function acquisitionFailureWithLease(error: unknown, providerLeaseId: string): JsonRpcCallError {
+function acquisitionFailureWithLease(
+  error: unknown,
+  providerLeaseId: string,
+  acquisitionId?: string,
+): JsonRpcCallError {
   return new JsonRpcCallError({
     code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
     message: formatErrorMessage(error),
-    data: { providerLeaseId },
+    data: {
+      providerLeaseId,
+      ...(acquisitionId
+        ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+        : {}),
+    },
   });
 }
 
@@ -448,7 +461,7 @@ function parseVmRecord(value: unknown, depth = 0): ExeDevVmRecord | null {
 }
 
 async function lookupVm(config: ExeDevDriverConfig, vmName: string): Promise<ExeDevVmRecord | null> {
-  const response = await runLifecycleCommand(config, `ls --json ${shellQuote(vmName)}`);
+  const response = await runLifecycleCommand(config, `ls -l --json ${shellQuote(vmName)}`);
   const list = Array.isArray((response as { vms?: unknown[] } | null)?.vms)
     ? (response as { vms: unknown[] }).vms
     : Array.isArray(response)
@@ -458,11 +471,38 @@ async function lookupVm(config: ExeDevDriverConfig, vmName: string): Promise<Exe
         : [];
   for (const candidate of list) {
     const parsed = parseVmRecord(candidate);
-    if (parsed?.name === vmName || parsed?.sshDest === vmName) {
+    if (parsed?.name === vmName) {
       return parsed;
     }
   }
   return null;
+}
+
+async function reconcileAcquisitionVm(
+  config: ExeDevDriverConfig,
+  vmName: string,
+): Promise<ExeDevVmRecord | null> {
+  for (let attempt = 0; attempt < ACQUISITION_RECONCILIATION_ATTEMPTS; attempt += 1) {
+    try {
+      const vm = await lookupVm(config, vmName);
+      if (vm) return vm;
+    } catch {
+      // A failed lookup is also ambiguous. Retry for eventual visibility and,
+      // if it remains unresolved, preserve the deterministic lease ID below.
+    }
+
+    if (attempt < ACQUISITION_RECONCILIATION_ATTEMPTS - 1) {
+      await delay(ACQUISITION_RECONCILIATION_DELAY_MS);
+    }
+  }
+  return null;
+}
+
+function isAmbiguousCreateError(error: unknown): boolean {
+  return !(error instanceof ExeDevApiError)
+    || error.status === 408
+    || error.status === 409
+    || error.status >= 500;
 }
 
 async function createVm(
@@ -481,8 +521,12 @@ async function createVm(
   return created;
 }
 
-function assertAcquisitionVmOwnership(vm: ExeDevVmRecord, acquisitionId: string): void {
-  if (!vm.tags.includes(acquisitionTag(acquisitionId))) {
+function assertAcquisitionVmOwnership(
+  vm: ExeDevVmRecord,
+  vmName: string,
+  acquisitionId: string,
+): void {
+  if (vm.name !== vmName || !vm.tags.includes(acquisitionTag(acquisitionId))) {
     throw new Error(
       `Refusing to adopt exe.dev VM ${vm.name}: acquisition ownership does not match ${acquisitionId}.`,
     );
@@ -503,7 +547,7 @@ async function acquireVm(
   const vmName = buildVmName(config, params);
   const existing = await lookupVm(config, vmName);
   if (existing) {
-    assertAcquisitionVmOwnership(existing, params.acquisitionId);
+    assertAcquisitionVmOwnership(existing, vmName, params.acquisitionId);
     return { vm: existing, created: false };
   }
 
@@ -514,17 +558,43 @@ async function acquireVm(
     if (!created) {
       throw new Error(`exe.dev did not return VM metadata for ${vmName}.`);
     }
+    assertAcquisitionVmOwnership(created, vmName, params.acquisitionId);
     return { vm: created, created: true };
   } catch (error) {
-    const reconciled = await lookupVm(config, vmName);
-    if (!reconciled) throw error;
-    assertAcquisitionVmOwnership(reconciled, params.acquisitionId);
+    if (!isAmbiguousCreateError(error)) throw error;
+    const reconciled = await reconcileAcquisitionVm(config, vmName);
+    if (!reconciled) throw acquisitionFailureWithLease(error, vmName);
+    assertAcquisitionVmOwnership(reconciled, vmName, params.acquisitionId);
     return { vm: reconciled, created: false };
   }
 }
 
 async function deleteVm(config: ExeDevDriverConfig, vmName: string): Promise<void> {
   await runLifecycleCommand(config, `rm --json ${shellQuote(vmName)}`);
+}
+
+async function deleteAcquisitionVm(
+  config: ExeDevDriverConfig,
+  params: PluginEnvironmentReleaseLeaseParams,
+): Promise<void> {
+  if (!params.providerLeaseId) return;
+  if (!params.acquisitionId) {
+    await deleteVm(config, params.providerLeaseId);
+    return;
+  }
+  const vm = await lookupVm(config, params.providerLeaseId);
+  if (!vm) {
+    if (
+      params.leaseMetadata?.[PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY] === params.acquisitionId
+    ) return;
+    throw new Error(`exe.dev VM ${params.providerLeaseId} is not visible yet; cleanup must be retried.`);
+  }
+  assertAcquisitionVmOwnership(vm, params.providerLeaseId, params.acquisitionId);
+  try {
+    await deleteVm(config, vm.name);
+  } catch (error) {
+    throw acquisitionFailureWithLease(error, vm.name, params.acquisitionId);
+  }
 }
 
 function buildSshDestination(config: ExeDevDriverConfig, vm: ExeDevVmRecord): string {
@@ -902,15 +972,15 @@ const plugin = definePlugin({
     try {
       return await buildLease(config, vm, params.requestedCwd, false, params.acquisitionId);
     } catch (error) {
-      if (created) {
+      if (created && !params.acquisitionId) {
         try {
           await deleteVm(config, vm.name);
         } catch {
-          throw acquisitionFailureWithLease(error, vm.name);
+          throw acquisitionFailureWithLease(error, vm.name, params.acquisitionId);
         }
         throw error;
       }
-      throw acquisitionFailureWithLease(error, vm.name);
+      throw acquisitionFailureWithLease(error, vm.name, params.acquisitionId);
     }
   },
 
@@ -932,7 +1002,7 @@ const plugin = definePlugin({
     if (!params.providerLeaseId) return;
     const config = parseDriverConfig(params.config);
     if (config.reuseLease) return;
-    await deleteVm(config, params.providerLeaseId);
+    await deleteAcquisitionVm(config, params);
   },
 
   async onEnvironmentDestroyLease(
@@ -940,7 +1010,7 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const config = parseDriverConfig(params.config);
-    await deleteVm(config, params.providerLeaseId);
+    await deleteAcquisitionVm(config, params);
   },
 
   async onEnvironmentRealizeWorkspace(
