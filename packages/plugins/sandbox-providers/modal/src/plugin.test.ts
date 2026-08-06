@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 
 const { MockNotFoundError, MockTimeoutError, MockSandboxTimeoutError } = vi.hoisted(() => {
   class MockNotFoundError extends Error {}
@@ -464,15 +465,42 @@ describe("Modal sandbox provider plugin", () => {
     await expect(plugin.definition.onEnvironmentAcquireLease?.({
       ...baseAcquireParams,
       config: baseConfig,
-    })).rejects.toThrow("mkdir failed");
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "mkdir failed",
+      data: { providerLeaseId: "sb-adopted" },
+    });
     expect(sandbox.terminate).not.toHaveBeenCalled();
   });
 
+  it("hands off a created sandbox when acquire cleanup also fails", async () => {
+    const sandbox = createFakeSandbox({
+      id: "sb-terminate-failed",
+      execImpl: async () => makeFakeProcess({ throwOnWait: new Error("mkdir failed") }),
+    });
+    sandbox.terminate.mockRejectedValue(new Error("terminate failed"));
+    mockAppFromName.mockResolvedValue({ appId: "ap-1" });
+    mockSandboxesCreate.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "mkdir failed",
+      data: { providerLeaseId: "sb-terminate-failed" },
+    });
+    expect(sandbox.terminate).toHaveBeenCalledTimes(1);
+  });
+
   it("terminates the sandbox if acquire workspace setup throws", async () => {
+    const setupError = new Error("mkdir failed");
     const sandbox = createFakeSandbox({
       execImpl: async (argv: string[]) => {
         if (argv[2]?.startsWith("mkdir -p")) {
-          return makeFakeProcess({ throwOnWait: new Error("mkdir failed") });
+          return makeFakeProcess({ throwOnWait: setupError });
         }
         return makeFakeProcess({ exitCode: 0 });
       },
@@ -485,7 +513,7 @@ describe("Modal sandbox provider plugin", () => {
         ...baseAcquireParams,
         config: baseConfig,
       }),
-    ).rejects.toThrow("mkdir failed");
+    ).rejects.toBe(setupError);
     expect(sandbox.terminate).toHaveBeenCalledTimes(1);
   });
 

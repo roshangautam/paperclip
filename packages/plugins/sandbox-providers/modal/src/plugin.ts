@@ -9,7 +9,11 @@ import {
   type Sandbox,
   type SandboxCreateParams,
 } from "modal";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import {
+  definePlugin,
+  JsonRpcCallError,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -257,6 +261,14 @@ function leaseMetadata(input: {
 
 function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function acquisitionFailureWithLease(error: unknown, providerLeaseId: string): JsonRpcCallError {
+  return new JsonRpcCallError({
+    code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+    message: formatErrorMessage(error),
+    data: { providerLeaseId },
+  });
 }
 
 function shellQuote(value: string): string {
@@ -537,9 +549,14 @@ const plugin = definePlugin({
         };
       } catch (error) {
         if (created) {
-          await sandbox.terminate().catch(() => undefined);
+          try {
+            await sandbox.terminate();
+          } catch {
+            throw acquisitionFailureWithLease(error, sandbox.sandboxId);
+          }
+          throw error;
         }
-        throw error;
+        throw acquisitionFailureWithLease(error, sandbox.sandboxId);
       }
     } finally {
       // Keep the client open for the lease lifetime is unnecessary; subsequent
