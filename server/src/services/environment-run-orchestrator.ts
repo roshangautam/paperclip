@@ -372,6 +372,10 @@ export function environmentRunOrchestrator(
       lease.metadata?.remoteCwd,
       parseObject(lease.metadata?.providerMetadata).remoteCwd,
     ].find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim() ?? null;
+    const configuredRemoteCwd = parseObject(parseObject(environment.config).driverConfig).remoteCwd;
+    const pluginRemoteCwd = environment.driver === "plugin" && typeof configuredRemoteCwd === "string"
+      ? configuredRemoteCwd.trim() || null
+      : null;
     if (
       environment.driver === "local" ||
       environment.driver === "ssh" ||
@@ -384,7 +388,7 @@ export function environmentRunOrchestrator(
           lease,
           workspace: {
             localPath: executionWorkspace.cwd,
-            remotePath: leaseRemoteCwd ?? undefined,
+            remotePath: leaseRemoteCwd ?? pluginRemoteCwd ?? undefined,
             mode: persistedExecutionWorkspace?.mode ?? effectiveExecutionWorkspaceMode ?? undefined,
             metadata: {
               workspaceRealizationRequest,
@@ -413,6 +417,7 @@ export function environmentRunOrchestrator(
     const realizedCwd =
       realizedWorkspaceCwd ??
       leaseRemoteCwd ??
+      pluginRemoteCwd ??
       executionWorkspace.cwd;
     if (provisionCommand && environment.driver !== "local") {
       try {

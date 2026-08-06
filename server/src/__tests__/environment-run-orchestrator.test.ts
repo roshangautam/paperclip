@@ -421,6 +421,32 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     }));
   });
 
+  it("uses the configured plugin cwd when realization and lease metadata omit it", async () => {
+    const environment = {
+      ...makeEnvironment("plugin" as Environment["driver"]),
+      config: { driverConfig: { remoteCwd: "/home/coder/configured-workspace" } },
+    };
+    mockBuildWorkspaceRealizationRequest.mockReturnValue({
+      ...mockBuildWorkspaceRealizationRequest(),
+      runtimeOverlay: { provisionCommand: "pnpm install" },
+    });
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue(null);
+
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({ cwd: "" }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await orchestrator.realizeForRun(makeRealizeInput({ environment }));
+
+    expect(runtime.realizeWorkspace).toHaveBeenCalledWith(expect.objectContaining({
+      workspace: expect.objectContaining({ remotePath: "/home/coder/configured-workspace" }),
+    }));
+    expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: "/home/coder/configured-workspace",
+    }));
+  });
+
   it("persisted metadata is updated on lease and execution workspace after realization", async () => {
     const persistedExecutionWorkspace = makePersistedExecutionWorkspace();
     const updatedLease = makeLease({
