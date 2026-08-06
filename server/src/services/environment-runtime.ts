@@ -440,12 +440,28 @@ async function buildEnvironmentSecretMetadataForLeaseFingerprint(input: {
   db: Db;
   companyId: string;
   environment: Environment;
+  resolvedSecretVersions: readonly ResolvedEnvironmentSecretVersion[];
 }): Promise<EffectiveRunConfigSecretVersionMetadata[]> {
   const refs = await collectEnvironmentSecretRefs({
     db: input.db,
     environment: input.environment,
   });
   if (refs.length === 0) return [];
+
+  const resolvedVersionsBySecretAndPath = new Map(
+    input.resolvedSecretVersions.map((resolved) => [
+      `${resolved.secretId}\0${resolved.configPath}`,
+      resolved.version,
+    ]),
+  );
+  const resolvedVersionForRef = (
+    ref: Awaited<ReturnType<typeof collectEnvironmentSecretRefs>>[number],
+    latestVersion: number | null,
+  ) => resolvedVersionsBySecretAndPath.get(`${ref.secretId}\0${ref.configPath}`) ?? (
+    ref.versionSelector === "latest" || ref.versionSelector === undefined
+      ? latestVersion
+      : ref.versionSelector
+  );
 
   const secretIds = [...new Set(refs.map((ref) => ref.secretId))];
   const secretRows = await input.db
@@ -461,9 +477,7 @@ async function buildEnvironmentSecretMetadataForLeaseFingerprint(input: {
   const versionRequests = refs.flatMap((ref) => {
     const secret = secretsById.get(ref.secretId);
     if (!secret) return [];
-    const resolvedVersion = ref.versionSelector === "latest" || ref.versionSelector === undefined
-      ? secret.latestVersion
-      : ref.versionSelector;
+    const resolvedVersion = resolvedVersionForRef(ref, secret.latestVersion);
     return typeof resolvedVersion === "number"
       ? [{ secretId: secret.id, version: resolvedVersion }]
       : [];
@@ -489,19 +503,22 @@ async function buildEnvironmentSecretMetadataForLeaseFingerprint(input: {
   for (const ref of refs) {
     const secret = secretsById.get(ref.secretId);
     if (!secret) {
+      const resolvedVersion = resolvedVersionsBySecretAndPath.get(
+        `${ref.secretId}\0${ref.configPath}`,
+      );
       metadata.push({
         configPath: ref.configPath,
         envKey: null,
         secretId: ref.secretId,
-        version: typeof ref.versionSelector === "number" ? ref.versionSelector : "unresolved",
+        version: resolvedVersion ?? (
+          typeof ref.versionSelector === "number" ? ref.versionSelector : "unresolved"
+        ),
         outcome: "failure",
       });
       continue;
     }
 
-    const resolvedVersion = ref.versionSelector === "latest" || ref.versionSelector === undefined
-      ? secret.latestVersion
-      : ref.versionSelector;
+    const resolvedVersion = resolvedVersionForRef(ref, secret.latestVersion);
     const versionRow = typeof resolvedVersion === "number"
       ? versionsBySecretAndNumber.get(`${secret.id}:${resolvedVersion}`) ?? null
       : null;
@@ -510,7 +527,7 @@ async function buildEnvironmentSecretMetadataForLeaseFingerprint(input: {
       configPath: ref.configPath,
       envKey: null,
       secretId: secret.id,
-      version: resolvedVersion,
+      version: resolvedVersion ?? "unresolved",
       provider: secret.provider,
       providerVersionRef: versionRow?.providerVersionRef ?? null,
       outcome: versionRow ? "success" : "failure",
@@ -529,6 +546,7 @@ async function buildReusableSandboxLeaseFingerprint(input: {
   adapterType: string | null;
   provider: string;
   providerConfig: Record<string, unknown>;
+  resolvedSecretVersions: readonly ResolvedEnvironmentSecretVersion[];
   providerPlugin?: {
     id: string;
     pluginKey: string;
@@ -540,6 +558,7 @@ async function buildReusableSandboxLeaseFingerprint(input: {
     db: input.db,
     companyId: input.companyId,
     environment: input.environment,
+    resolvedSecretVersions: input.resolvedSecretVersions,
   });
   return createEffectiveRunConfigFingerprints({
     lease: {
@@ -2158,6 +2177,7 @@ function createSandboxEnvironmentDriver(
                 adapterType: input.adapterType,
                 provider: parsed.config.provider,
                 providerConfig: providerConfigForLease,
+                resolvedSecretVersions: parsed.resolvedSecretVersions ?? [],
                 providerPlugin: {
                   id: pluginProvider.resolved.plugin.id,
                   pluginKey: pluginProvider.resolved.plugin.pluginKey,
@@ -2568,6 +2588,7 @@ function createSandboxEnvironmentDriver(
               adapterType: input.adapterType,
               provider: parsed.config.provider,
               providerConfig: providerConfigForLease,
+              resolvedSecretVersions: parsed.resolvedSecretVersions ?? [],
             })
           : null;
       const reusableCandidateLeases =

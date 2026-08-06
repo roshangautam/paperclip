@@ -759,6 +759,130 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
+  it("does not resume a reusable sandbox fingerprinted after its secret rotated", async () => {
+    const seeded = await seedPluginSandboxEnvironment({
+      reuseLease: true,
+      supportsReusableLeases: true,
+      secretValue: "version-one",
+    });
+    expect(seeded.apiSecret).not.toBeNull();
+
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId: seeded.companyId,
+      name: `Workspace ${projectId.slice(0, 8)}`,
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId: seeded.companyId,
+      projectId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Secret rotation workspace",
+      status: "active",
+      providerType: "local_fs",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const originalResolve = localEncryptedProvider.resolveVersion.bind(localEncryptedProvider);
+    let rotated = false;
+    vi.spyOn(localEncryptedProvider, "resolveVersion").mockImplementation(async (input) => {
+      const value = await originalResolve(input);
+      if (!rotated) {
+        rotated = true;
+        await secretService(db).rotate(seeded.apiSecret!.id, { value: "version-two" });
+      }
+      return value;
+    });
+
+    const acquiredApiKeys: string[] = [];
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === seeded.pluginId),
+      call: vi.fn(async (_pluginId: string, method: string, params: Record<string, any>) => {
+        if (method === "environmentAcquireLease") {
+          acquiredApiKeys.push(params.config.apiKey);
+          return {
+            providerLeaseId: params.config.apiKey === "version-one" ? "lease-v1" : "lease-v2",
+            metadata: {
+              provider: "reservation-plugin",
+              image: "fake:test",
+              timeoutMs: 1234,
+              reuseLease: true,
+            },
+          };
+        }
+        if (method === "environmentResumeLease") {
+          return {
+            providerLeaseId: params.providerLeaseId,
+            metadata: params.leaseMetadata,
+          };
+        }
+        if (method === "environmentReleaseLease" || method === "environmentDestroyLease") {
+          return undefined;
+        }
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const workspace = { id: executionWorkspaceId, mode: "shared_workspace" as const };
+
+    const first = await runtimeWithPlugin.acquireRunLease({
+      companyId: seeded.companyId,
+      environment: seeded.environment,
+      issueId: null,
+      agentId: seeded.agentId,
+      heartbeatRunId: seeded.runId,
+      persistedExecutionWorkspace: workspace,
+    });
+    expect(first.lease.providerLeaseId).toBe("lease-v1");
+    await runtimeWithPlugin.releaseRunLeases(seeded.runId);
+
+    const nextRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      invocationSource: "manual",
+      status: "running",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const second = await runtimeWithPlugin.acquireRunLease({
+      companyId: seeded.companyId,
+      environment: seeded.environment,
+      issueId: null,
+      agentId: seeded.agentId,
+      heartbeatRunId: nextRunId,
+      persistedExecutionWorkspace: workspace,
+    });
+
+    expect(acquiredApiKeys).toEqual(["version-one", "version-two"]);
+    expect(second.lease.providerLeaseId).toBe("lease-v2");
+    expect(workerManager.call).not.toHaveBeenCalledWith(
+      seeded.pluginId,
+      "environmentResumeLease",
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(workerManager.call).toHaveBeenCalledWith(
+      seeded.pluginId,
+      "environmentDestroyLease",
+      expect.objectContaining({ providerLeaseId: "lease-v1" }),
+      91234,
+    );
+    await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+      failureReason: "lease_fingerprint_mismatch",
+    });
+  });
+
   it("acquires and releases a local run lease through the runtime seam", async () => {
     const { companyId, environment, runId } = await seedEnvironment();
 
