@@ -662,12 +662,20 @@ describe("Modal sandbox provider plugin", () => {
     mockAppFromName.mockResolvedValue({ appId: "ap-1" });
     mockSandboxesCreate.mockResolvedValue(sandbox);
 
-    await expect(
-      plugin.definition.onEnvironmentAcquireLease?.({
-        ...baseAcquireParams,
-        config: baseConfig,
-      }),
-    ).rejects.toBe(setupError);
+    const error = await plugin.definition.onEnvironmentAcquireLease?.({
+      ...baseAcquireParams,
+      config: baseConfig,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(JsonRpcCallError);
+    expect(error).toMatchObject({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "mkdir failed",
+      data: {
+        providerLeaseId: sandbox.sandboxId,
+        cleanupVerifiedAcquisitionId: "acquisition-1",
+      },
+    });
     expect(sandbox.terminate).toHaveBeenCalledTimes(1);
   });
 

@@ -647,7 +647,7 @@ const plugin = definePlugin({
           } catch {
             throw acquisitionFailureWithLease(error, sandbox.sandboxId, params.acquisitionId);
           }
-          throw error;
+          throw acquisitionFailureWithLease(error, sandbox.sandboxId, params.acquisitionId);
         }
         throw acquisitionFailureWithLease(error, sandbox.sandboxId, params.acquisitionId);
       }
