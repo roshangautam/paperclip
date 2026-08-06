@@ -6106,10 +6106,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         resumed: true,
       },
     });
-    expect(realized).toEqual({
+    expect(realized).toMatchObject({
       cwd: "/workspace/project",
       metadata: {
         realized: true,
+        workspaceRealization: {
+          sync: { strategy: "provider_defined" },
+        },
       },
     });
     expect(executed).toMatchObject({
