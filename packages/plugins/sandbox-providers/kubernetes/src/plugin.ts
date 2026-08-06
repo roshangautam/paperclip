@@ -110,7 +110,13 @@ function metadataString(
   key: string,
 ): string | undefined {
   const value = metadata?.[key];
-  return typeof value === "string" && value.length > 0 ? value : undefined;
+  if (typeof value === "string" && value.length > 0) return value;
+  const providerMetadata = metadata?.providerMetadata;
+  if (!providerMetadata || typeof providerMetadata !== "object" || Array.isArray(providerMetadata)) {
+    return undefined;
+  }
+  const nestedValue = (providerMetadata as Record<string, unknown>)[key];
+  return typeof nestedValue === "string" && nestedValue.length > 0 ? nestedValue : undefined;
 }
 
 async function readOwnedWorkloadUid(
@@ -512,20 +518,14 @@ const plugin = definePlugin({
     params: PluginEnvironmentResumeLeaseParams,
   ): Promise<PluginEnvironmentLease> {
     const config = kubernetesProviderConfigSchema.parse(params.config);
-    const namespace =
-      typeof params.leaseMetadata?.namespace === "string"
-        ? params.leaseMetadata.namespace
-        : deriveTenantNamespace(config, params.companyId);
-    const leaseBackend =
-      typeof params.leaseMetadata?.backend === "string"
-        ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
-        : config.backend;
+    const namespace = metadataString(params.leaseMetadata, "namespace")
+      ?? deriveTenantNamespace(config, params.companyId);
+    const leaseBackend = (metadataString(params.leaseMetadata, "backend")
+      ?? config.backend) as "sandbox-cr" | "job";
     // acquireLease names the per-run Secret `${jobName}-env` and uses jobName
     // as the providerLeaseId, so the suffix fallback reconstructs it exactly.
-    const secretName =
-      typeof params.leaseMetadata?.secretName === "string"
-        ? params.leaseMetadata.secretName
-        : `${params.providerLeaseId}-env`;
+    const secretName = metadataString(params.leaseMetadata, "secretName")
+      ?? `${params.providerLeaseId}-env`;
 
     const kc = createKubeConfig({
       inCluster: config.inCluster,
@@ -625,10 +625,8 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const config = kubernetesProviderConfigSchema.parse(params.config);
-    const namespace =
-      typeof params.leaseMetadata?.namespace === "string"
-        ? params.leaseMetadata.namespace
-        : deriveTenantNamespace(config, params.companyId);
+    const namespace = metadataString(params.leaseMetadata, "namespace")
+      ?? deriveTenantNamespace(config, params.companyId);
 
     const kc = createKubeConfig({
       inCluster: config.inCluster,
@@ -636,10 +634,8 @@ const plugin = definePlugin({
     });
     const clients = makeKubeClients(kc);
 
-    const leaseBackend =
-      typeof params.leaseMetadata?.backend === "string"
-        ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
-        : config.backend;
+    const leaseBackend = (metadataString(params.leaseMetadata, "backend")
+      ?? config.backend) as "sandbox-cr" | "job";
     const releaseOrchestrator =
       leaseBackend === "sandbox-cr" ? sandboxCrOrchestrator : jobOrchestrator;
 
@@ -686,23 +682,13 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const config = kubernetesProviderConfigSchema.parse(params.config);
-    const namespace =
-      typeof params.leaseMetadata?.namespace === "string"
-        ? params.leaseMetadata.namespace
-        : deriveTenantNamespace(config, params.companyId);
-    const leaseBackend =
-      typeof params.leaseMetadata?.backend === "string"
-        ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
-        : config.backend;
-    const secretName =
-      typeof params.leaseMetadata?.secretName === "string"
-        ? params.leaseMetadata.secretName
-        : `${params.providerLeaseId}-env`;
-    const podName =
-      typeof params.leaseMetadata?.podName === "string" &&
-      params.leaseMetadata.podName.length > 0
-        ? params.leaseMetadata.podName
-        : null;
+    const namespace = metadataString(params.leaseMetadata, "namespace")
+      ?? deriveTenantNamespace(config, params.companyId);
+    const leaseBackend = (metadataString(params.leaseMetadata, "backend")
+      ?? config.backend) as "sandbox-cr" | "job";
+    const secretName = metadataString(params.leaseMetadata, "secretName")
+      ?? `${params.providerLeaseId}-env`;
+    const podName = metadataString(params.leaseMetadata, "podName") ?? null;
 
     const kc = createKubeConfig({
       inCluster: config.inCluster,

@@ -225,6 +225,30 @@ describe("onEnvironmentReleaseLease", () => {
     expect(h.release).not.toHaveBeenCalled();
   });
 
+  it("pins cleanup to provider metadata nested by the generic plugin runtime", async () => {
+    const readJob = vi.fn().mockResolvedValue(ownedJob());
+    h.clients = { batch: { readNamespacedJob: readJob } };
+
+    await expect(plugin.definition.onEnvironmentReleaseLease!({
+      ...params,
+      config: { inCluster: true, backend: "sandbox-cr" },
+      leaseMetadata: {
+        providerMetadata: {
+          namespace: "nested-namespace",
+          backend: "job",
+          acquisitionId,
+          workloadUid: "persisted-workload-uid",
+        },
+      },
+    })).rejects.toThrow("UID does not match the persisted lease");
+
+    expect(readJob).toHaveBeenCalledWith({
+      namespace: "nested-namespace",
+      name: providerLeaseId,
+    });
+    expect(h.release).not.toHaveBeenCalled();
+  });
+
   it("keeps an exact-name 404 retryable without prior ownership verification", async () => {
     h.clients = {
       batch: { readNamespacedJob: vi.fn().mockRejectedValue(notFound()) },
