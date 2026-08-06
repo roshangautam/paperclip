@@ -176,6 +176,144 @@ describe("resolveEnvironmentExecutionTarget", () => {
     });
   });
 
+  it("resolves plugin environments as sandbox callback targets", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
+      driver: "plugin",
+      config: {
+        pluginKey: "paperclip.coder-sandbox-provider",
+        driverKey: "coder",
+        driverConfig: {
+          timeoutMs: 840_000,
+        },
+      },
+    });
+    const execute = vi.fn().mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "ok",
+      stderr: "",
+    });
+
+    const target = await resolveEnvironmentExecutionTarget({
+      db: {} as never,
+      companyId: "company-1",
+      adapterType: "codex_local",
+      environment: {
+        id: "env-coder-1",
+        driver: "plugin",
+        config: {},
+      },
+      leaseId: "lease-coder-1",
+      leaseMetadata: {
+        providerMetadata: { remoteCwd: "/home/coder/workspace" },
+        shellCommand: "bash",
+        workspaceRealization: { sync: { strategy: "provider_defined" } },
+      },
+      lease: {} as never,
+      environmentRuntime: { execute } as never,
+    });
+
+    expect(target).toMatchObject({
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "paperclip.coder-sandbox-provider:coder",
+      remoteCwd: "/home/coder/workspace",
+      shellCommand: "bash",
+      timeoutMs: 840_000,
+      syncWorkspace: false,
+      streamRunLogs: true,
+    });
+
+    const result = await (target as Extract<typeof target, { transport: "sandbox" }>).runner!.execute({
+      command: "bash",
+      args: ["-lc", "pwd"],
+      cwd: "/home/coder/workspace",
+      env: {},
+      timeoutMs: 30_000,
+    });
+
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+      command: "bash",
+      args: ["-lc", "pwd"],
+      cwd: "/home/coder/workspace",
+    }));
+    expect(result).toMatchObject({ exitCode: 0, stdout: "ok" });
+  });
+
+  it("falls back to the plugin driver cwd", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
+      driver: "plugin",
+      config: {
+        pluginKey: "paperclip.coder-sandbox-provider",
+        driverKey: "coder",
+        driverConfig: { remoteCwd: "/home/coder/from-config" },
+      },
+    });
+
+    const target = await resolveEnvironmentExecutionTarget({
+      db: {} as never,
+      companyId: "company-1",
+      adapterType: "codex_local",
+      environment: { id: "env-1", driver: "plugin", config: {} },
+      leaseId: "lease-1",
+      leaseMetadata: {},
+      lease: null,
+      environmentRuntime: null,
+    });
+
+    expect(target).toMatchObject({ remoteCwd: "/home/coder/from-config" });
+  });
+
+  it("rejects plugin targets without a remote cwd", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
+      driver: "plugin",
+      config: {
+        pluginKey: "paperclip.coder-sandbox-provider",
+        driverKey: "coder",
+        driverConfig: {},
+      },
+    });
+
+    await expect(resolveEnvironmentExecutionTarget({
+      db: {} as never,
+      companyId: "company-1",
+      adapterType: "codex_local",
+      environment: { id: "env-1", driver: "plugin", config: {} },
+      leaseId: "lease-1",
+      leaseMetadata: {},
+      lease: null,
+      environmentRuntime: null,
+    })).rejects.toThrow('Plugin environment "env-1" did not provide a remote workspace cwd.');
+  });
+
+  it("prefers a freshly realized remote cwd over stale realization metadata", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
+      driver: "plugin",
+      config: {
+        pluginKey: "paperclip.coder-sandbox-provider",
+        driverKey: "coder",
+        driverConfig: {},
+      },
+    });
+
+    const target = await resolveEnvironmentExecutionTarget({
+      db: {} as never,
+      companyId: "company-1",
+      adapterType: "codex_local",
+      environment: { id: "env-1", driver: "plugin", config: {} },
+      leaseId: "lease-1",
+      leaseMetadata: {
+        remoteCwd: "/home/coder/fresh",
+        workspaceRealization: { remote: { path: "/home/coder/stale" } },
+      },
+      lease: null,
+      environmentRuntime: null,
+    });
+
+    expect(target).toMatchObject({ remoteCwd: "/home/coder/fresh" });
+  });
+
   it("resolves SSH execution targets in bridge mode", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "ssh",

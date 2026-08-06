@@ -15,6 +15,7 @@ import {
   ensureAdapterExecutionTargetCommandResolvable,
   formatAdapterExecutionTimeoutErrorMessage,
   formatAdapterExecutionTimeoutStartLogLine,
+  parseAdapterExecutionTarget,
   resolveAdapterExecutionTargetTimeout,
   resolveAdapterExecutionTargetTimeoutSec,
   runAdapterExecutionTargetProcess,
@@ -141,6 +142,15 @@ describe("sandbox adapter execution targets", () => {
   ): string {
     return events.filter((event) => event.stream === stream).map((event) => event.chunk).join("");
   }
+
+  it("preserves the workspace sync policy when parsing a sandbox target", () => {
+    expect(parseAdapterExecutionTarget({
+      kind: "remote",
+      transport: "sandbox",
+      remoteCwd: "/workspace",
+      syncWorkspace: false,
+    })).toMatchObject({ syncWorkspace: false });
+  });
 
   it("executes through the provider-neutral runner without a remote spec", async () => {
     const runner = {

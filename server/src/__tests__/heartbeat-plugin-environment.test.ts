@@ -101,6 +101,9 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
             },
           };
         }
+        if (method === "environmentRealizeWorkspace") {
+          return { cwd: "/workspace/project", metadata: { workspaceRealization: {} } };
+        }
         if (method === "environmentReleaseLease") {
           return undefined;
         }
@@ -226,7 +229,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       adapterType: "codex_local",
     });
     await vi.waitFor(() => {
-      expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", {
+      expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.objectContaining({
         driverKey: "sandbox",
         companyId,
         environmentId,
@@ -239,7 +242,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
           pluginKey,
           driverKey: "sandbox",
         }),
-      });
+      }));
     }, { timeout: 5_000 });
     expect(adapterExecute).toHaveBeenCalledTimes(1);
   }, 15_000);
@@ -270,6 +273,9 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
               remoteCwd: `/workspace/${String(payload.environmentId)}`,
             },
           };
+        }
+        if (method === "environmentRealizeWorkspace") {
+          return { cwd: `/workspace/${String(payload.environmentId)}`, metadata: { workspaceRealization: {} } };
         }
         if (method === "environmentReleaseLease") {
           return undefined;
@@ -503,6 +509,9 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
               remoteCwd: `/workspace/${String(payload.environmentId)}`,
             },
           };
+        }
+        if (method === "environmentRealizeWorkspace") {
+          return { cwd: `/workspace/${String(payload.environmentId)}`, metadata: { workspaceRealization: {} } };
         }
         if (method === "environmentReleaseLease") {
           return undefined;

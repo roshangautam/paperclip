@@ -66,6 +66,8 @@ export interface AdapterSandboxExecutionTarget {
   leaseId?: string | null;
   remoteCwd: string;
   timeoutMs?: number | null;
+  /** Set false when the provider already owns the remote workspace checkout. */
+  syncWorkspace?: boolean | null;
   runner?: CommandManagedRuntimeRunner;
   /**
    * Sandbox-backed adapter runs stream the agent CLI's stdout/stderr
@@ -1037,6 +1039,7 @@ export function parseAdapterExecutionTarget(value: unknown): AdapterExecutionTar
       leaseId: readStringMeta(parsed, "leaseId"),
       remoteCwd,
       timeoutMs: typeof parsed.timeoutMs === "number" ? parsed.timeoutMs : null,
+      syncWorkspace: typeof parsed.syncWorkspace === "boolean" ? parsed.syncWorkspace : null,
       streamRunLogs: typeof parsed.streamRunLogs === "boolean" ? parsed.streamRunLogs : null,
     };
   }
@@ -1144,6 +1147,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     workspaceRemoteDir: input.workspaceRemoteDir,
     workspaceExclude: input.workspaceExclude,
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
+    syncWorkspace: target.syncWorkspace,
     assets: input.assets,
     installCommand: input.installCommand,
     detectCommand: input.detectCommand,

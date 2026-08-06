@@ -61,7 +61,7 @@ import { logger } from "../middleware/logger.js";
 /** Default timeout for RPC calls in milliseconds. */
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 
-/** Hard upper bound for any RPC timeout (15 minutes). Prevents unbounded waits. */
+/** Hard upper bound for default RPC timeouts (15 minutes). */
 const MAX_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
 
 /** Timeout for the initialize RPC call. */
@@ -1132,7 +1132,7 @@ export function createPluginWorkerHandle(
       }
 
       const id = nextRequestId++;
-      const timeout = Math.min(timeoutMs ?? rpcTimeoutMs, MAX_RPC_TIMEOUT_MS);
+      const timeout = timeoutMs ?? Math.min(rpcTimeoutMs, MAX_RPC_TIMEOUT_MS);
       const invocationScope = deriveInvocationScope(method, params);
       const invocation = invocationScope ? registerInvocation(invocationScope) : null;
 
@@ -1249,6 +1249,15 @@ export function createPluginWorkerHandle(
           new Error(
             `Cannot call "${method}" — worker for "${pluginId}" is ${status}`,
           ),
+        );
+      }
+      if (
+        method === "environmentExecute" &&
+        supportedMethods.length > 0 &&
+        !supportedMethods.includes(method)
+      ) {
+        return Promise.reject(
+          new Error(`Plugin worker "${pluginId}" does not support required method "${method}".`),
         );
       }
       return callInternal(method, params, timeoutMs);

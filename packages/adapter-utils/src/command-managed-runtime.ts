@@ -250,6 +250,7 @@ export async function prepareCommandManagedRuntime(input: {
   workspaceRemoteDir?: string;
   workspaceExclude?: string[];
   preserveAbsentOnRestore?: string[];
+  syncWorkspace?: boolean | null;
   assets?: CommandManagedRuntimeAsset[];
   installCommand?: string | null;
   /** When provided alongside `installCommand`, skip the install if `command -v <detectCommand>` succeeds. */
@@ -304,6 +305,7 @@ export async function prepareCommandManagedRuntime(input: {
           workspaceRemoteDir,
           workspaceExclude: mergeRuntimeExcludes(input.workspaceExclude),
           preserveAbsentOnRestore: input.preserveAbsentOnRestore,
+          syncWorkspace: input.syncWorkspace,
           assets: input.assets,
           onProgress: input.onProgress,
           onRuntimeProgress: input.onRuntimeProgress,
@@ -340,6 +342,7 @@ export async function prepareCommandManagedRuntime(input: {
     workspaceRemoteDir,
     workspaceExclude: mergeRuntimeExcludes(input.workspaceExclude),
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
+    syncWorkspace: input.syncWorkspace,
     assets: input.assets,
     onProgress: input.onProgress,
     onRuntimeProgress: input.onRuntimeProgress,

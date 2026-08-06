@@ -124,6 +124,7 @@ describe("plugin-worker-manager stderr failure context", () => {
 
     try {
       await handle.start();
+      const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
 
       await expect(handle.call("environmentExecute", {
         driverKey: "e2b",
@@ -133,10 +134,44 @@ describe("plugin-worker-manager stderr failure context", () => {
         lease: { providerLeaseId: "lease-1" },
         command: "echo",
         delayMs: 50,
-      } as HostToWorkerMethods["environmentExecute"][0], 100)).resolves.toMatchObject({
+      } as HostToWorkerMethods["environmentExecute"][0], 900_001)).resolves.toMatchObject({
         exitCode: 0,
         stdout: "ok\n",
       });
+      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 900_001);
+      setTimeoutSpy.mockRestore();
+    } finally {
+      vi.restoreAllMocks();
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("rejects execution when the worker does not advertise environmentExecute", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+    });
+
+    try {
+      await handle.start();
+
+      await expect(handle.call("environmentExecute", {
+        driverKey: "e2b",
+        companyId: "company-1",
+        environmentId: "environment-1",
+        config: {},
+        lease: { providerLeaseId: "lease-1" },
+        command: "echo",
+      } as HostToWorkerMethods["environmentExecute"][0])).rejects.toThrow(
+        'does not support required method "environmentExecute"',
+      );
     } finally {
       await handle.stop().catch(() => undefined);
     }
