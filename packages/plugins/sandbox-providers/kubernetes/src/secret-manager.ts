@@ -14,11 +14,6 @@ export interface CreatePerRunSecretInput {
   createIfMissing?: boolean;
 }
 
-export interface CreatePerRunSecretResult {
-  /** True only when this invocation received a successful create response. */
-  created: boolean;
-}
-
 const MANAGED_BY = "paperclip-k8s-plugin";
 
 function statusCode(error: unknown): number | undefined {
@@ -29,7 +24,7 @@ function statusCode(error: unknown): number | undefined {
 function validateExistingSecret(
   secret: unknown,
   input: CreatePerRunSecretInput,
-): CreatePerRunSecretResult {
+): void {
   const typed = secret as {
     metadata?: {
       labels?: Record<string, string>;
@@ -73,21 +68,21 @@ function validateExistingSecret(
       `Refusing to adopt Kubernetes Secret ${input.secretName}: BOOTSTRAP_TOKEN is missing.`,
     );
   }
-  return { created: false };
 }
 
 async function readExistingSecret(
   clients: KubeClients,
   input: CreatePerRunSecretInput,
-): Promise<CreatePerRunSecretResult | null> {
+): Promise<boolean> {
   try {
     const secret = await clients.core.readNamespacedSecret({
       namespace: input.namespace,
       name: input.secretName,
     });
-    return validateExistingSecret(secret, input);
+    validateExistingSecret(secret, input);
+    return true;
   } catch (error) {
-    if (statusCode(error) === 404) return null;
+    if (statusCode(error) === 404) return false;
     throw error;
   }
 }
@@ -95,7 +90,7 @@ async function readExistingSecret(
 export async function createPerRunSecret(
   clients: KubeClients,
   input: CreatePerRunSecretInput,
-): Promise<CreatePerRunSecretResult> {
+): Promise<void> {
   if (!input.ownerUid) {
     throw new Error("createPerRunSecret requires a non-empty ownerUid");
   }
@@ -103,7 +98,7 @@ export async function createPerRunSecret(
     throw new Error("adapterEnv must not contain BOOTSTRAP_TOKEN (reserved key)");
   }
   const existing = await readExistingSecret(clients, input);
-  if (existing) return existing;
+  if (existing) return;
   if (input.createIfMissing === false) {
     throw new Error(
       `Refusing to recreate missing Kubernetes Secret ${input.secretName} for an adopted workload.`,
@@ -144,13 +139,12 @@ export async function createPerRunSecret(
       namespace: input.namespace,
       body,
     });
-    return { created: true };
   } catch (createError) {
     // Never patch or replace a Secret after an ambiguous create. The original
     // bootstrap token must survive replay, so reconcile by exact name and
     // validate ownership instead.
     const reconciled = await readExistingSecret(clients, input);
-    if (reconciled) return reconciled;
+    if (reconciled) return;
     throw createError;
   }
 }

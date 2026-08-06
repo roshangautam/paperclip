@@ -160,7 +160,6 @@ describe("onEnvironmentAcquireLease", () => {
 
   it("does not fail acquisition when initial pod discovery is unavailable", async () => {
     h.claim.mockResolvedValue({ uid: "uid-1", created: true });
-    h.createPerRunSecret.mockResolvedValue({ created: true });
     h.findPod.mockRejectedValue(new Error("pod list unavailable"));
 
     await expect(plugin.definition.onEnvironmentAcquireLease!(params)).resolves.toMatchObject({
@@ -459,7 +458,10 @@ describe("onEnvironmentDestroyLease", () => {
     expect(deleteSecret).not.toHaveBeenCalled();
   });
 
-  it("refuses to delete a replaced child resource", async () => {
+  it.each([
+    "workload owner",
+    "acquisition label",
+  ] as const)("refuses to delete a child resource with a mismatched %s", async (mismatch) => {
     const acquisitionId = "acquisition-destroy-child";
     const providerLeaseId = deriveAcquisitionResourceName(acquisitionId);
     const deleteJob = vi.fn().mockResolvedValue({});
@@ -469,7 +471,11 @@ describe("onEnvironmentDestroyLease", () => {
       custom: {},
       core: {
         readNamespacedPod: vi.fn().mockResolvedValue(
-          ownedChild(acquisitionId, "replacement-pod-uid", "other-workload-uid"),
+          ownedChild(
+            mismatch === "acquisition label" ? "other-acquisition" : acquisitionId,
+            "replacement-pod-uid",
+            mismatch === "workload owner" ? "other-workload-uid" : "workload-uid",
+          ),
         ),
         readNamespacedSecret: vi.fn(),
         deleteNamespacedPod: deletePod,
@@ -504,7 +510,9 @@ describe("onEnvironmentDestroyLease", () => {
         podName: `${providerLeaseId}-pod`,
         secretName: `${providerLeaseId}-env`,
       }),
-    })).rejects.toThrow(/owner does not match workload/);
+    })).rejects.toThrow(
+      mismatch === "acquisition label" ? /acquisition ownership/ : /owner does not match workload/,
+    );
 
     expect(deleteJob).toHaveBeenCalledWith(expect.objectContaining({
       body: { preconditions: { uid: "workload-uid" } },

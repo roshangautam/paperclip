@@ -3,6 +3,22 @@ import {
 } from "@paperclipai/plugin-sdk";
 import { describe, it, expect, vi } from "vitest";
 import { createJob, deleteJob, getJobStatus, findPodForJob, JobTimeoutError, waitForJobCompletion } from "../../src/job-orchestrator.js";
+import { isAmbiguousCreateError } from "../../src/sandbox-orchestrator.js";
+
+describe("isAmbiguousCreateError", () => {
+  it.each([
+    ["missing status", new Error("response lost"), true],
+    ["408", { code: 408 }, true],
+    ["409", { code: 409 }, true],
+    ["429", { code: 429 }, true],
+    ["500", { code: 500 }, true],
+    ["statusCode 503", { statusCode: 503 }, true],
+    ["404", { code: 404 }, false],
+    ["499", { code: 499 }, false],
+  ] as const)("classifies %s", (_name, error, expected) => {
+    expect(isAmbiguousCreateError(error)).toBe(expected);
+  });
+});
 
 describe("createJob", () => {
   const acquisitionId = "acquisition-1";
@@ -166,30 +182,14 @@ describe("getJobStatus", () => {
 
   it("returns phase=Running when active count is >0", async () => {
     const get = vi.fn().mockResolvedValue({ status: { active: 1 } });
+    const list = vi.fn();
     const clients = {
       batch: { readNamespacedJobStatus: get },
-      core: {
-        listNamespacedPod: vi.fn().mockResolvedValue({
-          items: [{ metadata: { name: "r-1-pod" }, status: { phase: "Running" } }],
-        }),
-      },
+      core: { listNamespacedPod: list },
     };
     const status = await getJobStatus(clients as never, "ns", "r-1");
     expect(status.phase).toBe("Running");
-  });
-
-  it("returns phase=Pending when an active Job only has Pending pods", async () => {
-    const get = vi.fn().mockResolvedValue({ status: { active: 1 } });
-    const clients = {
-      batch: { readNamespacedJobStatus: get },
-      core: {
-        listNamespacedPod: vi.fn().mockResolvedValue({
-          items: [{ metadata: { name: "r-1-pod" }, status: { phase: "Pending" } }],
-        }),
-      },
-    };
-    const status = await getJobStatus(clients as never, "ns", "r-1");
-    expect(status.phase).toBe("Pending");
+    expect(list).not.toHaveBeenCalled();
   });
 
   it("returns phase=Pending when no active/succeeded/failed counters set", async () => {
@@ -235,10 +235,7 @@ describe("deleteJob", () => {
 describe("waitForJobCompletion", () => {
   it("throws JobTimeoutError when the deadline is exceeded", async () => {
     const get = vi.fn().mockResolvedValue({ status: { active: 1 } });
-    const clients = {
-      batch: { readNamespacedJobStatus: get },
-      core: { listNamespacedPod: vi.fn().mockResolvedValue({ items: [] }) },
-    };
+    const clients = { batch: { readNamespacedJobStatus: get } };
     await expect(
       waitForJobCompletion(clients as never, "ns", "r-1", { timeoutMs: 50, pollMs: 10 }),
     ).rejects.toBeInstanceOf(JobTimeoutError);

@@ -102,9 +102,34 @@ describe("createPerRunSecret", () => {
     const create = vi.fn();
     const clients = { core: { readNamespacedSecret: read, createNamespacedSecret: create } };
 
-    await expect(
-      createPerRunSecret(clients as never, { ...baseInput, bootstrapToken: "new-token" }),
-    ).resolves.toEqual({ created: false });
+    await createPerRunSecret(clients as never, { ...baseInput, bootstrapToken: "new-token" });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "managed-by label",
+    "acquisition label",
+    "bootstrap token",
+  ] as const)("rejects an existing Secret with an invalid %s", async (mismatch) => {
+    const secret = existingSecret();
+    if (mismatch === "managed-by label") {
+      secret.metadata.labels["paperclip.io/managed-by"] = "another-controller";
+    } else if (mismatch === "acquisition label") {
+      secret.metadata.labels["paperclip.io/acquisition-id"] = "other-acquisition";
+    } else {
+      delete (secret.data as { BOOTSTRAP_TOKEN?: string }).BOOTSTRAP_TOKEN;
+    }
+    const create = vi.fn();
+    const clients = {
+      core: {
+        readNamespacedSecret: vi.fn().mockResolvedValue(secret),
+        createNamespacedSecret: create,
+      },
+    };
+
+    await expect(createPerRunSecret(clients as never, baseInput)).rejects.toThrow(
+      mismatch === "bootstrap token" ? /BOOTSTRAP_TOKEN is missing/ : /acquisition ownership/,
+    );
     expect(create).not.toHaveBeenCalled();
   });
 
@@ -184,9 +209,7 @@ describe("createPerRunSecret", () => {
     const create = vi.fn().mockRejectedValue(new Error("response lost"));
     const clients = { core: { readNamespacedSecret: read, createNamespacedSecret: create } };
 
-    await expect(createPerRunSecret(clients as never, baseInput)).resolves.toEqual({
-      created: false,
-    });
+    await createPerRunSecret(clients as never, baseInput);
     expect(read).toHaveBeenCalledTimes(2);
     expect(create).toHaveBeenCalledTimes(1);
   });

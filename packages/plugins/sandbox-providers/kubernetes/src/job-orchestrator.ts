@@ -122,13 +122,7 @@ export async function getJobStatus(
     return { phase: "Succeeded", complete: true, active, succeeded, failed };
   }
   if (active > 0) {
-    const pods = await listPodsForJob(clients, namespace, name);
-    if (pods.some((pod) => pod.status?.phase === "Running")) {
-      return { phase: "Running", complete: false, active, succeeded, failed };
-    }
-    if (!pods.some((pod) => pod.status?.phase === "Pending")) {
-      return { phase: "Running", complete: false, active, succeeded, failed };
-    }
+    return { phase: "Running", complete: false, active, succeeded, failed };
   }
   return { phase: "Pending", complete: false, active, succeeded, failed };
 }

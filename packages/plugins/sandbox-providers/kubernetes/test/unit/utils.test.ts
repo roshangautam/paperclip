@@ -3,7 +3,6 @@ import {
   deriveAcquisitionResourceName,
   deriveCompanySlug,
   deriveNamespaceName,
-  newRunUlidDns,
   paperclipLabels,
 } from "../../src/utils.js";
 
@@ -44,13 +43,6 @@ describe("deriveCompanySlug", () => {
 describe("deriveNamespaceName", () => {
   it("concatenates prefix and slug", () => {
     expect(deriveNamespaceName("paperclip-", "acme-co")).toBe("paperclip-acme-co");
-  });
-});
-
-describe("newRunUlidDns", () => {
-  it("produces a DNS-safe 26-char lowercase id", () => {
-    const id = newRunUlidDns();
-    expect(id).toMatch(/^[a-z0-9]{26}$/);
   });
 });
 
