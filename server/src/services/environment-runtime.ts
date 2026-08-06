@@ -1539,15 +1539,20 @@ function createSandboxEnvironmentDriver(
           await abandonSandboxLeaseReservation(reservation, "acquire_handoff_failed");
           return;
         } catch (unrecordedCleanupError) {
-          logger.error(
-            {
-              err: unrecordedCleanupError,
-              handoffErr: cleanupError,
-              environmentId: environment.id,
-              providerLeaseId: input.providerLeaseId,
-            },
-            "failed to clean up unrecorded sandbox lease after acquisition handoff failure",
-          );
+          try {
+            await persistStandaloneSandboxLeaseCleanup(reservation, input);
+          } catch (standalonePersistenceError) {
+            logger.error(
+              {
+                err: standalonePersistenceError,
+                cleanupErr: unrecordedCleanupError,
+                handoffErr: cleanupError,
+                environmentId: environment.id,
+                providerLeaseId: input.providerLeaseId,
+              },
+              "failed to persist sandbox cleanup after direct acquisition cleanup failure",
+            );
+          }
           return;
         }
       }

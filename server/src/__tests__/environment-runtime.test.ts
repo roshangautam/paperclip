@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, isNull } from "drizzle-orm";
 import {
   buildSshEnvLabFixtureConfig,
   getSshEnvLabSupport,
@@ -2841,6 +2841,14 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       isRunning: vi.fn((id: string) => id === pluginId),
       call: vi.fn(async (_pluginId: string, method: string) => {
         if (method === "environmentResumeLease") {
+          const [reservation] = await db
+            .select()
+            .from(environmentLeases)
+            .where(isNull(environmentLeases.providerLeaseId));
+          await db
+            .update(environmentLeases)
+            .set({ cleanupClaimId: randomUUID(), cleanupClaimedAt: new Date() })
+            .where(eq(environmentLeases.id, reservation!.id));
           return {
             providerLeaseId: "replacement-plugin-lease",
             metadata: {
