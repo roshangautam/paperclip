@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agentConfigRevisions,
@@ -44,12 +44,23 @@ import {
 } from "../services/built-in-agents.ts";
 import { readBuiltInAgentMarker, withBuiltInAgentMarker } from "../services/built-in-agent-metadata.ts";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
+import { routineService } from "../services/routines.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 function issuePrefix(id: string) {
   return `T${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
 }
 
 if (!embeddedPostgresSupport.supported) {
@@ -1234,6 +1245,137 @@ describeEmbeddedPostgres("built-in agents", () => {
         },
       },
     });
+  });
+
+  it("dispatches with ownership repaired while waiting for the routine lock", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    const agent = await agentService(db).create(companyId, {
+      name: "Routine Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: { model: "gpt-5.4" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const routinesSvc = routineService(db);
+    const routine = await routinesSvc.create(companyId, {
+      projectId: null,
+      goalId: null,
+      parentIssueId: null,
+      title: "Repair ownership race",
+      description: "Verify dispatch uses the locked routine revision.",
+      assigneeAgentId: agent.id,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+    }, {});
+    const [initialRevision] = await db
+      .select()
+      .from(routineRevisions)
+      .where(eq(routineRevisions.id, routine.latestRevisionId!));
+
+    const legacyResponsibleUserId = "built-in-bundles";
+    await db
+      .update(routines)
+      .set({ responsibleUserId: legacyResponsibleUserId })
+      .where(eq(routines.id, routine.id));
+    await db
+      .update(routineRevisions)
+      .set({
+        responsibleUserId: legacyResponsibleUserId,
+        snapshot: {
+          ...initialRevision!.snapshot,
+          routine: {
+            ...initialRevision!.snapshot.routine,
+            responsibleUserId: legacyResponsibleUserId,
+          },
+        },
+      })
+      .where(eq(routineRevisions.id, initialRevision!.id));
+
+    const activeRunId = randomUUID();
+    const activeIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: activeIssueId,
+      companyId,
+      title: "Existing routine execution",
+      status: "todo",
+      assigneeAgentId: agent.id,
+      responsibleUserId: legacyResponsibleUserId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: activeRunId,
+      originFingerprint: "default",
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: agent.id,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      responsibleUserId: legacyResponsibleUserId,
+      contextSnapshot: {
+        issueId: activeIssueId,
+        responsibleUserId: legacyResponsibleUserId,
+      },
+    });
+
+    const rowLocked = deferred<void>();
+    const repairCanCommit = deferred<void>();
+    let repairedRevisionId: string | null = null;
+    const ownershipRepair = db.transaction(async (tx) => {
+      await tx.execute(sql`select ${routines.id} from ${routines} where ${routines.id} = ${routine.id} for update`);
+      rowLocked.resolve();
+      await repairCanCommit.promise;
+
+      const [repairedRevision] = await tx
+        .insert(routineRevisions)
+        .values({
+          companyId,
+          routineId: routine.id,
+          revisionNumber: initialRevision!.revisionNumber + 1,
+          title: initialRevision!.title,
+          description: initialRevision!.description,
+          snapshot: {
+            ...initialRevision!.snapshot,
+            routine: {
+              ...initialRevision!.snapshot.routine,
+              responsibleUserId: "responsible-user",
+            },
+          },
+          changeSummary: "Repair legacy built-in ownership",
+          responsibleUserId: "responsible-user",
+        })
+        .returning();
+      repairedRevisionId = repairedRevision!.id;
+      await tx
+        .update(routines)
+        .set({
+          responsibleUserId: "responsible-user",
+          latestRevisionId: repairedRevision!.id,
+          latestRevisionNumber: repairedRevision!.revisionNumber,
+          updatedAt: new Date(),
+        })
+        .where(eq(routines.id, routine.id));
+    });
+
+    await rowLocked.promise;
+    const dispatched = routinesSvc.runRoutine(routine.id, { source: "api" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    repairCanCommit.resolve();
+    await ownershipRepair;
+
+    const repairedDispatch = await dispatched;
+    expect(repairedDispatch).toMatchObject({
+      status: "coalesced",
+      routineRevisionId: repairedRevisionId,
+      responsibleUserId: "responsible-user",
+      linkedIssueId: activeIssueId,
+    });
+    const subsequentDispatch = await routinesSvc.runRoutine(routine.id, { source: "api" });
+    expect(repairedDispatch.dispatchFingerprint).toBe(subsequentDispatch.dispatchFingerprint);
   });
 
   it("materializes the Summarizer bundle paused on Claude Haiku with a disabled routine", async () => {

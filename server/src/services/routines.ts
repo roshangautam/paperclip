@@ -1830,24 +1830,34 @@ export function routineService(
       : "routine_execution";
     const issueOriginId = managedIssueTemplate?.originId ?? input.routine.id;
     const issueBillingCode = managedIssueTemplate?.billingCode ?? null;
-    const dispatchFingerprint = createRoutineDispatchFingerprint({
-      payload: triggerPayload,
-      projectId,
-      projectWorkspaceId,
-      assigneeAgentId,
-      routineRevisionId: input.routine.latestRevisionId,
-      routineEnvFingerprint: createRoutineEnvFingerprint(input.routine.env),
-      executionWorkspaceId: input.executionWorkspaceId ?? null,
-      executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-      executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
-      title,
-      description,
-    });
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
         sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
       );
+      const lockedRoutine = await txDb
+        .select()
+        .from(routines)
+        .where(and(
+          eq(routines.id, input.routine.id),
+          eq(routines.companyId, input.routine.companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!lockedRoutine) throw notFound("Routine not found");
+
+      const dispatchFingerprint = createRoutineDispatchFingerprint({
+        payload: triggerPayload,
+        projectId,
+        projectWorkspaceId,
+        assigneeAgentId,
+        routineRevisionId: lockedRoutine.latestRevisionId,
+        routineEnvFingerprint: createRoutineEnvFingerprint(lockedRoutine.env),
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        executionWorkspacePreference: input.executionWorkspacePreference ?? null,
+        executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+        title,
+        description,
+      });
 
       if (input.idempotencyKey) {
         const existing = await txDb
@@ -1870,7 +1880,7 @@ export function routineService(
 
       const triggeredAt = new Date();
       const manualRunnerUserId = input.source === "manual" ? input.actor?.userId ?? null : null;
-      const latestRevisionResponsibleUserId = input.routine.latestRevisionId
+      const latestRevisionResponsibleUserId = lockedRoutine.latestRevisionId
         ? await txDb
             .select({
               responsibleUserId: routineRevisions.responsibleUserId,
@@ -1880,7 +1890,7 @@ export function routineService(
             .where(and(
               eq(routineRevisions.companyId, input.routine.companyId),
               eq(routineRevisions.routineId, input.routine.id),
-              eq(routineRevisions.id, input.routine.latestRevisionId),
+              eq(routineRevisions.id, lockedRoutine.latestRevisionId),
             ))
             .then((rows) => {
               const row = rows[0] ?? null;
@@ -1889,7 +1899,7 @@ export function routineService(
             })
         : null;
       const responsibleUserId =
-        manualRunnerUserId ?? latestRevisionResponsibleUserId ?? input.routine.responsibleUserId ?? null;
+        manualRunnerUserId ?? latestRevisionResponsibleUserId ?? lockedRoutine.responsibleUserId ?? null;
       const [createdRun] = await txDb
         .insert(routineRuns)
         .values({
@@ -1902,7 +1912,7 @@ export function routineService(
           idempotencyKey: input.idempotencyKey ?? null,
           triggerPayload,
           dispatchFingerprint,
-          routineRevisionId: input.routine.latestRevisionId,
+          routineRevisionId: lockedRoutine.latestRevisionId,
           responsibleUserId,
         })
         .returning();
@@ -1915,12 +1925,12 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+        const activeIssue = await findLiveExecutionIssue(lockedRoutine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
         });
-        if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
-          const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+        if (activeIssue && lockedRoutine.concurrencyPolicy !== "always_enqueue") {
+          const status = lockedRoutine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
             await touchIssueForUserInbox(txDb, {
               companyId: input.routine.companyId,
@@ -1950,12 +1960,12 @@ export function routineService(
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
             projectWorkspaceId,
-            goalId: input.routine.goalId,
-            parentId: input.routine.parentIssueId,
+            goalId: lockedRoutine.goalId,
+            parentId: lockedRoutine.parentIssueId,
             title,
             description,
             status: "todo",
-            priority: input.routine.priority,
+            priority: lockedRoutine.priority,
             assigneeAgentId,
             createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
             createdByUserId: manualRunnerUserId,
@@ -1978,16 +1988,16 @@ export function routineService(
             (error as { code?: string }).code === "23505" &&
             "constraint" in error &&
             (error as { constraint?: string }).constraint === "issues_open_routine_execution_uq";
-          if (!isOpenExecutionConflict || input.routine.concurrencyPolicy === "always_enqueue") {
+          if (!isOpenExecutionConflict || lockedRoutine.concurrencyPolicy === "always_enqueue") {
             throw error;
           }
 
-          const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+          const existingIssue = await findLiveExecutionIssue(lockedRoutine, txDb, dispatchFingerprint, {
             kind: issueOriginKind,
             id: issueOriginId,
           });
           if (!existingIssue) throw error;
-          const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+          const status = lockedRoutine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
             await touchIssueForUserInbox(txDb, {
               companyId: input.routine.companyId,
