@@ -421,6 +421,14 @@ export function environmentRunOrchestrator(
       executionWorkspace.cwd;
     if (provisionCommand && environment.driver !== "local") {
       try {
+        if (
+          environment.driver === "plugin" &&
+          !realizedWorkspaceCwd &&
+          !leaseRemoteCwd &&
+          !pluginRemoteCwd
+        ) {
+          throw new Error("Plugin workspace provisioning requires a remote working directory.");
+        }
         const provisionResult = await environmentRuntime.execute({
           environment,
           lease,

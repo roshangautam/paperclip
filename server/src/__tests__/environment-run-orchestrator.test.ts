@@ -447,6 +447,26 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     }));
   });
 
+  it("refuses plugin provisioning without a remote cwd", async () => {
+    const environment = makeEnvironment("plugin" as Environment["driver"]);
+    mockBuildWorkspaceRealizationRequest.mockReturnValue({
+      ...mockBuildWorkspaceRealizationRequest(),
+      runtimeOverlay: { provisionCommand: "pnpm install" },
+    });
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({ cwd: "" }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await expect(orchestrator.realizeForRun(makeRealizeInput({ environment }))).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof EnvironmentRunError &&
+        err.code === "workspace_realization_failed" &&
+        err.message.includes("requires a remote working directory"),
+    );
+    expect(runtime.execute).not.toHaveBeenCalled();
+  });
+
   it("persisted metadata is updated on lease and execution workspace after realization", async () => {
     const persistedExecutionWorkspace = makePersistedExecutionWorkspace();
     const updatedLease = makeLease({
