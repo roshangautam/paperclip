@@ -168,10 +168,24 @@ describe("bridge routes", () => {
     expect(sandbox.destroy).not.toHaveBeenCalled();
   });
 
-  it("preserves the resolved lease ID when acquisition setup fails", async () => {
-    const sessionExec = vi.fn()
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" })
-      .mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "mkdir failed" });
+  it.each([
+    {
+      phase: "ownership read",
+      results: [{ exitCode: 1, stdout: "", stderr: "cat failed" }],
+      message:
+        "read sentinel /workspace/paperclip/.paperclip-lease.json failed with exit code 1: cat failed",
+    },
+    {
+      phase: "workspace setup",
+      results: [
+        { exitCode: 0, stdout: "", stderr: "" },
+        { exitCode: 1, stdout: "", stderr: "mkdir failed" },
+      ],
+      message: "ensure workspace /workspace/paperclip failed with exit code 1: mkdir failed",
+    },
+  ])("preserves the resolved lease ID when acquisition $phase fails", async ({ results, message }) => {
+    const sessionExec = vi.fn();
+    for (const result of results) sessionExec.mockResolvedValueOnce(result);
     const sandbox = {
       getSession: vi.fn().mockResolvedValue({ exec: sessionExec }),
       createSession: vi.fn(),
@@ -195,7 +209,7 @@ describe("bridge routes", () => {
     expect(response.status).toBe(500);
     expect(await response.json()).toMatchObject({
       error: "internal_error",
-      message: "ensure workspace /workspace/paperclip failed with exit code 1: mkdir failed",
+      message,
       details: { providerLeaseId: "pc-acq-acquisition-1" },
     });
     expect(sandbox.destroy).not.toHaveBeenCalled();

@@ -298,23 +298,23 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
       normalizeId,
     });
     const sandbox = await resolveSandbox(env, providerLeaseId, { keepAlive, sleepAfter, normalizeId });
-    const existingAcquisitionId = await readSentinelAcquisitionId(sandbox, {
-      remoteCwd,
-      sessionStrategy,
-      sessionId,
-      timeoutMs,
-    });
-    if (existingAcquisitionId !== null && existingAcquisitionId !== body.acquisitionId) {
-      return toErrorResponse(
-        409,
-        "acquisition_conflict",
-        `Refusing to adopt Cloudflare sandbox ${providerLeaseId}: acquisition ownership does not match ${body.acquisitionId}.`,
-      );
-    }
     // Resolution does not reveal whether the Durable Object was created by
     // this request or already existed. Leave it intact on setup failure so a
     // host replay with the same acquisition ID can reconcile it safely.
     try {
+      const existingAcquisitionId = await readSentinelAcquisitionId(sandbox, {
+        remoteCwd,
+        sessionStrategy,
+        sessionId,
+        timeoutMs,
+      });
+      if (existingAcquisitionId !== null && existingAcquisitionId !== body.acquisitionId) {
+        return toErrorResponse(
+          409,
+          "acquisition_conflict",
+          `Refusing to adopt Cloudflare sandbox ${providerLeaseId}: acquisition ownership does not match ${body.acquisitionId}.`,
+        );
+      }
       await applySandboxKeepAlive(sandbox, keepAlive);
       await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
       await writeSentinel(sandbox, {
