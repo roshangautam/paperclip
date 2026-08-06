@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, eq, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companySecretBindings,
   companySecrets,
   companySecretVersions,
   environmentLeases,
+  heartbeatRuns,
 } from "@paperclipai/db";
 import type {
   Environment,
@@ -3697,6 +3698,7 @@ export function environmentRuntimeService(
   } = {},
 ) {
   const environmentsSvc = environmentService(db);
+  const runtimeStartedAt = new Date();
   const drivers = new Map<string, EnvironmentRuntimeDriver>();
 
   const defaultDrivers = [
@@ -3846,6 +3848,58 @@ export function environmentRuntimeService(
       ...input,
       expectedStatus: "pending_cleanup",
     });
+  }
+
+  async function promoteStaleSandboxAcquisitionReservations(updatedBefore: Date) {
+    const staleRows = await db
+      .select({ lease: environmentLeases })
+      .from(environmentLeases)
+      .leftJoin(heartbeatRuns, eq(environmentLeases.heartbeatRunId, heartbeatRuns.id))
+      .where(and(
+        eq(environmentLeases.status, "active"),
+        isNull(environmentLeases.providerLeaseId),
+        lte(environmentLeases.updatedAt, updatedBefore),
+        sql`${environmentLeases.metadata} ->> ${SANDBOX_LEASE_RESERVATION_KEY} = 'true'`,
+        sql`${environmentLeases.metadata} ->> ${SANDBOX_ACQUISITION_ID_KEY} = ${environmentLeases.id}::text`,
+        or(
+          and(
+            isNull(environmentLeases.heartbeatRunId),
+            lt(environmentLeases.updatedAt, runtimeStartedAt),
+          ),
+          isNull(heartbeatRuns.id),
+          inArray(heartbeatRuns.status, ["succeeded", "interrupted", "failed", "cancelled", "timed_out"]),
+        ),
+      ))
+      .orderBy(asc(environmentLeases.updatedAt))
+      .limit(SANDBOX_CLEANUP_RETRY_BATCH_SIZE);
+
+    for (const { lease: row } of staleRows) {
+      if (!readSandboxAcquisitionContext(toEnvironmentLeaseSnapshot(row))) continue;
+      const transitionAt = new Date();
+      await db
+        .update(environmentLeases)
+        .set({
+          status: "pending_cleanup",
+          releasedAt: transitionAt,
+          lastUsedAt: transitionAt,
+          failureReason: "provider_acquire_in_progress",
+          cleanupStatus: "failed",
+          cleanupClaimId: null,
+          cleanupClaimedAt: null,
+          metadata: sql<Record<string, unknown>>`
+            coalesce(${environmentLeases.metadata}, '{}'::jsonb)
+            || ${JSON.stringify({
+              [PENDING_CLEANUP_RELEASE_STATUS_KEY]: "failed",
+            })}::jsonb
+          `,
+        })
+        .where(and(
+          eq(environmentLeases.id, row.id),
+          eq(environmentLeases.status, "active"),
+          isNull(environmentLeases.providerLeaseId),
+          eq(environmentLeases.updatedAt, row.updatedAt),
+        ));
+    }
   }
 
   function renewPendingSandboxCleanupClaim(leaseId: string, claimId: string) {
@@ -4013,6 +4067,7 @@ export function environmentRuntimeService(
       const now = Date.now();
       const updatedBefore = new Date(now - SANDBOX_CLEANUP_RETRY_DELAY_MS);
       const claimStaleBefore = new Date(now - SANDBOX_CLEANUP_CLAIM_STALE_MS);
+      await promoteStaleSandboxAcquisitionReservations(updatedBefore);
       const claimAvailable = or(
         isNull(environmentLeases.cleanupClaimedAt),
         lte(environmentLeases.cleanupClaimedAt, claimStaleBefore),

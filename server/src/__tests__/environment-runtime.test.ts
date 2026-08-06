@@ -616,6 +616,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     supportsAcquisitionReplay?: boolean;
     secretValue?: string;
     customImageTemplateRef?: string;
+    leaveReservationActive?: boolean;
   } = {}) {
     const seeded = await seedPluginSandboxEnvironment({
       supportsAcquisitionReplay: input.supportsAcquisitionReplay ?? true,
@@ -675,19 +676,23 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
     expect(initialAcquireParams).toMatchObject({ acquisitionId: reservation?.id });
 
-    const pending = await runtimeBeforeCrash.releaseRunLeases(seeded.runId);
-    expect(pending).toHaveLength(1);
-    expect(pending[0]?.lease).toMatchObject({
-      id: reservation?.id,
-      status: "pending_cleanup",
-      providerLeaseId: null,
-      failureReason: "provider_acquire_in_progress",
-      metadata: expect.objectContaining({
-        sandboxLeaseReservation: true,
-        sandboxAcquisitionId: reservation?.id,
-        pendingCleanupReleaseStatus: "released",
-      }),
-    });
+    const pending = input.leaveReservationActive
+      ? [{ lease: reservation! }]
+      : await runtimeBeforeCrash.releaseRunLeases(seeded.runId);
+    if (!input.leaveReservationActive) {
+      expect(pending).toHaveLength(1);
+      expect(pending[0]?.lease).toMatchObject({
+        id: reservation?.id,
+        status: "pending_cleanup",
+        providerLeaseId: null,
+        failureReason: "provider_acquire_in_progress",
+        metadata: expect.objectContaining({
+          sandboxLeaseReservation: true,
+          sandboxAcquisitionId: reservation?.id,
+          pendingCleanupReleaseStatus: "released",
+        }),
+      });
+    }
     await db
       .update(environmentLeases)
       .set({ updatedAt: new Date(0) })
@@ -4433,6 +4438,58 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       pending: 0,
     });
     expect(workerManager.call).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers a stale active sandbox reservation after its owner run terminates", async () => {
+    const seeded = await seedPendingPluginSandboxAcquisition({ leaveReservationActive: true });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+
+    const recoveredWorkerManager = {
+      isRunning: vi.fn((id: string) => id === seeded.pluginId),
+      call: vi.fn(async (_pluginId: string, method: string, params: Record<string, unknown>) => {
+        if (method === "environmentAcquireLease") {
+          expect(params.acquisitionId).toBe(seeded.reservation.id);
+          return {
+            providerLeaseId: "recovered-after-terminal-owner",
+            metadata: {
+              acquisitionId: params.acquisitionId,
+              provider: "reservation-plugin",
+              image: "fake:test",
+            },
+          };
+        }
+        if (method === "environmentReleaseLease") {
+          expect(params).toMatchObject({
+            acquisitionId: seeded.reservation.id,
+            providerLeaseId: "recovered-after-terminal-owner",
+          });
+          return undefined;
+        }
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const recoveredRuntime = environmentRuntimeService(db, {
+      pluginWorkerManager: recoveredWorkerManager,
+    });
+
+    await expect(recoveredRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 1,
+      cleaned: 1,
+      pending: 0,
+    });
+    expect(recoveredWorkerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+    ]);
+    await expect(environmentService(db).getLeaseById(seeded.reservation.id)).resolves.toMatchObject({
+      status: "failed",
+      providerLeaseId: "recovered-after-terminal-owner",
+      cleanupStatus: "success",
+      metadata: expect.objectContaining({ pendingCleanupReleaseStatus: "failed" }),
+    });
   });
 
   it.each([
