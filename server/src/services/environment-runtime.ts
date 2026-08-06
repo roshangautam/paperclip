@@ -3929,7 +3929,7 @@ export function environmentRuntimeService(
             isNull(environmentLeases.heartbeatRunId),
             lt(environmentLeases.updatedAt, runtimeStartedAt),
           ),
-          isNull(heartbeatRuns.id),
+          and(isNotNull(environmentLeases.heartbeatRunId), isNull(heartbeatRuns.id)),
           inArray(heartbeatRuns.status, ["succeeded", "interrupted", "failed", "cancelled", "timed_out"]),
         ),
       ))

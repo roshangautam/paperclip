@@ -152,6 +152,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     while (fixtureRoots.length > 0) {
       const root = fixtureRoots.pop();
@@ -636,6 +637,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     secretValue?: string;
     customImageTemplateRef?: string;
     leaveReservationActive?: boolean;
+    heartbeatRunId?: string | null;
   } = {}) {
     const seeded = await seedPluginSandboxEnvironment({
       supportsAcquisitionReplay: input.supportsAcquisitionReplay ?? true,
@@ -679,7 +681,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       companyId: seeded.companyId,
       environment: seeded.environment,
       issueId: null,
-      heartbeatRunId: seeded.runId,
+      heartbeatRunId: input.heartbeatRunId === undefined ? seeded.runId : input.heartbeatRunId,
       persistedExecutionWorkspace: null,
     }).catch(() => undefined);
     await vi.waitFor(() => expect(workerManager.call).toHaveBeenCalledTimes(1));
@@ -4522,6 +4524,42 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       providerLeaseId: "recovered-after-terminal-owner",
       cleanupStatus: "success",
       metadata: expect.objectContaining({ pendingCleanupReleaseStatus: "failed" }),
+    });
+  });
+
+  it("does not recover a stale ad-hoc reservation still owned by this runtime", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const startedAt = new Date("2026-08-05T12:00:00.000Z");
+    vi.setSystemTime(startedAt);
+    const recoveryWorkerManager = {
+      isRunning: vi.fn(() => true),
+      call: vi.fn(async () => {
+        throw new Error("Live ad-hoc acquisition must not be replayed");
+      }),
+    } as unknown as PluginWorkerManager;
+    const liveRuntime = environmentRuntimeService(db, {
+      pluginWorkerManager: recoveryWorkerManager,
+    });
+    const seeded = await seedPendingPluginSandboxAcquisition({
+      heartbeatRunId: null,
+      leaveReservationActive: true,
+    });
+    await db
+      .update(environmentLeases)
+      .set({ updatedAt: startedAt })
+      .where(eq(environmentLeases.id, seeded.reservation.id));
+    vi.setSystemTime(new Date(startedAt.getTime() + 10 * 60_000));
+
+    await expect(liveRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 0,
+      cleaned: 0,
+      pending: 0,
+    });
+    expect(recoveryWorkerManager.call).not.toHaveBeenCalled();
+    await expect(environmentService(db).getLeaseById(seeded.reservation.id)).resolves.toMatchObject({
+      status: "active",
+      heartbeatRunId: null,
+      providerLeaseId: null,
     });
   });
 
