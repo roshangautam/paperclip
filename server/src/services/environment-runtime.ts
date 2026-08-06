@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companySecretBindings,
@@ -1282,36 +1282,37 @@ function createSandboxEnvironmentDriver(
     input: Parameters<typeof environmentsSvc.acquireLease>[0],
   ): Promise<EnvironmentLease | null> {
     const now = new Date();
+    const cleanupValues = {
+      executionWorkspaceId: input.executionWorkspaceId ?? null,
+      issueId: input.issueId ?? null,
+      heartbeatRunId: input.heartbeatRunId ?? null,
+      status: "pending_cleanup" as const,
+      leasePolicy: input.leasePolicy ?? "ephemeral",
+      provider: input.provider ?? null,
+      providerLeaseId: input.providerLeaseId ?? null,
+      expiresAt: input.expiresAt ?? null,
+      releasedAt: now,
+      failureReason: "acquire_handoff_failed",
+      cleanupStatus: "failed" as const,
+      metadata: sql<Record<string, unknown>>`
+        ${JSON.stringify({
+          ...(input.metadata ?? {}),
+          [LEASE_SCOPED_SECRET_BINDINGS_KEY]: true,
+        })}::jsonb
+        || jsonb_build_object(
+          'pendingCleanupReleaseStatus',
+          coalesce(
+            ${environmentLeases.metadata} -> 'pendingCleanupReleaseStatus',
+            '"expired"'::jsonb
+          )
+        )
+      `,
+      lastUsedAt: now,
+      updatedAt: now,
+    };
     const row = await db
       .update(environmentLeases)
-      .set({
-        executionWorkspaceId: input.executionWorkspaceId ?? null,
-        issueId: input.issueId ?? null,
-        heartbeatRunId: input.heartbeatRunId ?? null,
-        status: "pending_cleanup",
-        leasePolicy: input.leasePolicy ?? "ephemeral",
-        provider: input.provider ?? null,
-        providerLeaseId: input.providerLeaseId ?? null,
-        expiresAt: input.expiresAt ?? null,
-        releasedAt: now,
-        failureReason: "acquire_handoff_failed",
-        cleanupStatus: "failed",
-        metadata: sql<Record<string, unknown>>`
-          ${JSON.stringify({
-            ...(input.metadata ?? {}),
-            [LEASE_SCOPED_SECRET_BINDINGS_KEY]: true,
-          })}::jsonb
-          || jsonb_build_object(
-            'pendingCleanupReleaseStatus',
-            coalesce(
-              ${environmentLeases.metadata} -> 'pendingCleanupReleaseStatus',
-              '"expired"'::jsonb
-            )
-          )
-        `,
-        lastUsedAt: now,
-        updatedAt: now,
-      })
+      .set(cleanupValues)
       .where(and(
         eq(environmentLeases.id, reservation.id),
         inArray(environmentLeases.status, ["active", "pending_cleanup"]),
@@ -1323,17 +1324,29 @@ function createSandboxEnvironmentDriver(
       .then((rows) => rows[0] ?? null);
     if (row) return toEnvironmentLeaseSnapshot(row);
 
+    if (input.providerLeaseId) {
+      const claimedRow = await db
+        .update(environmentLeases)
+        .set(cleanupValues)
+        .where(and(
+          eq(environmentLeases.id, reservation.id),
+          eq(environmentLeases.status, "pending_cleanup"),
+          isNull(environmentLeases.providerLeaseId),
+          or(
+            isNotNull(environmentLeases.cleanupClaimId),
+            isNotNull(environmentLeases.cleanupClaimedAt),
+          ),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (claimedRow) return toEnvironmentLeaseSnapshot(claimedRow);
+    }
+
     const current = await db
       .select()
       .from(environmentLeases)
       .where(eq(environmentLeases.id, reservation.id))
       .then((rows) => rows[0] ?? null);
-    if (
-      current?.status === "pending_cleanup" &&
-      (!current.providerLeaseId && (current.cleanupClaimId || current.cleanupClaimedAt))
-    ) {
-      return null;
-    }
     if (input.providerLeaseId && current?.providerLeaseId === input.providerLeaseId) return null;
     throw new Error(`Sandbox lease reservation "${reservation.id}" changed before cleanup handoff.`);
   }

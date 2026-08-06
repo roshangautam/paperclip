@@ -2207,7 +2207,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
-  it("preserves an active cleanup claim when a provider acquisition returns late", async () => {
+  it("preserves a late provider lease id under an active cleanup claim", async () => {
     const seeded = await seedPluginSandboxEnvironment({ secretValue: "original-provider-key" });
     const replacementSecret = await secretService(db).create(seeded.companyId, {
       name: `replacement-provider-key-${randomUUID()}`,
@@ -2261,10 +2261,55 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const [reservation] = await db.select().from(environmentLeases);
     expect(reservation).toMatchObject({
       status: "pending_cleanup",
-      providerLeaseId: null,
+      providerLeaseId: "late-provider-lease",
       cleanupClaimId,
-      failureReason: "provider_acquire_in_progress",
+      failureReason: "acquire_handoff_failed",
       metadata: expect.objectContaining({ pendingCleanupReleaseStatus: "released" }),
+    });
+
+    await environmentService(db).releaseLease(reservation!.id, "pending_cleanup", {
+      failureReason: "provider_acquire_in_progress",
+      cleanupStatus: "failed",
+      expectedCleanupClaimId: cleanupClaimId,
+      expectedStatus: "pending_cleanup",
+    });
+    await environmentService(db).update(seeded.environment.id, {
+      driver: "sandbox",
+      name: seeded.environment.name,
+      config: {
+        ...seeded.environment.config,
+        apiKey: replacementSecret.id,
+      },
+    });
+    await db
+      .update(environmentLeases)
+      .set({ updatedAt: new Date(0) })
+      .where(eq(environmentLeases.id, reservation!.id));
+    const recoveredWorkerManager = {
+      isRunning: vi.fn((id: string) => id === seeded.pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        expect(method).toBe("environmentReleaseLease");
+      }),
+    } as unknown as PluginWorkerManager;
+    const recoveredRuntime = environmentRuntimeService(db, {
+      pluginWorkerManager: recoveredWorkerManager,
+    });
+
+    await expect(recoveredRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 1,
+      cleaned: 1,
+      pending: 0,
+    });
+    expect(recoveredWorkerManager.call).toHaveBeenCalledWith(
+      seeded.pluginId,
+      "environmentReleaseLease",
+      expect.objectContaining({ providerLeaseId: "late-provider-lease" }),
+      91234,
+    );
+    await expect(environmentService(db).getLeaseById(reservation!.id)).resolves.toMatchObject({
+      providerLeaseId: "late-provider-lease",
+      status: "released",
+      cleanupStatus: "success",
     });
   });
 
