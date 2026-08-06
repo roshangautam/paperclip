@@ -1004,7 +1004,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(rows[0]?.id).toBe(reservation?.id);
   });
 
-  it("does not activate a plugin sandbox after its run is released during provider acquisition", async () => {
+  it.each([
+    ["released", undefined],
+    ["failed", "failed"],
+  ] as const)("preserves %s intent when a plugin sandbox acquisition returns late", async (
+    expectedStatus,
+    releaseStatus,
+  ) => {
     const { pluginId, companyId, environment, runId } = await seedPluginSandboxEnvironment();
     let finishAcquire!: () => void;
     const acquireBlocked = new Promise<void>((resolve) => {
@@ -1042,7 +1048,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await vi.waitFor(() => expect(workerManager.call).toHaveBeenCalledTimes(1));
     const [reservation] = await db.select().from(environmentLeases);
 
-    const released = await runtimeWithPlugin.releaseRunLeases(runId);
+    const released = await runtimeWithPlugin.releaseRunLeases(runId, releaseStatus);
     expect(workerManager.call).toHaveBeenCalledTimes(1);
     finishAcquire();
     const outcome = await acquireOutcome;
@@ -1056,7 +1062,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       "environmentReleaseLease",
     ]);
     expect(finalLease?.id).toBe(reservation?.id);
-    expect(finalLease?.status).not.toBe("active");
+    expect(finalLease).toMatchObject({
+      status: expectedStatus,
+      cleanupStatus: "success",
+      metadata: expect.objectContaining({ pendingCleanupReleaseStatus: expectedStatus }),
+    });
   });
 
   it("reloads durable plugin metadata when provider handoff wins the reservation release race", async () => {

@@ -1257,11 +1257,19 @@ function createSandboxEnvironmentDriver(
         releasedAt: now,
         failureReason: "acquire_handoff_failed",
         cleanupStatus: "failed",
-        metadata: {
-          ...(input.metadata ?? {}),
-          [LEASE_SCOPED_SECRET_BINDINGS_KEY]: true,
-          [PENDING_CLEANUP_RELEASE_STATUS_KEY]: "expired",
-        },
+        metadata: sql<Record<string, unknown>>`
+          ${JSON.stringify({
+            ...(input.metadata ?? {}),
+            [LEASE_SCOPED_SECRET_BINDINGS_KEY]: true,
+          })}::jsonb
+          || jsonb_build_object(
+            'pendingCleanupReleaseStatus',
+            coalesce(
+              ${environmentLeases.metadata} -> 'pendingCleanupReleaseStatus',
+              '"expired"'::jsonb
+            )
+          )
+        `,
         lastUsedAt: now,
         updatedAt: now,
       })
@@ -1347,10 +1355,14 @@ function createSandboxEnvironmentDriver(
         return;
       }
 
+      const pendingTarget = claimedLease.metadata?.[PENDING_CLEANUP_RELEASE_STATUS_KEY];
+      const releaseStatus = pendingTarget === "released" || pendingTarget === "failed"
+        ? pendingTarget
+        : "expired";
       const release: EnvironmentDriverReleaseInput = {
         environment: cleanupEnvironment,
         lease: claimedLease,
-        status: "expired",
+        status: releaseStatus,
         cleanupClaimId: claim.claimId,
       };
       const metadataConfig = sandboxConfigFromLeaseMetadata(claimedLease);
@@ -1375,7 +1387,7 @@ function createSandboxEnvironmentDriver(
         await releaseSandboxProviderLease({
           config: config as unknown as SandboxEnvironmentConfig,
           providerLeaseId: claimedLease.providerLeaseId,
-          status: "expired",
+          status: releaseStatus,
         });
       } catch (error) {
         cleanupError = error;
