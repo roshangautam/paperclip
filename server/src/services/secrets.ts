@@ -532,7 +532,7 @@ function canonicalizeBinding(binding: EnvBinding): CanonicalEnvBinding {
   };
 }
 
-function assertClass3StaticLeaseAllowed(input: {
+export function assertClass3StaticLeaseAllowed(input: {
   targetType: SecretBindingTargetType;
   configPath: string;
   projectionClass?: string | null;
@@ -1166,6 +1166,35 @@ export function secretService(db: Db) {
       ? contextOrOptions
       : { bindingContext: contextOrOptions, accessContext: contextOrOptions };
     return (await resolveSecretValueInternal(companyId, secretId, version, options)).value;
+  }
+
+  async function resolveSecretValueForBindingWithMetadata(
+    companyId: string,
+    secretId: string,
+    context: SecretBindingContext,
+  ) {
+    const binding = await assertBindingContext(companyId, secretId, context);
+    if (!binding) {
+      throw unprocessable("Secret resolution requires a binding", { code: "binding_missing" });
+    }
+    const selector = binding.versionSelector;
+    if (selector !== "latest" && !/^[1-9]\d*$/.test(selector)) {
+      throw unprocessable("Secret binding uses an invalid version selector", { code: "version_missing" });
+    }
+    const version = selector === "latest" ? selector : Number(selector);
+    if (version !== "latest" && !Number.isSafeInteger(version)) {
+      throw unprocessable("Secret binding uses an invalid version selector", { code: "version_missing" });
+    }
+    const resolved = await resolveSecretValueInternal(companyId, secretId, version, {
+      bindingContext: context,
+      accessContext: context,
+    });
+    return {
+      value: resolved.value,
+      version: resolved.manifestEntry.version,
+      bindingId: binding.id,
+      versionSelector: binding.versionSelector,
+    };
   }
 
   async function resolveSecretValueForEphemeralAccess(
@@ -3060,6 +3089,7 @@ export function secretService(db: Db) {
     getById,
     getByName,
     resolveSecretValue,
+    resolveSecretValueForBindingWithMetadata,
     resolveSecretVersion,
     resolveSecretValueForEphemeralAccess,
 
