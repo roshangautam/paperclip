@@ -291,7 +291,9 @@ function acquisitionFailureWithLease(
     message: formatErrorMessage(error),
     data: {
       providerLeaseId,
-      ...(acquisitionId ? { cleanupVerifiedAcquisitionId: acquisitionId } : {}),
+      ...(acquisitionId
+        ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+        : {}),
     },
   });
 }
@@ -839,12 +841,19 @@ async function findSandboxByNameOrNull(
   name: string,
   acquisitionId: string,
 ): Promise<Sandbox | null> {
-  const result = await client.list(
-    { "paperclip-acquisition-id": acquisitionId },
-    1,
-    DAYTONA_SANDBOX_LIST_PAGE_SIZE,
-  );
-  const matches = result.items.filter((sandbox) => sandbox.name === name);
+  const matches: Sandbox[] = [];
+  let page = 1;
+  let totalPages = 1;
+  do {
+    const result = await client.list(
+      { "paperclip-acquisition-id": acquisitionId },
+      page,
+      DAYTONA_SANDBOX_LIST_PAGE_SIZE,
+    );
+    matches.push(...result.items.filter((sandbox) => sandbox.name === name));
+    totalPages = result.totalPages;
+    page += 1;
+  } while (page <= totalPages);
   if (matches.length > 1) {
     throw new Error(`Refusing to reconcile multiple Daytona sandboxes named ${name}.`);
   }
@@ -1175,6 +1184,11 @@ const plugin = definePlugin({
             console.warn(
               `Failed to delete Daytona sandbox after stop failure: ${formatErrorMessage(deleteError)}`,
             );
+            throw acquisitionFailureWithLease(
+              deleteError,
+              params.providerLeaseId!,
+              params.acquisitionId,
+            );
           });
         }
       }
@@ -1196,7 +1210,11 @@ const plugin = definePlugin({
       }
     }
 
-    await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
+    try {
+      await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
+    } catch (error) {
+      throw acquisitionFailureWithLease(error, params.providerLeaseId, params.acquisitionId);
+    }
   },
 
   async onEnvironmentDestroyLease(
@@ -1206,7 +1224,11 @@ const plugin = definePlugin({
     const config = parseDriverConfig(params.config);
     const sandbox = await getSandboxForCleanup(config, params);
     if (!sandbox) return;
-    await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
+    try {
+      await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
+    } catch (error) {
+      throw acquisitionFailureWithLease(error, params.providerLeaseId, params.acquisitionId);
+    }
   },
 
   async onEnvironmentRealizeWorkspace(

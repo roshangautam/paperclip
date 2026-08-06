@@ -262,6 +262,19 @@ function readPluginAcquireLeaseErrorData(
   };
 }
 
+function verifiedCleanupMetadata(
+  error: unknown,
+  lease: Pick<EnvironmentLease, "metadata" | "providerLeaseId">,
+): Record<string, string> {
+  const errorData = readPluginAcquireLeaseErrorData(error);
+  const acquisitionId = readPersistedAcquisitionId(lease.metadata);
+  return errorData?.providerLeaseId === lease.providerLeaseId
+    && errorData.cleanupVerifiedAcquisitionId === acquisitionId
+    && acquisitionId
+    ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+    : {};
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -846,6 +859,7 @@ function createSandboxEnvironmentDriver(
           environment,
           lease: cleanupLease,
           failureReason: "acquire_handoff_failed",
+          cleanupMetadata: withoutCleanupVerification(cleanupLease.metadata),
         });
         return;
       }
@@ -989,6 +1003,7 @@ function createSandboxEnvironmentDriver(
         expectedStatus: input.release.cleanupClaimId ? "pending_cleanup" : input.release.lease.status,
         metadata: {
           ...(input.release.lease.metadata ?? {}),
+          ...verifiedCleanupMetadata(input.cleanupError, input.release.lease),
           [PENDING_CLEANUP_RELEASE_STATUS_KEY]: releaseStatus,
         },
       });
@@ -1851,6 +1866,7 @@ function createSandboxEnvironmentDriver(
     lease: EnvironmentLease;
     failureReason: string;
     cleanupClaimId?: string;
+    cleanupMetadata?: Record<string, unknown>;
   }): Promise<EnvironmentLease | null> {
     let lease = input.lease;
     let cleanupClaimId = input.cleanupClaimId;
@@ -1861,7 +1877,7 @@ function createSandboxEnvironmentDriver(
       cleanupClaimId = claimed.cleanupClaimId;
     }
 
-    const metadata = lease.metadata ?? {};
+    const metadata = input.cleanupMetadata ?? lease.metadata ?? {};
     let cleanupError: unknown | null = null;
 
     try {
@@ -2156,6 +2172,7 @@ function createPluginEnvironmentDriver(
               expectedStatus: "active",
               metadata: {
                 ...(cleanupLease.metadata ?? {}),
+                ...verifiedCleanupMetadata(cleanupError, cleanupLease),
                 [PENDING_CLEANUP_RELEASE_STATUS_KEY]: "expired",
               },
             }).catch(() => null);

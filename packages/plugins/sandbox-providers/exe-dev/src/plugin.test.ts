@@ -1077,6 +1077,57 @@ describe("exe.dev sandbox provider plugin", () => {
     );
   });
 
+  it("preserves verified acquisition cleanup state after an ambiguous delete so retry can terminate", async () => {
+    const acquisitionId = "acquisition-cleanup-ambiguous-delete";
+    const vmName = "ambiguous-delete-vm";
+    const digest = createHash("sha256").update(acquisitionId).digest("hex");
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        vms: [{
+          vm_name: vmName,
+          ssh_dest: `${vmName}.exe.xyz`,
+          tags: [`paperclip-acquisition-${digest}`],
+        }],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response("response lost", { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ vms: [] }), { status: 200 }));
+
+    const error = await plugin.definition.onEnvironmentReleaseLease!({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: vmName,
+      config: { apiKey: "api-key", reuseLease: false },
+      leaseMetadata: {},
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      data: {
+        providerLeaseId: vmName,
+        cleanupVerifiedAcquisitionId: acquisitionId,
+      },
+    });
+
+    await expect(plugin.definition.onEnvironmentReleaseLease!({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: vmName,
+      config: { apiKey: "api-key", reuseLease: false },
+      leaseMetadata: (error as { data: Record<string, unknown> }).data,
+    })).resolves.toBeUndefined();
+
+    expect(fetchMock.mock.calls.map((call) => String(call[1]?.body ?? ""))).toEqual([
+      `ls -l --json '${vmName}'`,
+      `rm --json '${vmName}'`,
+      `ls -l --json '${vmName}'`,
+    ]);
+  });
+
   it.each([undefined, "another-acquisition"])(
     "keeps missing acquisition cleanup retryable without matching verification (%s)",
     async (cleanupVerifiedAcquisitionId) => {

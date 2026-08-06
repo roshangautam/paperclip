@@ -305,7 +305,9 @@ function acquisitionFailureWithLease(
     message: formatErrorMessage(error),
     data: {
       providerLeaseId,
-      ...(acquisitionId ? { cleanupVerifiedAcquisitionId: acquisitionId } : {}),
+      ...(acquisitionId
+        ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+        : {}),
     },
   });
 }
@@ -588,7 +590,11 @@ async function deleteAcquisitionVm(
     throw new Error(`exe.dev VM ${params.providerLeaseId} is not visible yet; cleanup must be retried.`);
   }
   assertAcquisitionVmOwnership(vm, params.providerLeaseId, params.acquisitionId);
-  await deleteVm(config, vm.name);
+  try {
+    await deleteVm(config, vm.name);
+  } catch (error) {
+    throw acquisitionFailureWithLease(error, vm.name, params.acquisitionId);
+  }
 }
 
 function buildSshDestination(config: ExeDevDriverConfig, vm: ExeDevVmRecord): string {
