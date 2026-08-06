@@ -20,6 +20,7 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       driverKey: "exe-dev",
       kind: "sandbox_provider",
+      supportsAcquisitionReplay: true,
       displayName: "exe.dev VM",
       description:
         "Provisions exe.dev VMs through the HTTPS API, then runs commands over direct SSH for long-lived Paperclip workloads.",
