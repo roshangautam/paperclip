@@ -88,12 +88,12 @@ export async function createJob(
     } catch (reconcileError) {
       if (reconcileError instanceof AcquisitionOwnershipMismatchError) throw reconcileError;
       if (isAmbiguousCreateError(createError)) {
-        throw acquisitionFailureWithLease(createError, name, acquisitionId);
+        throw acquisitionFailureWithLease(createError, name);
       }
       throw reconcileError;
     }
     if (isAmbiguousCreateError(createError)) {
-      throw acquisitionFailureWithLease(createError, name, acquisitionId);
+      throw acquisitionFailureWithLease(createError, name);
     }
     throw createError;
   }

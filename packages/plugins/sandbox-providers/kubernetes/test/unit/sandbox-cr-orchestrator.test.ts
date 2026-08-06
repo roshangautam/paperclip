@@ -1,5 +1,4 @@
 import {
-  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
 import { describe, it, expect, vi } from "vitest";
@@ -152,22 +151,19 @@ describe("createSandboxCr", () => {
     );
     const clients = { custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get } };
 
-    await expect(
-      createSandboxCr(
-        clients as never,
-        "ns",
-        { metadata: { name: "pc-abc", labels } },
-        acquisitionId,
-      ),
-    ).rejects.toMatchObject({
+    const failure = await createSandboxCr(
+      clients as never,
+      "ns",
+      { metadata: { name: "pc-abc", labels } },
+      acquisitionId,
+    ).then(() => null, (error: unknown) => error as { data?: unknown });
+
+    expect(failure).toMatchObject({
       name: "JsonRpcCallError",
       code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
       message: "response lost",
-      data: {
-        providerLeaseId: "pc-abc",
-        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
-      },
     });
+    expect(failure?.data).toEqual({ providerLeaseId: "pc-abc" });
     expect(get).toHaveBeenCalledTimes(2);
   });
 
@@ -178,20 +174,17 @@ describe("createSandboxCr", () => {
     const create = vi.fn().mockRejectedValue({ code: 408, message: "request timed out" });
     const clients = { custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get } };
 
-    await expect(
-      createSandboxCr(
-        clients as never,
-        "ns",
-        { metadata: { name: "pc-abc", labels } },
-        acquisitionId,
-      ),
-    ).rejects.toMatchObject({
+    const failure = await createSandboxCr(
+      clients as never,
+      "ns",
+      { metadata: { name: "pc-abc", labels } },
+      acquisitionId,
+    ).then(() => null, (error: unknown) => error as { data?: unknown });
+
+    expect(failure).toMatchObject({
       code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
-      data: {
-        providerLeaseId: "pc-abc",
-        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
-      },
     });
+    expect(failure?.data).toEqual({ providerLeaseId: "pc-abc" });
   });
 
   it("does not hand off a name collision discovered during reconciliation", async () => {
@@ -277,6 +270,52 @@ describe("getSandboxCrStatus", () => {
     const status = await getSandboxCrStatus(clients as never, "ns", "pc-abc");
     expect(status.phase).toBe("Failed");
     expect(status.reason).toBe("ImagePullFailed");
+  });
+
+  it("maps the agent-sandbox PodFailed conditions to Failed", async () => {
+    const get = vi.fn().mockResolvedValue({
+      metadata: { uid: "uid-1" },
+      status: {
+        conditions: [
+          { type: "Ready", status: "False", reason: "PodFailed" },
+          { type: "Finished", status: "True", reason: "PodFailed", message: "pod exited" },
+        ],
+      },
+    });
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    const status = await getSandboxCrStatus(clients as never, "ns", "pc-abc");
+    expect(status).toMatchObject({ phase: "Failed", reason: "PodFailed", message: "pod exited" });
+  });
+
+  it("prefers Failed=True over earlier inactive or derived failure conditions", async () => {
+    const get = vi.fn().mockResolvedValue({
+      metadata: { uid: "uid-1" },
+      status: {
+        conditions: [
+          { type: "Failed", status: "False", reason: "OldFailure" },
+          { type: "Ready", status: "False", reason: "PodFailed" },
+          { type: "Failed", status: "True", reason: "OOMKilled" },
+        ],
+      },
+    });
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    const status = await getSandboxCrStatus(clients as never, "ns", "pc-abc");
+    expect(status).toMatchObject({ phase: "Failed", reason: "OOMKilled" });
+  });
+
+  it("keeps a non-failure Ready=False condition Pending", async () => {
+    const get = vi.fn().mockResolvedValue({
+      metadata: { uid: "uid-1" },
+      status: {
+        conditions: [
+          { type: "Ready", status: "False", reason: "DependenciesNotReady" },
+        ],
+      },
+    });
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    await expect(getSandboxCrStatus(clients as never, "ns", "pc-abc")).resolves.toMatchObject({
+      phase: "Pending",
+    });
   });
 
   it("maps phase=Terminating to SandboxStatus.phase=Running with reason=Terminating", async () => {
@@ -458,5 +497,25 @@ describe("waitForSandboxReady", () => {
         pollMs: 10,
       }),
     ).rejects.toThrow(/failed.*OOMKilled/i);
+  });
+
+  it("throws immediately for the agent-sandbox PodFailed conditions", async () => {
+    const get = vi.fn().mockResolvedValue({
+      metadata: { uid: "u1" },
+      status: {
+        conditions: [
+          { type: "Ready", status: "False", reason: "PodFailed" },
+          { type: "Finished", status: "True", reason: "PodFailed", message: "pod exited" },
+        ],
+      },
+    });
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    await expect(
+      waitForSandboxReady(clients as never, "ns", "pc-abc", {
+        timeoutMs: 5000,
+        pollMs: 10,
+      }),
+    ).rejects.toThrow(/failed.*PodFailed.*pod exited/i);
+    expect(get).toHaveBeenCalledTimes(1);
   });
 });

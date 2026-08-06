@@ -501,9 +501,9 @@ const plugin = definePlugin({
         metadata: leaseMetadata as unknown as Record<string, unknown>,
       };
     } catch (error) {
-      // A replay can adopt this deterministic workload as soon as claim()
-      // returns. Hand cleanup to the host rather than racing that replay with
-      // an immediate delete from this failed setup attempt.
+      // claim() proved this deterministic workload belongs to the logical
+      // acquisition, whether this call created or adopted it. Hand cleanup to
+      // the host, which persists the retry and revalidates ownership plus UID.
       throw acquisitionFailureWithLease(error, jobName, params.acquisitionId);
     }
   },

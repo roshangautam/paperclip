@@ -112,23 +112,33 @@ function sandboxStatusSignals(status: Record<string, unknown>) {
   const conditions = Array.isArray(status.conditions)
     ? status.conditions as SandboxCondition[]
     : [];
-  const readyCondition = conditions.find((condition) => condition.type === "Ready");
-  const failedCondition = conditions.find((condition) =>
-    condition.type === "Failed"
-    || (condition.type === "Ready"
-      && condition.status === "False"
-      && typeof condition.reason === "string"
-      && /failed/i.test(condition.reason))
+  const readyCondition = conditions.find(
+    (condition) => condition.type === "Ready" && condition.status === "True",
   );
+  const hasFailureReason = (condition: SandboxCondition) =>
+    typeof condition.reason === "string" && /fail/i.test(condition.reason);
+  const failedCondition = conditions.find(
+    (condition) => condition.type === "Failed" && condition.status === "True",
+  ) ?? conditions.find(
+    (condition) => condition.type === "Finished"
+      && condition.status === "True"
+      && hasFailureReason(condition),
+  ) ?? conditions.find(
+    (condition) => condition.type === "Ready"
+      && condition.status === "False"
+      && hasFailureReason(condition),
+  );
+  const failureDetails = failedCondition
+    ?? conditions.find((condition) => condition.type === "Failed");
   const phase = (status.phase as string) ?? "";
-  const effectivePhase = phase === "Ready" || phase === "Failed" || phase === "Terminating"
+  const effectivePhase = phase === "Failed" || phase === "Terminating"
     ? phase
-    : readyCondition?.status === "True"
-      ? "Ready"
-      : failedCondition?.status === "True"
-        ? "Failed"
+    : failedCondition
+      ? "Failed"
+      : phase === "Ready" || readyCondition
+        ? "Ready"
         : phase || "Pending";
-  return { effectivePhase, readyCondition, failedCondition };
+  return { effectivePhase, readyCondition, failedCondition: failureDetails };
 }
 
 /**
@@ -215,12 +225,12 @@ export async function createSandboxCr(
     } catch (reconcileError) {
       if (reconcileError instanceof AcquisitionOwnershipMismatchError) throw reconcileError;
       if (isAmbiguousCreateError(createError)) {
-        throw acquisitionFailureWithLease(createError, name, acquisitionId);
+        throw acquisitionFailureWithLease(createError, name);
       }
       throw reconcileError;
     }
     if (isAmbiguousCreateError(createError)) {
-      throw acquisitionFailureWithLease(createError, name, acquisitionId);
+      throw acquisitionFailureWithLease(createError, name);
     }
     throw createError;
   }

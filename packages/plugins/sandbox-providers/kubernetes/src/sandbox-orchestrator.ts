@@ -1,6 +1,5 @@
 import {
   JsonRpcCallError,
-  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
 import type { KubeClients } from "./kube-client.js";
@@ -25,15 +24,11 @@ export function isAmbiguousCreateError(error: unknown): boolean {
 export function acquisitionFailureWithLease(
   error: unknown,
   providerLeaseId: string,
-  acquisitionId: string,
 ): JsonRpcCallError {
   return new JsonRpcCallError({
     code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
     message: error instanceof Error ? error.message : String(error),
-    data: {
-      providerLeaseId,
-      [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
-    },
+    data: { providerLeaseId },
   });
 }
 

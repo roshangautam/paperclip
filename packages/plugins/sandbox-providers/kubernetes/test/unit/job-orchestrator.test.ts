@@ -1,5 +1,4 @@
 import {
-  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
 import { describe, it, expect, vi } from "vitest";
@@ -88,17 +87,19 @@ describe("createJob", () => {
     );
     const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
 
-    await expect(
-      createJob(clients as never, "ns", { metadata: { name: "r-1", labels } }, acquisitionId),
-    ).rejects.toMatchObject({
+    const failure = await createJob(
+      clients as never,
+      "ns",
+      { metadata: { name: "r-1", labels } },
+      acquisitionId,
+    ).then(() => null, (error: unknown) => error as { data?: unknown });
+
+    expect(failure).toMatchObject({
       name: "JsonRpcCallError",
       code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
       message: "response lost",
-      data: {
-        providerLeaseId: "r-1",
-        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
-      },
     });
+    expect(failure?.data).toEqual({ providerLeaseId: "r-1" });
     expect(read).toHaveBeenCalledTimes(2);
   });
 
@@ -109,15 +110,17 @@ describe("createJob", () => {
     const create = vi.fn().mockRejectedValue({ code: 408, message: "request timed out" });
     const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
 
-    await expect(
-      createJob(clients as never, "ns", { metadata: { name: "r-1", labels } }, acquisitionId),
-    ).rejects.toMatchObject({
+    const failure = await createJob(
+      clients as never,
+      "ns",
+      { metadata: { name: "r-1", labels } },
+      acquisitionId,
+    ).then(() => null, (error: unknown) => error as { data?: unknown });
+
+    expect(failure).toMatchObject({
       code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
-      data: {
-        providerLeaseId: "r-1",
-        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
-      },
     });
+    expect(failure?.data).toEqual({ providerLeaseId: "r-1" });
   });
 
   it("does not hand off a name collision discovered during reconciliation", async () => {
