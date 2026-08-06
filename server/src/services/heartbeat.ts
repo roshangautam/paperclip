@@ -16644,6 +16644,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         message: options.eventMessage ?? "run cancelled",
         ...(options.eventPayload ? { payload: options.eventPayload } : {}),
       });
+      await releaseEnvironmentLeasesForRun({
+        runId: cancelled.id,
+        companyId: cancelled.companyId,
+        agentId: cancelled.agentId,
+        status: cancelled.status,
+        failureReason: cancelled.error ?? undefined,
+      });
+      await releaseRuntimeServicesForRun(cancelled.id).catch((err) => {
+        logger.warn({ err, runId: cancelled.id }, "failed to release runtime services for cancelled heartbeat run");
+      });
       await releaseIssueExecutionAndPromote(cancelled);
     }
 
@@ -16660,7 +16670,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
+      const cancelled = await setRunStatus(run.id, "cancelled", {
         finishedAt: new Date(),
         error: reason,
         errorCode,
@@ -16692,7 +16702,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId: run.processGroupId,
         });
       }
-      await releaseIssueExecutionAndPromote(run);
+      if (cancelled) {
+        await releaseEnvironmentLeasesForRun({
+          runId: cancelled.id,
+          companyId: cancelled.companyId,
+          agentId: cancelled.agentId,
+          status: cancelled.status,
+          failureReason: cancelled.error ?? undefined,
+        });
+        await releaseRuntimeServicesForRun(cancelled.id).catch((err) => {
+          logger.warn({ err, runId: cancelled.id }, "failed to release runtime services for cancelled heartbeat run");
+        });
+        await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
+      }
     }
 
     return runs.length;

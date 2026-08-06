@@ -552,22 +552,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   async function seedEnvironmentLeaseFixture(input: {
     companyId: string;
     runId: string;
-    issueId: string;
+    issueId: string | null;
     provider?: string;
   }) {
-    const environmentId = randomUUID();
     const leaseId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
-
-    await db.insert(environments).values({
-      id: environmentId,
-      companyId: input.companyId,
-      name: "Local test environment",
-      driver: "local",
-      status: "active",
-      config: {},
-      metadata: null,
-    });
+    let environmentId = await db
+      .select({ id: environments.id })
+      .from(environments)
+      .where(eq(environments.driver, "local"))
+      .then((rows) => rows[0]?.id ?? null);
+    if (!environmentId) {
+      environmentId = randomUUID();
+      await db.insert(environments).values({
+        id: environmentId,
+        name: "Local test environment",
+        driver: "local",
+        status: "active",
+        config: {},
+        metadata: null,
+      });
+    }
 
     await db.insert(environmentLeases).values({
       id: leaseId,
@@ -3423,6 +3428,55 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       effectiveTimeoutSec: 0,
       timeoutConfigured: false,
       timeoutFired: false,
+    });
+  });
+
+  it("releases active environment leases when a run is cancelled directly", async () => {
+    const { runId, companyId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: false,
+    });
+    const { leaseId } = await seedEnvironmentLeaseFixture({
+      companyId,
+      runId,
+      issueId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.cancelRun(runId);
+
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(lease?.status).toBe("expired");
+    expect(lease?.releasedAt).toBeTruthy();
+  });
+
+  it("releases active environment leases without stranding the issue when an agent pause cancels a run", async () => {
+    const { agentId, runId, issueId, companyId } = await seedRunFixture({
+      agentStatus: "paused",
+    });
+    const { leaseId } = await seedEnvironmentLeaseFixture({
+      companyId,
+      runId,
+      issueId,
+    });
+    const heartbeat = heartbeatService(db);
+
+    await expect(heartbeat.cancelActiveForAgent(agentId)).resolves.toBe(1);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "agent_paused" });
+
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(lease?.status).toBe("expired");
+    expect(lease?.releasedAt).toBeTruthy();
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({
+      status: "in_progress",
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
     });
   });
 
