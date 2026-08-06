@@ -64,7 +64,7 @@ import {
   resumePluginEnvironmentLease,
 } from "./plugin-environment-driver.js";
 import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
-import { secretService } from "./secrets.js";
+import { assertClass3StaticLeaseAllowed, secretService } from "./secrets.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
@@ -857,6 +857,69 @@ function createSandboxEnvironmentDriver(
     return parsed;
   }
 
+  async function validateSandboxSecretVersions(input: {
+    txDb: Db;
+    companyId: string;
+    bindings: Array<{
+      secretId: string;
+      version: number;
+      configPath: string;
+      projectionClass: string | null;
+      projectionAllowlistKey: string | null;
+    }>;
+  }): Promise<void> {
+    if (input.bindings.length === 0) return;
+
+    const secretIds = [...new Set(input.bindings.map((binding) => binding.secretId))];
+    const secrets = await input.txDb
+      .select({ id: companySecrets.id, status: companySecrets.status })
+      .from(companySecrets)
+      .where(and(
+        eq(companySecrets.companyId, input.companyId),
+        inArray(companySecrets.id, secretIds),
+      ));
+    const activeSecretIds = new Set(
+      secrets.filter((secret) => secret.status === "active").map((secret) => secret.id),
+    );
+    const versionNumbers = [...new Set(input.bindings.map((binding) => binding.version))];
+    const versions = await input.txDb
+      .select({
+        secretId: companySecretVersions.secretId,
+        version: companySecretVersions.version,
+        status: companySecretVersions.status,
+        revokedAt: companySecretVersions.revokedAt,
+      })
+      .from(companySecretVersions)
+      .where(and(
+        inArray(companySecretVersions.secretId, secretIds),
+        inArray(companySecretVersions.version, versionNumbers),
+      ));
+    const activeVersions = new Set(
+      versions
+        .filter((version) =>
+          version.status !== "disabled" && version.status !== "destroyed" && !version.revokedAt
+        )
+        .map((version) => `${version.secretId}:${version.version}`),
+    );
+
+    for (const binding of input.bindings) {
+      assertClass3StaticLeaseAllowed({
+        targetType: "environment",
+        configPath: binding.configPath,
+        projectionClass: binding.projectionClass,
+        projectionAllowlistKey: binding.projectionAllowlistKey,
+      });
+      if (
+        !activeSecretIds.has(binding.secretId) ||
+        !activeVersions.has(`${binding.secretId}:${binding.version}`)
+      ) {
+        throw new Error(
+          `Sandbox secret binding changed while acquiring lease at "${binding.configPath}".`,
+        );
+      }
+    }
+  }
+
   async function copyEnvironmentSecretBindingsToLease(input: {
     txDb: Db;
     companyId: string;
@@ -887,7 +950,7 @@ function createSandboxEnvironmentDriver(
         inArray(companySecretBindings.configPath, input.secretRefs.map((ref) => ref.configPath)),
       ));
     const bindingsByPath = new Map(bindings.map((binding) => [binding.configPath, binding]));
-    const secrets = secretService(input.txDb);
+    const bindingsToValidate: Parameters<typeof validateSandboxSecretVersions>[0]["bindings"] = [];
     const leaseBindings: Array<typeof companySecretBindings.$inferInsert> = [];
     for (const ref of input.secretRefs) {
       const binding = bindingsByPath.get(ref.configPath);
@@ -902,32 +965,31 @@ function createSandboxEnvironmentDriver(
       ) {
         throw new Error(`Sandbox secret binding changed while acquiring lease at "${ref.configPath}".`);
       }
-      const resolvedVersion = await secrets.resolveSecretVersion(
-        input.companyId,
-        binding.secretId,
-        resolved.version,
-        {
-          consumerType: "environment",
-          consumerId: input.environmentId,
-          configPath: binding.configPath,
-        },
-      );
-      if (resolvedVersion !== resolved.version) {
-        throw new Error(`Sandbox secret binding changed while acquiring lease at "${ref.configPath}".`);
-      }
+      bindingsToValidate.push({
+        secretId: binding.secretId,
+        version: resolved.version,
+        configPath: binding.configPath,
+        projectionClass: binding.projectionClass,
+        projectionAllowlistKey: binding.projectionAllowlistKey,
+      });
       leaseBindings.push({
         companyId: binding.companyId,
         secretId: binding.secretId,
         targetType: "environment_lease" as const,
         targetId: input.leaseId,
         configPath: binding.configPath,
-        versionSelector: String(resolvedVersion),
+        versionSelector: String(resolved.version),
         required: binding.required,
         label: binding.label,
         projectionClass: binding.projectionClass,
         projectionAllowlistKey: binding.projectionAllowlistKey,
       });
     }
+    await validateSandboxSecretVersions({
+      txDb: input.txDb,
+      companyId: input.companyId,
+      bindings: bindingsToValidate,
+    });
     await input.txDb.insert(companySecretBindings).values(leaseBindings);
   }
 
@@ -1007,7 +1069,7 @@ function createSandboxEnvironmentDriver(
     const environmentBindingsByPath = new Map(
       environmentBindings.map((binding) => [binding.configPath, binding]),
     );
-    const secrets = secretService(input.txDb);
+    const bindingsToValidate: Parameters<typeof validateSandboxSecretVersions>[0]["bindings"] = [];
     for (const resolved of input.resolvedSecretVersions) {
       const leaseBinding = leaseBindingsByPath.get(resolved.configPath);
       const environmentBinding = environmentBindingsByPath.get(resolved.configPath);
@@ -1027,30 +1089,31 @@ function createSandboxEnvironmentDriver(
           `Sandbox secret binding changed while acquiring lease at "${resolved.configPath}".`,
         );
       }
-      const validatedVersion = await secrets.resolveSecretVersion(
-        input.companyId,
-        environmentBinding.secretId,
-        resolved.version,
-        {
-          consumerType: "environment",
-          consumerId: input.environmentId,
-          configPath: environmentBinding.configPath,
-        },
-      );
       const frozenLeaseVersion = parseSandboxSecretVersionSelector(
         leaseBinding.versionSelector,
         leaseBinding.configPath,
       );
       if (
         frozenLeaseVersion === "latest" ||
-        frozenLeaseVersion !== resolved.version ||
-        validatedVersion !== resolved.version
+        frozenLeaseVersion !== resolved.version
       ) {
         throw new Error(
           `Sandbox secret binding changed while acquiring lease at "${leaseBinding.configPath}".`,
         );
       }
+      bindingsToValidate.push({
+        secretId: environmentBinding.secretId,
+        version: resolved.version,
+        configPath: environmentBinding.configPath,
+        projectionClass: environmentBinding.projectionClass,
+        projectionAllowlistKey: environmentBinding.projectionAllowlistKey,
+      });
     }
+    await validateSandboxSecretVersions({
+      txDb: input.txDb,
+      companyId: input.companyId,
+      bindings: bindingsToValidate,
+    });
   }
 
   async function acquireSandboxLease(

@@ -532,7 +532,7 @@ function canonicalizeBinding(binding: EnvBinding): CanonicalEnvBinding {
   };
 }
 
-function assertClass3StaticLeaseAllowed(input: {
+export function assertClass3StaticLeaseAllowed(input: {
   targetType: SecretBindingTargetType;
   configPath: string;
   projectionClass?: string | null;

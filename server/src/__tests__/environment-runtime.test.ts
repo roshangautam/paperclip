@@ -532,6 +532,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     supportsReusableLeases?: boolean;
     supportsAcquisitionReplay?: boolean;
     secretValue?: string;
+    secondarySecretValue?: string;
   } = {}) {
     const pluginId = randomUUID();
     const { companyId, agentId, environment: baseEnvironment, runId } = await seedEnvironment();
@@ -542,12 +543,20 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           value: input.secretValue,
         })
       : null;
+    const secondaryApiSecret = input.secondarySecretValue
+      ? await secretService(db).create(companyId, {
+          name: `reservation-plugin-secondary-api-key-${randomUUID()}`,
+          provider: "local_encrypted",
+          value: input.secondarySecretValue,
+        })
+      : null;
     const providerConfig = {
       provider: "reservation-plugin",
       image: "fake:test",
       timeoutMs: 1234,
       reuseLease: input.reuseLease ?? false,
       ...(apiSecret ? { apiKey: apiSecret.id } : {}),
+      ...(secondaryApiSecret ? { secondaryApiKey: secondaryApiSecret.id } : {}),
     };
     const environment = {
       ...baseEnvironment,
@@ -562,6 +571,15 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         targetType: "environment",
         targetId: environment.id,
         configPath: "apiKey",
+      });
+    }
+    if (secondaryApiSecret) {
+      await secretService(db).createBinding({
+        companyId,
+        secretId: secondaryApiSecret.id,
+        targetType: "environment",
+        targetId: environment.id,
+        configPath: "secondaryApiKey",
       });
     }
     await environmentService(db).update(environment.id, {
@@ -597,6 +615,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             properties: {
               image: { type: "string" },
               apiKey: { type: "string", format: "secret-ref" },
+              secondaryApiKey: { type: "string", format: "secret-ref" },
               timeoutMs: { type: "number" },
               reuseLease: { type: "boolean" },
             },
@@ -608,7 +627,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       updatedAt: new Date(),
     } as any);
 
-    return { pluginId, companyId, agentId, environment, runId, apiSecret };
+    return { pluginId, companyId, agentId, environment, runId, apiSecret, secondaryApiSecret };
   }
 
   async function seedPendingPluginSandboxAcquisition(input: {
@@ -708,7 +727,10 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   }
 
   it("pins the secret version that produced sandbox provider plaintext", async () => {
-    const seeded = await seedPluginSandboxEnvironment({ secretValue: "version-one" });
+    const seeded = await seedPluginSandboxEnvironment({
+      secretValue: "version-one",
+      secondarySecretValue: "secondary-version-one",
+    });
     expect(seeded.apiSecret).not.toBeNull();
 
     const originalResolve = localEncryptedProvider.resolveVersion.bind(localEncryptedProvider);
@@ -723,6 +745,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
 
     let receivedApiKey: unknown;
+    let receivedSecondaryApiKey: unknown;
     const workerManager = {
       isRunning: vi.fn((id: string) => id === seeded.pluginId),
       call: vi.fn(async (_pluginId: string, method: string, params: Record<string, any>) => {
@@ -730,6 +753,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           throw new Error(`Unexpected plugin method: ${method}`);
         }
         receivedApiKey = params.config.apiKey;
+        receivedSecondaryApiKey = params.config.secondaryApiKey;
         return {
           providerLeaseId: "secret-version-race-lease",
           metadata: { provider: "reservation-plugin", image: "fake:test" },
@@ -747,21 +771,30 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
 
     expect(receivedApiKey).toBe("version-one");
+    expect(receivedSecondaryApiKey).toBe("secondary-version-one");
     const [secret] = await db
       .select()
       .from(companySecrets)
       .where(eq(companySecrets.id, seeded.apiSecret!.id));
     expect(secret?.latestVersion).toBe(2);
-    const [leaseBinding] = await db
+    const leaseBindings = await db
       .select()
       .from(companySecretBindings)
       .where(eq(companySecretBindings.targetId, acquired.lease.id));
-    expect(leaseBinding).toMatchObject({
-      targetType: "environment_lease",
-      secretId: seeded.apiSecret!.id,
-      configPath: "apiKey",
-      versionSelector: "1",
-    });
+    expect(leaseBindings).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        targetType: "environment_lease",
+        secretId: seeded.apiSecret!.id,
+        configPath: "apiKey",
+        versionSelector: "1",
+      }),
+      expect.objectContaining({
+        targetType: "environment_lease",
+        secretId: seeded.secondaryApiSecret!.id,
+        configPath: "secondaryApiKey",
+        versionSelector: "1",
+      }),
+    ]));
   });
 
   it("does not resume a reusable sandbox fingerprinted after its secret rotated", async () => {
