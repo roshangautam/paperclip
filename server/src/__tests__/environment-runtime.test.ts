@@ -1174,9 +1174,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(releaseParams).toMatchObject({
       acquisitionId: acquireParams.acquisitionId,
       providerLeaseId: "structured-failed-acquisition",
-      leaseMetadata: {
-        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquireParams.acquisitionId,
-      },
+      leaseMetadata: expect.not.objectContaining({
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: expect.anything(),
+      }),
     });
     const [terminal] = await db.select().from(environmentLeases);
     expect(terminal).toMatchObject({
@@ -3637,9 +3637,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(workerManager.call.mock.calls[1]?.[2]).toMatchObject({
       acquisitionId: acquireParams.acquisitionId,
       providerLeaseId: "structured-generic-acquisition",
-      leaseMetadata: {
-        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquireParams.acquisitionId,
-      },
+      leaseMetadata: expect.not.objectContaining({
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: expect.anything(),
+      }),
     });
     const [terminal] = await db.select().from(environmentLeases);
     expect(terminal).toMatchObject({

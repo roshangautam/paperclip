@@ -223,6 +223,16 @@ const SANDBOX_CLEANUP_CLAIM_STALE_MS = 5 * 60 * 1000;
 const SANDBOX_CLEANUP_CLAIM_RENEW_MS = 60 * 1000;
 const SANDBOX_CLEANUP_RETRY_BATCH_SIZE = 10;
 const PENDING_CLEANUP_RELEASE_STATUS_KEY = "pendingCleanupReleaseStatus";
+
+function withoutCleanupVerification(
+  metadata: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | undefined {
+  if (!metadata) return undefined;
+  const copy = { ...metadata };
+  delete copy[PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY];
+  return copy;
+}
+
 const PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY = "sandboxProviderConfig";
 const LEASE_SCOPED_SECRET_BINDINGS_KEY = "leaseScopedSecretBindings";
 const SANDBOX_ACQUISITION_ID_KEY = "sandboxAcquisitionId";
@@ -801,7 +811,7 @@ function createSandboxEnvironmentDriver(
               config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
               ...(acquisitionId ? { acquisitionId } : {}),
               providerLeaseId: input.providerLeaseId ?? null,
-              leaseMetadata: input.metadata ?? undefined,
+              leaseMetadata: withoutCleanupVerification(input.metadata),
             },
             resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)),
           );
@@ -851,7 +861,11 @@ function createSandboxEnvironmentDriver(
         cleanupLease.metadata?.sandboxProviderPlugin ||
         (looseConfig && !isBuiltinSandboxProvider(looseConfig.provider))
       ) {
-        await releasePluginBackedSandboxLease(release, "acquire_handoff_failed");
+        await releasePluginBackedSandboxLease(
+          release,
+          "acquire_handoff_failed",
+          withoutCleanupVerification(cleanupLease.metadata),
+        );
         return;
       }
 
@@ -1763,6 +1777,7 @@ function createSandboxEnvironmentDriver(
   async function releasePluginBackedSandboxLease(
     input: EnvironmentDriverReleaseInput,
     failureReason?: string,
+    leaseMetadata = input.lease.metadata ?? undefined,
   ): Promise<EnvironmentLease | null> {
     const metadata = input.lease.metadata ?? {};
     const pluginId = readString(metadata.pluginId);
@@ -1784,7 +1799,7 @@ function createSandboxEnvironmentDriver(
           config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
           ...acquisitionIdentityParams(metadata),
           providerLeaseId: input.lease.providerLeaseId,
-          leaseMetadata: metadata,
+          leaseMetadata,
         }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)));
       } catch (error) {
         cleanupError = error;
@@ -2124,7 +2139,7 @@ function createPluginEnvironmentDriver(
             config: parsed.config.driverConfig,
             acquisitionId,
             providerLeaseId: errorData.providerLeaseId,
-            leaseMetadata: cleanupMetadata,
+            leaseMetadata: withoutCleanupVerification(cleanupMetadata),
           });
           cleanupError = null;
           if (cleanupLease) {
@@ -2178,9 +2193,6 @@ function createPluginEnvironmentDriver(
           pluginKey: parsed.config.pluginKey,
           driverKey: parsed.config.driverKey,
           acquisitionId,
-          ...(providerLease.metadata?.[PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY] === acquisitionId
-            ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
-            : {}),
         },
       });
     },

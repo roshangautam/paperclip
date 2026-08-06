@@ -822,10 +822,7 @@ async function buildLease(
     metadata: {
       provider: "exe-dev",
       vmName: vm.name,
-      ...(acquisitionId ? {
-        acquisitionId,
-        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
-      } : {}),
+      ...(acquisitionId ? { acquisitionId } : {}),
       sshDest: vm.sshDest,
       httpsUrl: vm.httpsUrl,
       region: vm.region,

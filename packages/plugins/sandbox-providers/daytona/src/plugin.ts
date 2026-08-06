@@ -472,10 +472,7 @@ function leaseMetadata(input: {
     sandboxId: input.sandbox.id,
     sandboxName: input.sandbox.name,
     sandboxState: input.sandbox.state ?? null,
-    ...(input.acquisitionId ? {
-      acquisitionId: input.acquisitionId,
-      [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: input.acquisitionId,
-    } : {}),
+    ...(input.acquisitionId ? { acquisitionId: input.acquisitionId } : {}),
     image: input.config.image,
     snapshot: input.config.snapshot,
     target: input.sandbox.target,

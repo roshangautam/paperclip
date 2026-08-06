@@ -361,9 +361,11 @@ describe("exe.dev sandbox provider plugin", () => {
       providerLeaseId: vmName,
       metadata: {
         acquisitionId,
-        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
       },
     });
+    expect(lease?.metadata).not.toHaveProperty(
+      PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+    );
   });
 
   it.each(["name", "tag"] as const)(

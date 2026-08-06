@@ -369,9 +369,11 @@ describe("Daytona sandbox provider plugin", () => {
       providerLeaseId: "sandbox-replay",
       metadata: {
         acquisitionId,
-        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
       },
     });
+    expect(lease?.metadata).not.toHaveProperty(
+      PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+    );
   });
 
   it("hands off an existing acquisition sandbox when restarting it fails", async () => {
