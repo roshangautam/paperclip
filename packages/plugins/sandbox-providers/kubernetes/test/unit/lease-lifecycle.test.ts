@@ -304,6 +304,32 @@ describe("destroyLeaseResources", () => {
     });
   });
 
+  it("does not delete replacement children when the workload UID was not observed", async () => {
+    const clients = {
+      ...makeClients(),
+      core: {
+        readNamespacedPod: vi.fn(),
+        readNamespacedSecret: vi.fn(),
+        deleteNamespacedPod: vi.fn(),
+        deleteNamespacedSecret: vi.fn(),
+      },
+    };
+    await destroyLeaseResources(clients as never, {
+      namespace: "ns",
+      name: "pc-job",
+      backend: "job",
+      podName: "pc-job-pod",
+      secretName: "pc-job-env",
+      workloadUid: null,
+      acquisitionId: "acquisition-1",
+    });
+    expect(clients.batch.deleteNamespacedJob).not.toHaveBeenCalled();
+    expect(clients.core.readNamespacedPod).not.toHaveBeenCalled();
+    expect(clients.core.readNamespacedSecret).not.toHaveBeenCalled();
+    expect(clients.core.deleteNamespacedPod).not.toHaveBeenCalled();
+    expect(clients.core.deleteNamespacedSecret).not.toHaveBeenCalled();
+  });
+
   it("is idempotent: every 404 is treated as success", async () => {
     const clients = {
       custom: { deleteNamespacedCustomObject: vi.fn().mockRejectedValue(notFound()) },

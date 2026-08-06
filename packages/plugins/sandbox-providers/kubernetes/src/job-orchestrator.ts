@@ -1,16 +1,15 @@
 import type { KubeClients } from "./kube-client.js";
-import type {
-  SandboxClaimResult,
-  SandboxOrchestrator,
-  SandboxStatus,
+import {
+  AcquisitionOwnershipMismatchError,
+  acquisitionFailureWithLease,
+  isAmbiguousCreateError,
+  kubeStatusCode,
+  type SandboxClaimResult,
+  type SandboxOrchestrator,
+  type SandboxStatus,
 } from "./sandbox-orchestrator.js";
 
 const MANAGED_BY = "paperclip-k8s-plugin";
-
-function statusCode(error: unknown): number | undefined {
-  return (error as { code?: number; statusCode?: number } | null)?.code
-    ?? (error as { code?: number; statusCode?: number } | null)?.statusCode;
-}
 
 function jobNameFromManifest(manifest: Record<string, unknown>): string {
   const metadata = manifest.metadata as { name?: unknown } | undefined;
@@ -32,7 +31,7 @@ function validateAcquiredJob(
     metadata?.labels?.["paperclip.io/managed-by"] !== MANAGED_BY
     || metadata.labels["paperclip.io/acquisition-id"] !== acquisitionId
   ) {
-    throw new Error(
+    throw new AcquisitionOwnershipMismatchError(
       `Refusing to adopt Kubernetes Job ${name}: acquisition ownership does not match ${acquisitionId}.`,
     );
   }
@@ -52,7 +51,7 @@ async function readAcquiredJob(
     const job = await clients.batch.readNamespacedJob({ namespace, name });
     return validateAcquiredJob(job, name, acquisitionId);
   } catch (error) {
-    if (statusCode(error) === 404) return null;
+    if (kubeStatusCode(error) === 404) return null;
     throw error;
   }
 }
@@ -83,8 +82,19 @@ export async function createJob(
     // A timeout/409 can mean the API server committed the create but the
     // response was lost. Re-read the exact deterministic name once and adopt
     // only if both Paperclip ownership labels match.
-    const reconciled = await readAcquiredJob(clients, namespace, name, acquisitionId);
-    if (reconciled) return reconciled;
+    try {
+      const reconciled = await readAcquiredJob(clients, namespace, name, acquisitionId);
+      if (reconciled) return reconciled;
+    } catch (reconcileError) {
+      if (reconcileError instanceof AcquisitionOwnershipMismatchError) throw reconcileError;
+      if (isAmbiguousCreateError(createError)) {
+        throw acquisitionFailureWithLease(createError, name, acquisitionId);
+      }
+      throw reconcileError;
+    }
+    if (isAmbiguousCreateError(createError)) {
+      throw acquisitionFailureWithLease(createError, name, acquisitionId);
+    }
     throw createError;
   }
 }
@@ -112,9 +122,29 @@ export async function getJobStatus(
     return { phase: "Succeeded", complete: true, active, succeeded, failed };
   }
   if (active > 0) {
-    return { phase: "Running", complete: false, active, succeeded, failed };
+    const pods = await listPodsForJob(clients, namespace, name);
+    if (pods.some((pod) => pod.status?.phase === "Running")) {
+      return { phase: "Running", complete: false, active, succeeded, failed };
+    }
+    if (!pods.some((pod) => pod.status?.phase === "Pending")) {
+      return { phase: "Running", complete: false, active, succeeded, failed };
+    }
   }
   return { phase: "Pending", complete: false, active, succeeded, failed };
+}
+
+type JobPod = { metadata?: { name?: string }; status?: { phase?: string } };
+
+async function listPodsForJob(
+  clients: KubeClients,
+  namespace: string,
+  jobName: string,
+): Promise<JobPod[]> {
+  const result = await clients.core.listNamespacedPod({
+    namespace,
+    labelSelector: `job-name=${jobName}`,
+  });
+  return ((result as { items?: JobPod[] }).items) ?? [];
 }
 
 export async function findPodForJob(
@@ -122,11 +152,7 @@ export async function findPodForJob(
   namespace: string,
   jobName: string,
 ): Promise<string | null> {
-  const result = await clients.core.listNamespacedPod({
-    namespace,
-    labelSelector: `job-name=${jobName}`,
-  });
-  const items = ((result as { items?: { metadata?: { name?: string }; status?: { phase?: string } }[] }).items) ?? [];
+  const items = await listPodsForJob(clients, namespace, jobName);
   const running = items.find((p) => p.status?.phase === "Running");
   return (running ?? items[0])?.metadata?.name ?? null;
 }
@@ -152,11 +178,13 @@ export async function deleteJob(
   clients: KubeClients,
   namespace: string,
   name: string,
+  uid?: string,
 ): Promise<void> {
   await clients.batch.deleteNamespacedJob({
     namespace,
     name,
     propagationPolicy: "Foreground",
+    ...(uid ? { body: { preconditions: { uid } } } : {}),
   });
 }
 

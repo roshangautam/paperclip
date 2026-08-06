@@ -113,8 +113,8 @@ Expected:
 - Role `paperclip-tenant-role`, RoleBinding `paperclip-tenant-rb`
 - ResourceQuota `paperclip-quota`, LimitRange `paperclip-limits`
 - NetworkPolicies `paperclip-deny-all` + `paperclip-egress-allow`
-- Job `pc-{ulid}` and its child Pod
-- Secret `pc-{ulid}-env` with `ownerReferences` pointing at the Job
+- Job `pc-acq-{32-hex}` and its child Pod
+- Secret `pc-acq-{32-hex}-env` with `ownerReferences` pointing at the Job
 
 ### 8. Tear down
 

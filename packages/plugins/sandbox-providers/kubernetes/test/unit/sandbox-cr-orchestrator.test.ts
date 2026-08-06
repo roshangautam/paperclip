@@ -1,3 +1,7 @@
+import {
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import { describe, it, expect, vi } from "vitest";
 import {
   createSandboxCr,
@@ -104,6 +108,25 @@ describe("createSandboxCr", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it("does not hand off a lease before create when the initial ownership read fails", async () => {
+    const get = vi.fn().mockRejectedValue(new Error("API unavailable"));
+    const create = vi.fn();
+    const clients = {
+      custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get },
+    };
+
+    const failure = await createSandboxCr(
+      clients as never,
+      "ns",
+      { metadata: { name: "pc-abc", labels } },
+      acquisitionId,
+    ).then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({ message: "API unavailable" });
+    expect(failure).not.toHaveProperty("data");
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it("reconciles an ambiguous create error by exact name and ownership", async () => {
     const get = vi.fn()
       .mockRejectedValueOnce({ code: 404 })
@@ -121,6 +144,78 @@ describe("createSandboxCr", () => {
     ).resolves.toEqual({ uid: "committed-uid", created: false });
     expect(get).toHaveBeenCalledTimes(2);
   });
+
+  it("preserves the deterministic lease id when an ambiguous create is not visible yet", async () => {
+    const get = vi.fn().mockRejectedValue({ code: 404 });
+    const create = vi.fn().mockRejectedValue(
+      Object.assign(new Error("response lost"), { code: "ECONNRESET" }),
+    );
+    const clients = { custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get } };
+
+    await expect(
+      createSandboxCr(
+        clients as never,
+        "ns",
+        { metadata: { name: "pc-abc", labels } },
+        acquisitionId,
+      ),
+    ).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "response lost",
+      data: {
+        providerLeaseId: "pc-abc",
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
+      },
+    });
+    expect(get).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves the deterministic lease id when reconciliation itself fails", async () => {
+    const get = vi.fn()
+      .mockRejectedValueOnce({ code: 404 })
+      .mockRejectedValueOnce({ code: 503 });
+    const create = vi.fn().mockRejectedValue({ code: 408, message: "request timed out" });
+    const clients = { custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get } };
+
+    await expect(
+      createSandboxCr(
+        clients as never,
+        "ns",
+        { metadata: { name: "pc-abc", labels } },
+        acquisitionId,
+      ),
+    ).rejects.toMatchObject({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      data: {
+        providerLeaseId: "pc-abc",
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
+      },
+    });
+  });
+
+  it("does not hand off a name collision discovered during reconciliation", async () => {
+    const get = vi.fn()
+      .mockRejectedValueOnce({ code: 404 })
+      .mockResolvedValueOnce({
+        metadata: {
+          uid: "other-uid",
+          labels: { ...labels, "paperclip.io/acquisition-id": "other-acquisition" },
+        },
+      });
+    const create = vi.fn().mockRejectedValue({ code: 409, message: "already exists" });
+    const clients = { custom: { createNamespacedCustomObject: create, getNamespacedCustomObject: get } };
+
+    const failure = await createSandboxCr(
+      clients as never,
+      "ns",
+      { metadata: { name: "pc-abc", labels } },
+      acquisitionId,
+    ).then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({ message: expect.stringMatching(/ownership does not match/) });
+    expect(failure).not.toHaveProperty("data");
+  });
 });
 
 describe("getSandboxCrStatus", () => {
@@ -131,6 +226,17 @@ describe("getSandboxCrStatus", () => {
     expect(status.phase).toBe("Running");
     expect(status.active).toBe(1);
     expect(status.complete).toBe(false);
+  });
+
+  it("maps a conditions-only Ready Sandbox to Running", async () => {
+    const get = vi.fn().mockResolvedValue({
+      metadata: { uid: "uid-1" },
+      status: { conditions: [{ type: "Ready", status: "True" }] },
+    });
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    const status = await getSandboxCrStatus(clients as never, "ns", "pc-abc");
+    expect(status.phase).toBe("Running");
+    expect(status.active).toBe(1);
   });
 
   it("maps phase=Pending to SandboxStatus.phase=Pending", async () => {
@@ -155,6 +261,21 @@ describe("getSandboxCrStatus", () => {
     const status = await getSandboxCrStatus(clients as never, "ns", "pc-abc");
     expect(status.phase).toBe("Failed");
     expect(status.failed).toBe(1);
+    expect(status.reason).toBe("ImagePullFailed");
+  });
+
+  it("maps a conditions-only Failed Sandbox to Failed", async () => {
+    const get = vi.fn().mockResolvedValue({
+      metadata: { uid: "uid-1" },
+      status: {
+        conditions: [
+          { type: "Failed", status: "True", reason: "ImagePullFailed", message: "no image" },
+        ],
+      },
+    });
+    const clients = { custom: { getNamespacedCustomObject: get } };
+    const status = await getSandboxCrStatus(clients as never, "ns", "pc-abc");
+    expect(status.phase).toBe("Failed");
     expect(status.reason).toBe("ImagePullFailed");
   });
 

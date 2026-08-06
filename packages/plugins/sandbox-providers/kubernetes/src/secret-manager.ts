@@ -11,6 +11,7 @@ export interface CreatePerRunSecretInput {
   ownerUid: string;
   bootstrapToken: string;
   adapterEnv: Record<string, string>;
+  createIfMissing?: boolean;
 }
 
 export interface CreatePerRunSecretResult {
@@ -103,6 +104,11 @@ export async function createPerRunSecret(
   }
   const existing = await readExistingSecret(clients, input);
   if (existing) return existing;
+  if (input.createIfMissing === false) {
+    throw new Error(
+      `Refusing to recreate missing Kubernetes Secret ${input.secretName} for an adopted workload.`,
+    );
+  }
 
   const body = {
       apiVersion: "v1",

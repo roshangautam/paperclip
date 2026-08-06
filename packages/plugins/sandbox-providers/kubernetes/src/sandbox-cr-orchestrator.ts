@@ -22,21 +22,20 @@
  */
 
 import type { KubeClients } from "./kube-client.js";
-import type {
-  SandboxClaimResult,
-  SandboxOrchestrator,
-  SandboxStatus,
+import {
+  AcquisitionOwnershipMismatchError,
+  acquisitionFailureWithLease,
+  isAmbiguousCreateError,
+  kubeStatusCode,
+  type SandboxClaimResult,
+  type SandboxOrchestrator,
+  type SandboxStatus,
 } from "./sandbox-orchestrator.js";
 
 const SANDBOX_GROUP = "agents.x-k8s.io";
 const SANDBOX_VERSION = "v1alpha1";
 const SANDBOX_PLURAL = "sandboxes";
 const MANAGED_BY = "paperclip-k8s-plugin";
-
-function statusCode(error: unknown): number | undefined {
-  return (error as { code?: number; statusCode?: number } | null)?.code
-    ?? (error as { code?: number; statusCode?: number } | null)?.statusCode;
-}
 
 function sandboxNameFromManifest(manifest: Record<string, unknown>): string {
   const metadata = manifest.metadata as { name?: unknown } | undefined;
@@ -58,7 +57,7 @@ function validateAcquiredSandbox(
     metadata?.labels?.["paperclip.io/managed-by"] !== MANAGED_BY
     || metadata.labels["paperclip.io/acquisition-id"] !== acquisitionId
   ) {
-    throw new Error(
+    throw new AcquisitionOwnershipMismatchError(
       `Refusing to adopt Kubernetes Sandbox ${name}: acquisition ownership does not match ${acquisitionId}.`,
     );
   }
@@ -84,7 +83,7 @@ async function readAcquiredSandbox(
     });
     return validateAcquiredSandbox(sandbox, name, acquisitionId);
   } catch (error) {
-    if (statusCode(error) === 404) return null;
+    if (kubeStatusCode(error) === 404) return null;
     throw error;
   }
 }
@@ -102,6 +101,36 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type SandboxCondition = {
+  type?: string;
+  status?: string;
+  reason?: string;
+  message?: string;
+};
+
+function sandboxStatusSignals(status: Record<string, unknown>) {
+  const conditions = Array.isArray(status.conditions)
+    ? status.conditions as SandboxCondition[]
+    : [];
+  const readyCondition = conditions.find((condition) => condition.type === "Ready");
+  const failedCondition = conditions.find((condition) =>
+    condition.type === "Failed"
+    || (condition.type === "Ready"
+      && condition.status === "False"
+      && typeof condition.reason === "string"
+      && /failed/i.test(condition.reason))
+  );
+  const phase = (status.phase as string) ?? "";
+  const effectivePhase = phase === "Ready" || phase === "Failed" || phase === "Terminating"
+    ? phase
+    : readyCondition?.status === "True"
+      ? "Ready"
+      : failedCondition?.status === "True"
+        ? "Failed"
+        : phase || "Pending";
+  return { effectivePhase, readyCondition, failedCondition };
+}
+
 /**
  * Map a Sandbox CR status.phase value to our SandboxStatus shape.
  * Sandbox phases: Pending | Ready | Terminating | Failed
@@ -110,9 +139,9 @@ function mapSandboxPhase(
   cr: Record<string, unknown>,
 ): SandboxStatus {
   const status = (cr.status as Record<string, unknown>) ?? {};
-  const phase = (status.phase as string) ?? "Pending";
+  const { effectivePhase, failedCondition } = sandboxStatusSignals(status);
 
-  switch (phase) {
+  switch (effectivePhase) {
     case "Ready":
       return {
         phase: "Running", // SandboxStatus.phase uses Job semantics; "Running" = active pod
@@ -131,16 +160,14 @@ function mapSandboxPhase(
         reason: "Terminating",
       };
     case "Failed": {
-      const conditions = (status.conditions as { type?: string; reason?: string; message?: string }[]) ?? [];
-      const failedCond = conditions.find((c) => c.type === "Failed");
       return {
         phase: "Failed",
         complete: false,
         active: 0,
         succeeded: 0,
         failed: 1,
-        reason: failedCond?.reason,
-        message: failedCond?.message,
+        reason: failedCondition?.reason,
+        message: failedCondition?.message,
       };
     }
     default:
@@ -177,13 +204,24 @@ export async function createSandboxCr(
     if (!uid) throw new Error("Sandbox CR created without a UID");
     return { uid, created: true };
   } catch (createError) {
-    const reconciled = await readAcquiredSandbox(
-      clients,
-      namespace,
-      name,
-      acquisitionId,
-    );
-    if (reconciled) return reconciled;
+    try {
+      const reconciled = await readAcquiredSandbox(
+        clients,
+        namespace,
+        name,
+        acquisitionId,
+      );
+      if (reconciled) return reconciled;
+    } catch (reconcileError) {
+      if (reconcileError instanceof AcquisitionOwnershipMismatchError) throw reconcileError;
+      if (isAmbiguousCreateError(createError)) {
+        throw acquisitionFailureWithLease(createError, name, acquisitionId);
+      }
+      throw reconcileError;
+    }
+    if (isAmbiguousCreateError(createError)) {
+      throw acquisitionFailureWithLease(createError, name, acquisitionId);
+    }
     throw createError;
   }
 }
@@ -301,6 +339,7 @@ export async function deleteSandboxCr(
   clients: KubeClients,
   namespace: string,
   name: string,
+  uid?: string,
 ): Promise<void> {
   await clients.custom.deleteNamespacedCustomObject({
     group: SANDBOX_GROUP,
@@ -309,6 +348,7 @@ export async function deleteSandboxCr(
     plural: SANDBOX_PLURAL,
     name,
     propagationPolicy: "Foreground",
+    ...(uid ? { body: { preconditions: { uid } } } : {}),
   });
 }
 
@@ -343,23 +383,18 @@ export async function waitForSandboxReady(
     }) as Record<string, unknown>;
 
     const status = (cr.status as Record<string, unknown>) ?? {};
-    // agent-sandbox v1alpha1 uses status.conditions[type=Ready,status=True],
-    // not status.phase. Fall back to phase for forward-compat.
-    const conditions = Array.isArray(status.conditions) ? status.conditions as Array<Record<string, unknown>> : [];
-    const readyCondition = conditions.find((c) => c.type === "Ready");
-    const failedCondition = conditions.find((c) => c.type === "Failed" || (c.type === "Ready" && c.status === "False" && typeof c.reason === "string" && /failed/i.test(c.reason)));
-    const phase = (status.phase as string) ?? "";
+    const { effectivePhase, failedCondition } = sandboxStatusSignals(status);
 
-    if (readyCondition?.status === "True" || phase === "Ready") {
+    if (effectivePhase === "Ready") {
       return mapSandboxPhase(cr);
     }
-    if (failedCondition?.status === "True" || phase === "Failed") {
+    if (effectivePhase === "Failed") {
       const mapped = mapSandboxPhase(cr);
       throw new Error(
         `Sandbox ${namespace}/${name} failed: ${mapped.reason ?? (failedCondition?.reason as string) ?? "unknown reason"} — ${mapped.message ?? (failedCondition?.message as string) ?? ""}`,
       );
     }
-    if (phase === "Terminating") {
+    if (effectivePhase === "Terminating") {
       // A Sandbox being torn down will never transition to Ready. Polling
       // until the deadline would burn the full timeoutMs (potentially
       // 30+ minutes) before throwing a generic timeout. Fail fast instead

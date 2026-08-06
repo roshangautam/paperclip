@@ -108,6 +108,15 @@ describe("createPerRunSecret", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it("does not create a replacement Secret for an adopted workload", async () => {
+    const clients = creatingClients([]);
+
+    await expect(
+      createPerRunSecret(clients as never, { ...baseInput, createIfMissing: false }),
+    ).rejects.toThrow(/adopted workload/);
+    expect(clients.core.createNamespacedSecret).not.toHaveBeenCalled();
+  });
+
   it("rejects a Secret whose owner UID does not match the acquired workload", async () => {
     const secret = existingSecret();
     secret.metadata.ownerReferences[0].uid = "other-uid";

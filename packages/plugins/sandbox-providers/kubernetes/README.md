@@ -95,17 +95,17 @@ NetworkPolicy      paperclip-egress-allow         (DNS + paperclip-server callba
 For each agent run (sandbox-cr backend):
 
 ```
-Sandbox CR         pc-{ulid}                       (agents.x-k8s.io/v1alpha1; explicit delete on release)
-Pod                pc-{ulid}-{podSuffix}           (managed by Sandbox controller; torn down on CR delete)
-Secret             pc-{ulid}-env                   (owned by Sandbox CR; cascade-deleted)
+Sandbox CR         pc-acq-{32-hex}                 (agents.x-k8s.io/v1alpha1; explicit delete on release)
+Pod                pc-acq-{32-hex}-{podSuffix}     (managed by Sandbox controller; torn down on CR delete)
+Secret             pc-acq-{32-hex}-env             (owned by Sandbox CR; cascade-deleted)
 ```
 
 For each agent run (job backend):
 
 ```
-Job                pc-{ulid}                       (backoffLimit: 0; explicit delete on release)
-Pod                pc-{ulid}-{podSuffix}           (owned by Job; cascade-deleted)
-Secret             pc-{ulid}-env                   (owned by Job; cascade-deleted)
+Job                pc-acq-{32-hex}                 (backoffLimit: 0; explicit delete on release)
+Pod                pc-acq-{32-hex}-{podSuffix}     (owned by Job; cascade-deleted)
+Secret             pc-acq-{32-hex}-env             (owned by Job; cascade-deleted)
 ```
 
 ## Security baseline

@@ -1,3 +1,7 @@
+import {
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import { describe, it, expect, vi } from "vitest";
 import { createJob, deleteJob, getJobStatus, findPodForJob, JobTimeoutError, waitForJobCompletion } from "../../src/job-orchestrator.js";
 
@@ -47,6 +51,23 @@ describe("createJob", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it("does not hand off a lease before create when the initial ownership read fails", async () => {
+    const read = vi.fn().mockRejectedValue(new Error("API unavailable"));
+    const create = vi.fn();
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+
+    const failure = await createJob(
+      clients as never,
+      "ns",
+      { metadata: { name: "r-1", labels } },
+      acquisitionId,
+    ).then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({ message: "API unavailable" });
+    expect(failure).not.toHaveProperty("data");
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it("reconciles an ambiguous create error by exact name and ownership", async () => {
     const read = vi.fn()
       .mockRejectedValueOnce({ code: 404 })
@@ -58,6 +79,68 @@ describe("createJob", () => {
       createJob(clients as never, "ns", { metadata: { name: "r-1", labels } }, acquisitionId),
     ).resolves.toEqual({ uid: "committed-uid", created: false });
     expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves the deterministic lease id when an ambiguous create is not visible yet", async () => {
+    const read = vi.fn().mockRejectedValue({ code: 404 });
+    const create = vi.fn().mockRejectedValue(
+      Object.assign(new Error("response lost"), { code: "ECONNRESET" }),
+    );
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+
+    await expect(
+      createJob(clients as never, "ns", { metadata: { name: "r-1", labels } }, acquisitionId),
+    ).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "response lost",
+      data: {
+        providerLeaseId: "r-1",
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
+      },
+    });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves the deterministic lease id when reconciliation itself fails", async () => {
+    const read = vi.fn()
+      .mockRejectedValueOnce({ code: 404 })
+      .mockRejectedValueOnce({ code: 503 });
+    const create = vi.fn().mockRejectedValue({ code: 408, message: "request timed out" });
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+
+    await expect(
+      createJob(clients as never, "ns", { metadata: { name: "r-1", labels } }, acquisitionId),
+    ).rejects.toMatchObject({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      data: {
+        providerLeaseId: "r-1",
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
+      },
+    });
+  });
+
+  it("does not hand off a name collision discovered during reconciliation", async () => {
+    const read = vi.fn()
+      .mockRejectedValueOnce({ code: 404 })
+      .mockResolvedValueOnce({
+        metadata: {
+          uid: "other-uid",
+          labels: { ...labels, "paperclip.io/acquisition-id": "other-acquisition" },
+        },
+      });
+    const create = vi.fn().mockRejectedValue({ code: 409, message: "already exists" });
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+
+    const failure = await createJob(
+      clients as never,
+      "ns",
+      { metadata: { name: "r-1", labels } },
+      acquisitionId,
+    ).then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({ message: expect.stringMatching(/ownership does not match/) });
+    expect(failure).not.toHaveProperty("data");
   });
 });
 
@@ -80,9 +163,30 @@ describe("getJobStatus", () => {
 
   it("returns phase=Running when active count is >0", async () => {
     const get = vi.fn().mockResolvedValue({ status: { active: 1 } });
-    const clients = { batch: { readNamespacedJobStatus: get } };
+    const clients = {
+      batch: { readNamespacedJobStatus: get },
+      core: {
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [{ metadata: { name: "r-1-pod" }, status: { phase: "Running" } }],
+        }),
+      },
+    };
     const status = await getJobStatus(clients as never, "ns", "r-1");
     expect(status.phase).toBe("Running");
+  });
+
+  it("returns phase=Pending when an active Job only has Pending pods", async () => {
+    const get = vi.fn().mockResolvedValue({ status: { active: 1 } });
+    const clients = {
+      batch: { readNamespacedJobStatus: get },
+      core: {
+        listNamespacedPod: vi.fn().mockResolvedValue({
+          items: [{ metadata: { name: "r-1-pod" }, status: { phase: "Pending" } }],
+        }),
+      },
+    };
+    const status = await getJobStatus(clients as never, "ns", "r-1");
+    expect(status.phase).toBe("Pending");
   });
 
   it("returns phase=Pending when no active/succeeded/failed counters set", async () => {
@@ -128,7 +232,10 @@ describe("deleteJob", () => {
 describe("waitForJobCompletion", () => {
   it("throws JobTimeoutError when the deadline is exceeded", async () => {
     const get = vi.fn().mockResolvedValue({ status: { active: 1 } });
-    const clients = { batch: { readNamespacedJobStatus: get } };
+    const clients = {
+      batch: { readNamespacedJobStatus: get },
+      core: { listNamespacedPod: vi.fn().mockResolvedValue({ items: [] }) },
+    };
     await expect(
       waitForJobCompletion(clients as never, "ns", "r-1", { timeoutMs: 50, pollMs: 10 }),
     ).rejects.toBeInstanceOf(JobTimeoutError);
