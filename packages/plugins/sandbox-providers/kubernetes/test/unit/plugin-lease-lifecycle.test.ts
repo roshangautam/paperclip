@@ -1,15 +1,50 @@
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Mock the kube-client module so the plugin handlers run against injected
 // fake API clients instead of a real cluster. h.clients is swapped per test.
-const h = vi.hoisted(() => ({ clients: {} as Record<string, unknown> }));
+const h = vi.hoisted(() => ({
+  clients: {} as Record<string, unknown>,
+  claim: vi.fn(),
+  release: vi.fn(),
+  findPod: vi.fn(),
+  createPerRunSecret: vi.fn(),
+  ensureTenant: vi.fn(),
+}));
 
 vi.mock("../../src/kube-client.js", () => ({
   createKubeConfig: vi.fn(() => ({})),
   makeKubeClients: vi.fn(() => h.clients),
 }));
 
+vi.mock("../../src/tenant-orchestrator.js", () => ({
+  ensureTenant: h.ensureTenant,
+}));
+
+vi.mock("../../src/secret-manager.js", () => ({
+  createPerRunSecret: h.createPerRunSecret,
+}));
+
+vi.mock("../../src/job-orchestrator.js", () => ({
+  JobTimeoutError: class JobTimeoutError extends Error {},
+  deleteJob: async (
+    clients: { batch: { deleteNamespacedJob(input: Record<string, unknown>): Promise<unknown> } },
+    namespace: string,
+    name: string,
+  ) => {
+    await clients.batch.deleteNamespacedJob({ namespace, name, propagationPolicy: "Foreground" });
+  },
+  jobOrchestrator: {
+    claim: h.claim,
+    release: h.release,
+    findPod: h.findPod,
+    waitForCompletion: vi.fn(),
+    streamLogs: vi.fn(),
+  },
+}));
+
 import plugin from "../../src/plugin.js";
+import { deriveAcquisitionResourceName } from "../../src/utils.js";
 
 const CONFIG = { inCluster: true, backend: "sandbox-cr" };
 
@@ -41,6 +76,63 @@ function readySandboxCr(podName: string): Record<string, unknown> {
 
 beforeEach(() => {
   h.clients = {};
+  h.claim.mockReset();
+  h.release.mockReset();
+  h.findPod.mockReset();
+  h.createPerRunSecret.mockReset();
+  h.ensureTenant.mockReset().mockResolvedValue(undefined);
+});
+
+describe("onEnvironmentAcquireLease", () => {
+  const acquisitionId = "acquisition-handoff";
+  const expectedJobName = deriveAcquisitionResourceName(acquisitionId);
+  const params = {
+    driverKey: "kubernetes",
+    companyId: "acme",
+    environmentId: "env-1",
+    acquisitionId,
+    runId: "run-1",
+    config: { inCluster: true, backend: "job" },
+  };
+
+  it("hands off an adopted workload when local setup fails", async () => {
+    h.claim.mockResolvedValue({ uid: "uid-1", created: false });
+    h.createPerRunSecret.mockRejectedValue(new Error("secret setup failed"));
+
+    await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "secret setup failed",
+      data: { providerLeaseId: expectedJobName },
+    });
+
+    expect(h.release).not.toHaveBeenCalled();
+  });
+
+  it("hands off a newly created workload when setup cleanup fails", async () => {
+    h.claim.mockResolvedValue({ uid: "uid-1", created: true });
+    h.createPerRunSecret.mockRejectedValue(new Error("secret setup failed"));
+    h.release.mockRejectedValue(new Error("delete failed"));
+
+    await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "secret setup failed",
+      data: { providerLeaseId: expectedJobName },
+    });
+
+    expect(h.release).toHaveBeenCalledWith(h.clients, "paperclip-acme", expectedJobName);
+  });
+
+  it("rethrows the setup error after a newly created workload is confirmed cleaned up", async () => {
+    const setupError = new Error("secret setup failed");
+    h.claim.mockResolvedValue({ uid: "uid-1", created: true });
+    h.createPerRunSecret.mockRejectedValue(setupError);
+    h.release.mockResolvedValue(undefined);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toBe(setupError);
+    expect(h.release).toHaveBeenCalledWith(h.clients, "paperclip-acme", expectedJobName);
+  });
 });
 
 describe("onEnvironmentResumeLease", () => {

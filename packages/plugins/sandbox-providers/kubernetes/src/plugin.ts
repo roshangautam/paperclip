@@ -1,5 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import {
+  definePlugin,
+  JsonRpcCallError,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -73,6 +77,18 @@ function generateBootstrapToken(): string {
   // this plugin. For now this per-run random token is stored in the per-run
   // Secret and read by the runtime image entrypoint for initial registration.
   return randomBytes(32).toString("hex");
+}
+
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function acquisitionFailureWithLease(error: unknown, providerLeaseId: string): JsonRpcCallError {
+  return new JsonRpcCallError({
+    code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+    message: formatErrorMessage(error),
+    data: { providerLeaseId },
+  });
 }
 
 // One FastUploadInterceptor instance per active lease. Scoping per lease
@@ -354,9 +370,14 @@ const plugin = definePlugin({
       // adopted workload may be the durable result of the previous crashed
       // acquisition attempt and must remain available for the next replay.
       if (workloadCreated) {
-        await orchestrator.release(clients, namespace, jobName).catch(() => undefined);
+        try {
+          await orchestrator.release(clients, namespace, jobName);
+        } catch {
+          throw acquisitionFailureWithLease(error, jobName);
+        }
+        throw error;
       }
-      throw error;
+      throw acquisitionFailureWithLease(error, jobName);
     }
   },
 
