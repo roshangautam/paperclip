@@ -37,6 +37,7 @@ import {
   issueTreeHolds,
   issueWorkProducts,
   issues,
+  plugins,
   projects,
   projectWorkspaces,
   workspaceOperations,
@@ -103,6 +104,8 @@ import {
   heartbeatService,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
 } from "../services/heartbeat.ts";
+import { environmentRuntimeService } from "../services/environment-runtime.ts";
+import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 import {
   readHotRestartIntent,
   resolveHotRestartReportPath,
@@ -594,6 +597,88 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     return { environmentId, leaseId };
+  }
+
+  async function seedRetryableSandboxLeaseFixture(input: {
+    companyId: string;
+    runId: string;
+    issueId: string | null;
+  }) {
+    const pluginId = randomUUID();
+    const pluginKey = `acme.cleanup-provider.${pluginId}`;
+    const provider = `cleanup-${pluginId}`;
+    const environmentId = randomUUID();
+    const leaseId = randomUUID();
+    const now = new Date("2026-03-19T00:00:00.000Z");
+
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey,
+      packageName: `@acme/cleanup-provider-${pluginId}`,
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: pluginKey,
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Cleanup Provider",
+        description: "Test sandbox provider for cancellation cleanup",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{
+          driverKey: provider,
+          kind: "sandbox_provider",
+          displayName: "Cleanup Sandbox",
+          configSchema: { type: "object" },
+        }],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: now,
+    } as any);
+    await db.insert(environments).values({
+      id: environmentId,
+      companyId: input.companyId,
+      name: "Retryable Cleanup Sandbox",
+      driver: "sandbox",
+      status: "active",
+      config: {
+        provider,
+        image: "fake:test",
+        reuseLease: false,
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(environmentLeases).values({
+      id: leaseId,
+      companyId: input.companyId,
+      environmentId,
+      issueId: input.issueId,
+      heartbeatRunId: input.runId,
+      status: "active",
+      leasePolicy: "ephemeral",
+      provider,
+      providerLeaseId: `provider-${leaseId}`,
+      acquiredAt: now,
+      lastUsedAt: now,
+      metadata: {
+        driver: "sandbox",
+        provider,
+        pluginId,
+        pluginKey,
+        sandboxProviderPlugin: true,
+        image: "fake:test",
+        reuseLease: false,
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    return { pluginId, leaseId };
   }
 
   it("does not reap active adapter executions started by another heartbeat service instance", async () => {
@@ -3477,6 +3562,87 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       executionRunId: null,
       executionAgentNameKey: null,
       executionLockedAt: null,
+    });
+  });
+
+  it.each([
+    "direct run cancellation",
+    "agent-wide cancellation",
+  ] as const)("records retryable lease cleanup before %s becomes terminal", async (cancellationPath) => {
+    const { agentId, runId, companyId } = await seedRunFixture({
+      agentStatus: cancellationPath === "agent-wide cancellation" ? "paused" : "running",
+      includeIssue: false,
+    });
+    const { pluginId, leaseId } = await seedRetryableSandboxLeaseFixture({
+      companyId,
+      runId,
+      issueId: null,
+    });
+    const runStatusesDuringRelease: string[] = [];
+    const unavailableWorkerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        expect(method).toBe("environmentReleaseLease");
+        const [run] = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        runStatusesDuringRelease.push(run!.status);
+        throw new Error("provider cleanup unavailable");
+      }),
+    } as unknown as PluginWorkerManager;
+    const heartbeat = heartbeatService(db, { pluginWorkerManager: unavailableWorkerManager });
+
+    if (cancellationPath === "agent-wide cancellation") {
+      await expect(heartbeat.cancelActiveForAgent(agentId)).resolves.toBe(1);
+    } else {
+      await expect(heartbeat.cancelRun(runId)).resolves.toMatchObject({ status: "cancelled" });
+    }
+
+    expect(runStatusesDuringRelease).toEqual(["running"]);
+    await expect(heartbeat.getRun(runId)).resolves.toMatchObject({ status: "cancelled" });
+    const [pendingLease] = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leaseId));
+    expect(pendingLease).toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      metadata: expect.objectContaining({ pendingCleanupReleaseStatus: "expired" }),
+    });
+
+    await db
+      .update(environmentLeases)
+      .set({ updatedAt: new Date(0) })
+      .where(eq(environmentLeases.id, leaseId));
+    const recoveredWorkerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        expect(method).toBe("environmentReleaseLease");
+      }),
+    } as unknown as PluginWorkerManager;
+    const recoveredRuntime = environmentRuntimeService(db, {
+      pluginWorkerManager: recoveredWorkerManager,
+    });
+
+    await expect(recoveredRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 1,
+      cleaned: 1,
+      pending: 0,
+    });
+    await expect(recoveredRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 0,
+      cleaned: 0,
+      pending: 0,
+    });
+    expect(recoveredWorkerManager.call).toHaveBeenCalledTimes(1);
+    const [releasedLease] = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leaseId));
+    expect(releasedLease).toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
     });
   });
 

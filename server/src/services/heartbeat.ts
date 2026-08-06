@@ -16623,6 +16623,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runningProcesses.delete(run.id);
     }
 
+    await releaseEnvironmentLeasesForRun({
+      runId: run.id,
+      companyId: run.companyId,
+      agentId: run.agentId,
+      status: "cancelled",
+      failureReason: reason,
+    });
+
     const finishedAt = new Date();
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt,
@@ -16644,13 +16652,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         message: options.eventMessage ?? "run cancelled",
         ...(options.eventPayload ? { payload: options.eventPayload } : {}),
       });
-      await releaseEnvironmentLeasesForRun({
-        runId: cancelled.id,
-        companyId: cancelled.companyId,
-        agentId: cancelled.agentId,
-        status: cancelled.status,
-        failureReason: cancelled.error ?? undefined,
-      });
       await releaseRuntimeServicesForRun(cancelled.id).catch((err) => {
         logger.warn({ err, runId: cancelled.id }, "failed to release runtime services for cancelled heartbeat run");
       });
@@ -16670,6 +16671,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
+      const running = runningProcesses.get(run.id);
+      try {
+        if (running) {
+          await terminateHeartbeatRunProcess({
+            pid: running.child.pid ?? run.processPid,
+            processGroupId: running.processGroupId ?? run.processGroupId,
+            graceMs: Math.max(1, running.graceSec) * 1000,
+          });
+        } else if (run.processPid || run.processGroupId) {
+          await terminateHeartbeatRunProcess({
+            pid: run.processPid,
+            processGroupId: run.processGroupId,
+          });
+        }
+      } finally {
+        runningProcesses.delete(run.id);
+      }
+
+      await releaseEnvironmentLeasesForRun({
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: "cancelled",
+        failureReason: reason,
+      });
+
       const cancelled = await setRunStatus(run.id, "cancelled", {
         finishedAt: new Date(),
         error: reason,
@@ -16688,28 +16715,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         error: reason,
       });
 
-      const running = runningProcesses.get(run.id);
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-        runningProcesses.delete(run.id);
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
       if (cancelled) {
-        await releaseEnvironmentLeasesForRun({
-          runId: cancelled.id,
-          companyId: cancelled.companyId,
-          agentId: cancelled.agentId,
-          status: cancelled.status,
-          failureReason: cancelled.error ?? undefined,
-        });
         await releaseRuntimeServicesForRun(cancelled.id).catch((err) => {
           logger.warn({ err, runId: cancelled.id }, "failed to release runtime services for cancelled heartbeat run");
         });
