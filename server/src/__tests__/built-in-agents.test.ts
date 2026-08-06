@@ -1247,7 +1247,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     });
   });
 
-  it("dispatches with ownership repaired while waiting for the routine lock", async () => {
+  it("dispatches from the repaired revision after waiting for the routine lock", async () => {
     const companyId = await seedCompany({ requireApproval: false });
     const agent = await agentService(db).create(companyId, {
       name: "Routine Agent",
@@ -1325,6 +1325,11 @@ describeEmbeddedPostgres("built-in agents", () => {
     const rowLocked = deferred<void>();
     const repairCanCommit = deferred<void>();
     let repairedRevisionId: string | null = null;
+    const repairedTitle = "Repair ownership race for {{subject}}";
+    const repairedDescription = "Dispatch {{subject}} from the locked routine revision.";
+    const repairedVariables = [
+      { name: "subject", label: null, type: "text" as const, defaultValue: null, required: true, options: [] },
+    ];
     const ownershipRepair = db.transaction(async (tx) => {
       await tx.execute(sql`select ${routines.id} from ${routines} where ${routines.id} = ${routine.id} for update`);
       rowLocked.resolve();
@@ -1336,12 +1341,15 @@ describeEmbeddedPostgres("built-in agents", () => {
           companyId,
           routineId: routine.id,
           revisionNumber: initialRevision!.revisionNumber + 1,
-          title: initialRevision!.title,
-          description: initialRevision!.description,
+          title: repairedTitle,
+          description: repairedDescription,
           snapshot: {
             ...initialRevision!.snapshot,
             routine: {
               ...initialRevision!.snapshot.routine,
+              title: repairedTitle,
+              description: repairedDescription,
+              variables: repairedVariables,
               responsibleUserId: "responsible-user",
             },
           },
@@ -1353,6 +1361,9 @@ describeEmbeddedPostgres("built-in agents", () => {
       await tx
         .update(routines)
         .set({
+          title: repairedTitle,
+          description: repairedDescription,
+          variables: repairedVariables,
           responsibleUserId: "responsible-user",
           latestRevisionId: repairedRevision!.id,
           latestRevisionNumber: repairedRevision!.revisionNumber,
@@ -1362,7 +1373,8 @@ describeEmbeddedPostgres("built-in agents", () => {
     });
 
     await rowLocked.promise;
-    const dispatched = routinesSvc.runRoutine(routine.id, { source: "api" });
+    const runInput = { source: "api" as const, variables: { subject: "current content" } };
+    const dispatched = routinesSvc.runRoutine(routine.id, runInput);
     await new Promise((resolve) => setTimeout(resolve, 10));
     repairCanCommit.resolve();
     await ownershipRepair;
@@ -1373,8 +1385,9 @@ describeEmbeddedPostgres("built-in agents", () => {
       routineRevisionId: repairedRevisionId,
       responsibleUserId: "responsible-user",
       linkedIssueId: activeIssueId,
+      triggerPayload: { variables: { subject: "current content" } },
     });
-    const subsequentDispatch = await routinesSvc.runRoutine(routine.id, { source: "api" });
+    const subsequentDispatch = await routinesSvc.runRoutine(routine.id, runInput);
     expect(repairedDispatch.dispatchFingerprint).toBe(subsequentDispatch.dispatchFingerprint);
   });
 
