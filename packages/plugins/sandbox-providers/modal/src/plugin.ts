@@ -12,6 +12,7 @@ import {
 import {
   definePlugin,
   JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
 import type {
@@ -199,17 +200,27 @@ async function findAcquiredSandbox(
     throw error;
   }
 
+  await assertAcquisitionSandboxOwnership(sandbox, name, acquisitionId);
+  return sandbox;
+}
+
+async function assertAcquisitionSandboxOwnership(
+  sandbox: Sandbox,
+  sandboxName: string,
+  acquisitionId: string,
+): Promise<void> {
   const tags = await sandbox.getTags();
   const owner = tags["paperclip-acquisition-id"];
   if (owner && owner !== acquisitionId) {
     throw new Error(
-      `Refusing to adopt Modal sandbox ${name}: acquisition ownership does not match ${acquisitionId}.`,
+      `Refusing to adopt Modal sandbox ${sandboxName}: acquisition ownership does not match ${acquisitionId}.`,
     );
   }
   if (!owner) {
-    throw new Error(`Refusing to adopt unowned Modal sandbox ${name} for acquisition ${acquisitionId}.`);
+    throw new Error(
+      `Refusing to adopt unowned Modal sandbox ${sandboxName} for acquisition ${acquisitionId}.`,
+    );
   }
-  return sandbox;
 }
 
 async function acquireSandbox(
@@ -233,7 +244,7 @@ async function acquireSandbox(
   } catch (error) {
     const reconciled = await findAcquiredSandbox(client, config, name, params.acquisitionId);
     if (reconciled) return { sandbox: reconciled, created: false };
-    throw error;
+    throw acquisitionFailureWithLease(error, name);
   }
 }
 
@@ -263,11 +274,20 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function acquisitionFailureWithLease(error: unknown, providerLeaseId: string): JsonRpcCallError {
+function acquisitionFailureWithLease(
+  error: unknown,
+  providerLeaseId: string,
+  acquisitionId?: string,
+): JsonRpcCallError {
   return new JsonRpcCallError({
     code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
     message: formatErrorMessage(error),
-    data: { providerLeaseId },
+    data: {
+      providerLeaseId,
+      ...(acquisitionId
+        ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+        : {}),
+    },
   });
 }
 
@@ -382,6 +402,47 @@ async function getSandboxOrNull(
     if (isModalNotFound(error)) return null;
     throw error;
   }
+}
+
+async function getSandboxForCleanup(
+  client: ModalClient,
+  config: ModalDriverConfig,
+  params: PluginEnvironmentReleaseLeaseParams,
+): Promise<Sandbox | null> {
+  if (!params.providerLeaseId) return null;
+  const acquisitionName = params.acquisitionId
+    ? acquisitionSandboxName(params.acquisitionId)
+    : null;
+  const sandbox = params.providerLeaseId === acquisitionName
+    ? await findAcquiredSandbox(
+      client,
+      config,
+      params.providerLeaseId,
+      params.acquisitionId!,
+    )
+    : await getSandboxOrNull(client, params.providerLeaseId);
+  if (!sandbox) {
+    if (
+      params.acquisitionId &&
+      params.leaseMetadata?.[PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY] === params.acquisitionId
+    ) {
+      return null;
+    }
+    if (params.providerLeaseId === acquisitionName) {
+      throw new Error(
+        `Modal sandbox ${params.providerLeaseId} is not visible yet; cleanup must be retried.`,
+      );
+    }
+    return null;
+  }
+  if (params.acquisitionId && params.providerLeaseId !== acquisitionName) {
+    await assertAcquisitionSandboxOwnership(
+      sandbox,
+      params.providerLeaseId,
+      params.acquisitionId,
+    );
+  }
+  return sandbox;
 }
 
 function warnIfUnsupportedNode(logger: { warn: (msg: string) => void } | undefined): void {
@@ -552,11 +613,11 @@ const plugin = definePlugin({
           try {
             await sandbox.terminate();
           } catch {
-            throw acquisitionFailureWithLease(error, sandbox.sandboxId);
+            throw acquisitionFailureWithLease(error, sandbox.sandboxId, params.acquisitionId);
           }
           throw error;
         }
-        throw acquisitionFailureWithLease(error, sandbox.sandboxId);
+        throw acquisitionFailureWithLease(error, sandbox.sandboxId, params.acquisitionId);
       }
     } finally {
       // Keep the client open for the lease lifetime is unnecessary; subsequent
@@ -602,7 +663,7 @@ const plugin = definePlugin({
     const config = parseDriverConfig(params.config);
     const client = createModalClient(config);
     try {
-      const sandbox = await getSandboxOrNull(client, params.providerLeaseId);
+      const sandbox = await getSandboxForCleanup(client, config, params);
       if (!sandbox) return;
       if (config.reuseLease) {
         // Modal has no separate pause primitive. Detaching releases the local
@@ -612,7 +673,11 @@ const plugin = definePlugin({
         void sandbox.detach();
         return;
       }
-      await sandbox.terminate();
+      try {
+        await sandbox.terminate();
+      } catch (error) {
+        throw acquisitionFailureWithLease(error, params.providerLeaseId, params.acquisitionId);
+      }
     } finally {
       client.close();
     }
@@ -625,9 +690,13 @@ const plugin = definePlugin({
     const config = parseDriverConfig(params.config);
     const client = createModalClient(config);
     try {
-      const sandbox = await getSandboxOrNull(client, params.providerLeaseId);
+      const sandbox = await getSandboxForCleanup(client, config, params);
       if (!sandbox) return;
-      await sandbox.terminate();
+      try {
+        await sandbox.terminate();
+      } catch (error) {
+        throw acquisitionFailureWithLease(error, params.providerLeaseId, params.acquisitionId);
+      }
     } finally {
       client.close();
     }
