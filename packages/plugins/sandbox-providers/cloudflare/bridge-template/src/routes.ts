@@ -314,20 +314,25 @@ export async function handleBridgeRequest(request: Request, env: BridgeEnv): Pro
     // Resolution does not reveal whether the Durable Object was created by
     // this request or already existed. Leave it intact on setup failure so a
     // host replay with the same acquisition ID can reconcile it safely.
-    await applySandboxKeepAlive(sandbox, keepAlive);
-    await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
-    await writeSentinel(sandbox, {
-      providerLeaseId,
-      acquisitionId: body.acquisitionId,
-      remoteCwd,
-      sessionStrategy,
-      sessionId,
-      keepAlive,
-      sleepAfter,
-      normalizeId,
-      resumedLease: false,
-      timeoutMs,
-    });
+    try {
+      await applySandboxKeepAlive(sandbox, keepAlive);
+      await ensureWorkspace(sandbox, { remoteCwd, sessionStrategy, sessionId, timeoutMs });
+      await writeSentinel(sandbox, {
+        providerLeaseId,
+        acquisitionId: body.acquisitionId,
+        remoteCwd,
+        sessionStrategy,
+        sessionId,
+        keepAlive,
+        sleepAfter,
+        normalizeId,
+        resumedLease: false,
+        timeoutMs,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return toErrorResponse(500, "internal_error", message, { providerLeaseId });
+    }
 
     return toJsonResponse({
       providerLeaseId,

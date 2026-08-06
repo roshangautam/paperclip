@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 
 const fetchMock = vi.fn();
 let plugin: typeof import("./plugin.js").default;
+let JsonRpcCallError: typeof import("@paperclipai/plugin-sdk").JsonRpcCallError;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -28,6 +30,7 @@ describe("Cloudflare sandbox provider plugin", () => {
     vi.stubGlobal("fetch", fetchMock);
     vi.resetModules();
     plugin = (await import("./plugin.js")).default;
+    JsonRpcCallError = (await import("@paperclipai/plugin-sdk")).JsonRpcCallError;
   });
 
   it("declares the Cloudflare environment lifecycle handlers", async () => {
@@ -153,6 +156,49 @@ describe("Cloudflare sandbox provider plugin", () => {
       runId: "run-1",
       issueId: "issue-1",
       requestedCwd: "/workspace/paperclip",
+    });
+  });
+
+  it("hands off a retained Cloudflare sandbox when acquisition setup fails", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        ok: true,
+        provider: "cloudflare",
+        bridgeVersion: "0.1.0",
+        capabilities: { acquisitionReplay: true, reuseLease: true, namedSessions: true, previewUrls: false },
+      }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: "internal_error",
+          message: "ensure workspace failed",
+          details: { providerLeaseId: "pc-acq-acquisition-1" },
+        },
+        500,
+      ),
+    );
+
+    const failure = await plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "cloudflare",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId: "acquisition-1",
+      runId: "run-1",
+      config: {
+        bridgeBaseUrl: "https://bridge.example.workers.dev",
+        bridgeAuthToken: "resolved-token",
+      },
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(JsonRpcCallError);
+    expect(failure).toMatchObject({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "ensure workspace failed",
+      data: { providerLeaseId: "pc-acq-acquisition-1" },
     });
   });
 

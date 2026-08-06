@@ -1,6 +1,11 @@
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import {
+  definePlugin,
+  JsonRpcCallError,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import type {
   PluginLogger,
+  PluginEnvironmentAcquireLeaseErrorData,
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentExecuteParams,
@@ -198,28 +203,55 @@ const plugin = definePlugin({
         "Cloudflare sandbox bridge does not support replay-safe lease acquisition; deploy the current bridge before acquiring leases.",
       );
     }
-    return await client.acquireLease(
-      {
-        acquisitionId: params.acquisitionId,
-        environmentId: params.environmentId,
-        runId: params.runId,
-        issueId: params.issueId,
-        reuseLease: config.reuseLease,
-        keepAlive: config.keepAlive,
-        sleepAfter: config.sleepAfter,
-        normalizeId: config.normalizeId,
-        requestedCwd: params.requestedCwd?.trim() || config.requestedCwd,
-        sessionStrategy: config.sessionStrategy,
-        sessionId: config.sessionId,
-        timeoutMs: config.timeoutMs,
-      },
-      {
-        acquisitionId: params.acquisitionId,
-        environmentId: params.environmentId,
-        runId: params.runId,
-        issueId: params.issueId,
-      },
-    );
+    try {
+      return await client.acquireLease(
+        {
+          acquisitionId: params.acquisitionId,
+          environmentId: params.environmentId,
+          runId: params.runId,
+          issueId: params.issueId,
+          reuseLease: config.reuseLease,
+          keepAlive: config.keepAlive,
+          sleepAfter: config.sleepAfter,
+          normalizeId: config.normalizeId,
+          requestedCwd: params.requestedCwd?.trim() || config.requestedCwd,
+          sessionStrategy: config.sessionStrategy,
+          sessionId: config.sessionId,
+          timeoutMs: config.timeoutMs,
+        },
+        {
+          acquisitionId: params.acquisitionId,
+          environmentId: params.environmentId,
+          runId: params.runId,
+          issueId: params.issueId,
+        },
+      );
+    } catch (error) {
+      const details = error instanceof CloudflareBridgeError
+        && error.details
+        && typeof error.details === "object"
+        && !Array.isArray(error.details)
+        ? error.details as Record<string, unknown>
+        : null;
+      const providerLeaseId = typeof details?.providerLeaseId === "string"
+        ? details.providerLeaseId
+        : null;
+      if (
+        error instanceof CloudflareBridgeError
+        && providerLeaseId
+        && providerLeaseId.trim().length > 0
+      ) {
+        const data: PluginEnvironmentAcquireLeaseErrorData = {
+          providerLeaseId,
+        };
+        throw new JsonRpcCallError({
+          code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+          message: error.message,
+          data,
+        });
+      }
+      throw error;
+    }
   },
 
   async onEnvironmentResumeLease(

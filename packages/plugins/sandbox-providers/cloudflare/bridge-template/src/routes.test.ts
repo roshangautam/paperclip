@@ -168,6 +168,39 @@ describe("bridge routes", () => {
     expect(sandbox.destroy).not.toHaveBeenCalled();
   });
 
+  it("preserves the resolved lease ID when acquisition setup fails", async () => {
+    const sessionExec = vi.fn()
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" })
+      .mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "mkdir failed" });
+    const sandbox = {
+      getSession: vi.fn().mockResolvedValue({ exec: sessionExec }),
+      createSession: vi.fn(),
+      setKeepAlive: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn(),
+    };
+    vi.mocked(resolveSandbox).mockResolvedValue(sandbox as never);
+
+    const response = await handleBridgeRequest(
+      bridgeRequest("/api/paperclip-sandbox/v1/leases/acquire", {
+        acquisitionId: "acquisition-1",
+        environmentId: "env-1",
+        runId: "run-1",
+        requestedCwd: "/workspace/paperclip",
+        sessionStrategy: "named",
+        sessionId: "paperclip",
+      }),
+      { BRIDGE_AUTH_TOKEN: "secret-token", Sandbox: {} as never },
+    );
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      error: "internal_error",
+      message: "ensure workspace /workspace/paperclip failed with exit code 1: mkdir failed",
+      details: { providerLeaseId: "pc-acq-acquisition-1" },
+    });
+    expect(sandbox.destroy).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])("rejects a sandbox whose sentinel belongs to another acquisition (reuseLease=%s)", async (reuseLease) => {
     const sessionExec = vi.fn().mockResolvedValue({
       exitCode: 0,
