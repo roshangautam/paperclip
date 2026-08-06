@@ -30,7 +30,6 @@ export const kubernetesProviderConfigSchema = z
     runtimeClassName: z.string().optional(),
     serviceAccountAnnotations: z.record(z.string()).default({}),
 
-    jobTtlSecondsAfterFinished: z.number().int().nonnegative().default(900),
     podActivityDeadlineSec: z.number().int().positive().default(3600),
 
     /**
@@ -82,6 +81,8 @@ export function parseKubernetesProviderConfig(input: unknown): KubernetesProvide
 }
 
 export interface KubernetesLeaseMetadata {
+  acquisitionId: string;
+  workloadUid: string;
   namespace: string;
   /** Name of the workload resource (Job name for job backend, Sandbox CR name for sandbox-cr backend). */
   jobName: string;

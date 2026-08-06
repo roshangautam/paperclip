@@ -1,6 +1,4 @@
-import { createHash, randomInt } from "node:crypto";
-
-const ULID_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
+import { createHash } from "node:crypto";
 
 // Namespace names are capped at 63 chars (RFC 1123). The default "paperclip-"
 // prefix leaves 53 for the slug, which fits a full 36-char UUID untruncated.
@@ -27,23 +25,21 @@ export function deriveNamespaceName(prefix: string, slug: string): string {
   return `${prefix}${slug}`;
 }
 
-export function newRunUlidDns(now: () => number = Date.now): string {
-  const timestamp = now();
-  let out = "";
-  let t = timestamp;
-  for (let i = 0; i < 10; i++) {
-    out = ULID_ALPHABET[t & 0x1f] + out;
-    t = Math.floor(t / 32);
-  }
-  for (let i = 0; i < 16; i++) {
-    // crypto-strength randomness: these become Job/Sandbox CR names and the
-    // providerLeaseId, so they must not be enumerable.
-    out += ULID_ALPHABET[randomInt(32)];
-  }
-  return out;
+/**
+ * Derive a stable RFC 1123 resource name from the host's acquisition ID.
+ *
+ * The full acquisition ID remains on the resource as an ownership label; the
+ * hash is only the collision-resistant Kubernetes object name. Keeping the
+ * name deterministic lets a replay issue an exact GET instead of listing or
+ * guessing which workload a prior, ambiguous create produced.
+ */
+export function deriveAcquisitionResourceName(acquisitionId: string): string {
+  const digest = createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32);
+  return `pc-acq-${digest}`;
 }
 
 export interface LabelsInput {
+  acquisitionId: string;
   runId: string;
   agentId: string;
   companyId: string;
@@ -52,6 +48,7 @@ export interface LabelsInput {
 
 export function paperclipLabels(input: LabelsInput): Record<string, string> {
   return {
+    "paperclip.io/acquisition-id": input.acquisitionId,
     "paperclip.io/run-id": input.runId,
     "paperclip.io/agent-id": input.agentId,
     "paperclip.io/company-id": input.companyId,

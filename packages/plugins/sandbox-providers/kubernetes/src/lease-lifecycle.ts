@@ -156,6 +156,58 @@ export interface DestroyLeaseInput {
   backend: "sandbox-cr" | "job";
   podName: string | null;
   secretName: string | null;
+  /** null means the workload was already absent; undefined preserves legacy callers. */
+  workloadUid?: string | null;
+  acquisitionId?: string;
+}
+
+type ChildKind = "Pod" | "Secret";
+
+async function readOwnedChildUid(
+  clients: KubeClients,
+  input: DestroyLeaseInput,
+  kind: ChildKind,
+  name: string,
+): Promise<string | null | undefined> {
+  if (!input.acquisitionId && !input.workloadUid) return undefined;
+  let child: unknown;
+  try {
+    child = kind === "Pod"
+      ? await clients.core.readNamespacedPod({ namespace: input.namespace, name })
+      : await clients.core.readNamespacedSecret({ namespace: input.namespace, name });
+  } catch (error) {
+    if (isKubeNotFoundError(error)) return null;
+    throw error;
+  }
+  const metadata = (child as {
+    metadata?: {
+      uid?: unknown;
+      labels?: Record<string, string>;
+      ownerReferences?: Array<{ uid?: string }>;
+    };
+  } | null)?.metadata;
+  const sandboxControllerPod = kind === "Pod" && input.backend === "sandbox-cr";
+  if (!sandboxControllerPod && input.acquisitionId && (
+    metadata?.labels?.["paperclip.io/managed-by"] !== "paperclip-k8s-plugin"
+    || metadata.labels["paperclip.io/acquisition-id"] !== input.acquisitionId
+  )) {
+    throw new Error(
+      `Refusing to destroy Kubernetes ${kind} ${name}: acquisition ownership does not match ${input.acquisitionId}.`,
+    );
+  }
+  if (
+    (input.workloadUid
+      && !metadata?.ownerReferences?.some((owner) => owner.uid === input.workloadUid))
+    || (sandboxControllerPod && !input.workloadUid)
+  ) {
+    throw new Error(
+      `Refusing to destroy Kubernetes ${kind} ${name}: owner does not match workload ${input.workloadUid}.`,
+    );
+  }
+  if (typeof metadata?.uid !== "string" || metadata.uid.length === 0) {
+    throw new Error(`Kubernetes ${kind} ${name} has no UID.`);
+  }
+  return metadata.uid;
 }
 
 /**
@@ -169,25 +221,40 @@ export async function destroyLeaseResources(
   clients: KubeClients,
   input: DestroyLeaseInput,
 ): Promise<void> {
-  if (input.backend === "sandbox-cr") {
-    await ignoreNotFound(deleteSandboxCr(clients, input.namespace, input.name));
-  } else {
-    await ignoreNotFound(deleteJob(clients, input.namespace, input.name));
+  if (input.workloadUid === null) return;
+  if (input.workloadUid !== null) {
+    if (input.backend === "sandbox-cr") {
+      await ignoreNotFound(
+        deleteSandboxCr(clients, input.namespace, input.name, input.workloadUid),
+      );
+    } else {
+      await ignoreNotFound(
+        deleteJob(clients, input.namespace, input.name, input.workloadUid),
+      );
+    }
   }
   if (input.podName) {
-    await ignoreNotFound(
-      clients.core.deleteNamespacedPod({
-        namespace: input.namespace,
-        name: input.podName,
-      }),
-    );
+    const podUid = await readOwnedChildUid(clients, input, "Pod", input.podName);
+    if (podUid !== null) {
+      await ignoreNotFound(
+        clients.core.deleteNamespacedPod({
+          namespace: input.namespace,
+          name: input.podName,
+          ...(podUid ? { body: { preconditions: { uid: podUid } } } : {}),
+        }),
+      );
+    }
   }
   if (input.secretName) {
-    await ignoreNotFound(
-      clients.core.deleteNamespacedSecret({
-        namespace: input.namespace,
-        name: input.secretName,
-      }),
-    );
+    const secretUid = await readOwnedChildUid(clients, input, "Secret", input.secretName);
+    if (secretUid !== null) {
+      await ignoreNotFound(
+        clients.core.deleteNamespacedSecret({
+          namespace: input.namespace,
+          name: input.secretName,
+          ...(secretUid ? { body: { preconditions: { uid: secretUid } } } : {}),
+        }),
+      );
+    }
   }
 }

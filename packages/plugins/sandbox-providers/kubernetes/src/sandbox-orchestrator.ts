@@ -1,4 +1,36 @@
+import {
+  JsonRpcCallError,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import type { KubeClients } from "./kube-client.js";
+
+export class AcquisitionOwnershipMismatchError extends Error {}
+
+export function kubeStatusCode(error: unknown): number | undefined {
+  const candidate = error as { code?: unknown; statusCode?: unknown } | null;
+  if (typeof candidate?.code === "number" && Number.isFinite(candidate.code)) {
+    return candidate.code;
+  }
+  return typeof candidate?.statusCode === "number" && Number.isFinite(candidate.statusCode)
+    ? candidate.statusCode
+    : undefined;
+}
+
+export function isAmbiguousCreateError(error: unknown): boolean {
+  const code = kubeStatusCode(error);
+  return code === undefined || code === 408 || code === 409 || code === 429 || code >= 500;
+}
+
+export function acquisitionFailureWithLease(
+  error: unknown,
+  providerLeaseId: string,
+): JsonRpcCallError {
+  return new JsonRpcCallError({
+    code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+    message: error instanceof Error ? error.message : String(error),
+    data: { providerLeaseId },
+  });
+}
 
 export interface SandboxStatus {
   phase: "Pending" | "Running" | "Succeeded" | "Failed";
@@ -8,6 +40,12 @@ export interface SandboxStatus {
   failed: number;
   reason?: string;
   message?: string;
+}
+
+export interface SandboxClaimResult {
+  uid: string;
+  /** True only when this invocation received a successful create response. */
+  created: boolean;
 }
 
 /**
@@ -23,7 +61,8 @@ export interface SandboxOrchestrator {
     clients: KubeClients,
     namespace: string,
     manifest: Record<string, unknown>,
-  ): Promise<{ uid: string }>;
+    acquisitionId: string,
+  ): Promise<SandboxClaimResult>;
 
   /** Read current lifecycle phase. */
   getStatus(
@@ -48,7 +87,12 @@ export interface SandboxOrchestrator {
   ): Promise<void>;
 
   /** Tear down the sandbox. Implementations MUST cascade-delete child resources. */
-  release(clients: KubeClients, namespace: string, name: string): Promise<void>;
+  release(
+    clients: KubeClients,
+    namespace: string,
+    name: string,
+    uid?: string,
+  ): Promise<void>;
 
   /** Block until phase is Succeeded or Failed, or throw on timeout. */
   waitForCompletion(

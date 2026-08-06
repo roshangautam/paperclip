@@ -72,7 +72,6 @@ Common optional fields:
 | `egressMode` | `"standard"` | `standard` (NetworkPolicy + CIDRs) or `cilium` (CiliumNetworkPolicy + FQDN allow-list). |
 | `runtimeClassName` | (none) | e.g. `kata-fc` for Firecracker-backed microVMs. Cluster must have the RuntimeClass installed. |
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
-| `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
 | `podActivityDeadlineSec` | `3600` | Hard ceiling on a single run's wall-clock time. |
 
 Full JSON Schema in `src/manifest.ts`.
@@ -96,17 +95,17 @@ NetworkPolicy      paperclip-egress-allow         (DNS + paperclip-server callba
 For each agent run (sandbox-cr backend):
 
 ```
-Sandbox CR         pc-{ulid}                       (agents.x-k8s.io/v1alpha1; explicit delete on release)
-Pod                pc-{ulid}-{podSuffix}           (managed by Sandbox controller; torn down on CR delete)
-Secret             pc-{ulid}-env                   (owned by Sandbox CR; cascade-deleted)
+Sandbox CR         pc-acq-{32-hex}                 (agents.x-k8s.io/v1alpha1; explicit delete on release)
+Pod                pc-acq-{32-hex}-{podSuffix}     (managed by Sandbox controller; torn down on CR delete)
+Secret             pc-acq-{32-hex}-env             (owned by Sandbox CR; cascade-deleted)
 ```
 
 For each agent run (job backend):
 
 ```
-Job                pc-{ulid}                       (backoffLimit: 0, ttlSecondsAfterFinished from config)
-Pod                pc-{ulid}-{podSuffix}           (owned by Job; cascade-deleted)
-Secret             pc-{ulid}-env                   (owned by Job; cascade-deleted)
+Job                pc-acq-{32-hex}                 (backoffLimit: 0; explicit delete on release)
+Pod                pc-acq-{32-hex}-{podSuffix}     (owned by Job; cascade-deleted)
+Secret             pc-acq-{32-hex}-env             (owned by Job; cascade-deleted)
 ```
 
 ## Security baseline

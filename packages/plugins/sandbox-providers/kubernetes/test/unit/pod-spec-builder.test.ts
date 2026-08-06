@@ -12,7 +12,6 @@ const baseInput = {
   resources: { requests: { cpu: "250m", memory: "512Mi" }, limits: { cpu: "2", memory: "4Gi" } },
   runtimeClassName: undefined,
   activeDeadlineSec: 3600,
-  ttlSecondsAfterFinished: 900,
 };
 
 describe("buildJobManifest", () => {
@@ -22,10 +21,10 @@ describe("buildJobManifest", () => {
     expect(job.kind).toBe("Job");
   });
 
-  it("sets Job-level lifecycle controls: backoffLimit=0, ttlSecondsAfterFinished, activeDeadlineSeconds", () => {
-    const job = buildJobManifest({ ...baseInput, activeDeadlineSec: 1800, ttlSecondsAfterFinished: 600 });
+  it("keeps replayable Jobs until explicit release while enforcing execution limits", () => {
+    const job = buildJobManifest({ ...baseInput, activeDeadlineSec: 1800 });
     expect(job.spec.backoffLimit).toBe(0);
-    expect(job.spec.ttlSecondsAfterFinished).toBe(600);
+    expect(job.spec.ttlSecondsAfterFinished).toBeUndefined();
     expect(job.spec.activeDeadlineSeconds).toBe(1800);
   });
 
