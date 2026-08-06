@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   ModalClient,
   NotFoundError,
@@ -8,7 +9,11 @@ import {
   type Sandbox,
   type SandboxCreateParams,
 } from "modal";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import {
+  definePlugin,
+  JsonRpcCallError,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -127,11 +132,14 @@ async function resolveApp(client: ModalClient, config: ModalDriverConfig): Promi
 function buildSandboxCreateParams(input: {
   config: ModalDriverConfig;
   tags: Record<string, string>;
+  name?: string;
 }): SandboxCreateParams {
   const params: SandboxCreateParams = {
+    name: input.name,
     workdir: input.config.workdir,
     timeoutMs: input.config.sandboxTimeoutMs,
     blockNetwork: input.config.blockNetwork,
+    tags: input.tags,
   };
   if (input.config.idleTimeoutMs != null) {
     params.idleTimeoutMs = input.config.idleTimeoutMs;
@@ -139,16 +147,13 @@ function buildSandboxCreateParams(input: {
   if (input.config.cidrAllowlist && input.config.cidrAllowlist.length > 0) {
     params.cidrAllowlist = input.config.cidrAllowlist;
   }
-  // Modal sandboxes accept tag metadata via setTags after creation; the create
-  // RPC does not take tags directly. We pass them through input so the caller
-  // can apply them after `create` resolves.
-  void input.tags;
   return params;
 }
 
 function buildSandboxTags(input: {
   companyId: string;
   environmentId: string;
+  acquisitionId?: string;
   runId?: string;
   reuseLease: boolean;
 }): Record<string, string> {
@@ -157,6 +162,7 @@ function buildSandboxTags(input: {
     "paperclip-company-id": input.companyId,
     "paperclip-environment-id": input.environmentId,
     "paperclip-reuse-lease": input.reuseLease ? "true" : "false",
+    ...(input.acquisitionId ? { "paperclip-acquisition-id": input.acquisitionId } : {}),
     ...(input.runId ? { "paperclip-run-id": input.runId } : {}),
   };
 }
@@ -166,22 +172,75 @@ async function createSandboxFor(
   app: App,
   config: ModalDriverConfig,
   tags: Record<string, string>,
+  options: { name?: string } = {},
 ): Promise<Sandbox> {
   const image = client.images.fromRegistry(config.image);
-  const params = buildSandboxCreateParams({ config, tags });
-  const sandbox = await client.sandboxes.create(app, image, params);
+  const params = buildSandboxCreateParams({ config, tags, name: options.name });
+  return await client.sandboxes.create(app, image, params);
+}
+
+function acquisitionSandboxName(acquisitionId: string): string {
+  return `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+}
+
+async function findAcquiredSandbox(
+  client: ModalClient,
+  config: ModalDriverConfig,
+  name: string,
+  acquisitionId: string,
+): Promise<Sandbox | null> {
+  let sandbox: Sandbox;
   try {
-    await sandbox.setTags(tags);
+    sandbox = await client.sandboxes.fromName(config.appName, name, {
+      environment: config.environment ?? undefined,
+    });
   } catch (error) {
-    // setTags is best-effort metadata; surface but do not block lease creation.
-    console.warn(`Failed to set tags on Modal sandbox ${sandbox.sandboxId}: ${formatErrorMessage(error)}`);
+    if (error instanceof NotFoundError) return null;
+    throw error;
+  }
+
+  const tags = await sandbox.getTags();
+  const owner = tags["paperclip-acquisition-id"];
+  if (owner && owner !== acquisitionId) {
+    throw new Error(
+      `Refusing to adopt Modal sandbox ${name}: acquisition ownership does not match ${acquisitionId}.`,
+    );
+  }
+  if (!owner) {
+    throw new Error(`Refusing to adopt unowned Modal sandbox ${name} for acquisition ${acquisitionId}.`);
   }
   return sandbox;
+}
+
+async function acquireSandbox(
+  client: ModalClient,
+  app: App,
+  config: ModalDriverConfig,
+  params: PluginEnvironmentAcquireLeaseParams,
+  tags: Record<string, string>,
+): Promise<{ sandbox: Sandbox; created: boolean }> {
+  const name = acquisitionSandboxName(params.acquisitionId);
+  const existing = await findAcquiredSandbox(client, config, name, params.acquisitionId);
+  if (existing) return { sandbox: existing, created: false };
+
+  try {
+    return {
+      sandbox: await createSandboxFor(client, app, config, tags, {
+        name,
+      }),
+      created: true,
+    };
+  } catch (error) {
+    const reconciled = await findAcquiredSandbox(client, config, name, params.acquisitionId);
+    if (reconciled) return { sandbox: reconciled, created: false };
+    throw error;
+  }
 }
 
 function leaseMetadata(input: {
   config: ModalDriverConfig;
   sandbox: Sandbox;
+  acquisitionId?: string;
   remoteCwd: string;
   resumedLease: boolean;
 }) {
@@ -189,6 +248,7 @@ function leaseMetadata(input: {
     provider: "modal",
     shellCommand: "sh",
     sandboxId: input.sandbox.sandboxId,
+    ...(input.acquisitionId ? { acquisitionId: input.acquisitionId } : {}),
     appName: input.config.appName,
     image: input.config.image,
     sandboxTimeoutMs: input.config.sandboxTimeoutMs,
@@ -201,6 +261,14 @@ function leaseMetadata(input: {
 
 function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function acquisitionFailureWithLease(error: unknown, providerLeaseId: string): JsonRpcCallError {
+  return new JsonRpcCallError({
+    code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+    message: formatErrorMessage(error),
+    data: { providerLeaseId },
+  });
 }
 
 function shellQuote(value: string): string {
@@ -462,10 +530,11 @@ const plugin = definePlugin({
       const tags = buildSandboxTags({
         companyId: params.companyId,
         environmentId: params.environmentId,
+        acquisitionId: params.acquisitionId,
         runId: params.runId,
         reuseLease: config.reuseLease,
       });
-      const sandbox = await createSandboxFor(client, app, config, tags);
+      const { sandbox, created } = await acquireSandbox(client, app, config, params, tags);
       try {
         await ensureRemoteWorkspace(sandbox, config.workdir);
         return {
@@ -473,13 +542,21 @@ const plugin = definePlugin({
           metadata: leaseMetadata({
             config,
             sandbox,
+            acquisitionId: params.acquisitionId,
             remoteCwd: config.workdir,
             resumedLease: false,
           }),
         };
       } catch (error) {
-        await sandbox.terminate().catch(() => undefined);
-        throw error;
+        if (created) {
+          try {
+            await sandbox.terminate();
+          } catch {
+            throw acquisitionFailureWithLease(error, sandbox.sandboxId);
+          }
+          throw error;
+        }
+        throw acquisitionFailureWithLease(error, sandbox.sandboxId);
       }
     } finally {
       // Keep the client open for the lease lifetime is unnecessary; subsequent

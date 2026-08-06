@@ -1,5 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import {
+  definePlugin,
+  JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -34,11 +39,15 @@ import {
   SandboxCrTimeoutError,
 } from "./sandbox-cr-orchestrator.js";
 import { execInPod, wrapCommandWithEnv } from "./pod-exec.js";
-import { checkLeaseResumable, destroyLeaseResources } from "./lease-lifecycle.js";
 import {
+  checkLeaseResumable,
+  destroyLeaseResources,
+  isKubeNotFoundError,
+} from "./lease-lifecycle.js";
+import {
+  deriveAcquisitionResourceName,
   deriveCompanySlug,
   deriveNamespaceName,
-  newRunUlidDns,
   paperclipLabels,
 } from "./utils.js";
 
@@ -73,6 +82,144 @@ function generateBootstrapToken(): string {
   // this plugin. For now this per-run random token is stored in the per-run
   // Secret and read by the runtime image entrypoint for initial registration.
   return randomBytes(32).toString("hex");
+}
+
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function acquisitionFailureWithLease(
+  error: unknown,
+  providerLeaseId: string,
+  acquisitionId?: string,
+): JsonRpcCallError {
+  return new JsonRpcCallError({
+    code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+    message: formatErrorMessage(error),
+    data: {
+      providerLeaseId,
+      ...(acquisitionId
+        ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+        : {}),
+    },
+  });
+}
+
+function metadataString(
+  metadata: Record<string, unknown> | undefined,
+  key: string,
+): string | undefined {
+  const value = metadata?.[key];
+  if (typeof value === "string" && value.length > 0) return value;
+  const providerMetadata = metadata?.providerMetadata;
+  if (!providerMetadata || typeof providerMetadata !== "object" || Array.isArray(providerMetadata)) {
+    return undefined;
+  }
+  const nestedValue = (providerMetadata as Record<string, unknown>)[key];
+  return typeof nestedValue === "string" && nestedValue.length > 0 ? nestedValue : undefined;
+}
+
+async function readOwnedWorkloadUid(
+  clients: ReturnType<typeof makeKubeClients>,
+  namespace: string,
+  name: string,
+  backend: "sandbox-cr" | "job",
+  acquisitionId?: string,
+  expectedUid?: string,
+): Promise<string | null> {
+  if (acquisitionId && name !== deriveAcquisitionResourceName(acquisitionId)) {
+    throw new Error(
+      `Refusing to release Kubernetes workload ${name}: acquisition ownership does not match ${acquisitionId}.`,
+    );
+  }
+
+  let workload: unknown;
+  try {
+    workload = backend === "sandbox-cr"
+      ? await clients.custom.getNamespacedCustomObject({
+          group: "agents.x-k8s.io",
+          version: "v1alpha1",
+          namespace,
+          plural: "sandboxes",
+          name,
+        })
+      : await clients.batch.readNamespacedJob({ namespace, name });
+  } catch (error) {
+    if (isKubeNotFoundError(error)) return null;
+    throw error;
+  }
+
+  const metadata = (workload as {
+    metadata?: { uid?: unknown; labels?: Record<string, string> };
+  } | null)?.metadata;
+  if (acquisitionId && (
+    metadata?.labels?.["paperclip.io/managed-by"] !== "paperclip-k8s-plugin"
+    || metadata.labels["paperclip.io/acquisition-id"] !== acquisitionId
+  )) {
+    throw new Error(
+      `Refusing to release Kubernetes workload ${name}: acquisition ownership does not match ${acquisitionId}.`,
+    );
+  }
+  if (typeof metadata?.uid !== "string" || metadata.uid.length === 0) {
+    throw new Error(`Kubernetes workload ${name} has no UID.`);
+  }
+  if (expectedUid && metadata.uid !== expectedUid) {
+    throw new Error(
+      `Refusing to release Kubernetes workload ${name}: UID does not match the persisted lease.`,
+    );
+  }
+  return metadata.uid;
+}
+
+async function assertAcquisitionCleanupSafe(
+  clients: ReturnType<typeof makeKubeClients>,
+  namespace: string,
+  name: string,
+  backend: "sandbox-cr" | "job",
+  acquisitionId: string | undefined,
+  leaseMetadata: Record<string, unknown> | undefined,
+): Promise<{ acquisitionId?: string; workloadUid: string | null }> {
+  const persistedAcquisitionId = metadataString(leaseMetadata, "acquisitionId");
+  if (
+    persistedAcquisitionId
+    && acquisitionId
+    && persistedAcquisitionId !== acquisitionId
+  ) {
+    throw new Error(
+      `Refusing to release Kubernetes workload ${name}: acquisition ownership does not match ${acquisitionId}.`,
+    );
+  }
+  // Hosts predating acquisition replay used random pc-{ulid} names and did
+  // not persist acquisitionId. Keep those leases releasable while requiring
+  // full label validation for deterministic acquisition resources.
+  const verifiedAcquisitionId = persistedAcquisitionId
+    ?? (acquisitionId && name === deriveAcquisitionResourceName(acquisitionId)
+      ? acquisitionId
+      : undefined);
+  const persistedWorkloadUid = metadataString(leaseMetadata, "workloadUid");
+  const workloadUid = await readOwnedWorkloadUid(
+    clients,
+    namespace,
+    name,
+    backend,
+    verifiedAcquisitionId,
+    persistedWorkloadUid,
+  );
+  if (
+    !workloadUid
+    && verifiedAcquisitionId
+    && !persistedWorkloadUid
+    && leaseMetadata?.[PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]
+      !== verifiedAcquisitionId
+  ) {
+    throw new Error(
+      `Kubernetes workload ${name} is not visible yet; cleanup must be retried.`,
+    );
+  }
+  return {
+    acquisitionId: verifiedAcquisitionId,
+    workloadUid: workloadUid ?? persistedWorkloadUid ?? null,
+  };
 }
 
 // One FastUploadInterceptor instance per active lease. Scoping per lease
@@ -252,12 +399,13 @@ const plugin = definePlugin({
       resourceQuota: DEFAULT_RESOURCE_QUOTA,
     });
 
-    const jobName = `pc-${newRunUlidDns()}`;
+    const jobName = deriveAcquisitionResourceName(params.acquisitionId);
     const secretName = `${jobName}-env`;
 
     // TODO: use params.runId as stand-in for agentId in labels; future
     // versions will have a dedicated agentId on AcquireLeaseParams.
     const labels = paperclipLabels({
+      acquisitionId: params.acquisitionId,
       runId: params.runId,
       agentId: params.runId,
       companyId: params.companyId,
@@ -298,11 +446,15 @@ const plugin = definePlugin({
           resources: config.defaultResources ?? {},
           runtimeClassName: config.runtimeClassName,
           activeDeadlineSec: config.podActivityDeadlineSec,
-          ttlSecondsAfterFinished: config.jobTtlSecondsAfterFinished,
           imagePullSecrets: config.imagePullSecrets,
         });
 
-    const { uid: ownerUid } = await orchestrator.claim(clients, namespace, manifest);
+    const { uid: ownerUid, created: workloadCreated } = await orchestrator.claim(
+      clients,
+      namespace,
+      manifest,
+      params.acquisitionId,
+    );
 
     // defaultEnv (non-secret base, e.g. the inference base URL) is layered first;
     // the process-env secrets named by envKeys override it.
@@ -314,59 +466,91 @@ const plugin = definePlugin({
     // NOTE: For sandbox-cr, if the Secret outlives the Sandbox due to a cluster
     // quirk, the release() call will still clean it up via namespace GC or
     // explicit delete in a future iteration.
-    await createPerRunSecret(clients, {
-      namespace,
-      secretName,
-      runId: params.runId,
-      ownerKind: isSandboxCrBackend ? "Sandbox" : "Job",
-      ownerApiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1alpha1" : "batch/v1",
-      ownerName: jobName,
-      ownerUid,
-      bootstrapToken,
-      adapterEnv,
-    });
+    try {
+      const createMissingSecret = workloadCreated
+        || (await orchestrator.getStatus(clients, namespace, jobName)).phase === "Pending";
+      await createPerRunSecret(clients, {
+        namespace,
+        secretName,
+        acquisitionId: params.acquisitionId,
+        runId: params.runId,
+        ownerKind: isSandboxCrBackend ? "Sandbox" : "Job",
+        ownerApiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1alpha1" : "batch/v1",
+        ownerName: jobName,
+        ownerUid,
+        bootstrapToken,
+        adapterEnv,
+        createIfMissing: createMissingSecret,
+      });
 
-    const podName = await orchestrator.findPod(clients, namespace, jobName);
+      let podName: string | null = null;
+      try {
+        podName = await orchestrator.findPod(clients, namespace, jobName);
+      } catch {
+        // Pod discovery is only a cache warm-up; execute/resume resolves it
+        // again once the workload is ready.
+      }
 
-    const leaseMetadata: KubernetesLeaseMetadata = {
-      namespace,
-      jobName,
-      podName,
-      secretName,
-      phase: "Pending",
-      backend: config.backend,
-    };
+      const leaseMetadata: KubernetesLeaseMetadata = {
+        acquisitionId: params.acquisitionId,
+        workloadUid: ownerUid,
+        namespace,
+        jobName,
+        podName,
+        secretName,
+        phase: "Pending",
+        backend: config.backend,
+      };
 
-    return {
-      providerLeaseId: jobName,
-      metadata: leaseMetadata as unknown as Record<string, unknown>,
-    };
+      return {
+        providerLeaseId: jobName,
+        metadata: leaseMetadata as unknown as Record<string, unknown>,
+      };
+    } catch (error) {
+      // claim() proved this deterministic workload belongs to the logical
+      // acquisition, whether this call created or adopted it. Hand cleanup to
+      // the host, which persists the retry and revalidates ownership plus UID.
+      throw acquisitionFailureWithLease(error, jobName, params.acquisitionId);
+    }
   },
 
   async onEnvironmentResumeLease(
     params: PluginEnvironmentResumeLeaseParams,
   ): Promise<PluginEnvironmentLease> {
     const config = kubernetesProviderConfigSchema.parse(params.config);
-    const namespace =
-      typeof params.leaseMetadata?.namespace === "string"
-        ? params.leaseMetadata.namespace
-        : deriveTenantNamespace(config, params.companyId);
-    const leaseBackend =
-      typeof params.leaseMetadata?.backend === "string"
-        ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
-        : config.backend;
+    const namespace = metadataString(params.leaseMetadata, "namespace")
+      ?? deriveTenantNamespace(config, params.companyId);
+    const leaseBackend = (metadataString(params.leaseMetadata, "backend")
+      ?? config.backend) as "sandbox-cr" | "job";
     // acquireLease names the per-run Secret `${jobName}-env` and uses jobName
     // as the providerLeaseId, so the suffix fallback reconstructs it exactly.
-    const secretName =
-      typeof params.leaseMetadata?.secretName === "string"
-        ? params.leaseMetadata.secretName
-        : `${params.providerLeaseId}-env`;
+    const secretName = metadataString(params.leaseMetadata, "secretName")
+      ?? `${params.providerLeaseId}-env`;
 
     const kc = createKubeConfig({
       inCluster: config.inCluster,
       kubeconfig: config.kubeconfig,
     });
     const clients = makeKubeClients(kc);
+
+    const resumeAcquisitionId = metadataString(params.leaseMetadata, "acquisitionId");
+    const persistedWorkloadUid = metadataString(params.leaseMetadata, "workloadUid");
+    if (resumeAcquisitionId || persistedWorkloadUid) {
+      const workloadUid = await readOwnedWorkloadUid(
+        clients,
+        namespace,
+        params.providerLeaseId,
+        leaseBackend,
+        resumeAcquisitionId,
+        persistedWorkloadUid,
+      );
+      if (!workloadUid) {
+        return {
+          providerLeaseId: null,
+          metadata: { expired: true, reason: "Kubernetes workload no longer exists" },
+        };
+      }
+    }
 
     const check = await checkLeaseResumable(clients, {
       namespace,
@@ -398,6 +582,8 @@ const plugin = definePlugin({
     }
 
     const leaseMetadata: KubernetesLeaseMetadata = {
+      acquisitionId: resumeAcquisitionId ?? "",
+      workloadUid: persistedWorkloadUid ?? "",
       namespace,
       jobName: params.providerLeaseId,
       podName: check.podName,
@@ -439,10 +625,8 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const config = kubernetesProviderConfigSchema.parse(params.config);
-    const namespace =
-      typeof params.leaseMetadata?.namespace === "string"
-        ? params.leaseMetadata.namespace
-        : deriveTenantNamespace(config, params.companyId);
+    const namespace = metadataString(params.leaseMetadata, "namespace")
+      ?? deriveTenantNamespace(config, params.companyId);
 
     const kc = createKubeConfig({
       inCluster: config.inCluster,
@@ -450,12 +634,19 @@ const plugin = definePlugin({
     });
     const clients = makeKubeClients(kc);
 
-    const leaseBackend =
-      typeof params.leaseMetadata?.backend === "string"
-        ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
-        : config.backend;
+    const leaseBackend = (metadataString(params.leaseMetadata, "backend")
+      ?? config.backend) as "sandbox-cr" | "job";
     const releaseOrchestrator =
       leaseBackend === "sandbox-cr" ? sandboxCrOrchestrator : jobOrchestrator;
+
+    const cleanup = await assertAcquisitionCleanupSafe(
+      clients,
+      namespace,
+      params.providerLeaseId,
+      leaseBackend,
+      params.acquisitionId,
+      params.leaseMetadata,
+    );
 
     // Drop the FastUploadInterceptor associated with THIS lease (only).
     // Each lease has its own interceptor instance via uploadInterceptorsByLease,
@@ -463,13 +654,26 @@ const plugin = definePlugin({
     uploadInterceptorsByLease.delete(params.providerLeaseId);
     readySandboxesByLease.delete(params.providerLeaseId);
 
+    if (!cleanup.workloadUid) return;
+
     try {
-      await releaseOrchestrator.release(clients, namespace, params.providerLeaseId);
+      await releaseOrchestrator.release(
+        clients,
+        namespace,
+        params.providerLeaseId,
+        cleanup.workloadUid,
+      );
     } catch (err) {
       // If the resource is already gone (404), that's fine.
       const code = (err as { code?: number; statusCode?: number }).code
         ?? (err as { code?: number; statusCode?: number }).statusCode;
-      if (code !== 404) throw err;
+      if (code !== 404) {
+        throw acquisitionFailureWithLease(
+          err,
+          params.providerLeaseId,
+          params.acquisitionId,
+        );
+      }
     }
   },
 
@@ -478,34 +682,33 @@ const plugin = definePlugin({
   ): Promise<void> {
     if (!params.providerLeaseId) return;
     const config = kubernetesProviderConfigSchema.parse(params.config);
-    const namespace =
-      typeof params.leaseMetadata?.namespace === "string"
-        ? params.leaseMetadata.namespace
-        : deriveTenantNamespace(config, params.companyId);
-    const leaseBackend =
-      typeof params.leaseMetadata?.backend === "string"
-        ? (params.leaseMetadata.backend as "sandbox-cr" | "job")
-        : config.backend;
-    const secretName =
-      typeof params.leaseMetadata?.secretName === "string"
-        ? params.leaseMetadata.secretName
-        : `${params.providerLeaseId}-env`;
-    const podName =
-      typeof params.leaseMetadata?.podName === "string" &&
-      params.leaseMetadata.podName.length > 0
-        ? params.leaseMetadata.podName
-        : null;
-
-    // Clear per-lease in-memory state up front, regardless of what the
-    // cluster says — the lease is dead either way.
-    uploadInterceptorsByLease.delete(params.providerLeaseId);
-    readySandboxesByLease.delete(params.providerLeaseId);
+    const namespace = metadataString(params.leaseMetadata, "namespace")
+      ?? deriveTenantNamespace(config, params.companyId);
+    const leaseBackend = (metadataString(params.leaseMetadata, "backend")
+      ?? config.backend) as "sandbox-cr" | "job";
+    const secretName = metadataString(params.leaseMetadata, "secretName")
+      ?? `${params.providerLeaseId}-env`;
+    const podName = metadataString(params.leaseMetadata, "podName") ?? null;
 
     const kc = createKubeConfig({
       inCluster: config.inCluster,
       kubeconfig: config.kubeconfig,
     });
     const clients = makeKubeClients(kc);
+
+    const cleanup = await assertAcquisitionCleanupSafe(
+      clients,
+      namespace,
+      params.providerLeaseId,
+      leaseBackend,
+      params.acquisitionId,
+      params.leaseMetadata,
+    );
+
+    // Clear per-lease in-memory state only after confirming that this caller
+    // owns the workload it asked us to destroy.
+    uploadInterceptorsByLease.delete(params.providerLeaseId);
+    readySandboxesByLease.delete(params.providerLeaseId);
 
     // Forcibly delete everything acquireLease created (Sandbox CR / Job, pod,
     // per-run Secret). 404s are success — destroy must be idempotent.
@@ -515,6 +718,8 @@ const plugin = definePlugin({
       backend: leaseBackend,
       podName,
       secretName,
+      workloadUid: cleanup.workloadUid,
+      acquisitionId: cleanup.acquisitionId,
     });
   },
 

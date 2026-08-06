@@ -20,6 +20,7 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       driverKey: "modal",
       kind: "sandbox_provider",
+      supportsAcquisitionReplay: true,
       displayName: "Modal Sandbox",
       description:
         "Provisions Modal sandboxes with configurable image, app, auth, timeouts, and network controls.",

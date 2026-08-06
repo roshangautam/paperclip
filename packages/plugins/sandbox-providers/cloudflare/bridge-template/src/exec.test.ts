@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@cloudflare/sandbox", () => ({
+  Sandbox: class {},
   getSandbox: vi.fn(),
 }));
 

@@ -1,25 +1,46 @@
+import { createHash } from "node:crypto";
+import {
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockCreate = vi.hoisted(() => vi.fn());
 const mockGet = vi.hoisted(() => vi.fn());
+const mockList = vi.hoisted(() => vi.fn());
 const mockSnapshotGet = vi.hoisted(() => vi.fn());
 const mockSnapshotDelete = vi.hoisted(() => vi.fn());
-const { MockDaytonaNotFoundError, MockDaytonaTimeoutError } = vi.hoisted(() => {
+const {
+  MockDaytonaConflictError,
+  MockDaytonaConnectionError,
+  MockDaytonaNotFoundError,
+  MockDaytonaTimeoutError,
+} = vi.hoisted(() => {
+  class MockDaytonaConflictError extends Error {}
+  class MockDaytonaConnectionError extends Error {}
   class MockDaytonaNotFoundError extends Error {}
   class MockDaytonaTimeoutError extends Error {}
-  return { MockDaytonaNotFoundError, MockDaytonaTimeoutError };
+  return {
+    MockDaytonaConflictError,
+    MockDaytonaConnectionError,
+    MockDaytonaNotFoundError,
+    MockDaytonaTimeoutError,
+  };
 });
 
 vi.mock("@daytonaio/sdk", () => ({
   Daytona: class MockDaytona {
     create = mockCreate;
     get = mockGet;
+    list = mockList;
     snapshot = {
       get: mockSnapshotGet,
       delete: mockSnapshotDelete,
     };
     constructor(_config?: unknown) {}
   },
+  DaytonaConnectionError: MockDaytonaConnectionError,
+  DaytonaConflictError: MockDaytonaConflictError,
   DaytonaNotFoundError: MockDaytonaNotFoundError,
   DaytonaTimeoutError: MockDaytonaTimeoutError,
 }));
@@ -33,12 +54,14 @@ function createMockSandbox(overrides: {
   state?: string;
   recoverable?: boolean;
   workDir?: string;
+  labels?: Record<string, string>;
 } = {}) {
   return {
     id: overrides.id ?? "sandbox-123",
     name: overrides.name ?? "paperclip-sandbox",
     state: overrides.state ?? "started",
     recoverable: overrides.recoverable ?? false,
+    labels: overrides.labels ?? {},
     target: "us",
     errorReason: null,
     getWorkDir: vi.fn().mockResolvedValue(overrides.workDir ?? "/home/daytona"),
@@ -74,6 +97,7 @@ describe("Daytona sandbox provider plugin", () => {
   beforeEach(() => {
     mockCreate.mockReset();
     mockGet.mockReset();
+    mockList.mockReset();
     mockSnapshotGet.mockReset();
     mockSnapshotDelete.mockReset();
     vi.restoreAllMocks();
@@ -90,6 +114,7 @@ describe("Daytona sandbox provider plugin", () => {
     expect(plugin.definition.onEnvironmentStartInteractiveSetup).toBeTypeOf("function");
     expect(plugin.definition.onEnvironmentCaptureTemplate).toBeTypeOf("function");
     expect(manifest.environmentDrivers?.[0]).toMatchObject({
+      supportsAcquisitionReplay: true,
       supportsInteractiveSetup: true,
       interactiveSetupConnectionTypes: ["ssh"],
       supportsTemplateCapture: true,
@@ -305,6 +330,419 @@ describe("Daytona sandbox provider plugin", () => {
       "/home/daytona/paperclip-workspace/.paperclip-runtime/reusable-sandbox-lease.json",
       300,
     );
+  });
+
+  it("replays by listing the exact sandbox name instead of looking it up as an ID", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-replay-1";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      id: "sandbox-replay",
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    mockList.mockResolvedValue({
+      items: [createMockSandbox({ name: `${sandboxName}-other` }), sandbox],
+      total: 2,
+      page: 1,
+      totalPages: 1,
+    });
+    mockGet.mockRejectedValue(new MockDaytonaNotFoundError("sandbox names are not IDs"));
+
+    const lease = await plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-replayed",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    });
+
+    expect(mockList).toHaveBeenCalledWith({ "paperclip-acquisition-id": acquisitionId }, 1, 100);
+    expect(mockGet).not.toHaveBeenCalled();
+    expect(mockCreate).not.toHaveBeenCalled();
+    expect(lease).toMatchObject({
+      providerLeaseId: "sandbox-replay",
+      metadata: {
+        acquisitionId,
+      },
+    });
+    expect(lease?.metadata).not.toHaveProperty(
+      PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+    );
+  });
+
+  it("replays an exact acquisition sandbox found on a later page", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-replay-page-2";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      id: "sandbox-replay-page-2",
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    mockList
+      .mockResolvedValueOnce({
+        items: [createMockSandbox({ name: `${sandboxName}-other` })],
+        total: 2,
+        page: 1,
+        totalPages: 2,
+      })
+      .mockResolvedValueOnce({ items: [sandbox], total: 2, page: 2, totalPages: 2 });
+
+    const lease = await plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-replayed",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    });
+
+    expect(mockList).toHaveBeenNthCalledWith(2, { "paperclip-acquisition-id": acquisitionId }, 2, 100);
+    expect(mockCreate).not.toHaveBeenCalled();
+    expect(lease).toMatchObject({ providerLeaseId: "sandbox-replay-page-2" });
+  });
+
+  it("hands off an existing acquisition sandbox when restarting it fails", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-replay-start-failed";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      id: "sandbox-replay-start-failed",
+      name: sandboxName,
+      state: "stopped",
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    sandbox.start.mockRejectedValue(new Error("restart failed"));
+    mockList.mockResolvedValue({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "restart failed",
+      data: {
+        providerLeaseId: sandbox.id,
+        cleanupVerifiedAcquisitionId: acquisitionId,
+      },
+    });
+
+    expect(sandbox.start).toHaveBeenCalledWith(300);
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it("creates a deterministic acquisition sandbox with an ownership label", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-create-1";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      id: "sandbox-created",
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    mockList.mockResolvedValue({ items: [], total: 0, page: 1, totalPages: 0 });
+    mockCreate.mockResolvedValue(sandbox);
+
+    await plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    });
+
+    expect(mockList).toHaveBeenCalledWith({ "paperclip-acquisition-id": acquisitionId }, 1, 100);
+    const [createParams] = mockCreate.mock.calls[0] as [Record<string, unknown>];
+    expect(createParams).toMatchObject({
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+  });
+
+  it.each(["name", "label"] as const)(
+    "rejects a successful Daytona create response with the wrong %s",
+    async (mismatch) => {
+      process.env.DAYTONA_API_KEY = "host-key";
+      const acquisitionId = `acquisition-create-wrong-${mismatch}`;
+      const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+      const sandbox = createMockSandbox({
+        name: mismatch === "name" ? `${sandboxName}-other` : sandboxName,
+        labels: {
+          "paperclip-acquisition-id": mismatch === "label" ? "other-acquisition" : acquisitionId,
+        },
+      });
+      mockList.mockResolvedValue({ items: [], total: 0, page: 1, totalPages: 0 });
+      mockCreate.mockResolvedValue(sandbox);
+
+      await expect(plugin.definition.onEnvironmentAcquireLease?.({
+        driverKey: "daytona",
+        companyId: "company-1",
+        environmentId: "env-1",
+        acquisitionId,
+        runId: "run-1",
+        config: { image: "node:20", timeoutMs: 300000, reuseLease: false },
+      })).rejects.toThrow("acquisition ownership does not match");
+
+      expect(sandbox.getWorkDir).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects a deterministic Daytona name owned by another acquisition", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-collision-1";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": "other-acquisition" },
+    });
+    mockList.mockResolvedValue({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toThrow(/acquisition ownership does not match/);
+
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it("rejects ambiguous exact-name Daytona acquisition matches", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-duplicate-name-1";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const labels = { "paperclip-acquisition-id": acquisitionId };
+    mockList.mockResolvedValueOnce({
+      items: [
+        createMockSandbox({ id: "sandbox-duplicate-1", name: sandboxName, labels }),
+        createMockSandbox({ id: "sandbox-duplicate-2", name: sandboxName, labels }),
+      ],
+      total: 2,
+      page: 1,
+      totalPages: 1,
+    });
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toThrow(`Refusing to reconcile multiple Daytona sandboxes named ${sandboxName}.`);
+
+    expect(mockList).toHaveBeenCalledWith({ "paperclip-acquisition-id": acquisitionId }, 1, 100);
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an ambiguous Daytona create without deleting the adopted sandbox", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-ambiguous-1";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    sandbox.getWorkDir.mockRejectedValue(new Error("workdir lookup failed"));
+    mockList
+      .mockResolvedValueOnce({ items: [], total: 0, page: 1, totalPages: 0 })
+      .mockResolvedValueOnce({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
+    mockCreate.mockRejectedValue(new MockDaytonaConnectionError("response lost"));
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "workdir lookup failed",
+      data: { providerLeaseId: sandbox.id },
+    });
+
+    expect(mockList).toHaveBeenCalledTimes(2);
+    expect(mockGet).not.toHaveBeenCalled();
+    expect(sandbox.delete).not.toHaveBeenCalled();
+  });
+
+  it("retries reconciliation when a create conflict is not immediately visible", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-conflict-eventual-consistency";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      id: "sandbox-eventually-visible",
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    mockList
+      .mockResolvedValueOnce({ items: [], total: 0, page: 1, totalPages: 0 })
+      .mockRejectedValueOnce(new MockDaytonaConnectionError("list temporarily unavailable"))
+      .mockResolvedValueOnce({ items: [], total: 0, page: 1, totalPages: 0 })
+      .mockResolvedValueOnce({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
+    mockCreate.mockRejectedValue(new MockDaytonaConflictError("sandbox name already exists"));
+
+    const lease = await plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    });
+
+    expect(mockList).toHaveBeenCalledTimes(4);
+    expect(lease).toMatchObject({
+      providerLeaseId: "sandbox-eventually-visible",
+      metadata: { acquisitionId },
+    });
+  });
+
+  it("hands off the deterministic name when ambiguous-create reconciliation is exhausted", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-ambiguous-missing";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    mockList.mockResolvedValue({ items: [], total: 0, page: 1, totalPages: 0 });
+    mockCreate.mockRejectedValue(new MockDaytonaTimeoutError("create response timed out"));
+
+    const error = await plugin.definition.onEnvironmentAcquireLease!({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+    });
+    expect((error as { data: unknown }).data).toEqual({ providerLeaseId: sandboxName });
+
+    expect(mockList).toHaveBeenCalledTimes(6);
+  });
+
+  it("hands off a reconciled acquisition sandbox when restarting it fails", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-reconciled-start-failed";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      id: "sandbox-reconciled-start-failed",
+      name: sandboxName,
+      state: "stopped",
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    sandbox.start.mockRejectedValue(new Error("reconciled restart failed"));
+    mockList.mockResolvedValueOnce({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
+    mockCreate.mockRejectedValue(new MockDaytonaConnectionError("create response lost"));
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "reconciled restart failed",
+      data: { providerLeaseId: sandbox.id },
+    });
+
+    expect(mockList).toHaveBeenCalledTimes(1);
+    expect(sandbox.start).toHaveBeenCalledWith(300);
+    expect(sandbox.delete).not.toHaveBeenCalled();
+  });
+
+  it("hands off a created acquisition sandbox without deleting it when local setup fails", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-setup-failed";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      id: "sandbox-delete-failed",
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    sandbox.getWorkDir.mockRejectedValue(new Error("workdir lookup failed"));
+    mockList.mockResolvedValue({ items: [], total: 0, page: 1, totalPages: 0 });
+    mockCreate.mockResolvedValue(sandbox);
+
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      runId: "run-1",
+      config: {
+        image: "node:20",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "workdir lookup failed",
+      data: { providerLeaseId: "sandbox-delete-failed" },
+    });
+
+    expect(mockCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ name: sandboxName }),
+      { timeout: 300 },
+    );
+    expect(sandbox.delete).not.toHaveBeenCalled();
   });
 
   it("starts an interactive setup sandbox with redacted metadata and one-time SSH payload", async () => {
@@ -958,6 +1396,145 @@ describe("Daytona sandbox provider plugin", () => {
     expect(reusable.delete).not.toHaveBeenCalled();
     expect(ephemeral.delete).toHaveBeenCalledWith(300);
   });
+
+  it("preserves verified acquisition cleanup state after an ambiguous delete so retry can terminate", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-cleanup-ambiguous-delete";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    sandbox.delete.mockRejectedValueOnce(new Error("response lost"));
+    mockList
+      .mockResolvedValueOnce({ items: [sandbox], total: 1, page: 1, totalPages: 1 })
+      .mockResolvedValueOnce({ items: [], total: 0, page: 1, totalPages: 0 });
+
+    const error = await plugin.definition.onEnvironmentReleaseLease!({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: sandboxName,
+      config: { timeoutMs: 300000, reuseLease: false },
+      leaseMetadata: {},
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: "JsonRpcCallError",
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: expect.stringContaining("response lost"),
+      data: {
+        providerLeaseId: sandboxName,
+        cleanupVerifiedAcquisitionId: acquisitionId,
+      },
+    });
+
+    await expect(plugin.definition.onEnvironmentReleaseLease!({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: sandboxName,
+      config: { timeoutMs: 300000, reuseLease: false },
+      leaseMetadata: (error as { data: Record<string, unknown> }).data,
+    })).resolves.toBeUndefined();
+
+    expect(sandbox.delete).toHaveBeenCalledTimes(1);
+    expect(mockList).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([undefined, "another-acquisition"])(
+    "keeps deterministic cleanup retryable without matching verification (%s)",
+    async (cleanupVerifiedAcquisitionId) => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-cleanup-delayed";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": acquisitionId },
+    });
+    mockList
+      .mockResolvedValueOnce({ items: [], total: 0, page: 1, totalPages: 0 })
+      .mockResolvedValueOnce({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
+
+      const params = {
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: sandboxName,
+      leaseMetadata: cleanupVerifiedAcquisitionId
+        ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: cleanupVerifiedAcquisitionId }
+        : {},
+      config: {
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    };
+    await expect(plugin.definition.onEnvironmentReleaseLease?.(params)).rejects.toThrow(
+      "cleanup must be retried",
+    );
+    await expect(plugin.definition.onEnvironmentReleaseLease?.(params)).resolves.toBeUndefined();
+
+    expect(mockGet).not.toHaveBeenCalled();
+    expect(sandbox.delete).toHaveBeenCalledWith(300);
+    },
+  );
+
+  it("accepts a missing Daytona sandbox after verified acquisition", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = "acquisition-cleanup-already-deleted";
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    mockList.mockResolvedValue({ items: [], total: 0, page: 1, totalPages: 0 });
+
+    await expect(plugin.definition.onEnvironmentReleaseLease?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: sandboxName,
+      leaseMetadata: {
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
+      },
+      config: {
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).resolves.toBeUndefined();
+  });
+
+  it.each(["release", "destroy"] as const)(
+    "validates acquisition ownership before %s of a deterministic Daytona sandbox",
+    async (lifecycle) => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const acquisitionId = `acquisition-cleanup-owned-${lifecycle}`;
+    const sandboxName = `pc-acq-${createHash("sha256").update(acquisitionId).digest("hex").slice(0, 32)}`;
+    const sandbox = createMockSandbox({
+      name: sandboxName,
+      labels: { "paperclip-acquisition-id": "another-acquisition" },
+    });
+    mockList.mockResolvedValueOnce({ items: [sandbox], total: 1, page: 1, totalPages: 1 });
+
+    const handler = lifecycle === "release"
+      ? plugin.definition.onEnvironmentReleaseLease
+      : plugin.definition.onEnvironmentDestroyLease;
+    await expect(handler?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      acquisitionId,
+      providerLeaseId: sandboxName,
+      config: {
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+    })).rejects.toThrow("acquisition ownership does not match");
+
+    expect(mockList).toHaveBeenCalledWith({ "paperclip-acquisition-id": acquisitionId }, 1, 100);
+    expect(sandbox.delete).not.toHaveBeenCalled();
+    },
+  );
 
   it("archives instead of deleting when the lease was acquired with archiveOnRelease", async () => {
     process.env.DAYTONA_API_KEY = "host-key";

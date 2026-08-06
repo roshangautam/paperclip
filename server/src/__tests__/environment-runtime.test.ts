@@ -31,13 +31,18 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import {
+  JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import { environmentRuntimeService, findReusableSandboxLeaseId } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.ts";
 import { secretService } from "../services/secrets.ts";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
+import { logger } from "../middleware/logger.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1311,8 +1316,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
     const workerManager = {
       isRunning: vi.fn((id: string) => id === pluginId),
-      call: vi.fn(async (_pluginId: string, method: string) => {
-        if (method === "environmentAcquireLease") throw acquisitionError;
+      call: vi.fn(async (_pluginId: string, method: string, params: Record<string, unknown>) => {
+        if (method === "environmentAcquireLease") {
+          (acquisitionError.data as Record<string, unknown>)[
+            PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY
+          ] = params.acquisitionId;
+          throw acquisitionError;
+        }
         if (method === "environmentReleaseLease") return undefined;
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
@@ -1331,6 +1341,14 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       "environmentAcquireLease",
       "environmentReleaseLease",
     ]);
+    const acquisitionId = workerManager.call.mock.calls[0]?.[2].acquisitionId;
+    expect(workerManager.call.mock.calls[1]?.[2]).toMatchObject({
+      acquisitionId,
+      providerLeaseId: "structured-failed-acquisition",
+      leaseMetadata: expect.objectContaining({
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
+      }),
+    });
     const [terminal] = await db.select().from(environmentLeases);
     expect(terminal).toMatchObject({
       status: "expired",
@@ -1338,6 +1356,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       cleanupStatus: "success",
       metadata: expect.objectContaining({
         sandboxLeaseReservation: false,
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
       }),
     });
   });
@@ -1351,12 +1370,26 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       message: "provider setup failed after creation",
       data: { providerLeaseId: "structured-cleanup-retry" },
     });
+    let acquisitionId: unknown;
     let failRelease = true;
     const workerManager = {
       isRunning: vi.fn((id: string) => id === pluginId),
-      call: vi.fn(async (_pluginId: string, method: string) => {
-        if (method === "environmentAcquireLease") throw acquisitionError;
+      call: vi.fn(async (_pluginId: string, method: string, params: Record<string, unknown>) => {
+        if (method === "environmentAcquireLease") {
+          acquisitionId = params.acquisitionId;
+          (acquisitionError.data as Record<string, unknown>)[
+            PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY
+          ] = acquisitionId;
+          throw acquisitionError;
+        }
         if (method === "environmentReleaseLease") {
+          expect(params).toMatchObject({
+            acquisitionId,
+            providerLeaseId: "structured-cleanup-retry",
+            leaseMetadata: expect.objectContaining({
+              [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId,
+            }),
+          });
           if (failRelease) throw new Error("cleanup unavailable");
           return undefined;
         }
@@ -1624,8 +1657,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(executed.stdout).toBe("ok\n");
     expect(released).toHaveLength(1);
     expect(released[0]?.lease.status).toBe("released");
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.anything(), 31000);
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.anything(), 31234);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.anything(), 91000);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.anything(), 91234);
   });
 
   it("keeps plugin sandbox cleanup on its lease-scoped secret after the environment changes", async () => {
@@ -1784,12 +1817,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       config: expect.objectContaining({
         apiKey: "resolved-provider-key",
       }),
-    }), 31234);
+    }), 91234);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.objectContaining({
       config: expect.objectContaining({
         apiKey: "resolved-provider-key",
       }),
-    }), 31234);
+    }), 91234);
     await expect(db
       .select()
       .from(companySecretBindings)
@@ -2044,6 +2077,10 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       "environmentAcquireLease",
       "environmentReleaseLease",
     ]);
+    expect(workerManager.call.mock.calls[1]?.[2]).toMatchObject({
+      acquisitionId: reservationId,
+      providerLeaseId: "directly-cleaned-provider-lease",
+    });
   });
 
   it("preserves an active cleanup claim when a provider acquisition returns late", async () => {
@@ -2240,7 +2277,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       config: expect.objectContaining({
         apiKey: "current-provider-key",
       }),
-    }), 31234);
+    }), 91234);
   });
 
   it("waits briefly for a ready sandbox provider plugin worker to come online", async () => {
@@ -2332,7 +2369,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
     expect(acquired.lease.providerLeaseId).toBe("sandbox-1");
     expect(workerManager.isRunning).toHaveBeenCalledTimes(3);
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.anything(), 31234);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.anything(), 91234);
   });
 
   it("extends plugin-backed sandbox lease RPC timeouts from provider config", async () => {
@@ -2428,7 +2465,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           reuseLease: false,
         },
       }),
-      70_000,
+      130_000,
     );
   });
 
@@ -2517,6 +2554,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         if (method === "environmentDestroyLease") {
           if (params.providerLeaseId === "replacement-plugin-lease") {
+            expect(params.acquisitionId).toEqual(params.leaseMetadata &&
+              (params.leaseMetadata as Record<string, unknown>).sandboxAcquisitionId);
             replacementDestroyCalls += 1;
             if (replacementDestroyCalls === 1) await compensationBlocked;
           }
@@ -2925,11 +2964,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(workerManager.call).toHaveBeenNthCalledWith(1, pluginId, "environmentResumeLease", expect.objectContaining({
       driverKey: "fake-plugin",
       providerLeaseId: "stale-plugin-lease",
-    }), 31234);
+    }), 91234);
     expect(workerManager.call).toHaveBeenNthCalledWith(2, pluginId, "environmentDestroyLease", expect.objectContaining({
       driverKey: "fake-plugin",
       providerLeaseId: "stale-plugin-lease",
-    }), 31234);
+    }), 91234);
     expect(workerManager.call).toHaveBeenNthCalledWith(3, pluginId, "environmentAcquireLease", expect.objectContaining({
       driverKey: "fake-plugin",
       config: {
@@ -2940,7 +2979,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       agentId,
       executionWorkspaceId,
       runId,
-    }), 31234);
+    }), 91234);
     await expect(environmentService(db).getLeaseById(staleLease.id)).resolves.toMatchObject({
       status: "expired",
       cleanupStatus: "success",
@@ -3113,7 +3152,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     );
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.objectContaining({
       providerLeaseId: "lease-template-a",
-    }), 31234);
+    }), 91234);
     await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
       status: "expired",
       cleanupStatus: "success",
@@ -3407,7 +3446,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     );
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.objectContaining({
       providerLeaseId: "lease-resolved-provider-key",
-    }), 31234);
+    }), 91234);
     await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
       status: "expired",
       cleanupStatus: "success",
@@ -3469,7 +3508,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       agentId,
       executionWorkspaceId,
       runId: nextRunId,
-    }), 31234);
+    }), 91234);
     await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
       status: "active",
       cleanupStatus: null,
@@ -3614,7 +3653,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(acquired.lease.providerLeaseId).toBe("fresh-plugin-lease");
     expect(acquired.lease.leasePolicy).toBe("ephemeral");
     expect(workerManager.call).toHaveBeenCalledTimes(1);
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.anything(), 31234);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.anything(), 91234);
   });
 
   it("destroys scoped reusable plugin-backed sandbox leases", async () => {
@@ -3648,7 +3687,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         driverKey: "fake-plugin",
         providerLeaseId: "reusable-plugin-lease",
       }),
-      31234,
+      91234,
     );
     await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
       status: "expired",
@@ -3868,7 +3907,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           pluginId,
           "environmentDestroyLease",
           expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
-          31234,
+          91234,
         );
       }
       await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
@@ -4052,7 +4091,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       pluginId,
       "environmentReleaseLease",
       expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
-      31234,
+      91234,
     );
     expect(recoveredWorkerManager.call).not.toHaveBeenCalledWith(
       pluginId,
@@ -4089,7 +4128,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       pluginId,
       "environmentDestroyLease",
       expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
-      31234,
+      91234,
     );
   });
 
@@ -4123,7 +4162,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       pluginId,
       "environmentDestroyLease",
       expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
-      31234,
+      91234,
     );
   });
 
@@ -4273,8 +4312,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         }
         if (method === "environmentReleaseLease") {
           expect(params).toMatchObject({
+            acquisitionId: seeded.reservation.id,
             providerLeaseId: providerLeaseIdBeforeCrash ?? "acquired-during-replay",
-            leaseMetadata: expect.objectContaining({ acquisitionId: seeded.reservation.id }),
+            leaseMetadata: expect.objectContaining({
+              sandboxAcquisitionId: seeded.reservation.id,
+            }),
           });
           seeded.providerLeases.clear();
           return undefined;
@@ -4304,7 +4346,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       providerLeaseId: providerLeaseIdBeforeCrash ?? "acquired-during-replay",
       cleanupStatus: "success",
       metadata: expect.objectContaining({
-        acquisitionId: seeded.reservation.id,
+        sandboxAcquisitionId: seeded.reservation.id,
         provider: "reservation-plugin",
         driver: "sandbox",
         pluginId: seeded.pluginId,
@@ -4454,8 +4496,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           expect(cleanupSibling?.id).not.toBe(seeded.reservation.id);
           cleanupSiblingId = cleanupSibling!.id;
           expect(params).toMatchObject({
+            acquisitionId: seeded.reservation.id,
             providerLeaseId: "replay-created-provider-lease",
-            leaseMetadata: expect.objectContaining({ acquisitionId: seeded.reservation.id }),
+            leaseMetadata: expect.objectContaining({
+              sandboxAcquisitionId: seeded.reservation.id,
+            }),
           });
           seeded.providerLeases.delete(seeded.reservation.id);
           return undefined;
@@ -4793,7 +4838,10 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const replayError = new JsonRpcCallError({
       code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
       message: "replayed setup failed after creation",
-      data: { providerLeaseId: "structured-replay-lease" },
+      data: {
+        providerLeaseId: "structured-replay-lease",
+        cleanupVerifiedAcquisitionId: seeded.reservation.id,
+      },
     });
     const recoveredWorkerManager = {
       isRunning: vi.fn((id: string) => id === seeded.pluginId),
@@ -4802,7 +4850,15 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           expect(params).toEqual(seeded.initialAcquireParams);
           throw replayError;
         }
-        if (method === "environmentReleaseLease") return undefined;
+        if (method === "environmentReleaseLease") {
+          expect(params).toMatchObject({
+            acquisitionId: seeded.reservation.id,
+            leaseMetadata: expect.objectContaining({
+              [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: seeded.reservation.id,
+            }),
+          });
+          return undefined;
+        }
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
     } as unknown as PluginWorkerManager;
@@ -4825,6 +4881,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       cleanupStatus: "success",
       metadata: expect.objectContaining({
         sandboxLeaseReservation: false,
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: seeded.reservation.id,
       }),
     });
   });
@@ -5083,7 +5140,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         driverKey: "fake-plugin",
         providerLeaseId: "reusable-plugin-lease",
       }),
-      31234,
+      91234,
     );
     await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
       status: "expired",
@@ -5341,9 +5398,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       executionWorkspaceId: undefined,
       adapterType: undefined,
     });
+    const acquireParams = workerManager.call.mock.calls[0]?.[2];
     expect(acquired.lease.providerLeaseId).toBe("plugin-lease-1");
     expect(acquired.lease.expiresAt?.toISOString()).toBe(expiresAt);
     expect(acquired.lease.metadata).toMatchObject({
+      acquisitionId: acquireParams.acquisitionId,
       driver: "plugin",
       pluginId,
       pluginKey: "acme.environments",
@@ -5369,6 +5428,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
     expect(released).toHaveLength(1);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", {
+      acquisitionId: acquireParams.acquisitionId,
       driverKey: "fake-plugin",
       companyId,
       environmentId: environment.id,
@@ -5376,6 +5436,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       config: {},
       providerLeaseId: "plugin-lease-1",
       leaseMetadata: expect.objectContaining({
+        acquisitionId: acquireParams.acquisitionId,
         driver: "plugin",
         pluginId,
         providerMetadata: expect.objectContaining({
@@ -5384,6 +5445,195 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       }),
     });
     expect(released[0]?.lease.status).toBe("released");
+  });
+
+  it.each([false, true])("cleans up a generic plugin lease reported by a structured acquisition error (cleanupFails=%s)", async (cleanupFails) => {
+    const pluginId = randomUUID();
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "plugin",
+      name: "Structured Failure Plugin Environment",
+      config: {
+        pluginKey: "acme.structured-environments",
+        driverKey: "structured-driver",
+        driverConfig: { template: "base" },
+      },
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.structured-environments",
+      packageName: "@acme/structured-environments",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.structured-environments",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Structured Environments",
+        description: "Test structured plugin acquisition failure cleanup",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{
+          driverKey: "structured-driver",
+          displayName: "Structured driver",
+          configSchema: { type: "object" },
+        }],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+    const acquisitionError = new JsonRpcCallError({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "generic provider setup failed after creation",
+      data: { providerLeaseId: "structured-generic-acquisition" },
+    });
+    const workerManager = {
+      isRunning: vi.fn(() => true),
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        if (method === "environmentAcquireLease") {
+          (acquisitionError.data as Record<string, unknown>)[
+            PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY
+          ] = params.acquisitionId;
+          throw acquisitionError;
+        }
+        if (method === "environmentReleaseLease") {
+          if (cleanupFails) {
+            throw new JsonRpcCallError({
+              code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+              message: "generic provider cleanup failed after verifying acquisition",
+              data: {
+                providerLeaseId: "structured-generic-acquisition",
+                cleanupVerifiedAcquisitionId: params.acquisitionId,
+              },
+            });
+          }
+          return undefined;
+        }
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    await expect(runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toBe(acquisitionError);
+
+    expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+    ]);
+    const acquireParams = workerManager.call.mock.calls[0]?.[2];
+    expect(workerManager.call.mock.calls[1]?.[2]).toMatchObject({
+      acquisitionId: acquireParams.acquisitionId,
+      providerLeaseId: "structured-generic-acquisition",
+      leaseMetadata: expect.not.objectContaining({
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: expect.anything(),
+      }),
+    });
+    const [terminal] = await db.select().from(environmentLeases);
+    if (cleanupFails) {
+      expect(terminal).toMatchObject({
+        status: "pending_cleanup",
+        providerLeaseId: "structured-generic-acquisition",
+        cleanupStatus: "failed",
+        failureReason: "acquire_handoff_failed",
+        metadata: {
+          acquisitionId: acquireParams.acquisitionId,
+          [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquireParams.acquisitionId,
+          pendingCleanupReleaseStatus: "expired",
+        },
+      });
+      return;
+    }
+    expect(terminal).toMatchObject({
+      status: "expired",
+      providerLeaseId: "structured-generic-acquisition",
+      cleanupStatus: "success",
+      metadata: {
+        acquisitionId: acquireParams.acquisitionId,
+        [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquireParams.acquisitionId,
+      },
+    });
+  });
+
+  it("does not report failed generic plugin compensation when direct release succeeds", async () => {
+    const pluginId = randomUUID();
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "plugin",
+      config: {
+        pluginKey: "acme.unrecorded-cleanup",
+        driverKey: "unrecorded-driver",
+        driverConfig: {},
+      },
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.unrecorded-cleanup",
+      packageName: "@acme/unrecorded-cleanup",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.unrecorded-cleanup",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Unrecorded cleanup",
+        description: "Test cleanup when lease persistence fails",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{
+          driverKey: "unrecorded-driver",
+          displayName: "Unrecorded driver",
+          configSchema: { type: "object" },
+        }],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+    const acquisitionError = new JsonRpcCallError({
+      code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,
+      message: "provider setup failed after creation",
+      data: { providerLeaseId: "unrecorded-provider-lease" },
+    });
+    const workerManager = {
+      isRunning: vi.fn(() => true),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentAcquireLease") {
+          await db.delete(environments).where(eq(environments.id, environment.id));
+          throw acquisitionError;
+        }
+        if (method === "environmentReleaseLease") return undefined;
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const loggerError = vi.spyOn(logger, "error");
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+    await expect(runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    })).rejects.toBe(acquisitionError);
+
+    expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual([
+      "environmentAcquireLease",
+      "environmentReleaseLease",
+    ]);
+    expect(loggerError).not.toHaveBeenCalled();
+    loggerError.mockRestore();
+    await expect(db.select().from(environmentLeases)).resolves.toHaveLength(0);
   });
 
   it("delegates the full plugin environment lifecycle through the worker manager", async () => {
@@ -5557,13 +5807,14 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       args: ["ok"],
       cwd: "/workspace/project",
       env: { FOO: "bar" },
-    }), 31000);
+    }), 91000);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", {
       driverKey: "fake-plugin",
       companyId,
       environmentId: environment.id,
       issueId: null,
       config: { template: "base" },
+      acquisitionId: acquired.lease.metadata?.acquisitionId,
       providerLeaseId: "plugin-lease-full",
       leaseMetadata: expect.objectContaining({
         driver: "plugin",

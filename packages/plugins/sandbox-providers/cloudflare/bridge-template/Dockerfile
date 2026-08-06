@@ -9,6 +9,7 @@ RUN apt-get update \
     findutils \
     git \
     tar \
+    util-linux \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

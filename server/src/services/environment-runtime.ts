@@ -22,7 +22,11 @@ import type {
   PluginEnvironmentLease,
   PluginEnvironmentRealizeWorkspaceResult,
 } from "@paperclipai/plugin-sdk";
-import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import {
+  JsonRpcCallError,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
+  PLUGIN_RPC_ERROR_CODES,
+} from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
 import { environmentService } from "./environments.js";
 import {
@@ -228,6 +232,16 @@ const SANDBOX_CLEANUP_CLAIM_STALE_MS = 5 * 60 * 1000;
 const SANDBOX_CLEANUP_CLAIM_RENEW_MS = 60 * 1000;
 const SANDBOX_CLEANUP_RETRY_BATCH_SIZE = 10;
 const PENDING_CLEANUP_RELEASE_STATUS_KEY = "pendingCleanupReleaseStatus";
+
+function withoutCleanupVerification(
+  metadata: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | undefined {
+  if (!metadata) return undefined;
+  const copy = { ...metadata };
+  delete copy[PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY];
+  return copy;
+}
+
 const PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY = "sandboxProviderConfig";
 const LEASE_SCOPED_SECRET_BINDINGS_KEY = "leaseScopedSecretBindings";
 const SANDBOX_ACQUISITION_CONTEXT_KEY = "sandboxAcquisition";
@@ -248,9 +262,15 @@ function readPluginAcquireLeaseErrorData(
   }
 
   const providerLeaseId = (error.data as Partial<PluginEnvironmentAcquireLeaseErrorData>).providerLeaseId;
-  return typeof providerLeaseId === "string" && providerLeaseId.trim().length > 0
-    ? { providerLeaseId }
-    : null;
+  if (typeof providerLeaseId !== "string" || providerLeaseId.trim().length === 0) return null;
+  const cleanupVerifiedAcquisitionId =
+    (error.data as Partial<PluginEnvironmentAcquireLeaseErrorData>).cleanupVerifiedAcquisitionId;
+  return {
+    providerLeaseId,
+    ...(typeof cleanupVerifiedAcquisitionId === "string"
+      ? { cleanupVerifiedAcquisitionId }
+      : {}),
+  };
 }
 
 type SandboxAcquisitionContext = {
@@ -1519,6 +1539,7 @@ function createSandboxEnvironmentDriver(
         expectedStatus: input.release.cleanupClaimId ? "pending_cleanup" : input.release.lease.status,
         metadata: {
           ...(input.release.lease.metadata ?? {}),
+          ...verifiedCleanupMetadata(input.cleanupError, input.release.lease),
           [PENDING_CLEANUP_RELEASE_STATUS_KEY]: releaseStatus,
         },
       });
@@ -1843,7 +1864,12 @@ function createSandboxEnvironmentDriver(
               providerLeaseId: errorData.providerLeaseId,
               metadata: sql<Record<string, unknown>>`
                 coalesce(${environmentLeases.metadata}, '{}'::jsonb)
-                || ${JSON.stringify({ [SANDBOX_LEASE_RESERVATION_KEY]: false })}::jsonb
+                || ${JSON.stringify({
+                  [SANDBOX_LEASE_RESERVATION_KEY]: false,
+                  ...(errorData.cleanupVerifiedAcquisitionId === acquisitionId
+                    ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+                    : {}),
+                })}::jsonb
               `,
               lastUsedAt: new Date(),
               updatedAt: new Date(),
@@ -2002,6 +2028,7 @@ function createSandboxEnvironmentDriver(
               environmentId: input.environment.id,
               issueId: input.lease.issueId,
               config: workerConfig,
+              acquisitionId,
               providerLeaseId: providerLease.providerLeaseId,
               leaseMetadata: metadata,
             },
@@ -2316,6 +2343,7 @@ function createSandboxEnvironmentDriver(
                     environmentId: input.environment.id,
                     issueId: input.issueId,
                     config: workerConfig,
+                    acquisitionId: reservation.id,
                     providerLeaseId: providerLease!.providerLeaseId,
                     leaseMetadata: replacementMetadata,
                   },
@@ -2384,6 +2412,9 @@ function createSandboxEnvironmentDriver(
           const cleanupMetadata = {
             ...fallbackLeaseMetadata,
             [SANDBOX_LEASE_RESERVATION_KEY]: false,
+            ...(errorData.cleanupVerifiedAcquisitionId === reservation.id
+              ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: reservation.id }
+              : {}),
           };
           await compensateFailedSandboxLeaseAcquisition(
             input.environment,
@@ -2410,6 +2441,7 @@ function createSandboxEnvironmentDriver(
                 environmentId: input.environment.id,
                 issueId: input.issueId,
                 config: workerConfig,
+                acquisitionId: reservation.id,
                 providerLeaseId: errorData.providerLeaseId,
                 leaseMetadata: cleanupMetadata,
               },
@@ -2449,6 +2481,7 @@ function createSandboxEnvironmentDriver(
               environmentId: input.environment.id,
               issueId: input.issueId,
               config: workerConfig,
+              acquisitionId: reservation.id,
               providerLeaseId: acquiredLease.providerLeaseId,
               leaseMetadata,
             },
@@ -2982,6 +3015,7 @@ function createSandboxEnvironmentDriver(
   async function releasePluginBackedSandboxLease(
     input: EnvironmentDriverReleaseInput,
     failureReason?: string,
+    leaseMetadata = input.lease.metadata ?? undefined,
   ): Promise<EnvironmentLease | null> {
     const metadata = input.lease.metadata ?? {};
     const pluginId = readString(metadata.pluginId);
@@ -3001,8 +3035,9 @@ function createSandboxEnvironmentDriver(
           environmentId: input.environment.id,
           issueId: input.lease.issueId,
           config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
+          ...acquisitionIdentityParams(metadata),
           providerLeaseId: input.lease.providerLeaseId,
-          leaseMetadata: metadata,
+          leaseMetadata,
         }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)));
       } catch (error) {
         cleanupError = error;
@@ -3054,6 +3089,7 @@ function createSandboxEnvironmentDriver(
     lease: EnvironmentLease;
     failureReason: string;
     cleanupClaimId?: string;
+    cleanupMetadata?: Record<string, unknown>;
   }): Promise<EnvironmentLease | null> {
     let lease = input.lease;
     let cleanupClaimId = input.cleanupClaimId;
@@ -3064,7 +3100,7 @@ function createSandboxEnvironmentDriver(
       cleanupClaimId = claimed.cleanupClaimId;
     }
 
-    const metadata = lease.metadata ?? {};
+    const metadata = input.cleanupMetadata ?? lease.metadata ?? {};
     let cleanupError: unknown | null = null;
 
     try {
@@ -3085,6 +3121,7 @@ function createSandboxEnvironmentDriver(
             environmentId: input.environment.id,
             issueId: lease.issueId,
             config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
+            ...acquisitionIdentityParams(metadata),
             providerLeaseId: lease.providerLeaseId,
             leaseMetadata: metadata,
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)));
@@ -3132,6 +3169,31 @@ function pluginDriverProviderKey(config: PluginEnvironmentConfig): string {
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function readPersistedAcquisitionId(metadata: Record<string, unknown> | null | undefined): string | null {
+  return readString(metadata?.[SANDBOX_ACQUISITION_ID_KEY])
+    ?? readString(metadata?.acquisitionId);
+}
+
+function acquisitionIdentityParams(
+  metadata: Record<string, unknown> | null | undefined,
+): { acquisitionId?: string } {
+  const acquisitionId = readPersistedAcquisitionId(metadata);
+  return acquisitionId ? { acquisitionId } : {};
+}
+
+function verifiedCleanupMetadata(
+  error: unknown,
+  lease: Pick<EnvironmentLease, "metadata" | "providerLeaseId">,
+): Record<string, string> {
+  const errorData = readPluginAcquireLeaseErrorData(error);
+  const acquisitionId = readPersistedAcquisitionId(lease.metadata);
+  return errorData?.providerLeaseId === lease.providerLeaseId
+    && errorData.cleanupVerifiedAcquisitionId === acquisitionId
+    && acquisitionId
+    ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+    : {};
 }
 
 function readSandboxCustomImageReplay(value: unknown): SandboxCustomImageReplay | null {
@@ -3202,10 +3264,12 @@ function readSandboxAcquisitionContext(lease: EnvironmentLease): SandboxAcquisit
 
 const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "agentId",
+  "acquisitionId",
   "driver",
   "executionWorkspaceMode",
   LEASE_SCOPED_SECRET_BINDINGS_KEY,
   PENDING_CLEANUP_RELEASE_STATUS_KEY,
+  PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   SANDBOX_LEASE_RESERVATION_KEY,
   "pluginId",
   "pluginKey",
@@ -3337,19 +3401,100 @@ function createPluginEnvironmentDriver(
       }
       const { plugin } = await resolvePluginDriver(parsed.config);
       const acquisitionId = randomUUID();
-      const providerLease = await workerManager.call(plugin.id, "environmentAcquireLease", {
-        acquisitionId,
-        driverKey: parsed.config.driverKey,
-        companyId: input.companyId,
-        environmentId: input.environment.id,
-        issueId: input.issueId,
-        config: parsed.config.driverConfig,
-        runId: input.heartbeatRunId ?? acquisitionId,
-        workspaceMode: input.executionWorkspaceMode ?? undefined,
-        agentId: input.agentId ?? undefined,
-        executionWorkspaceId: input.executionWorkspaceId ?? undefined,
-        adapterType: input.adapterType ?? undefined,
-      });
+      let providerLease: PluginEnvironmentLease;
+      try {
+        providerLease = await workerManager.call(plugin.id, "environmentAcquireLease", {
+          acquisitionId,
+          driverKey: parsed.config.driverKey,
+          companyId: input.companyId,
+          environmentId: input.environment.id,
+          issueId: input.issueId,
+          config: parsed.config.driverConfig,
+          runId: input.heartbeatRunId ?? acquisitionId,
+          workspaceMode: input.executionWorkspaceMode ?? undefined,
+          agentId: input.agentId ?? undefined,
+          executionWorkspaceId: input.executionWorkspaceId ?? undefined,
+          adapterType: input.adapterType ?? undefined,
+        });
+      } catch (error) {
+        const errorData = readPluginAcquireLeaseErrorData(error);
+        if (!errorData) throw error;
+
+        const cleanupMetadata = {
+          ...(input.agentId ? { agentId: input.agentId } : {}),
+          providerMetadata: {},
+          driver: input.environment.driver,
+          executionWorkspaceMode: input.executionWorkspaceMode,
+          pluginId: plugin.id,
+          pluginKey: parsed.config.pluginKey,
+          driverKey: parsed.config.driverKey,
+          acquisitionId,
+          ...(errorData.cleanupVerifiedAcquisitionId === acquisitionId
+            ? { [PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY]: acquisitionId }
+            : {}),
+        };
+        let cleanupLease: EnvironmentLease | null = null;
+        let cleanupError: unknown | null = null;
+        try {
+          cleanupLease = await environmentsSvc.acquireLease({
+            companyId: input.companyId,
+            environmentId: input.environment.id,
+            executionWorkspaceId: input.executionWorkspaceId,
+            issueId: input.issueId,
+            heartbeatRunId: input.heartbeatRunId,
+            leasePolicy: "ephemeral",
+            provider: `plugin:${parsed.config.pluginKey}:${parsed.config.driverKey}`,
+            providerLeaseId: errorData.providerLeaseId,
+            metadata: cleanupMetadata,
+          });
+        } catch (error) {
+          cleanupError = error;
+        }
+
+        try {
+          await workerManager.call(plugin.id, "environmentReleaseLease", {
+            driverKey: parsed.config.driverKey,
+            companyId: input.companyId,
+            environmentId: input.environment.id,
+            issueId: input.issueId,
+            config: parsed.config.driverConfig,
+            acquisitionId,
+            providerLeaseId: errorData.providerLeaseId,
+            leaseMetadata: withoutCleanupVerification(cleanupMetadata),
+          });
+          cleanupError = null;
+          if (cleanupLease) {
+            await environmentsSvc.releaseLease(cleanupLease.id, "expired", {
+              cleanupStatus: "success",
+            });
+          }
+        } catch (error) {
+          cleanupError = error;
+          if (cleanupLease) {
+            await environmentsSvc.releaseLease(cleanupLease.id, "pending_cleanup", {
+              failureReason: "acquire_handoff_failed",
+              cleanupStatus: "failed",
+              expectedStatus: "active",
+              metadata: {
+                ...(cleanupLease.metadata ?? {}),
+                ...verifiedCleanupMetadata(cleanupError, cleanupLease),
+                [PENDING_CLEANUP_RELEASE_STATUS_KEY]: "expired",
+              },
+            }).catch(() => null);
+          }
+        }
+        if (cleanupError) {
+          logger.error(
+            {
+              err: cleanupError,
+              environmentId: input.environment.id,
+              providerLeaseId: errorData.providerLeaseId,
+            },
+            "failed to compensate plugin environment lease after acquisition failure",
+          );
+        }
+        throw error;
+      }
 
       return await environmentsSvc.acquireLease({
         companyId: input.companyId,
@@ -3369,6 +3514,7 @@ function createPluginEnvironmentDriver(
           pluginId: plugin.id,
           pluginKey: parsed.config.pluginKey,
           driverKey: parsed.config.driverKey,
+          acquisitionId,
         },
       });
     },
@@ -3381,6 +3527,7 @@ function createPluginEnvironmentDriver(
         environmentId: input.environment.id,
         issueId: input.lease.issueId,
         config: driverConfig,
+        ...acquisitionIdentityParams(input.lease.metadata),
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });
@@ -3406,6 +3553,7 @@ function createPluginEnvironmentDriver(
           driverKey,
           driverConfig,
         },
+        ...acquisitionIdentityParams(input.lease.metadata),
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });
@@ -3427,6 +3575,7 @@ function createPluginEnvironmentDriver(
           driverKey,
           driverConfig,
         },
+        ...acquisitionIdentityParams(input.lease.metadata),
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });

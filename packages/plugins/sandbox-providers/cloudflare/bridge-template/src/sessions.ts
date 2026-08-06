@@ -76,9 +76,17 @@ export async function cleanupTimedOutExecution(
     sessionId?: string;
   },
 ): Promise<void> {
-  if (options.sessionStrategy === "default") {
-    await sandbox.destroy().catch(() => undefined);
+  if (options.sessionStrategy === "named") {
+    await sandbox.deleteSession(options.sessionId?.trim() || DEFAULT_SESSION_ID).catch(() => undefined);
     return;
   }
-  await sandbox.deleteSession(options.sessionId?.trim() || DEFAULT_SESSION_ID).catch(() => undefined);
+
+  const readLeaseOwnership = (sandbox as CloudflareSandbox & {
+    readLeaseOwnership?: () => Promise<{ status: string }>;
+  }).readLeaseOwnership;
+  if (typeof readLeaseOwnership === "function") {
+    const ownership = await readLeaseOwnership.call(sandbox).catch(() => null);
+    if (ownership?.status !== "missing") return;
+  }
+  await sandbox.destroy().catch(() => undefined);
 }

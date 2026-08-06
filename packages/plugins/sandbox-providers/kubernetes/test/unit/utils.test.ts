@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { deriveCompanySlug, deriveNamespaceName, newRunUlidDns, paperclipLabels } from "../../src/utils.js";
+import {
+  deriveAcquisitionResourceName,
+  deriveCompanySlug,
+  deriveNamespaceName,
+  paperclipLabels,
+} from "../../src/utils.js";
 
 describe("deriveCompanySlug", () => {
   it("lowercases and replaces non-alphanumerics", () => {
@@ -41,20 +46,23 @@ describe("deriveNamespaceName", () => {
   });
 });
 
-describe("newRunUlidDns", () => {
-  it("produces a DNS-safe 26-char lowercase id", () => {
-    const id = newRunUlidDns();
-    expect(id).toMatch(/^[a-z0-9]{26}$/);
-  });
-});
-
 describe("paperclipLabels", () => {
   it("returns canonical label map", () => {
-    const labels = paperclipLabels({ runId: "r1", agentId: "a1", companyId: "c1", adapterType: "claude_local" });
+    const labels = paperclipLabels({ acquisitionId: "acq-1", runId: "r1", agentId: "a1", companyId: "c1", adapterType: "claude_local" });
+    expect(labels["paperclip.io/acquisition-id"]).toBe("acq-1");
     expect(labels["paperclip.io/run-id"]).toBe("r1");
     expect(labels["paperclip.io/agent-id"]).toBe("a1");
     expect(labels["paperclip.io/company-id"]).toBe("c1");
     expect(labels["paperclip.io/adapter"]).toBe("claude_local");
     expect(labels["paperclip.io/managed-by"]).toBe("paperclip-k8s-plugin");
+  });
+});
+
+describe("deriveAcquisitionResourceName", () => {
+  it("is stable, DNS-safe, and sensitive to the full acquisition ID", () => {
+    const first = deriveAcquisitionResourceName("Acquisition/One");
+    expect(first).toBe(deriveAcquisitionResourceName("Acquisition/One"));
+    expect(first).not.toBe(deriveAcquisitionResourceName("Acquisition/Two"));
+    expect(first).toMatch(/^pc-acq-[a-f0-9]{32}$/);
   });
 });

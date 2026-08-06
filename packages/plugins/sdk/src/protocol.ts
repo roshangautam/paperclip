@@ -598,7 +598,12 @@ export interface PluginEnvironmentLease {
  */
 export interface PluginEnvironmentAcquireLeaseErrorData {
   providerLeaseId: string;
+  /** Acquisition whose ownership the provider verified before handing off cleanup. */
+  cleanupVerifiedAcquisitionId?: string;
 }
+
+/** Lease metadata proving acquisition ownership before cleanup starts. */
+export const PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY = "cleanupVerifiedAcquisitionId";
 
 export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDriverBaseParams {
   /**
@@ -633,6 +638,12 @@ export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDri
 }
 
 export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDriverBaseParams {
+  /**
+   * Stable host-generated identifier from the matching acquisition request.
+   * This is optional so providers can still clean up leases created by hosts
+   * that predate the acquisition identity lifecycle contract.
+   */
+  acquisitionId?: string;
   providerLeaseId: string | null;
   leaseMetadata?: Record<string, unknown>;
 }

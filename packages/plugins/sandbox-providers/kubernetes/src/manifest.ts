@@ -20,6 +20,7 @@ const manifest: PaperclipPluginManifestV1 = {
     {
       driverKey: "kubernetes",
       kind: "sandbox_provider",
+      supportsAcquisitionReplay: true,
       displayName: "Kubernetes",
       description:
         "Dispatches agent runs in per-tenant Kubernetes namespaces. Default backend (sandbox-cr, alpha) uses kubernetes-sigs/agent-sandbox for multi-command exec; fallback backend (job) uses stable batch/v1 Job for clusters without agent-sandbox installed.",
@@ -86,11 +87,6 @@ const manifest: PaperclipPluginManifestV1 = {
             additionalProperties: { type: "string" },
             description:
               "Annotations applied to the per-tenant ServiceAccount (e.g. `eks.amazonaws.com/role-arn` for IRSA).",
-          },
-          jobTtlSecondsAfterFinished: {
-            type: "integer",
-            minimum: 0,
-            description: "Seconds after a Job completes before it is garbage-collected (default: 900).",
           },
           podActivityDeadlineSec: {
             type: "integer",
