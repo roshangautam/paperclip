@@ -241,8 +241,7 @@ describe("resolveEnvironmentExecutionTarget", () => {
       },
       leaseId: "lease-coder-1",
       leaseMetadata: {
-        providerMetadata: { remoteCwd: "/home/coder/workspace" },
-        shellCommand: "bash",
+        providerMetadata: { remoteCwd: "/home/coder/workspace", shellCommand: "bash" },
         workspaceRealization: { sync: { strategy: "provider_defined" } },
       },
       lease: {} as never,
@@ -274,6 +273,33 @@ describe("resolveEnvironmentExecutionTarget", () => {
       cwd: "/home/coder/workspace",
     }));
     expect(result).toMatchObject({ exitCode: 0, stdout: "ok" });
+  });
+
+  it("keeps core workspace sync when a legacy plugin omits workspace realization", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
+      driver: "plugin",
+      config: {
+        pluginKey: "acme.legacy-sandbox-provider",
+        driverKey: "legacy",
+        driverConfig: {},
+      },
+    });
+
+    const target = await resolveEnvironmentExecutionTarget({
+      db: {} as never,
+      companyId: "company-1",
+      adapterType: "codex_local",
+      environment: { id: "env-legacy-1", driver: "plugin", config: {} },
+      leaseId: "lease-legacy-1",
+      leaseMetadata: { remoteCwd: "/home/legacy/workspace" },
+      lease: null,
+      environmentRuntime: null,
+    });
+
+    expect(target).toMatchObject({
+      remoteCwd: "/home/legacy/workspace",
+    });
+    expect(target).not.toHaveProperty("syncWorkspace");
   });
 
   it("falls back to the plugin driver cwd", async () => {

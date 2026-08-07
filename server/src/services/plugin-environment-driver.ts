@@ -311,7 +311,7 @@ export async function realizePluginEnvironmentWorkspace(input: {
   pluginId?: string | null;
   params: PluginEnvironmentRealizeWorkspaceParams;
   config: PluginEnvironmentConfig;
-}): Promise<PluginEnvironmentRealizeWorkspaceResult> {
+}): Promise<PluginEnvironmentRealizeWorkspaceResult | null> {
   const { plugin } = input.pluginId
     ? { plugin: { id: input.pluginId } }
     : await resolvePluginEnvironmentDriver({
@@ -331,7 +331,7 @@ export async function realizePluginEnvironmentWorkspace(input: {
       error instanceof JsonRpcCallError &&
       error.code === PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED
     ) {
-      return { cwd: "" };
+      return null;
     }
     throw error;
   }

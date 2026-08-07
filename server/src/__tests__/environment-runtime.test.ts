@@ -74,7 +74,7 @@ describe("realizePluginEnvironmentWorkspace", () => {
         lease: { providerLeaseId: "lease-1" },
         workspace: { localPath: "/tmp/project" },
       },
-    })).resolves.toEqual({ cwd: "" });
+    })).resolves.toBeNull();
     expect(call).toHaveBeenCalledWith(
       "plugin-1",
       "environmentRealizeWorkspace",
@@ -6111,7 +6111,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       metadata: {
         realized: true,
         workspaceRealization: {
-          sync: { strategy: "provider_defined" },
+          sync: { strategy: "sandbox_archive_upload_download" },
         },
       },
     });

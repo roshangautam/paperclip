@@ -57,11 +57,12 @@ export async function resolveEnvironmentExecutionTarget(input: {
       parsed.driver === "sandbox" ? parsed.config : parsed.config.driverConfig,
     );
     const workspaceRealization = parseObject(input.leaseMetadata?.workspaceRealization);
+    const providerMetadata = parseObject(input.leaseMetadata?.providerMetadata);
 
     const resolvedRemoteCwd = [
       input.leaseMetadata?.remoteCwd,
       parseObject(workspaceRealization.remote).path,
-      parseObject(input.leaseMetadata?.providerMetadata).remoteCwd,
+      providerMetadata.remoteCwd,
       parsed.driver === "plugin" ? runtimeConfig.remoteCwd : null,
     ].find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
     if (parsed.driver === "plugin" && !resolvedRemoteCwd) {
@@ -71,9 +72,10 @@ export async function resolveEnvironmentExecutionTarget(input: {
     }
     const remoteCwd = resolvedRemoteCwd ?? DEFAULT_SANDBOX_REMOTE_CWD;
     const timeoutMs = typeof runtimeConfig.timeoutMs === "number" ? runtimeConfig.timeoutMs : null;
+    const configuredShellCommand = input.leaseMetadata?.shellCommand ?? providerMetadata.shellCommand;
     const shellCommand =
-      input.leaseMetadata?.shellCommand === "bash" || input.leaseMetadata?.shellCommand === "sh"
-        ? input.leaseMetadata.shellCommand
+      configuredShellCommand === "bash" || configuredShellCommand === "sh"
+        ? configuredShellCommand
         : null;
 
     return {

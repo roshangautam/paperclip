@@ -3716,6 +3716,9 @@ function createPluginEnvironmentDriver(
           workspace: input.workspace,
         },
       });
+      if (!result) {
+        return { cwd: "" };
+      }
       const record = buildWorkspaceRealizationRecordFromDriverInput({
         environment: input.environment,
         lease: input.lease,

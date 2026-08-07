@@ -120,15 +120,19 @@ export function buildWorkspaceRealizationRecord(input: {
     input.environment.driver === "ssh" || input.environment.driver === "sandbox" || input.environment.driver === "plugin"
       ? input.environment.driver
       : "local";
-  const remotePath =
+  const providerRemotePath =
     readString(providerMetadata.remoteCwd) ??
     readString(leaseMetadata.remoteCwd) ??
     readString(providerMetadata.remotePath) ??
     null;
+  const realizedCwd = readString(input.realizedCwd);
+  const remotePath = transport === "plugin" ? realizedCwd ?? providerRemotePath : providerRemotePath;
   const host = readString(leaseMetadata.host);
   const port = readNumber(leaseMetadata.port);
   const username = readString(leaseMetadata.username);
   const sandboxId = readString(leaseMetadata.sandboxId) ?? readString(providerMetadata.sandboxId);
+  const providerOwnsWorkspaceSync =
+    parseObject(parseObject(providerMetadata.workspaceRealization).sync).strategy === "provider_defined";
 
   const sync = (() => {
     if (transport === "local") {
@@ -152,11 +156,17 @@ export function buildWorkspaceRealizationRecord(input: {
         syncBack: "Download a workspace archive from the sandbox and mirror it back locally after adapter execution.",
       };
     }
-    return {
-      strategy: "provider_defined" as const,
-      prepare: "Delegate workspace materialization to the plugin environment driver.",
-      syncBack: "Delegate result synchronization to the plugin environment driver.",
-    };
+    return providerOwnsWorkspaceSync
+      ? {
+          strategy: "provider_defined" as const,
+          prepare: "Delegate workspace materialization to the plugin environment driver.",
+          syncBack: "Delegate result synchronization to the plugin environment driver.",
+        }
+      : {
+          strategy: "sandbox_archive_upload_download" as const,
+          prepare: "Upload a workspace archive into the plugin sandbox before adapter execution.",
+          syncBack: "Download the plugin sandbox workspace and mirror it back locally after adapter execution.",
+        };
   })();
 
   const provider =
@@ -170,7 +180,7 @@ export function buildWorkspaceRealizationRecord(input: {
         ? `SSH workspace realized at ${username ?? "user"}@${host ?? "host"}:${port ?? 22}:${remotePath ?? input.request.source.localPath}.`
         : transport === "sandbox"
           ? `Sandbox workspace realized at ${remotePath ?? "/"}${sandboxId ? ` in ${sandboxId}` : ""}.`
-          : `Plugin workspace realized at ${input.realizedCwd ?? remotePath ?? localPath}.`;
+          : `Plugin workspace realized at ${realizedCwd ?? remotePath ?? localPath}.`;
 
   return {
     version: 1,
