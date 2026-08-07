@@ -16,10 +16,13 @@ import {
   companySkillVersions,
   companySkills,
   createDb,
+  heartbeatRuns,
   issueThreadInteractions,
   issues,
   principalPermissionGrants,
   routines,
+  routineRevisions,
+  routineRuns,
   routineTriggers,
 } from "@paperclipai/db";
 import { readPaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
@@ -40,6 +43,7 @@ import {
 } from "../services/built-in-agents.ts";
 import { readBuiltInAgentMarker, withBuiltInAgentMarker } from "../services/built-in-agent-metadata.ts";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
+import { routineService } from "../services/routines.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -56,6 +60,16 @@ const BUILT_IN_MARKER_UNIQUE_INDEX_DDL = `
 
 function issuePrefix(id: string) {
   return `T${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
 }
 
 if (!embeddedPostgresSupport.supported) {
@@ -127,6 +141,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     await db.delete(routines);
     await db.delete(issueThreadInteractions);
     await db.delete(issues);
+    await db.delete(heartbeatRuns);
     await db.delete(builtInManagedResources);
     await db.delete(companySkillVersions);
     await db.delete(companySkills);
@@ -1175,6 +1190,702 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(grantKeys).not.toContain("tasks:assign");
     expect(grantKeys).not.toContain("agents:configure");
     expect(grantKeys).not.toContain("skills:create");
+  });
+
+  it("uses the company default and audits legacy ownership repair for approved built-ins on startup", async () => {
+    const companyId = await seedCompany({ requireApproval: true });
+    await reconcileBuiltInAgentsOnStartup(db);
+    const pending = await builtInAgentService(db).get(companyId, "reflection-coach");
+    const approval = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.companyId, companyId))
+      .then((rows) => rows.find(
+        (row) => (row.payload as { agentId?: string } | null)?.agentId === pending.agentId,
+      ));
+    await approvalService(db).approve(approval!.id, "board-user", "Approved Reflection Coach");
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    const [revision] = await db.select().from(routineRevisions).where(eq(routineRevisions.id, routine!.latestRevisionId!));
+    const [trigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.routineId, routine!.id));
+
+    expect(routine).toMatchObject({
+      assigneeAgentId: pending.agentId,
+      responsibleUserId: "responsible-user",
+      createdByUserId: null,
+    });
+
+    await db
+      .update(routines)
+      .set({
+        title: "Legacy stock reflection routine",
+        status: "active",
+        responsibleUserId: "built-in-bundles",
+        createdByUserId: "built-in-bundles",
+      })
+      .where(eq(routines.id, routine!.id));
+    await db
+      .update(routineTriggers)
+      .set({ enabled: true })
+      .where(eq(routineTriggers.id, trigger!.id));
+    await db
+      .update(routineRevisions)
+      .set({
+        responsibleUserId: "built-in-bundles",
+        snapshot: {
+          ...revision!.snapshot,
+          routine: { ...revision!.snapshot.routine, responsibleUserId: "built-in-bundles" },
+        },
+      })
+      .where(eq(routineRevisions.id, revision!.id));
+
+    const liveRoutineRunId = randomUUID();
+    const liveIssueId = randomUUID();
+    const liveHeartbeatRunId = randomUUID();
+    const runningHeartbeatRunId = randomUUID();
+    await db.insert(issues).values({
+      id: liveIssueId,
+      companyId,
+      title: "Legacy live reflection execution",
+      status: "blocked",
+      assigneeAgentId: pending.agentId,
+      responsibleUserId: "built-in-bundles",
+      originKind: "routine_execution",
+      originId: routine!.id,
+      originRunId: liveRoutineRunId,
+      originFingerprint: "legacy-live-reflection",
+    });
+    await db.insert(routineRuns).values({
+      id: liveRoutineRunId,
+      companyId,
+      routineId: routine!.id,
+      triggerId: trigger!.id,
+      source: "schedule",
+      status: "failed",
+      routineRevisionId: revision!.id,
+      responsibleUserId: "built-in-bundles",
+      dispatchFingerprint: "legacy-live-reflection",
+      linkedIssueId: liveIssueId,
+      failureReason: "Execution issue moved to blocked",
+      completedAt: new Date(),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: liveHeartbeatRunId,
+      companyId,
+      agentId: pending.agentId!,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      responsibleUserId: "built-in-bundles",
+      contextSnapshot: {
+        issueId: liveIssueId,
+        responsibleUserId: "built-in-bundles",
+        preserved: "context-value",
+      },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runningHeartbeatRunId,
+      companyId,
+      agentId: pending.agentId!,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      responsibleUserId: "built-in-bundles",
+      contextSnapshot: {
+        issueId: liveIssueId,
+        responsibleUserId: "built-in-bundles",
+      },
+      startedAt: new Date(),
+    });
+
+    const liveRunWithoutHeartbeatId = randomUUID();
+    const liveIssueWithoutHeartbeatId = randomUUID();
+    await db.insert(issues).values({
+      id: liveIssueWithoutHeartbeatId,
+      companyId,
+      title: "Legacy live reflection execution awaiting heartbeat",
+      status: "todo",
+      assigneeAgentId: pending.agentId,
+      responsibleUserId: "built-in-bundles",
+      originKind: "routine_execution",
+      originId: routine!.id,
+      originRunId: liveRunWithoutHeartbeatId,
+      originFingerprint: "legacy-live-reflection-without-heartbeat",
+    });
+    await db.insert(routineRuns).values({
+      id: liveRunWithoutHeartbeatId,
+      companyId,
+      routineId: routine!.id,
+      triggerId: trigger!.id,
+      source: "schedule",
+      status: "issue_created",
+      routineRevisionId: revision!.id,
+      responsibleUserId: "built-in-bundles",
+      dispatchFingerprint: "legacy-live-reflection-without-heartbeat",
+      linkedIssueId: liveIssueWithoutHeartbeatId,
+    });
+
+    const historicalRoutineRunId = randomUUID();
+    const historicalIssueId = randomUUID();
+    const historicalHeartbeatRunId = randomUUID();
+    await db.insert(issues).values({
+      id: historicalIssueId,
+      companyId,
+      title: "Historical cancelled reflection execution",
+      status: "cancelled",
+      assigneeAgentId: pending.agentId,
+      responsibleUserId: "built-in-bundles",
+      originKind: "routine_execution",
+      originId: routine!.id,
+      originRunId: historicalRoutineRunId,
+      originFingerprint: "legacy-blocked-reflection",
+    });
+    await db.insert(routineRuns).values({
+      id: historicalRoutineRunId,
+      companyId,
+      routineId: routine!.id,
+      triggerId: trigger!.id,
+      source: "schedule",
+      status: "failed",
+      routineRevisionId: revision!.id,
+      responsibleUserId: "built-in-bundles",
+      dispatchFingerprint: "legacy-blocked-reflection",
+      linkedIssueId: historicalIssueId,
+      failureReason: "Execution issue moved to cancelled",
+      completedAt: new Date(),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: historicalHeartbeatRunId,
+      companyId,
+      agentId: pending.agentId!,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      responsibleUserId: "built-in-bundles",
+      contextSnapshot: {
+        issueId: historicalIssueId,
+        responsibleUserId: "built-in-bundles",
+      },
+      error: "Responsible user is not authorized",
+      finishedAt: new Date(),
+    });
+
+    const legacyState = await builtInAgentService(db).get(companyId, "reflection-coach");
+    const legacyRoutineState = legacyState.resources.find((resource) => resource.resourceKind === "routine");
+    await db
+      .update(builtInManagedResources)
+      .set({ stockHash: legacyRoutineState!.currentHash! })
+      .where(and(
+        eq(builtInManagedResources.companyId, companyId),
+        eq(builtInManagedResources.resourceKind, "routine"),
+      ));
+    const updateAvailableState = await builtInAgentService(db).get(companyId, "reflection-coach");
+    expect(updateAvailableState.resources.find((resource) => resource.resourceKind === "routine")).toMatchObject({
+      stockStatus: "stock_update_available",
+      scheduleEnabled: true,
+    });
+
+    await Promise.all(
+      Array.from({ length: 20 }, () => reconcileBuiltInAgentsOnStartup(db)),
+    );
+
+    const [repaired] = await db.select().from(routines).where(eq(routines.id, routine!.id));
+    const [repairedRevision] = await db
+      .select()
+      .from(routineRevisions)
+      .where(eq(routineRevisions.id, repaired!.latestRevisionId!));
+    const [repairedTrigger] = await db
+      .select()
+      .from(routineTriggers)
+      .where(eq(routineTriggers.routineId, repaired!.id));
+    expect(repaired).toMatchObject({
+      title: "Legacy stock reflection routine",
+      status: "active",
+      responsibleUserId: "responsible-user",
+    });
+    expect(repairedTrigger).toMatchObject({ enabled: true });
+    expect(repaired!.latestRevisionNumber).toBeGreaterThan(routine!.latestRevisionNumber);
+    expect(repairedRevision).toMatchObject({
+      responsibleUserId: "responsible-user",
+      snapshot: { routine: { responsibleUserId: "responsible-user" } },
+    });
+    const [historicalRevision] = await db
+      .select()
+      .from(routineRevisions)
+      .where(eq(routineRevisions.id, revision!.id));
+    expect(historicalRevision).toMatchObject({
+      responsibleUserId: "built-in-bundles",
+      snapshot: { routine: { responsibleUserId: "built-in-bundles" } },
+    });
+    const [repairedLiveRoutineRun] = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.id, liveRoutineRunId));
+    const [repairedLiveIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, liveIssueId));
+    const [repairedLiveHeartbeatRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, liveHeartbeatRunId));
+    const [preservedRunningHeartbeatRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningHeartbeatRunId));
+    expect(repairedLiveRoutineRun).toMatchObject({
+      responsibleUserId: "responsible-user",
+      routineRevisionId: revision!.id,
+      dispatchFingerprint: "legacy-live-reflection",
+    });
+    expect(repairedLiveIssue).toMatchObject({ responsibleUserId: "responsible-user" });
+    expect(repairedLiveHeartbeatRun).toMatchObject({
+      responsibleUserId: "responsible-user",
+      contextSnapshot: {
+        issueId: liveIssueId,
+        responsibleUserId: "responsible-user",
+        preserved: "context-value",
+      },
+    });
+    expect(preservedRunningHeartbeatRun).toMatchObject({
+      status: "running",
+      responsibleUserId: "built-in-bundles",
+      contextSnapshot: {
+        issueId: liveIssueId,
+        responsibleUserId: "built-in-bundles",
+      },
+    });
+    const [repairedLiveRunWithoutHeartbeat] = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.id, liveRunWithoutHeartbeatId));
+    const [repairedLiveIssueWithoutHeartbeat] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, liveIssueWithoutHeartbeatId));
+    expect(repairedLiveRunWithoutHeartbeat).toMatchObject({ responsibleUserId: "responsible-user" });
+    expect(repairedLiveIssueWithoutHeartbeat).toMatchObject({ responsibleUserId: "responsible-user" });
+    const [preservedHistoricalRoutineRun] = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.id, historicalRoutineRunId));
+    const [preservedHistoricalIssue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, historicalIssueId));
+    const [preservedHistoricalHeartbeatRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, historicalHeartbeatRunId));
+    expect(preservedHistoricalRoutineRun?.responsibleUserId).toBe("built-in-bundles");
+    expect(preservedHistoricalIssue?.responsibleUserId).toBe("built-in-bundles");
+    expect(preservedHistoricalHeartbeatRun).toMatchObject({
+      responsibleUserId: "built-in-bundles",
+      contextSnapshot: { responsibleUserId: "built-in-bundles" },
+    });
+    const repairEvents = await db
+      .select()
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "built_in_agent.routine_ownership_repaired"),
+      ));
+    expect(repairEvents).toHaveLength(1);
+    const [repairEvent] = repairEvents;
+    expect(repairEvent).toMatchObject({
+      actorType: "system",
+      actorId: "built-in-bundles",
+      entityType: "routine",
+      entityId: routine!.id,
+      details: {
+        key: "reflection-coach",
+        routineKey: "recent-agent-reflection",
+        previousResponsibleUserId: "built-in-bundles",
+        responsibleUserId: "responsible-user",
+        repairedRecords: {
+          routineRuns: 2,
+          issues: 2,
+          heartbeatRuns: 1,
+          heartbeatRunContextSnapshots: 1,
+        },
+      },
+    });
+  });
+
+  it("defers routine creation until a responsible user exists", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Ownerless Paperclip",
+      issuePrefix: issuePrefix(companyId),
+      requireBoardApprovalForNewAgents: false,
+    });
+    const builtIns = builtInAgentService(db);
+
+    const ownerless = await builtIns.ensure(companyId, "reflection-coach");
+    expect(ownerless.resources.find((resource) => resource.resourceKind === "routine")).toMatchObject({
+      resourceId: null,
+      stockStatus: "missing",
+    });
+    expect(await db.select().from(routines).where(eq(routines.companyId, companyId))).toHaveLength(0);
+
+    await db
+      .update(companies)
+      .set({ defaultResponsibleUserId: "responsible-user" })
+      .where(eq(companies.id, companyId));
+    const reconciled = await builtIns.ensure(companyId, "reflection-coach");
+    expect(reconciled.resources.find((resource) => resource.resourceKind === "routine")).toMatchObject({
+      stockStatus: "stock_current",
+    });
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    expect(routine?.responsibleUserId).toBe("responsible-user");
+  });
+
+  it("repairs a legacy routine row when its latest revision already has the real owner", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    await builtInAgentService(db).ensure(companyId, "reflection-coach");
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    const originalRevisionId = routine!.latestRevisionId;
+    await db
+      .update(routines)
+      .set({ responsibleUserId: "built-in-bundles" })
+      .where(eq(routines.id, routine!.id));
+
+    await reconcileBuiltInAgentsOnStartup(db);
+
+    const [repaired] = await db.select().from(routines).where(eq(routines.id, routine!.id));
+    const [revision] = await db
+      .select()
+      .from(routineRevisions)
+      .where(eq(routineRevisions.id, repaired!.latestRevisionId!));
+    expect(repaired).toMatchObject({
+      responsibleUserId: "responsible-user",
+      latestRevisionNumber: routine!.latestRevisionNumber + 1,
+    });
+    expect(repaired!.latestRevisionId).not.toBe(originalRevisionId);
+    expect(revision).toMatchObject({
+      responsibleUserId: "responsible-user",
+      snapshot: { routine: { responsibleUserId: "responsible-user" } },
+    });
+  });
+
+  it("fails legacy ownership repair when no real responsible user exists", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    await builtInAgentService(db).ensure(companyId, "reflection-coach");
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    await db
+      .update(companies)
+      .set({ defaultResponsibleUserId: null })
+      .where(eq(companies.id, companyId));
+    await db
+      .update(routines)
+      .set({ responsibleUserId: "built-in-bundles" })
+      .where(eq(routines.id, routine!.id));
+
+    await expect(reconcileBuiltInAgentsOnStartup(db)).rejects.toThrow("Routine requires a responsible user");
+    const [unrepaired] = await db.select().from(routines).where(eq(routines.id, routine!.id));
+    expect(unrepaired?.responsibleUserId).toBe("built-in-bundles");
+  });
+
+  it("dispatches from the repaired revision after waiting for the routine lock", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    const agent = await agentService(db).create(companyId, {
+      name: "Routine Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: { model: "gpt-5.4" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const dispatchReachedLock = deferred<void>();
+    const dispatchCanLock = deferred<void>();
+    const routinesSvc = routineService(db, {
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock.resolve();
+        await dispatchCanLock.promise;
+      },
+    });
+    const routine = await routinesSvc.create(companyId, {
+      projectId: null,
+      goalId: null,
+      parentIssueId: null,
+      title: "Repair ownership race",
+      description: "Verify dispatch uses the locked routine revision.",
+      assigneeAgentId: agent.id,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+    }, {});
+    const [initialRevision] = await db
+      .select()
+      .from(routineRevisions)
+      .where(eq(routineRevisions.id, routine.latestRevisionId!));
+
+    const legacyResponsibleUserId = "built-in-bundles";
+    await db
+      .update(routines)
+      .set({ responsibleUserId: legacyResponsibleUserId })
+      .where(eq(routines.id, routine.id));
+    await db
+      .update(routineRevisions)
+      .set({
+        responsibleUserId: legacyResponsibleUserId,
+        snapshot: {
+          ...initialRevision!.snapshot,
+          routine: {
+            ...initialRevision!.snapshot.routine,
+            responsibleUserId: legacyResponsibleUserId,
+          },
+        },
+      })
+      .where(eq(routineRevisions.id, initialRevision!.id));
+
+    const activeRunId = randomUUID();
+    const activeIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: activeIssueId,
+      companyId,
+      title: "Existing routine execution",
+      status: "todo",
+      assigneeAgentId: agent.id,
+      responsibleUserId: legacyResponsibleUserId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: activeRunId,
+      originFingerprint: "default",
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: agent.id,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      responsibleUserId: legacyResponsibleUserId,
+      contextSnapshot: {
+        issueId: activeIssueId,
+        responsibleUserId: legacyResponsibleUserId,
+      },
+    });
+
+    let repairedRevisionId: string | null = null;
+    const repairedTitle = "Repair ownership race for {{subject}}";
+    const repairedDescription = "Dispatch {{subject}} from the locked routine revision.";
+    const staleRowTitle = "Stale current-row title";
+    const staleRowDescription = "Stale current-row description";
+    const repairedVariables = [
+      { name: "subject", label: null, type: "text" as const, defaultValue: null, required: true, options: [] },
+    ];
+    const runInput = { source: "api" as const, variables: { subject: "current content" } };
+    const dispatched = routinesSvc.runRoutine(routine.id, runInput);
+    await dispatchReachedLock.promise;
+    await db.transaction(async (tx) => {
+      const [repairedRevision] = await tx
+        .insert(routineRevisions)
+        .values({
+          companyId,
+          routineId: routine.id,
+          revisionNumber: initialRevision!.revisionNumber + 1,
+          title: repairedTitle,
+          description: repairedDescription,
+          snapshot: {
+            ...initialRevision!.snapshot,
+            routine: {
+              ...initialRevision!.snapshot.routine,
+              title: repairedTitle,
+              description: repairedDescription,
+              variables: repairedVariables,
+              responsibleUserId: "responsible-user",
+            },
+          },
+          changeSummary: "Repair legacy built-in ownership",
+          responsibleUserId: "responsible-user",
+        })
+        .returning();
+      repairedRevisionId = repairedRevision!.id;
+      await tx
+        .update(routines)
+        .set({
+          title: staleRowTitle,
+          description: staleRowDescription,
+          variables: repairedVariables,
+          responsibleUserId: "responsible-user",
+          latestRevisionId: repairedRevision!.id,
+          latestRevisionNumber: repairedRevision!.revisionNumber,
+          updatedAt: new Date(),
+        })
+        .where(eq(routines.id, routine.id));
+    });
+    dispatchCanLock.resolve();
+
+    const repairedDispatch = await dispatched;
+    expect(repairedDispatch).toMatchObject({
+      status: "coalesced",
+      routineRevisionId: repairedRevisionId,
+      responsibleUserId: "responsible-user",
+      linkedIssueId: activeIssueId,
+      triggerPayload: { variables: { subject: "current content" } },
+    });
+    await db
+      .update(routines)
+      .set({ title: repairedTitle, description: repairedDescription })
+      .where(eq(routines.id, routine.id));
+    const subsequentDispatch = await routinesSvc.runRoutine(routine.id, runInput);
+    expect(repairedDispatch.dispatchFingerprint).toBe(subsequentDispatch.dispatchFingerprint);
+  });
+
+  it("rejects a dispatch when the routine is archived before it acquires the lock", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    const agent = await agentService(db).create(companyId, {
+      name: "Archive Race Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: { model: "gpt-5.4" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const dispatchReachedLock = deferred<void>();
+    const dispatchCanLock = deferred<void>();
+    const routinesSvc = routineService(db, {
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock.resolve();
+        await dispatchCanLock.promise;
+      },
+    });
+    const routine = await routinesSvc.create(companyId, {
+      projectId: null,
+      goalId: null,
+      parentIssueId: null,
+      title: "Archive dispatch race",
+      description: "Do not dispatch after archival.",
+      assigneeAgentId: agent.id,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+    }, {});
+
+    const dispatched = routinesSvc.runRoutine(routine.id, { source: "api" });
+    await dispatchReachedLock.promise;
+    await db
+      .update(routines)
+      .set({ status: "archived", updatedAt: new Date() })
+      .where(eq(routines.id, routine.id));
+    dispatchCanLock.resolve();
+
+    await expect(dispatched).rejects.toMatchObject({
+      status: 409,
+      message: "Routine is archived",
+    });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).resolves.toHaveLength(0);
+  });
+
+  it("rejects a dispatch when its trigger is disabled before it acquires the lock", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    const agent = await agentService(db).create(companyId, {
+      name: "Trigger Disable Race Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: { model: "gpt-5.4" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const dispatchReachedLock = deferred<void>();
+    const dispatchCanLock = deferred<void>();
+    const routinesSvc = routineService(db, {
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock.resolve();
+        await dispatchCanLock.promise;
+      },
+    });
+    const routine = await routinesSvc.create(companyId, {
+      projectId: null,
+      goalId: null,
+      parentIssueId: null,
+      title: "Trigger disable race",
+      description: "Do not dispatch a disabled trigger.",
+      assigneeAgentId: agent.id,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+    }, {});
+    const { trigger } = await routinesSvc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 9 * * *",
+      timezone: "UTC",
+    }, {});
+
+    const dispatched = routinesSvc.runRoutine(routine.id, { source: "api", triggerId: trigger.id });
+    await dispatchReachedLock.promise;
+    await db
+      .update(routineTriggers)
+      .set({ enabled: false, updatedAt: new Date() })
+      .where(eq(routineTriggers.id, trigger.id));
+    dispatchCanLock.resolve();
+
+    await expect(dispatched).rejects.toMatchObject({
+      status: 409,
+      message: "Routine trigger is not active",
+    });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).resolves.toHaveLength(0);
+  });
+
+  it("rejects a dispatch when its trigger is replaced before it acquires the lock", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    const agent = await agentService(db).create(companyId, {
+      name: "Trigger Replacement Race Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: { model: "gpt-5.4" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const dispatchReachedLock = deferred<void>();
+    const dispatchCanLock = deferred<void>();
+    const routinesSvc = routineService(db, {
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock.resolve();
+        await dispatchCanLock.promise;
+      },
+    });
+    const routine = await routinesSvc.create(companyId, {
+      projectId: null,
+      goalId: null,
+      parentIssueId: null,
+      title: "Trigger replacement race",
+      description: "Do not dispatch a replaced trigger.",
+      assigneeAgentId: agent.id,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+    }, {});
+    const { trigger } = await routinesSvc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 9 * * *",
+      timezone: "UTC",
+    }, {});
+
+    const dispatched = routinesSvc.runRoutine(routine.id, { source: "api", triggerId: trigger.id });
+    await dispatchReachedLock.promise;
+    await routinesSvc.deleteTrigger(trigger.id, {});
+    const { trigger: replacement } = await routinesSvc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 10 * * *",
+      timezone: "UTC",
+    }, {});
+    dispatchCanLock.resolve();
+
+    expect(replacement.id).not.toBe(trigger.id);
+    await expect(dispatched).rejects.toMatchObject({
+      status: 403,
+      message: "Trigger does not belong to routine",
+    });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).resolves.toHaveLength(0);
   });
 
   it("materializes the Summarizer bundle paused on Claude Haiku with a disabled routine", async () => {

@@ -102,6 +102,8 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   catchUpPolicy: z.enum(ROUTINE_CATCH_UP_POLICIES),
   activityGatePolicy: z.enum(ROUTINE_ACTIVITY_GATE_POLICIES).default("always"),
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).default("company"),
+  originKind: z.string().optional(),
+  originId: z.string().nullable().optional(),
   variables: z.array(routineVariableSchema),
   env: envConfigSchema.nullable().default(null),
   responsibleUserId: z.string().nullable().default(null),
