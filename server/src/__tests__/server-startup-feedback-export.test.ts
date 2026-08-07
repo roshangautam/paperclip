@@ -29,6 +29,7 @@ const {
   issueThreadInteractionServiceFactoryMock,
   issueThreadInteractionServiceMock,
   loadConfigMock,
+  reconcileBuiltInAgentsOnStartupMock,
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
   routineServiceMock,
@@ -123,6 +124,13 @@ const {
     close: vi.fn(),
   };
   const loadConfigMock = vi.fn();
+  const reconcileBuiltInAgentsOnStartupMock = vi.fn(async () => ({
+    scanned: 0,
+    reconciled: 0,
+    unknown: 0,
+    duplicates: 0,
+    autoEnsured: 0,
+  }));
 
   return {
     createAppMock,
@@ -144,6 +152,7 @@ const {
     issueThreadInteractionServiceFactoryMock,
     issueThreadInteractionServiceMock,
     loadConfigMock,
+    reconcileBuiltInAgentsOnStartupMock,
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
     routineServiceMock,
@@ -293,12 +302,7 @@ vi.mock("../services/index.js", () => ({
     failed: 0,
     seededAgentIds: [],
   })),
-  reconcileBuiltInAgentsOnStartup: vi.fn(async () => ({
-    scanned: 0,
-    reconciled: 0,
-    unknown: 0,
-    duplicates: 0,
-  })),
+  reconcileBuiltInAgentsOnStartup: reconcileBuiltInAgentsOnStartupMock,
   reconcilePersistedRuntimeServicesOnStartup: vi.fn(async () => ({ reconciled: 0 })),
   resolveHeartbeatSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
   routineService: routineServiceFactoryMock,
@@ -539,6 +543,38 @@ describe("startServer feedback export wiring", () => {
     } finally {
       setIntervalSpy.mockRestore();
     }
+  });
+
+  it("reconciles built-in agent ownership before resuming queued runs", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    let finishReconciliation!: () => void;
+    const reconciliationPending = new Promise<void>((resolve) => {
+      finishReconciliation = resolve;
+    });
+    reconcileBuiltInAgentsOnStartupMock.mockImplementationOnce(async () => {
+      await reconciliationPending;
+      return { scanned: 0, reconciled: 0, unknown: 0, duplicates: 0, autoEnsured: 0 };
+    });
+
+    const startup = startServer();
+    await vi.waitFor(() => expect(reconcileBuiltInAgentsOnStartupMock).toHaveBeenCalledTimes(1));
+    expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
+
+    finishReconciliation();
+    await startup;
+
+    expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not resume queued runs when built-in ownership reconciliation fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    reconcileBuiltInAgentsOnStartupMock.mockRejectedValueOnce(new Error("reconciliation failed"));
+
+    await expect(startServer()).rejects.toThrow("reconciliation failed");
+
+    expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
+    expect(routineServiceMock.tickScheduledTriggers).not.toHaveBeenCalled();
+    expect(fakeServer.listen).not.toHaveBeenCalled();
   });
 
   it("does not replay hot-restart adoption when the orphan reaper retries", async () => {

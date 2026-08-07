@@ -90,6 +90,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
   async function seedFixture(opts?: {
     runtimeEnv?: Record<string, string | undefined>;
+    beforeDispatchRoutineLock?: () => Promise<void>;
     wakeup?: (
       agentId: string,
       wakeupOpts: {
@@ -100,8 +101,11 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         requestedByActorType?: "user" | "agent" | "system";
         requestedByActorId?: string | null;
         contextSnapshot?: Record<string, unknown>;
+        deferStart?: boolean;
       },
     ) => Promise<unknown>;
+    startQueuedRunsForAgent?: (agentId: string) => Promise<unknown>;
+    omitStartQueuedRunsForAgent?: boolean;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -118,6 +122,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
         requestedByActorType?: "user" | "agent" | "system";
         requestedByActorId?: string | null;
         contextSnapshot?: Record<string, unknown>;
+        deferStart?: boolean;
       };
     }> = [];
 
@@ -150,6 +155,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     const svc = routineService(db, {
       runtimeEnv: opts?.runtimeEnv,
+      beforeDispatchRoutineLock: opts?.beforeDispatchRoutineLock,
       heartbeat: {
         wakeup: async (wakeupAgentId, wakeupOpts) => {
           wakeups.push({ agentId: wakeupAgentId, opts: wakeupOpts });
@@ -184,6 +190,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
             .where(eq(issues.id, issueId));
           return { id: queuedRunId };
         },
+        ...(opts?.omitStartQueuedRunsForAgent
+          ? {}
+          : { startQueuedRunsForAgent: async (wakeupAgentId: string) => opts?.startQueuedRunsForAgent?.(wakeupAgentId) }),
       },
     });
     const issueSvc = issueService(db);
@@ -1106,6 +1115,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
           requestedByActorType: undefined,
           requestedByActorId: null,
           contextSnapshot: { issueId: run.linkedIssueId, source: "routine.dispatch" },
+          deferStart: true,
         },
       },
     ]);
@@ -1143,7 +1153,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(inboxIssues.map((issue) => issue.id)).toContain(run.linkedIssueId);
   });
 
-  it("uses the routine revision responsible-user snapshot for automatic runs", async () => {
+  it("uses the routine revision owner when a legacy snapshot omits it", async () => {
     const { companyId, agentId, projectId, svc } = await seedFixture();
     const responsibleUserId = randomUUID();
     const driftUserId = randomUUID();
@@ -1163,6 +1173,22 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       },
       { userId: responsibleUserId },
     );
+
+    const [revision] = await db
+      .select()
+      .from(routineRevisions)
+      .where(eq(routineRevisions.id, routine.latestRevisionId!));
+    const legacyRoutineSnapshot = { ...revision!.snapshot.routine };
+    delete legacyRoutineSnapshot.responsibleUserId;
+    await db
+      .update(routineRevisions)
+      .set({
+        snapshot: {
+          ...revision!.snapshot,
+          routine: legacyRoutineSnapshot,
+        },
+      })
+      .where(eq(routineRevisions.id, revision!.id));
 
     await db
       .update(routines)
@@ -1196,6 +1222,36 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(run.status).toBe("issue_created");
     expect(wakeupResolved).toBe(true);
+  });
+
+  it("starts a queued routine heartbeat only after dispatch commits", async () => {
+    let routineId = "";
+    let expectedAgentId = "";
+    const startQueuedRunsForAgent = vi.fn(async (agentId: string) => {
+      const visibleRun = await db
+        .select({ status: routineRuns.status })
+        .from(routineRuns)
+        .where(eq(routineRuns.routineId, routineId))
+        .then((rows) => rows[0] ?? null);
+      expect(agentId).toBe(expectedAgentId);
+      expect(visibleRun?.status).toBe("issue_created");
+    });
+    const fixture = await seedFixture({ startQueuedRunsForAgent });
+    routineId = fixture.routine.id;
+    expectedAgentId = fixture.agentId;
+
+    await fixture.svc.runRoutine(routineId, { source: "manual" });
+
+    expect(fixture.wakeups[0]?.opts.deferStart).toBe(true);
+    expect(startQueuedRunsForAgent).toHaveBeenCalledOnce();
+  });
+
+  it("does not defer wakeup startup when no post-commit starter is available", async () => {
+    const fixture = await seedFixture({ omitStartQueuedRunsForAgent: true });
+
+    await fixture.svc.runRoutine(fixture.routine.id, { source: "manual" });
+
+    expect(fixture.wakeups[0]?.opts.deferStart).toBe(false);
   });
 
   it("coalesces only when the existing routine issue has a live execution run", async () => {
@@ -1348,10 +1404,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const previousRunId = randomUUID();
     const liveHeartbeatRunId = randomUUID();
 
-    await db
-      .update(routines)
-      .set({ concurrencyPolicy: "skip_if_active" })
-      .where(eq(routines.id, routine.id));
+    await svc.update(routine.id, { concurrencyPolicy: "skip_if_active" }, {});
 
     const previousIssue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
@@ -2357,6 +2410,136 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(runs[0]?.status).toBe("issue_created");
     const updatedTrigger = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id)).then((rows) => rows[0]);
     expect(updatedTrigger?.nextRunAt).toEqual(new Date("2026-07-16T01:10:00.000Z"));
+  });
+
+  it("preserves a schedule changed while dispatch waits for the routine lock", async () => {
+    let dispatchReachedLock!: () => void;
+    let dispatchCanLock!: () => void;
+    const reachedLock = new Promise<void>((resolve) => { dispatchReachedLock = resolve; });
+    const canLock = new Promise<void>((resolve) => { dispatchCanLock = resolve; });
+    const { routine, svc } = await seedFixture({
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock();
+        await canLock;
+      },
+    });
+    const { trigger } = await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 9 * * *",
+      timezone: "UTC",
+    }, {});
+    await db.update(routineTriggers).set({
+      nextRunAt: new Date("2026-07-16T09:00:00.000Z"),
+    }).where(eq(routineTriggers.id, trigger.id));
+
+    const ticking = svc.tickScheduledTriggers(new Date("2026-07-16T09:05:00.000Z"));
+    await reachedLock;
+    const changed = await svc.updateTrigger(trigger.id, {
+      cronExpression: "30 10 * * *",
+    }, {});
+    const changedNextRunAt = changed!.trigger.nextRunAt;
+    dispatchCanLock();
+
+    await expect(ticking).resolves.toEqual({ triggered: 1 });
+    const updatedTrigger = await db.select().from(routineTriggers)
+      .where(eq(routineTriggers.id, trigger.id)).then((rows) => rows[0]);
+    expect(updatedTrigger).toMatchObject({ cronExpression: "30 10 * * *", nextRunAt: changedNextRunAt });
+  });
+
+  it("does not roll back a schedule advanced during dispatch", async () => {
+    let firstWakeupReached!: () => void;
+    let finishFirstWakeup!: () => void;
+    const wakeupReached = new Promise<void>((resolve) => { firstWakeupReached = resolve; });
+    const firstWakeupCanFinish = new Promise<void>((resolve) => { finishFirstWakeup = resolve; });
+    let wakeupCount = 0;
+    const { routine, svc } = await seedFixture({
+      wakeup: async () => {
+        wakeupCount += 1;
+        if (wakeupCount === 1) {
+          firstWakeupReached();
+          await firstWakeupCanFinish;
+        }
+        return { id: randomUUID() };
+      },
+    });
+    const { trigger } = await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 * * * *",
+      timezone: "UTC",
+    }, {});
+    await db.update(routineTriggers).set({
+      nextRunAt: new Date("2026-07-16T00:00:00.000Z"),
+    }).where(eq(routineTriggers.id, trigger.id));
+
+    const firstTick = svc.tickScheduledTriggers(new Date("2026-07-16T00:05:00.000Z"));
+    await wakeupReached;
+    const secondTick = svc.tickScheduledTriggers(new Date("2026-07-16T01:05:00.000Z"));
+    await vi.waitFor(async () => {
+      const current = await db.select().from(routineTriggers)
+        .where(eq(routineTriggers.id, trigger.id)).then((rows) => rows[0]);
+      expect(current?.nextRunAt).toEqual(new Date("2026-07-16T02:00:00.000Z"));
+    });
+    finishFirstWakeup();
+
+    await Promise.all([firstTick, secondTick]);
+    const current = await db.select().from(routineTriggers)
+      .where(eq(routineTriggers.id, trigger.id)).then((rows) => rows[0]);
+    expect(current?.nextRunAt).toEqual(new Date("2026-07-16T02:00:00.000Z"));
+  });
+
+  it("rejects a scheduled dispatch paused while it waits for the routine lock", async () => {
+    let dispatchReachedLock!: () => void;
+    let dispatchCanLock!: () => void;
+    const reachedLock = new Promise<void>((resolve) => { dispatchReachedLock = resolve; });
+    const canLock = new Promise<void>((resolve) => { dispatchCanLock = resolve; });
+    const { routine, svc } = await seedFixture({
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock();
+        await canLock;
+      },
+    });
+    const { trigger } = await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 9 * * *",
+      timezone: "UTC",
+    }, {});
+    await db.update(routineTriggers).set({
+      nextRunAt: new Date("2026-07-16T09:00:00.000Z"),
+    }).where(eq(routineTriggers.id, trigger.id));
+
+    const ticking = svc.tickScheduledTriggers(new Date("2026-07-16T09:05:00.000Z"));
+    await reachedLock;
+    await svc.update(routine.id, { status: "paused" }, {});
+    dispatchCanLock();
+
+    await expect(ticking).rejects.toMatchObject({ status: 409, message: "Routine is not active" });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).resolves.toHaveLength(0);
+  });
+
+  it("rejects a webhook dispatch paused while it waits for the routine lock", async () => {
+    let dispatchReachedLock!: () => void;
+    let dispatchCanLock!: () => void;
+    const reachedLock = new Promise<void>((resolve) => { dispatchReachedLock = resolve; });
+    const canLock = new Promise<void>((resolve) => { dispatchCanLock = resolve; });
+    const { routine, svc } = await seedFixture({
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock();
+        await canLock;
+      },
+    });
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      { kind: "webhook", signingMode: "none" },
+      {},
+    );
+
+    const firing = svc.firePublicTrigger(trigger.publicId!, { payload: {} });
+    await reachedLock;
+    await svc.update(routine.id, { status: "paused" }, {});
+    dispatchCanLock();
+
+    await expect(firing).rejects.toMatchObject({ status: 409, message: "Routine is not active" });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).resolves.toHaveLength(0);
   });
 
   it("continues replaying each missed hourly tick", async () => {
