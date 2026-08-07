@@ -414,47 +414,6 @@ export function environmentRunOrchestrator(
     }
 
     const provisionCommand = workspaceRealizationRequest.runtimeOverlay.provisionCommand?.trim() ?? "";
-    const realizedCwd =
-      realizedWorkspaceCwd ??
-      leaseRemoteCwd ??
-      pluginRemoteCwd ??
-      executionWorkspace.cwd;
-    if (provisionCommand && environment.driver !== "local") {
-      try {
-        if (
-          environment.driver === "plugin" &&
-          !realizedWorkspaceCwd &&
-          !leaseRemoteCwd &&
-          !pluginRemoteCwd
-        ) {
-          throw new Error("Plugin workspace provisioning requires a remote working directory.");
-        }
-        const provisionResult = await environmentRuntime.execute({
-          environment,
-          lease,
-          command: "bash",
-          args: ["-lc", provisionCommand],
-          cwd: realizedCwd,
-          env: {
-            SHELL: "/bin/bash",
-          },
-          timeoutMs: 300_000,
-        });
-        if (provisionResult.exitCode !== 0 || provisionResult.timedOut) {
-          throw new Error(formatProvisionFailureDetail(provisionResult));
-        }
-      } catch (err) {
-        throw new EnvironmentRunError(
-          "workspace_realization_failed",
-          `Failed to provision workspace for environment "${environment.name}" (${environment.driver}): ${err instanceof Error ? err.message : String(err)}`,
-          {
-            environmentId: environment.id,
-            driver: environment.driver,
-            cause: err,
-          },
-        );
-      }
-    }
 
     // Step 3: Persist realization metadata on lease and execution workspace
     const hasWorkspaceRealization = Object.keys(workspaceRealization).length > 0;
@@ -506,6 +465,56 @@ export function environmentRunOrchestrator(
           cause: err,
         },
       );
+    }
+
+    if (provisionCommand && environment.driver !== "local") {
+      if (
+        executionTarget?.kind === "remote" &&
+        executionTarget.transport === "sandbox" &&
+        executionTarget.syncWorkspace !== false
+      ) {
+        executionTarget = { ...executionTarget, provisionCommand };
+      } else {
+        const realizedCwd =
+          realizedWorkspaceCwd ??
+          leaseRemoteCwd ??
+          pluginRemoteCwd ??
+          executionWorkspace.cwd;
+        try {
+          if (
+            environment.driver === "plugin" &&
+            !realizedWorkspaceCwd &&
+            !leaseRemoteCwd &&
+            !pluginRemoteCwd
+          ) {
+            throw new Error("Plugin workspace provisioning requires a remote working directory.");
+          }
+          const provisionResult = await environmentRuntime.execute({
+            environment,
+            lease,
+            command: "bash",
+            args: ["-lc", provisionCommand],
+            cwd: realizedCwd,
+            env: {
+              SHELL: "/bin/bash",
+            },
+            timeoutMs: 300_000,
+          });
+          if (provisionResult.exitCode !== 0 || provisionResult.timedOut) {
+            throw new Error(formatProvisionFailureDetail(provisionResult));
+          }
+        } catch (err) {
+          throw new EnvironmentRunError(
+            "workspace_realization_failed",
+            `Failed to provision workspace for environment "${environment.name}" (${environment.driver}): ${err instanceof Error ? err.message : String(err)}`,
+            {
+              environmentId: environment.id,
+              driver: environment.driver,
+              cause: err,
+            },
+          );
+        }
+      }
     }
 
     return {

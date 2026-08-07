@@ -295,7 +295,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     );
   });
 
-  it("plugin driver realizes the workspace before resolving the target", async () => {
+  it("defers core-synced plugin provisioning to the execution target", async () => {
     const environment = makeEnvironment("plugin" as Environment["driver"]);
     const executionTarget = {
       kind: "remote",
@@ -349,10 +349,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     );
 
     expect(runtime.realizeWorkspace).toHaveBeenCalledOnce();
-    expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
-      cwd: "/home/coder/workspace",
-      args: ["-lc", "pnpm install"],
-    }));
+    expect(runtime.execute).not.toHaveBeenCalled();
     expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
       "lease-1",
       expect.objectContaining({ remoteCwd: "/home/coder/workspace" }),
@@ -362,7 +359,10 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
       transport: "plugin",
       remote: { path: "/home/coder/workspace" },
     });
-    expect(result.executionTarget).toEqual(executionTarget);
+    expect(result.executionTarget).toEqual({
+      ...executionTarget,
+      provisionCommand: "pnpm install",
+    });
   });
 
   it("persists a plugin cwd when realization metadata is omitted", async () => {
@@ -509,7 +509,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(result.persistedExecutionWorkspace).toEqual(updatedEw);
   });
 
-  it("runs a remote provision command after workspace realization when configured", async () => {
+  it("defers sandbox provisioning when the adapter manages workspace sync", async () => {
     mockBuildWorkspaceRealizationRequest.mockReturnValue({
       version: 1,
       adapterType: "claude_local",
@@ -557,21 +557,14 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     });
     const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
 
-    await orchestrator.realizeForRun(makeRealizeInput({
+    const result = await orchestrator.realizeForRun(makeRealizeInput({
       environment: makeEnvironment("sandbox"),
     }));
 
-    expect(runtime.execute).toHaveBeenCalledOnce();
-    expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
-      environment: expect.objectContaining({ driver: "sandbox" }),
-      lease: expect.objectContaining({ id: "lease-1" }),
-      command: "bash",
-      args: ["-lc", "npm install -g @anthropic-ai/claude-code"],
-      cwd: "/remote/workspace",
-      env: {
-        SHELL: "/bin/bash",
-      },
-    }));
+    expect(runtime.execute).not.toHaveBeenCalled();
+    expect(result.executionTarget).toMatchObject({
+      provisionCommand: "npm install -g @anthropic-ai/claude-code",
+    });
   });
 
   it("runs project-level provision commands for ssh environments", async () => {
@@ -653,7 +646,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
   });
 
-  it("surfaces remote provision command failures before resolving the adapter target", async () => {
+  it("surfaces provider-defined provision command failures", async () => {
     mockBuildWorkspaceRealizationRequest.mockReturnValue({
       version: 1,
       adapterType: "claude_local",
@@ -678,6 +671,13 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
         provisionCommand: "install-tool",
       },
     });
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      remoteCwd: "/remote/workspace",
+      syncWorkspace: false,
+    });
 
     const runtime = makeMockRuntime({
       execute: vi.fn().mockResolvedValue({
@@ -699,6 +699,6 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
         String(err.message).includes("install-tool: not found"),
     );
 
-    expect(mockResolveEnvironmentExecutionTarget).not.toHaveBeenCalled();
+    expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
   });
 });
