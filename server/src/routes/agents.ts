@@ -431,6 +431,7 @@ export function agentRoutes(
     };
 
     let realizedCwd: string | null = null;
+    let workspaceRealization: Record<string, unknown> | null = null;
     try {
       const realized = await environmentRuntime.realizeWorkspace({
         environment: testEnvironment,
@@ -444,6 +445,7 @@ export function agentRoutes(
         typeof realized.cwd === "string" && realized.cwd.trim().length > 0
           ? realized.cwd.trim()
           : null;
+      workspaceRealization = readObject(realized.metadata?.workspaceRealization);
     } catch (err) {
       await releaseLease("failed");
       return {
@@ -464,10 +466,15 @@ export function agentRoutes(
     let target: AdapterExecutionTarget | null;
     try {
       // Prefer the cwd the realize step returned; fall back to lease metadata.
+      const leaseMetadata = (leaseRecord.lease.metadata as Record<string, unknown> | null) ?? null;
       const leaseMetadataForTarget: Record<string, unknown> | null =
-        realizedCwd
-          ? { ...(leaseRecord.lease.metadata ?? {}), remoteCwd: realizedCwd }
-          : (leaseRecord.lease.metadata as Record<string, unknown> | null) ?? null;
+        realizedCwd || workspaceRealization
+          ? {
+              ...(leaseMetadata ?? {}),
+              ...(realizedCwd ? { remoteCwd: realizedCwd } : {}),
+              ...(workspaceRealization ? { workspaceRealization } : {}),
+            }
+          : leaseMetadata;
 
       target = await resolveEnvironmentExecutionTarget({
         db,
