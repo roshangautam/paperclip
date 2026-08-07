@@ -16701,6 +16701,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
       return false;
     }
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: null, processGroupId: null, updatedAt: new Date() })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
     runningProcesses.delete(run.id);
     return true;
   }

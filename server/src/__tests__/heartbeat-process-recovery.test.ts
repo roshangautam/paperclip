@@ -3502,6 +3502,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     async (cancellationPath) => {
       const { agentId, runId, companyId, issueId } = await seedRunFixture({
         agentStatus: cancellationPath === "agent-wide cancellation" ? "paused" : "running",
+        processPid: 12345,
       });
       const { leaseId } = await seedEnvironmentLeaseFixture({
         companyId,
@@ -3524,6 +3525,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
       await expect(heartbeat.getRun(runId)).resolves.toMatchObject({
         status: "cancelled",
+        processPid: 12345,
         resultJson: expect.objectContaining({
           cancellationCleanupPending: {
             mode: cancellationPath === "agent-wide cancellation" ? "agent_wide" : "direct",
@@ -3547,6 +3549,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await expect(heartbeat.reapOrphanedRuns()).resolves.toEqual({ reaped: 1, runIds: [runId] });
 
       const recoveredRun = await heartbeat.getRun(runId);
+      expect(recoveredRun?.processPid).toBeNull();
+      expect(recoveredRun?.processGroupId).toBeNull();
       expect(recoveredRun?.resultJson).not.toHaveProperty("cancellationCleanupPending");
       const [releasedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
       expect(releasedLease).toMatchObject({ status: "expired", releasedAt: expect.any(Date) });
