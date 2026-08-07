@@ -32,7 +32,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
     };
   }
 
-  if (input.environment.driver === "sandbox") {
+  if (input.environment.driver === "sandbox" || input.environment.driver === "plugin") {
     if (
       input.adapterType !== "codex_local" &&
       input.adapterType !== "claude_local" &&
@@ -49,33 +49,54 @@ export async function resolveEnvironmentExecutionTarget(input: {
       driver: input.environment.driver as "sandbox",
       config: parseObject(input.environment.config),
     });
-    if (parsed.driver !== "sandbox") {
+    if (parsed.driver !== "sandbox" && parsed.driver !== "plugin") {
       return null;
     }
 
-    const remoteCwd =
-      typeof input.leaseMetadata?.remoteCwd === "string" && input.leaseMetadata.remoteCwd.trim().length > 0
-        ? input.leaseMetadata.remoteCwd.trim()
-        : DEFAULT_SANDBOX_REMOTE_CWD;
-    const timeoutMs = "timeoutMs" in parsed.config ? parsed.config.timeoutMs : null;
+    const runtimeConfig = parseObject(
+      parsed.driver === "sandbox" ? parsed.config : parsed.config.driverConfig,
+    );
+    const workspaceRealization = parseObject(input.leaseMetadata?.workspaceRealization);
+    const providerMetadata = parseObject(input.leaseMetadata?.providerMetadata);
+
+    const resolvedRemoteCwd = [
+      input.leaseMetadata?.remoteCwd,
+      parseObject(workspaceRealization.remote).path,
+      providerMetadata.remoteCwd,
+      parsed.driver === "plugin" ? runtimeConfig.remoteCwd : null,
+    ].find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
+    if (parsed.driver === "plugin" && !resolvedRemoteCwd) {
+      throw new Error(
+        `Plugin environment "${input.environment.id ?? "unknown"}" did not provide a remote workspace cwd.`,
+      );
+    }
+    const remoteCwd = resolvedRemoteCwd ?? DEFAULT_SANDBOX_REMOTE_CWD;
+    const timeoutMs = typeof runtimeConfig.timeoutMs === "number" ? runtimeConfig.timeoutMs : null;
+    const configuredShellCommand = input.leaseMetadata?.shellCommand ?? providerMetadata.shellCommand;
     const shellCommand =
-      input.leaseMetadata?.shellCommand === "bash" || input.leaseMetadata?.shellCommand === "sh"
-        ? input.leaseMetadata.shellCommand
+      configuredShellCommand === "bash" || configuredShellCommand === "sh"
+        ? configuredShellCommand
         : null;
 
     return {
       kind: "remote",
       transport: "sandbox",
-      providerKey: parsed.config.provider,
+      providerKey:
+        parsed.driver === "sandbox"
+          ? parsed.config.provider
+          : `${parsed.config.pluginKey}:${parsed.config.driverKey}`,
       shellCommand,
       remoteCwd,
       environmentId: input.environment.id ?? null,
       leaseId: input.leaseId ?? null,
       timeoutMs,
+      ...(parseObject(workspaceRealization.sync).strategy === "provider_defined"
+        ? { syncWorkspace: false }
+        : {}),
       // Run-log streaming defaults ON for sandbox environments so agent CLI
       // output reaches the UI mid-run; `streamRunLogs: false` is an explicit
       // opt-out back to batch-at-end delivery.
-      streamRunLogs: parsed.config.streamRunLogs !== false,
+      streamRunLogs: runtimeConfig.streamRunLogs !== false,
       runner: input.environmentRuntime && input.lease
         ? {
             supportsSingleStreamStdinProgress: false,

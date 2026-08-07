@@ -295,22 +295,176 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     );
   });
 
-  it("non-sandbox driver skips workspace realization and goes straight to target resolution", async () => {
+  it("defers core-synced plugin provisioning to the execution target", async () => {
     const environment = makeEnvironment("plugin" as Environment["driver"]);
-    const executionTarget = null;
+    const executionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "paperclip.coder-sandbox-provider:coder",
+      remoteCwd: "/home/coder/workspace",
+    };
 
+    mockBuildWorkspaceRealizationRequest.mockReturnValue({
+      version: 1,
+      adapterType: "claude_local",
+      companyId: "company-1",
+      environmentId: "env-1",
+      executionWorkspaceId: null,
+      issueId: null,
+      heartbeatRunId: "run-1",
+      requestedMode: null,
+      source: {
+        kind: "project_primary",
+        localPath: "/workspace/project",
+        projectId: null,
+        projectWorkspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+        strategy: "project_primary",
+        branchName: null,
+        worktreePath: null,
+      },
+      runtimeOverlay: {
+        provisionCommand: "pnpm install",
+      },
+    });
     mockResolveEnvironmentExecutionTarget.mockResolvedValue(executionTarget);
 
-    const runtime = makeMockRuntime();
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({
+        cwd: "/home/coder/workspace",
+        metadata: {
+          workspaceRealization: {
+            version: 1,
+            transport: "plugin",
+            remote: { path: "/home/coder/workspace" },
+          },
+        },
+      }),
+    });
     const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
 
     const result = await orchestrator.realizeForRun(
       makeRealizeInput({ environment }),
     );
 
-    expect(runtime.realizeWorkspace).not.toHaveBeenCalled();
+    expect(runtime.realizeWorkspace).toHaveBeenCalledOnce();
+    expect(runtime.execute).not.toHaveBeenCalled();
+    expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
+      "lease-1",
+      expect.objectContaining({ remoteCwd: "/home/coder/workspace" }),
+    );
+    expect(result.workspaceRealization).toEqual({
+      version: 1,
+      transport: "plugin",
+      remote: { path: "/home/coder/workspace" },
+    });
+    expect(result.executionTarget).toEqual({
+      ...executionTarget,
+      provisionCommand: "pnpm install",
+    });
+  });
+
+  it("persists a plugin cwd when realization metadata is omitted", async () => {
+    const environment = makeEnvironment("plugin" as Environment["driver"]);
+    const updatedLease = makeLease({ metadata: { remoteCwd: "/home/coder/workspace" } });
+    mockUpdateLeaseMetadata.mockResolvedValue(updatedLease);
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue(null);
+
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({ cwd: "/home/coder/workspace" }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    const result = await orchestrator.realizeForRun(makeRealizeInput({ environment }));
+
+    expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
+      "lease-1",
+      expect.objectContaining({ remoteCwd: "/home/coder/workspace" }),
+    );
+    expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lease: updatedLease,
+        leaseMetadata: expect.objectContaining({ remoteCwd: "/home/coder/workspace" }),
+      }),
+    );
     expect(result.workspaceRealization).toEqual({});
-    expect(result.executionTarget).toBeNull();
+  });
+
+  it("uses the provider cwd when the optional realization hook is absent", async () => {
+    const environment = makeEnvironment("plugin" as Environment["driver"]);
+    mockBuildWorkspaceRealizationRequest.mockReturnValue({
+      ...mockBuildWorkspaceRealizationRequest(),
+      runtimeOverlay: { provisionCommand: "pnpm install" },
+    });
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue(null);
+
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({ cwd: "" }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await orchestrator.realizeForRun(makeRealizeInput({
+      environment,
+      lease: makeLease({
+        metadata: {
+          providerMetadata: { remoteCwd: "/home/coder/workspace" },
+        },
+      }),
+    }));
+
+    expect(runtime.realizeWorkspace).toHaveBeenCalledWith(expect.objectContaining({
+      workspace: expect.objectContaining({ remotePath: "/home/coder/workspace" }),
+    }));
+    expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: "/home/coder/workspace",
+    }));
+  });
+
+  it("uses the configured plugin cwd when realization and lease metadata omit it", async () => {
+    const environment = {
+      ...makeEnvironment("plugin" as Environment["driver"]),
+      config: { driverConfig: { remoteCwd: "/home/coder/configured-workspace" } },
+    };
+    mockBuildWorkspaceRealizationRequest.mockReturnValue({
+      ...mockBuildWorkspaceRealizationRequest(),
+      runtimeOverlay: { provisionCommand: "pnpm install" },
+    });
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue(null);
+
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({ cwd: "" }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await orchestrator.realizeForRun(makeRealizeInput({ environment }));
+
+    expect(runtime.realizeWorkspace).toHaveBeenCalledWith(expect.objectContaining({
+      workspace: expect.objectContaining({ remotePath: "/home/coder/configured-workspace" }),
+    }));
+    expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: "/home/coder/configured-workspace",
+    }));
+  });
+
+  it("refuses plugin provisioning without a remote cwd", async () => {
+    const environment = makeEnvironment("plugin" as Environment["driver"]);
+    mockBuildWorkspaceRealizationRequest.mockReturnValue({
+      ...mockBuildWorkspaceRealizationRequest(),
+      runtimeOverlay: { provisionCommand: "pnpm install" },
+    });
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({ cwd: "" }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await expect(orchestrator.realizeForRun(makeRealizeInput({ environment }))).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof EnvironmentRunError &&
+        err.code === "workspace_realization_failed" &&
+        err.message.includes("requires a remote working directory"),
+    );
+    expect(runtime.execute).not.toHaveBeenCalled();
   });
 
   it("persisted metadata is updated on lease and execution workspace after realization", async () => {
@@ -355,7 +509,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(result.persistedExecutionWorkspace).toEqual(updatedEw);
   });
 
-  it("runs a remote provision command after workspace realization when configured", async () => {
+  it("defers sandbox provisioning when the adapter manages workspace sync", async () => {
     mockBuildWorkspaceRealizationRequest.mockReturnValue({
       version: 1,
       adapterType: "claude_local",
@@ -403,21 +557,14 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     });
     const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
 
-    await orchestrator.realizeForRun(makeRealizeInput({
+    const result = await orchestrator.realizeForRun(makeRealizeInput({
       environment: makeEnvironment("sandbox"),
     }));
 
-    expect(runtime.execute).toHaveBeenCalledOnce();
-    expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
-      environment: expect.objectContaining({ driver: "sandbox" }),
-      lease: expect.objectContaining({ id: "lease-1" }),
-      command: "bash",
-      args: ["-lc", "npm install -g @anthropic-ai/claude-code"],
-      cwd: "/remote/workspace",
-      env: {
-        SHELL: "/bin/bash",
-      },
-    }));
+    expect(runtime.execute).not.toHaveBeenCalled();
+    expect(result.executionTarget).toMatchObject({
+      provisionCommand: "npm install -g @anthropic-ai/claude-code",
+    });
   });
 
   it("runs project-level provision commands for ssh environments", async () => {
@@ -499,7 +646,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
   });
 
-  it("surfaces remote provision command failures before resolving the adapter target", async () => {
+  it("surfaces provider-defined provision command failures", async () => {
     mockBuildWorkspaceRealizationRequest.mockReturnValue({
       version: 1,
       adapterType: "claude_local",
@@ -524,6 +671,13 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
         provisionCommand: "install-tool",
       },
     });
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      remoteCwd: "/remote/workspace",
+      syncWorkspace: false,
+    });
 
     const runtime = makeMockRuntime({
       execute: vi.fn().mockResolvedValue({
@@ -545,6 +699,6 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
         String(err.message).includes("install-tool: not found"),
     );
 
-    expect(mockResolveEnvironmentExecutionTarget).not.toHaveBeenCalled();
+    expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
   });
 });

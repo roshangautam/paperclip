@@ -3693,7 +3693,7 @@ function createPluginEnvironmentDriver(
         lease: input.lease,
         status: "released",
       });
-      return await realizePluginEnvironmentWorkspace({
+      const result = await realizePluginEnvironmentWorkspace({
         db,
         workerManager,
         pluginId: plugin.id,
@@ -3716,6 +3716,23 @@ function createPluginEnvironmentDriver(
           workspace: input.workspace,
         },
       });
+      if (!result) {
+        return { cwd: "" };
+      }
+      const record = buildWorkspaceRealizationRecordFromDriverInput({
+        environment: input.environment,
+        lease: input.lease,
+        workspace: input.workspace,
+        cwd: result.cwd,
+        providerMetadata: result.metadata,
+      });
+      return {
+        ...result,
+        metadata: {
+          ...result.metadata,
+          workspaceRealization: record,
+        },
+      };
     },
 
     async execute(input) {

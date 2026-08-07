@@ -20,6 +20,7 @@ import type {
   PluginEnvironmentRealizeWorkspaceParams,
   PluginEnvironmentRealizeWorkspaceResult,
 } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { unprocessable } from "../errors.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -310,7 +311,7 @@ export async function realizePluginEnvironmentWorkspace(input: {
   pluginId?: string | null;
   params: PluginEnvironmentRealizeWorkspaceParams;
   config: PluginEnvironmentConfig;
-}): Promise<PluginEnvironmentRealizeWorkspaceResult> {
+}): Promise<PluginEnvironmentRealizeWorkspaceResult | null> {
   const { plugin } = input.pluginId
     ? { plugin: { id: input.pluginId } }
     : await resolvePluginEnvironmentDriver({
@@ -318,7 +319,22 @@ export async function realizePluginEnvironmentWorkspace(input: {
         workerManager: input.workerManager,
         config: input.config,
       });
-  return await input.workerManager.call(plugin.id, "environmentRealizeWorkspace", input.params);
+  try {
+    return await input.workerManager.call(
+      plugin.id,
+      "environmentRealizeWorkspace",
+      input.params,
+      resolvePluginExecuteRpcTimeoutMs({ config: input.config.driverConfig }),
+    );
+  } catch (error) {
+    if (
+      error instanceof JsonRpcCallError &&
+      error.code === PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED
+    ) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 export async function executePluginEnvironmentCommand(input: {

@@ -38,6 +38,7 @@ import {
 } from "@paperclipai/plugin-sdk";
 import { environmentRuntimeService, findReusableSandboxLeaseId } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
+import { realizePluginEnvironmentWorkspace } from "../services/plugin-environment-driver.ts";
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.ts";
 import { secretService } from "../services/secrets.ts";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.ts";
@@ -47,6 +48,41 @@ import { logger } from "../middleware/logger.ts";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const sshFixtureSupport = await getSshEnvLabSupport();
+
+describe("realizePluginEnvironmentWorkspace", () => {
+  it("treats an optional workspace realization hook as a no-op", async () => {
+    const call = vi.fn().mockRejectedValue(new JsonRpcCallError({
+        code: PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED,
+        message: "environmentRealizeWorkspace is not implemented by this plugin",
+      }));
+    const workerManager = { call } as unknown as PluginWorkerManager;
+
+    await expect(realizePluginEnvironmentWorkspace({
+      db: null as never,
+      workerManager,
+      pluginId: "plugin-1",
+      config: {
+        pluginKey: "acme.environments",
+        driverKey: "legacy",
+        driverConfig: { timeoutMs: 1_234 },
+      },
+      params: {
+        driverKey: "legacy",
+        companyId: "company-1",
+        environmentId: "environment-1",
+        config: {},
+        lease: { providerLeaseId: "lease-1" },
+        workspace: { localPath: "/tmp/project" },
+      },
+    })).resolves.toBeNull();
+    expect(call).toHaveBeenCalledWith(
+      "plugin-1",
+      "environmentRealizeWorkspace",
+      expect.any(Object),
+      91_234,
+    );
+  });
+});
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -6070,10 +6106,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         resumed: true,
       },
     });
-    expect(realized).toEqual({
+    expect(realized).toMatchObject({
       cwd: "/workspace/project",
       metadata: {
         realized: true,
+        workspaceRealization: {
+          sync: { strategy: "sandbox_archive_upload_download" },
+        },
       },
     });
     expect(executed).toMatchObject({
@@ -6103,7 +6142,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         localPath: "/tmp/project",
         mode: "ephemeral",
       },
-    }));
+    }), undefined);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.objectContaining({
       driverKey: "fake-plugin",
       companyId,

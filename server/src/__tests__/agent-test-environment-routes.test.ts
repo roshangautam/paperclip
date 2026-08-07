@@ -241,6 +241,12 @@ describe("agent test-environment route", () => {
   });
 
   it("runs the adapter probe against the resolved sandbox target on the happy path and releases the lease on success", async () => {
+    mockEnvironmentRuntime.realizeWorkspace.mockResolvedValueOnce({
+      cwd: "/home/user/paperclip-workspace",
+      metadata: {
+        workspaceRealization: { sync: { strategy: "provider_defined" } },
+      },
+    });
     mockResolveEnvironmentExecutionTarget.mockResolvedValueOnce({
       kind: "remote",
       transport: "sandbox",
@@ -291,6 +297,13 @@ describe("agent test-environment route", () => {
       }),
       environmentName: "Sandbox QA",
     });
+    expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leaseMetadata: expect.objectContaining({
+          workspaceRealization: { sync: { strategy: "provider_defined" } },
+        }),
+      }),
+    );
     expect(res.body).toMatchObject({ adapterType: "external_test", status: "pass" });
     expect(res.body.checks).toEqual([
       expect.objectContaining({

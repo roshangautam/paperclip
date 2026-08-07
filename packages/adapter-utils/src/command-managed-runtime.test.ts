@@ -239,6 +239,58 @@ describe("command managed runtime", () => {
     expect(calls.filter((call) => call.stdin != null).length).toBe(1);
   });
 
+  it("keeps provider-defined workspaces intact while installing and syncing runtime assets", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-provider-workspace-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    const localAssetDir = path.join(rootDir, "local-asset");
+    const installMarker = path.join(rootDir, "installed");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+    await mkdir(localAssetDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "local-only.txt"), "local\n");
+    await writeFile(path.join(remoteWorkspaceDir, "provider-checkout.txt"), "provider\n");
+    await writeFile(path.join(localAssetDir, "credential.txt"), "initial\n");
+
+    const { runner } = makeSpawnRunner();
+    let restoredCredential = "";
+    const prepared = await prepareCommandManagedRuntime({
+      runner,
+      spec: { remoteCwd: remoteWorkspaceDir, timeoutMs: 30_000 },
+      adapterKey: "codex",
+      workspaceLocalDir: localWorkspaceDir,
+      syncWorkspace: false,
+      installCommand: `printf installed > ${JSON.stringify(installMarker)}`,
+      assets: [{
+        key: "auth",
+        localDir: localAssetDir,
+        restore: async ({ assetDir, readFile: readRemoteFile }) => {
+          restoredCredential = (await readRemoteFile(path.posix.join(assetDir, "credential.txt")))
+            .toString("utf8");
+        },
+      }],
+    });
+
+    await expect(readFile(installMarker, "utf8")).resolves.toBe("installed");
+    await expect(readFile(path.join(remoteWorkspaceDir, "provider-checkout.txt"), "utf8"))
+      .resolves.toBe("provider\n");
+    await expect(readFile(path.join(remoteWorkspaceDir, "local-only.txt"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(prepared.assetDirs.auth, "credential.txt"), "utf8"))
+      .resolves.toBe("initial\n");
+
+    await writeFile(path.join(remoteWorkspaceDir, "provider-checkout.txt"), "provider changed\n");
+    await writeFile(path.join(prepared.assetDirs.auth, "credential.txt"), "refreshed\n");
+    await prepared.restoreWorkspace();
+
+    await expect(readFile(path.join(localWorkspaceDir, "local-only.txt"), "utf8"))
+      .resolves.toBe("local\n");
+    await expect(readFile(path.join(localWorkspaceDir, "provider-checkout.txt"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    expect(restoredCredential).toBe("refreshed\n");
+  });
+
   it("runs setup commands from a stable root cwd when staging into a nested remote workspace dir", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-command-runtime-nested-"));
     cleanupDirs.push(rootDir);

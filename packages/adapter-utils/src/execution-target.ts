@@ -62,10 +62,13 @@ export interface AdapterSandboxExecutionTarget {
   transport: "sandbox";
   providerKey?: string | null;
   shellCommand?: "bash" | "sh" | null;
+  provisionCommand?: string | null;
   environmentId?: string | null;
   leaseId?: string | null;
   remoteCwd: string;
   timeoutMs?: number | null;
+  /** Set false when the provider already owns the remote workspace checkout. */
+  syncWorkspace?: boolean | null;
   runner?: CommandManagedRuntimeRunner;
   /**
    * Sandbox-backed adapter runs stream the agent CLI's stdout/stderr
@@ -1037,6 +1040,8 @@ export function parseAdapterExecutionTarget(value: unknown): AdapterExecutionTar
       leaseId: readStringMeta(parsed, "leaseId"),
       remoteCwd,
       timeoutMs: typeof parsed.timeoutMs === "number" ? parsed.timeoutMs : null,
+      provisionCommand: readStringMeta(parsed, "provisionCommand"),
+      syncWorkspace: typeof parsed.syncWorkspace === "boolean" ? parsed.syncWorkspace : null,
       streamRunLogs: typeof parsed.streamRunLogs === "boolean" ? parsed.streamRunLogs : null,
     };
   }
@@ -1144,12 +1149,28 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     workspaceRemoteDir: input.workspaceRemoteDir,
     workspaceExclude: input.workspaceExclude,
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
+    syncWorkspace: target.syncWorkspace,
     assets: input.assets,
     installCommand: input.installCommand,
     detectCommand: input.detectCommand,
     onProgress: input.onProgress,
     onRuntimeProgress: input.onRuntimeProgress,
   });
+  const provisionCommand = target.provisionCommand?.trim();
+  if (provisionCommand) {
+    const result = await requireSandboxRunner(target).execute({
+      command: preferredSandboxShell(target),
+      args: shellCommandArgs(provisionCommand),
+      cwd: prepared.workspaceRemoteDir,
+      timeoutMs: 300_000,
+    });
+    if (result.timedOut || (result.exitCode ?? 1) !== 0) {
+      const detail = (result.stderr || result.stdout).trim().split(/\r?\n/, 1)[0]?.slice(0, 480);
+      throw new Error(
+        `Workspace provision command ${result.timedOut ? "timed out" : `exited ${result.exitCode ?? "?"}`}${detail ? `: ${detail}` : ""}`,
+      );
+    }
+  }
   return {
     target,
     workspaceRemoteDir: prepared.workspaceRemoteDir,
