@@ -3498,16 +3498,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it.each(["direct run cancellation", "agent-wide cancellation"] as const)(
-    "retains process ownership and leases when %s cannot terminate the process",
+    "recovers retained process ownership and leases after %s cannot terminate the process",
     async (cancellationPath) => {
-      const { agentId, runId, companyId } = await seedRunFixture({
+      const { agentId, runId, companyId, issueId } = await seedRunFixture({
         agentStatus: cancellationPath === "agent-wide cancellation" ? "paused" : "running",
-        includeIssue: false,
       });
       const { leaseId } = await seedEnvironmentLeaseFixture({
         companyId,
         runId,
-        issueId: null,
+        issueId,
       });
       const heartbeat = heartbeatService(db);
       runningProcesses.set(runId, {
@@ -3523,10 +3522,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         await expect(heartbeat.cancelRun(runId)).resolves.toMatchObject({ status: "cancelled" });
       }
 
-      await expect(heartbeat.getRun(runId)).resolves.toMatchObject({ status: "cancelled" });
+      await expect(heartbeat.getRun(runId)).resolves.toMatchObject({
+        status: "cancelled",
+        resultJson: expect.objectContaining({
+          cancellationCleanupPending: {
+            mode: cancellationPath === "agent-wide cancellation" ? "agent_wide" : "direct",
+          },
+        }),
+      });
       const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
       expect(lease?.status).toBe("active");
       expect(lease?.releasedAt).toBeNull();
+      const [lockedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(lockedIssue).toMatchObject({ checkoutRunId: runId, executionRunId: runId });
       expect(runningProcesses.has(runId)).toBe(true);
       expect(mockTerminateLocalService).toHaveBeenCalledTimes(2);
       expect(mockTerminateLocalService).toHaveBeenNthCalledWith(
@@ -3534,6 +3542,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         expect.objectContaining({ pid: 12345, processGroupId: null }),
         { forceAfterMs: 1 },
       );
+
+      mockTerminateLocalService.mockResolvedValue(undefined);
+      await expect(heartbeat.reapOrphanedRuns()).resolves.toEqual({ reaped: 1, runIds: [runId] });
+
+      const recoveredRun = await heartbeat.getRun(runId);
+      expect(recoveredRun?.resultJson).not.toHaveProperty("cancellationCleanupPending");
+      const [releasedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+      expect(releasedLease).toMatchObject({ status: "expired", releasedAt: expect.any(Date) });
+      const [releasedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(releasedIssue?.checkoutRunId).toBeNull();
+      expect(releasedIssue?.executionRunId).not.toBe(runId);
+      if (cancellationPath === "agent-wide cancellation") {
+        expect(releasedIssue?.executionRunId).toBeNull();
+      }
+      const [recoveredAgent] = await db.select().from(agents).where(eq(agents.id, agentId));
+      if (cancellationPath === "agent-wide cancellation") {
+        expect(recoveredAgent?.status).toBe("paused");
+      } else {
+        expect(["idle", "running"]).toContain(recoveredAgent?.status);
+      }
+      expect(runningProcesses.has(runId)).toBe(false);
+      await expect(heartbeat.reapOrphanedRuns()).resolves.toEqual({ reaped: 0, runIds: [] });
     },
   );
 
