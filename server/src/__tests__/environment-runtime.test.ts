@@ -5308,7 +5308,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
-  it("does not let a late failed initial cleanup overwrite a successful release", async () => {
+  it("serializes overlapping initial cleanup and retries after the claimed release fails", async () => {
     const { pluginId, lease, runId } = await seedPluginSandboxLease("overlapping-initial-release");
     let failFirstCleanup!: (error: Error) => void;
     const firstCleanupBlocked = new Promise<void>((_resolve, reject) => {
@@ -5324,12 +5324,28 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
     const lateFailure = runtimeWithPlugin.releaseRunLeases(runId);
     await vi.waitFor(() => expect(workerManager.call).toHaveBeenCalledTimes(1));
-    const successfulRelease = await runtimeWithPlugin.releaseRunLeases(runId);
+    const overlappingRelease = await runtimeWithPlugin.releaseRunLeases(runId);
     failFirstCleanup(new Error("late provider failure"));
     const failedRelease = await lateFailure;
 
-    expect(successfulRelease).toHaveLength(1);
-    expect(failedRelease).toHaveLength(0);
+    expect(overlappingRelease).toHaveLength(0);
+    expect(failedRelease).toHaveLength(1);
+    expect(workerManager.call).toHaveBeenCalledTimes(1);
+    await expect(environmentService(db).getLeaseById(lease.id)).resolves.toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+    });
+    await db
+      .update(environmentLeases)
+      .set({ updatedAt: new Date(0) })
+      .where(eq(environmentLeases.id, lease.id));
+
+    await expect(runtimeWithPlugin.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 1,
+      cleaned: 1,
+      pending: 0,
+    });
+    expect(workerManager.call).toHaveBeenCalledTimes(2);
     await expect(environmentService(db).getLeaseById(lease.id)).resolves.toMatchObject({
       status: "released",
       cleanupStatus: "success",
