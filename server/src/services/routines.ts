@@ -2051,6 +2051,7 @@ export function routineService(
         }
 
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
+        const deferWakeupStart = heartbeat.startQueuedRunsForAgent !== undefined;
         const queuedWakeup = await queueIssueAssignmentWakeup({
           heartbeat,
           issue: createdIssue,
@@ -2059,9 +2060,9 @@ export function routineService(
           contextSource: "routine.dispatch",
           requestedByActorType: input.source === "schedule" ? "system" : undefined,
           rethrowOnError: true,
-          deferStart: true,
+          deferStart: deferWakeupStart,
         });
-        if (queuedWakeup) deferredWakeupAgentId = createdIssue.assigneeAgentId;
+        if (queuedWakeup && deferWakeupStart) deferredWakeupAgentId = createdIssue.assigneeAgentId;
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,

@@ -107,6 +107,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       },
     ) => Promise<unknown>;
     startQueuedRunsForAgent?: (agentId: string) => Promise<unknown>;
+    omitStartQueuedRunsForAgent?: boolean;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -191,7 +192,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
             .where(eq(issues.id, issueId));
           return { id: queuedRunId };
         },
-        startQueuedRunsForAgent: async (wakeupAgentId) => opts?.startQueuedRunsForAgent?.(wakeupAgentId),
+        ...(opts?.omitStartQueuedRunsForAgent
+          ? {}
+          : { startQueuedRunsForAgent: async (wakeupAgentId: string) => opts?.startQueuedRunsForAgent?.(wakeupAgentId) }),
       },
     });
     const issueSvc = issueService(db);
@@ -1124,6 +1127,14 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(fixture.wakeups[0]?.opts.deferStart).toBe(true);
     expect(startQueuedRunsForAgent).toHaveBeenCalledOnce();
+  });
+
+  it("does not defer wakeup startup when no post-commit starter is available", async () => {
+    const fixture = await seedFixture({ omitStartQueuedRunsForAgent: true });
+
+    await fixture.svc.runRoutine(fixture.routine.id, { source: "manual" });
+
+    expect(fixture.wakeups[0]?.opts.deferStart).toBe(false);
   });
 
   it("coalesces only when the existing routine issue has a live execution run", async () => {
