@@ -14,8 +14,10 @@ export interface IssueAssignmentWakeupDeps {
       requestedByActorType?: "user" | "agent" | "system";
       requestedByActorId?: string | null;
       contextSnapshot?: Record<string, unknown>;
+      deferStart?: boolean;
     },
   ) => Promise<unknown>;
+  startQueuedRunsForAgent?: (agentId: string) => Promise<unknown>;
 }
 
 export function queueIssueAssignmentWakeup(input: {
@@ -28,6 +30,7 @@ export function queueIssueAssignmentWakeup(input: {
   requestedByActorId?: string | null;
   taskKey?: string | null;
   rethrowOnError?: boolean;
+  deferStart?: boolean;
 }) {
   if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
 
@@ -48,6 +51,7 @@ export function queueIssueAssignmentWakeup(input: {
         source: input.contextSource,
         ...(input.taskKey ? { taskKey: input.taskKey } : {}),
       },
+      deferStart: input.deferStart,
     })
     .catch((err) => {
       logger.warn({ err, issueId: input.issue.id }, "failed to wake assignee on issue assignment");

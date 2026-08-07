@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   activityLog,
   agentConfigRevisions,
@@ -1043,6 +1043,7 @@ describeEmbeddedPostgres("built-in agents", () => {
     const liveRoutineRunId = randomUUID();
     const liveIssueId = randomUUID();
     const liveHeartbeatRunId = randomUUID();
+    const runningHeartbeatRunId = randomUUID();
     await db.insert(issues).values({
       id: liveIssueId,
       companyId,
@@ -1080,6 +1081,47 @@ describeEmbeddedPostgres("built-in agents", () => {
         responsibleUserId: "built-in-bundles",
         preserved: "context-value",
       },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runningHeartbeatRunId,
+      companyId,
+      agentId: pending.agentId!,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      responsibleUserId: "built-in-bundles",
+      contextSnapshot: {
+        issueId: liveIssueId,
+        responsibleUserId: "built-in-bundles",
+      },
+      startedAt: new Date(),
+    });
+
+    const liveRunWithoutHeartbeatId = randomUUID();
+    const liveIssueWithoutHeartbeatId = randomUUID();
+    await db.insert(issues).values({
+      id: liveIssueWithoutHeartbeatId,
+      companyId,
+      title: "Legacy live reflection execution awaiting heartbeat",
+      status: "todo",
+      assigneeAgentId: pending.agentId,
+      responsibleUserId: "built-in-bundles",
+      originKind: "routine_execution",
+      originId: routine!.id,
+      originRunId: liveRunWithoutHeartbeatId,
+      originFingerprint: "legacy-live-reflection-without-heartbeat",
+    });
+    await db.insert(routineRuns).values({
+      id: liveRunWithoutHeartbeatId,
+      companyId,
+      routineId: routine!.id,
+      triggerId: trigger!.id,
+      source: "schedule",
+      status: "issue_created",
+      routineRevisionId: revision!.id,
+      responsibleUserId: "built-in-bundles",
+      dispatchFingerprint: "legacy-live-reflection-without-heartbeat",
+      linkedIssueId: liveIssueWithoutHeartbeatId,
     });
 
     const historicalRoutineRunId = randomUUID();
@@ -1186,6 +1228,10 @@ describeEmbeddedPostgres("built-in agents", () => {
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, liveHeartbeatRunId));
+    const [preservedRunningHeartbeatRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningHeartbeatRunId));
     expect(repairedLiveRoutineRun).toMatchObject({
       responsibleUserId: "responsible-user",
       routineRevisionId: revision!.id,
@@ -1200,6 +1246,24 @@ describeEmbeddedPostgres("built-in agents", () => {
         preserved: "context-value",
       },
     });
+    expect(preservedRunningHeartbeatRun).toMatchObject({
+      status: "running",
+      responsibleUserId: "built-in-bundles",
+      contextSnapshot: {
+        issueId: liveIssueId,
+        responsibleUserId: "built-in-bundles",
+      },
+    });
+    const [repairedLiveRunWithoutHeartbeat] = await db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.id, liveRunWithoutHeartbeatId));
+    const [repairedLiveIssueWithoutHeartbeat] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, liveIssueWithoutHeartbeatId));
+    expect(repairedLiveRunWithoutHeartbeat).toMatchObject({ responsibleUserId: "responsible-user" });
+    expect(repairedLiveIssueWithoutHeartbeat).toMatchObject({ responsibleUserId: "responsible-user" });
     const [preservedHistoricalRoutineRun] = await db
       .select()
       .from(routineRuns)
@@ -1238,13 +1302,88 @@ describeEmbeddedPostgres("built-in agents", () => {
         previousResponsibleUserId: "built-in-bundles",
         responsibleUserId: "responsible-user",
         repairedRecords: {
-          routineRuns: 1,
-          issues: 1,
+          routineRuns: 2,
+          issues: 2,
           heartbeatRuns: 1,
           heartbeatRunContextSnapshots: 1,
         },
       },
     });
+  });
+
+  it("defers routine creation until a responsible user exists", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Ownerless Paperclip",
+      issuePrefix: issuePrefix(companyId),
+      requireBoardApprovalForNewAgents: false,
+    });
+    const builtIns = builtInAgentService(db);
+
+    const ownerless = await builtIns.ensure(companyId, "reflection-coach");
+    expect(ownerless.resources.find((resource) => resource.resourceKind === "routine")).toMatchObject({
+      resourceId: null,
+      stockStatus: "missing",
+    });
+    expect(await db.select().from(routines).where(eq(routines.companyId, companyId))).toHaveLength(0);
+
+    await db
+      .update(companies)
+      .set({ defaultResponsibleUserId: "responsible-user" })
+      .where(eq(companies.id, companyId));
+    const reconciled = await builtIns.ensure(companyId, "reflection-coach");
+    expect(reconciled.resources.find((resource) => resource.resourceKind === "routine")).toMatchObject({
+      stockStatus: "stock_current",
+    });
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    expect(routine?.responsibleUserId).toBe("responsible-user");
+  });
+
+  it("repairs a legacy routine row when its latest revision already has the real owner", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    await builtInAgentService(db).ensure(companyId, "reflection-coach");
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    const originalRevisionId = routine!.latestRevisionId;
+    await db
+      .update(routines)
+      .set({ responsibleUserId: "built-in-bundles" })
+      .where(eq(routines.id, routine!.id));
+
+    await reconcileBuiltInAgentsOnStartup(db);
+
+    const [repaired] = await db.select().from(routines).where(eq(routines.id, routine!.id));
+    const [revision] = await db
+      .select()
+      .from(routineRevisions)
+      .where(eq(routineRevisions.id, repaired!.latestRevisionId!));
+    expect(repaired).toMatchObject({
+      responsibleUserId: "responsible-user",
+      latestRevisionNumber: routine!.latestRevisionNumber + 1,
+    });
+    expect(repaired!.latestRevisionId).not.toBe(originalRevisionId);
+    expect(revision).toMatchObject({
+      responsibleUserId: "responsible-user",
+      snapshot: { routine: { responsibleUserId: "responsible-user" } },
+    });
+  });
+
+  it("fails legacy ownership repair when no real responsible user exists", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    await builtInAgentService(db).ensure(companyId, "reflection-coach");
+    const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+    await db
+      .update(companies)
+      .set({ defaultResponsibleUserId: null })
+      .where(eq(companies.id, companyId));
+    await db
+      .update(routines)
+      .set({ responsibleUserId: "built-in-bundles" })
+      .where(eq(routines.id, routine!.id));
+
+    await expect(reconcileBuiltInAgentsOnStartup(db)).rejects.toThrow("Routine requires a responsible user");
+    const [unrepaired] = await db.select().from(routines).where(eq(routines.id, routine!.id));
+    expect(unrepaired?.responsibleUserId).toBe("built-in-bundles");
   });
 
   it("dispatches from the repaired revision after waiting for the routine lock", async () => {
@@ -1258,7 +1397,14 @@ describeEmbeddedPostgres("built-in agents", () => {
       runtimeConfig: {},
       permissions: {},
     });
-    const routinesSvc = routineService(db);
+    const dispatchReachedLock = deferred<void>();
+    const dispatchCanLock = deferred<void>();
+    const routinesSvc = routineService(db, {
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock.resolve();
+        await dispatchCanLock.promise;
+      },
+    });
     const routine = await routinesSvc.create(companyId, {
       projectId: null,
       goalId: null,
@@ -1322,19 +1468,18 @@ describeEmbeddedPostgres("built-in agents", () => {
       },
     });
 
-    const rowLocked = deferred<void>();
-    const repairCanCommit = deferred<void>();
     let repairedRevisionId: string | null = null;
     const repairedTitle = "Repair ownership race for {{subject}}";
     const repairedDescription = "Dispatch {{subject}} from the locked routine revision.";
+    const staleRowTitle = "Stale current-row title";
+    const staleRowDescription = "Stale current-row description";
     const repairedVariables = [
       { name: "subject", label: null, type: "text" as const, defaultValue: null, required: true, options: [] },
     ];
-    const ownershipRepair = db.transaction(async (tx) => {
-      await tx.execute(sql`select ${routines.id} from ${routines} where ${routines.id} = ${routine.id} for update`);
-      rowLocked.resolve();
-      await repairCanCommit.promise;
-
+    const runInput = { source: "api" as const, variables: { subject: "current content" } };
+    const dispatched = routinesSvc.runRoutine(routine.id, runInput);
+    await dispatchReachedLock.promise;
+    await db.transaction(async (tx) => {
       const [repairedRevision] = await tx
         .insert(routineRevisions)
         .values({
@@ -1361,8 +1506,8 @@ describeEmbeddedPostgres("built-in agents", () => {
       await tx
         .update(routines)
         .set({
-          title: repairedTitle,
-          description: repairedDescription,
+          title: staleRowTitle,
+          description: staleRowDescription,
           variables: repairedVariables,
           responsibleUserId: "responsible-user",
           latestRevisionId: repairedRevision!.id,
@@ -1371,13 +1516,7 @@ describeEmbeddedPostgres("built-in agents", () => {
         })
         .where(eq(routines.id, routine.id));
     });
-
-    await rowLocked.promise;
-    const runInput = { source: "api" as const, variables: { subject: "current content" } };
-    const dispatched = routinesSvc.runRoutine(routine.id, runInput);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    repairCanCommit.resolve();
-    await ownershipRepair;
+    dispatchCanLock.resolve();
 
     const repairedDispatch = await dispatched;
     expect(repairedDispatch).toMatchObject({
@@ -1387,8 +1526,166 @@ describeEmbeddedPostgres("built-in agents", () => {
       linkedIssueId: activeIssueId,
       triggerPayload: { variables: { subject: "current content" } },
     });
+    await db
+      .update(routines)
+      .set({ title: repairedTitle, description: repairedDescription })
+      .where(eq(routines.id, routine.id));
     const subsequentDispatch = await routinesSvc.runRoutine(routine.id, runInput);
     expect(repairedDispatch.dispatchFingerprint).toBe(subsequentDispatch.dispatchFingerprint);
+  });
+
+  it("rejects a dispatch when the routine is archived before it acquires the lock", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    const agent = await agentService(db).create(companyId, {
+      name: "Archive Race Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: { model: "gpt-5.4" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const dispatchReachedLock = deferred<void>();
+    const dispatchCanLock = deferred<void>();
+    const routinesSvc = routineService(db, {
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock.resolve();
+        await dispatchCanLock.promise;
+      },
+    });
+    const routine = await routinesSvc.create(companyId, {
+      projectId: null,
+      goalId: null,
+      parentIssueId: null,
+      title: "Archive dispatch race",
+      description: "Do not dispatch after archival.",
+      assigneeAgentId: agent.id,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+    }, {});
+
+    const dispatched = routinesSvc.runRoutine(routine.id, { source: "api" });
+    await dispatchReachedLock.promise;
+    await db
+      .update(routines)
+      .set({ status: "archived", updatedAt: new Date() })
+      .where(eq(routines.id, routine.id));
+    dispatchCanLock.resolve();
+
+    await expect(dispatched).rejects.toMatchObject({
+      status: 409,
+      message: "Routine is archived",
+    });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).resolves.toHaveLength(0);
+  });
+
+  it("rejects a dispatch when its trigger is disabled before it acquires the lock", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    const agent = await agentService(db).create(companyId, {
+      name: "Trigger Disable Race Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: { model: "gpt-5.4" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const dispatchReachedLock = deferred<void>();
+    const dispatchCanLock = deferred<void>();
+    const routinesSvc = routineService(db, {
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock.resolve();
+        await dispatchCanLock.promise;
+      },
+    });
+    const routine = await routinesSvc.create(companyId, {
+      projectId: null,
+      goalId: null,
+      parentIssueId: null,
+      title: "Trigger disable race",
+      description: "Do not dispatch a disabled trigger.",
+      assigneeAgentId: agent.id,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+    }, {});
+    const { trigger } = await routinesSvc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 9 * * *",
+      timezone: "UTC",
+    }, {});
+
+    const dispatched = routinesSvc.runRoutine(routine.id, { source: "api", triggerId: trigger.id });
+    await dispatchReachedLock.promise;
+    await db
+      .update(routineTriggers)
+      .set({ enabled: false, updatedAt: new Date() })
+      .where(eq(routineTriggers.id, trigger.id));
+    dispatchCanLock.resolve();
+
+    await expect(dispatched).rejects.toMatchObject({
+      status: 409,
+      message: "Routine trigger is not active",
+    });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).resolves.toHaveLength(0);
+  });
+
+  it("rejects a dispatch when its trigger is replaced before it acquires the lock", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    const agent = await agentService(db).create(companyId, {
+      name: "Trigger Replacement Race Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: { model: "gpt-5.4" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const dispatchReachedLock = deferred<void>();
+    const dispatchCanLock = deferred<void>();
+    const routinesSvc = routineService(db, {
+      beforeDispatchRoutineLock: async () => {
+        dispatchReachedLock.resolve();
+        await dispatchCanLock.promise;
+      },
+    });
+    const routine = await routinesSvc.create(companyId, {
+      projectId: null,
+      goalId: null,
+      parentIssueId: null,
+      title: "Trigger replacement race",
+      description: "Do not dispatch a replaced trigger.",
+      assigneeAgentId: agent.id,
+      priority: "medium",
+      status: "active",
+      concurrencyPolicy: "coalesce_if_active",
+      catchUpPolicy: "skip_missed",
+    }, {});
+    const { trigger } = await routinesSvc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 9 * * *",
+      timezone: "UTC",
+    }, {});
+
+    const dispatched = routinesSvc.runRoutine(routine.id, { source: "api", triggerId: trigger.id });
+    await dispatchReachedLock.promise;
+    await routinesSvc.deleteTrigger(trigger.id, {});
+    const { trigger: replacement } = await routinesSvc.createTrigger(routine.id, {
+      kind: "schedule",
+      cronExpression: "0 10 * * *",
+      timezone: "UTC",
+    }, {});
+    dispatchCanLock.resolve();
+
+    expect(replacement.id).not.toBe(trigger.id);
+    await expect(dispatched).rejects.toMatchObject({
+      status: 403,
+      message: "Trigger does not belong to routine",
+    });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).resolves.toHaveLength(0);
   });
 
   it("materializes the Summarizer bundle paused on Claude Haiku with a disabled routine", async () => {

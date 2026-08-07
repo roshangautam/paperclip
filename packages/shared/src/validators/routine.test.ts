@@ -27,6 +27,8 @@ describe("routine validators", () => {
         status: "active",
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
+        originKind: "pipeline_automation",
+        originId: "pipeline-123",
         variables: [],
       },
       triggers: [{
@@ -43,6 +45,10 @@ describe("routine validators", () => {
     });
 
     expect(parsed.triggers[0]?.publicId).toBe("routine_webhook_123");
+    expect(parsed.routine).toMatchObject({
+      originKind: "pipeline_automation",
+      originId: "pipeline-123",
+    });
   });
 
   it("rejects secret-bearing trigger fields in routine revision snapshots", () => {

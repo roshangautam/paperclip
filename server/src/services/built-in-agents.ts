@@ -1284,9 +1284,13 @@ export function builtInAgentService(db: Db) {
     return resumed as Agent;
   }
 
-  function routineOwnershipRepairOptions(definition: BuiltInAgentDefinition) {
+  function routineOwnershipRepairOptions(
+    definition: BuiltInAgentDefinition,
+    currentResponsibleUserId?: string | null,
+  ) {
     return {
-      fallbackResponsibleUserId: "built-in-bundles",
+      fallbackResponsibleUserId:
+        currentResponsibleUserId === "built-in-bundles" ? undefined : currentResponsibleUserId,
       repairResponsibleUserId: "built-in-bundles",
       responsibleUserRepairActivity: {
         actorId: "built-in-bundles",
@@ -1324,7 +1328,7 @@ export function builtInAgentService(db: Db) {
         concurrencyPolicy: routine.concurrencyPolicy,
         catchUpPolicy: routine.catchUpPolicy,
         variables: routine.variables,
-      }, actor, routineOwnershipRepairOptions(definition))
+      }, actor, routineOwnershipRepairOptions(definition, existing.responsibleUserId))
       : await routineSvc.create(agent.companyId, {
         title: routine.title,
         description: routine.description,
@@ -1334,7 +1338,7 @@ export function builtInAgentService(db: Db) {
         concurrencyPolicy: routine.concurrencyPolicy,
         catchUpPolicy: routine.catchUpPolicy,
         variables: routine.variables,
-      }, actor, { fallbackResponsibleUserId: "built-in-bundles" });
+      }, actor);
     if (!nextRoutine) throw notFound("Built-in routine not found");
     await db
       .update(routines)
@@ -1409,9 +1413,26 @@ export function builtInAgentService(db: Db) {
       mode === "reset"
       || currentState.stockStatus === "missing"
       || currentState.stockStatus === "stock_update_available";
-    let nextRoutine = shouldWrite
-      ? await createOrResetRoutine(agent, definition, routine, mode)
-      : routine;
+    let nextRoutine: Routine | null;
+    try {
+      nextRoutine = shouldWrite
+        ? await createOrResetRoutine(agent, definition, routine, mode)
+        : routine;
+    } catch (error) {
+      if (
+        !routine
+        && error instanceof HttpError
+        && error.status === 422
+        && error.message === "Routine requires a responsible user"
+      ) {
+        return withRoutineControls(currentState, {
+          routine: null,
+          triggers,
+          proposal: await pendingUpdateProposal(agent),
+        });
+      }
+      throw error;
+    }
     if (!shouldWrite) {
       nextRoutine = await repairRoutineOwnership(nextRoutine, definition);
     }

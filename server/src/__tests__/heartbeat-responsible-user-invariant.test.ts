@@ -185,7 +185,36 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     }
   });
 
-  it("uses a repaired routine-run owner ahead of the legacy pinned revision", async () => {
+  it("keeps a deferred-start wakeup queued until explicitly started", async () => {
+    const { companyId, ownerUserId, agentId } = await seedCompany();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Queue before routine commit",
+      status: "todo",
+      assigneeAgentId: agentId,
+      responsibleUserId: ownerUserId,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId },
+      deferStart: true,
+    });
+
+    expect(run?.status).toBe("queued");
+    await expect(
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, run!.id)).then((rows) => rows[0]),
+    ).resolves.toMatchObject({ status: "queued" });
+    await heartbeat.startQueuedRunsForAgent(agentId);
+    await expect(waitForRun(db, run!.id)).resolves.toMatchObject({ status: "succeeded" });
+  });
+
+  it.each(["issueId", "taskId"] as const)("waits for concurrent routine-run ownership repair before claiming a %s context", async (contextIssueKey) => {
     const { companyId, ownerUserId, agentId } = await seedCompany();
     const legacyResponsibleUserId = "built-in-bundles";
     const routineId = randomUUID();
@@ -198,7 +227,7 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
       companyId,
       title: "Repaired built-in routine",
       assigneeAgentId: agentId,
-      responsibleUserId: ownerUserId,
+      responsibleUserId: legacyResponsibleUserId,
     });
     await db.insert(routineRevisions).values({
       id: routineRevisionId,
@@ -249,22 +278,98 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
       source: "schedule",
       status: "issue_created",
       routineRevisionId,
-      responsibleUserId: ownerUserId,
+      responsibleUserId: legacyResponsibleUserId,
       linkedIssueId: issueId,
     });
-
-    const run = await heartbeat.wakeup(agentId, {
-      source: "assignment",
+    const [queuedRun] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
       triggerDetail: "system",
-      reason: "issue_assigned",
+      status: "queued",
+      responsibleUserId: legacyResponsibleUserId,
+      contextSnapshot: {
+        [contextIssueKey]: issueId,
+        source: "routine.dispatch",
+        responsibleUserId: legacyResponsibleUserId,
+      },
+    }).returning();
+
+    let claimReachedRoutineLock!: () => void;
+    const reachedRoutineLock = new Promise<void>((resolve) => { claimReachedRoutineLock = resolve; });
+    const racingHeartbeat = heartbeatService(db, {
+      beforeClaimRoutineLock: async () => { claimReachedRoutineLock(); },
+    });
+
+    let finishAdapter!: () => void;
+    const adapterCanFinish = new Promise<void>((resolve) => { finishAdapter = resolve; });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await adapterCanFinish;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Responsible-user invariant test run.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    let repairCanCommit!: () => void;
+    const canCommit = new Promise<void>((resolve) => { repairCanCommit = resolve; });
+    let repairUpdated!: () => void;
+    const updated = new Promise<void>((resolve) => { repairUpdated = resolve; });
+    const repairing = db.transaction(async (tx) => {
+      await tx.update(routines).set({
+        responsibleUserId: ownerUserId,
+        updatedAt: new Date(),
+      }).where(eq(routines.id, routineId));
+      await tx.update(routineRuns).set({
+        responsibleUserId: ownerUserId,
+        updatedAt: new Date(),
+      }).where(eq(routineRuns.id, routineRunId));
+      repairUpdated();
+      await canCommit;
+    });
+
+    try {
+      await updated;
+      const resuming = racingHeartbeat.resumeQueuedRuns();
+      await reachedRoutineLock;
+      repairCanCommit();
+      await repairing;
+      await resuming;
+      const claimed = await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queuedRun!.id)).then((rows) => rows[0]);
+      expect(claimed).toMatchObject({ status: "running", responsibleUserId: ownerUserId });
+      if (contextIssueKey === "taskId") {
+        expect(claimed?.contextSnapshot).toMatchObject({ issueId, taskId: issueId });
+      }
+    } finally {
+      repairCanCommit();
+      finishAdapter();
+    }
+    const completed = await waitForRun(db, queuedRun!.id);
+    expect(completed?.responsibleUserId).toBe(ownerUserId);
+    expect(completed?.responsibleUserId).not.toBe(legacyResponsibleUserId);
+  });
+
+  it("preserves a non-UUID task key without treating it as an issue", async () => {
+    const { agentId, ownerUserId } = await seedCompany();
+    const run = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "task_scoped_work",
       requestedByActorType: "system",
-      contextSnapshot: { issueId, source: "routine.dispatch" },
+      contextSnapshot: { taskId: "task-123" },
     });
 
     expect(run).not.toBeNull();
     const completed = await waitForRun(db, run!.id);
-    expect(completed?.responsibleUserId).toBe(ownerUserId);
-    expect(completed?.responsibleUserId).not.toBe(legacyResponsibleUserId);
+    expect(completed).toMatchObject({ status: "succeeded", responsibleUserId: ownerUserId });
+    expect(completed?.contextSnapshot).toMatchObject({ taskId: "task-123" });
+    expect(completed?.contextSnapshot).not.toHaveProperty("issueId");
   });
 
   it("uses the triggering user for manual UI/API runs", async () => {
