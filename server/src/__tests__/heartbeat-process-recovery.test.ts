@@ -3497,31 +3497,45 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runningProcesses.has(runId)).toBe(false);
   });
 
-  it("continues durable cancellation and lease cleanup when process termination fails", async () => {
-    const { runId, companyId } = await seedRunFixture({
-      agentStatus: "running",
-      includeIssue: false,
-    });
-    const { leaseId } = await seedEnvironmentLeaseFixture({
-      companyId,
-      runId,
-      issueId: null,
-    });
-    const heartbeat = heartbeatService(db);
-    runningProcesses.set(runId, {
-      child: { pid: 12345 } as ChildProcess,
-      graceSec: 1,
-      processGroupId: null,
-    });
-    mockTerminateLocalService.mockRejectedValueOnce(new Error("termination unavailable"));
+  it.each(["direct run cancellation", "agent-wide cancellation"] as const)(
+    "retains process ownership and leases when %s cannot terminate the process",
+    async (cancellationPath) => {
+      const { agentId, runId, companyId } = await seedRunFixture({
+        agentStatus: cancellationPath === "agent-wide cancellation" ? "paused" : "running",
+        includeIssue: false,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({
+        companyId,
+        runId,
+        issueId: null,
+      });
+      const heartbeat = heartbeatService(db);
+      runningProcesses.set(runId, {
+        child: { pid: 12345 } as ChildProcess,
+        graceSec: 1,
+        processGroupId: null,
+      });
+      mockTerminateLocalService.mockRejectedValue(new Error("termination unavailable"));
 
-    await expect(heartbeat.cancelRun(runId)).resolves.toMatchObject({ status: "cancelled" });
-    await expect(heartbeat.getRun(runId)).resolves.toMatchObject({ status: "cancelled" });
-    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
-    expect(lease?.status).toBe("expired");
-    expect(lease?.releasedAt).toBeTruthy();
-    expect(runningProcesses.has(runId)).toBe(false);
-  });
+      if (cancellationPath === "agent-wide cancellation") {
+        await expect(heartbeat.cancelActiveForAgent(agentId)).resolves.toBe(1);
+      } else {
+        await expect(heartbeat.cancelRun(runId)).resolves.toMatchObject({ status: "cancelled" });
+      }
+
+      await expect(heartbeat.getRun(runId)).resolves.toMatchObject({ status: "cancelled" });
+      const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+      expect(lease?.status).toBe("active");
+      expect(lease?.releasedAt).toBeNull();
+      expect(runningProcesses.has(runId)).toBe(true);
+      expect(mockTerminateLocalService).toHaveBeenCalledTimes(2);
+      expect(mockTerminateLocalService).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ pid: 12345, processGroupId: null }),
+        { forceAfterMs: 1 },
+      );
+    },
+  );
 
   it("records manual cancellation stop metadata", async () => {
     const { runId } = await seedRunFixture({
