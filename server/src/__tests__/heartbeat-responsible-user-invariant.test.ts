@@ -14,6 +14,9 @@ import {
   heartbeatRuns,
   issueComments,
   issues,
+  routines,
+  routineRevisions,
+  routineRuns,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -105,6 +108,9 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     await deleteHeartbeatRunsAfterEvents(db);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
+    await db.delete(routineRuns);
+    await db.delete(routineRevisions);
+    await db.delete(routines);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companySkills);
@@ -177,6 +183,193 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
       const completed = await waitForRun(db, run!.id);
       expect(completed?.responsibleUserId).toBe(issueResponsibleUserId);
     }
+  });
+
+  it("keeps a deferred-start wakeup queued until explicitly started", async () => {
+    const { companyId, ownerUserId, agentId } = await seedCompany();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Queue before routine commit",
+      status: "todo",
+      assigneeAgentId: agentId,
+      responsibleUserId: ownerUserId,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId },
+      deferStart: true,
+    });
+
+    expect(run?.status).toBe("queued");
+    await expect(
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, run!.id)).then((rows) => rows[0]),
+    ).resolves.toMatchObject({ status: "queued" });
+    await heartbeat.startQueuedRunsForAgent(agentId);
+    await expect(waitForRun(db, run!.id)).resolves.toMatchObject({ status: "succeeded" });
+  });
+
+  it.each(["issueId", "taskId"] as const)("waits for concurrent routine-run ownership repair before claiming a %s context", async (contextIssueKey) => {
+    const { companyId, ownerUserId, agentId } = await seedCompany();
+    const legacyResponsibleUserId = "built-in-bundles";
+    const routineId = randomUUID();
+    const routineRevisionId = randomUUID();
+    const routineRunId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Repaired built-in routine",
+      assigneeAgentId: agentId,
+      responsibleUserId: legacyResponsibleUserId,
+    });
+    await db.insert(routineRevisions).values({
+      id: routineRevisionId,
+      companyId,
+      routineId,
+      revisionNumber: 1,
+      title: "Legacy built-in routine revision",
+      responsibleUserId: legacyResponsibleUserId,
+      snapshot: {
+        version: 1,
+        routine: {
+          id: routineId,
+          companyId,
+          projectId: null,
+          goalId: null,
+          parentIssueId: null,
+          title: "Legacy built-in routine revision",
+          description: null,
+          assigneeAgentId: agentId,
+          priority: "medium",
+          status: "active",
+          concurrencyPolicy: "coalesce_if_active",
+          catchUpPolicy: "skip_missed",
+          originKind: "built_in_bundle",
+          originId: "recent-agent-reflection",
+          variables: [],
+          env: null,
+          responsibleUserId: legacyResponsibleUserId,
+        },
+        triggers: [],
+      },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Legacy routine execution",
+      status: "todo",
+      assigneeAgentId: agentId,
+      responsibleUserId: legacyResponsibleUserId,
+      originKind: "routine_execution",
+      originId: routineId,
+      originRunId: routineRunId,
+    });
+    await db.insert(routineRuns).values({
+      id: routineRunId,
+      companyId,
+      routineId,
+      source: "schedule",
+      status: "issue_created",
+      routineRevisionId,
+      responsibleUserId: legacyResponsibleUserId,
+      linkedIssueId: issueId,
+    });
+    const [queuedRun] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      responsibleUserId: legacyResponsibleUserId,
+      contextSnapshot: {
+        [contextIssueKey]: issueId,
+        source: "routine.dispatch",
+        responsibleUserId: legacyResponsibleUserId,
+      },
+    }).returning();
+
+    let claimReachedRoutineLock!: () => void;
+    const reachedRoutineLock = new Promise<void>((resolve) => { claimReachedRoutineLock = resolve; });
+    const racingHeartbeat = heartbeatService(db, {
+      beforeClaimRoutineLock: async () => { claimReachedRoutineLock(); },
+    });
+
+    let finishAdapter!: () => void;
+    const adapterCanFinish = new Promise<void>((resolve) => { finishAdapter = resolve; });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await adapterCanFinish;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Responsible-user invariant test run.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    let repairCanCommit!: () => void;
+    const canCommit = new Promise<void>((resolve) => { repairCanCommit = resolve; });
+    let repairUpdated!: () => void;
+    const updated = new Promise<void>((resolve) => { repairUpdated = resolve; });
+    const repairing = db.transaction(async (tx) => {
+      await tx.update(routines).set({
+        responsibleUserId: ownerUserId,
+        updatedAt: new Date(),
+      }).where(eq(routines.id, routineId));
+      await tx.update(routineRuns).set({
+        responsibleUserId: ownerUserId,
+        updatedAt: new Date(),
+      }).where(eq(routineRuns.id, routineRunId));
+      repairUpdated();
+      await canCommit;
+    });
+
+    try {
+      await updated;
+      const resuming = racingHeartbeat.resumeQueuedRuns();
+      await reachedRoutineLock;
+      repairCanCommit();
+      await repairing;
+      await resuming;
+      const claimed = await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queuedRun!.id)).then((rows) => rows[0]);
+      expect(claimed).toMatchObject({ status: "running", responsibleUserId: ownerUserId });
+      if (contextIssueKey === "taskId") {
+        expect(claimed?.contextSnapshot).toMatchObject({ issueId, taskId: issueId });
+      }
+    } finally {
+      repairCanCommit();
+      finishAdapter();
+    }
+    const completed = await waitForRun(db, queuedRun!.id);
+    expect(completed?.responsibleUserId).toBe(ownerUserId);
+    expect(completed?.responsibleUserId).not.toBe(legacyResponsibleUserId);
+  });
+
+  it("preserves a non-UUID task key without treating it as an issue", async () => {
+    const { agentId, ownerUserId } = await seedCompany();
+    const run = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "task_scoped_work",
+      requestedByActorType: "system",
+      contextSnapshot: { taskId: "task-123" },
+    });
+
+    expect(run).not.toBeNull();
+    const completed = await waitForRun(db, run!.id);
+    expect(completed).toMatchObject({ status: "succeeded", responsibleUserId: ownerUserId });
+    expect(completed?.contextSnapshot).toMatchObject({ taskId: "task-123" });
+    expect(completed?.contextSnapshot).not.toHaveProperty("issueId");
   });
 
   it("uses the triggering user for manual UI/API runs", async () => {
