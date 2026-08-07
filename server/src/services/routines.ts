@@ -158,8 +158,6 @@ type RoutineOwnershipRepairCounts = {
   heartbeatRunContextSnapshots: number;
 };
 
-const LIVE_ROUTINE_RUN_STATUSES = ["received", "issue_created"];
-
 async function repairLiveRoutineExecutionOwnership(
   txDb: Db,
   input: {
@@ -192,7 +190,6 @@ async function repairLiveRoutineExecutionOwnership(
       and(
         eq(routineRuns.companyId, input.companyId),
         eq(routineRuns.routineId, input.routineId),
-        inArray(routineRuns.status, LIVE_ROUTINE_RUN_STATUSES),
         inArray(issues.status, OPEN_ISSUE_STATUSES),
       ),
     );
@@ -226,7 +223,6 @@ async function repairLiveRoutineExecutionOwnership(
     .where(
       and(
         inArray(routineRuns.id, eligibleRoutineRunIds),
-        inArray(routineRuns.status, LIVE_ROUTINE_RUN_STATUSES),
         eq(routineRuns.responsibleUserId, input.previousResponsibleUserId),
       ),
     )

@@ -1048,7 +1048,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       id: liveIssueId,
       companyId,
       title: "Legacy live reflection execution",
-      status: "todo",
+      status: "blocked",
       assigneeAgentId: pending.agentId,
       responsibleUserId: "built-in-bundles",
       originKind: "routine_execution",
@@ -1062,11 +1062,13 @@ describeEmbeddedPostgres("built-in agents", () => {
       routineId: routine!.id,
       triggerId: trigger!.id,
       source: "schedule",
-      status: "issue_created",
+      status: "failed",
       routineRevisionId: revision!.id,
       responsibleUserId: "built-in-bundles",
       dispatchFingerprint: "legacy-live-reflection",
       linkedIssueId: liveIssueId,
+      failureReason: "Execution issue moved to blocked",
+      completedAt: new Date(),
     });
     await db.insert(heartbeatRuns).values({
       id: liveHeartbeatRunId,
@@ -1130,8 +1132,8 @@ describeEmbeddedPostgres("built-in agents", () => {
     await db.insert(issues).values({
       id: historicalIssueId,
       companyId,
-      title: "Historical blocked reflection execution",
-      status: "blocked",
+      title: "Historical cancelled reflection execution",
+      status: "cancelled",
       assigneeAgentId: pending.agentId,
       responsibleUserId: "built-in-bundles",
       originKind: "routine_execution",
@@ -1150,7 +1152,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       responsibleUserId: "built-in-bundles",
       dispatchFingerprint: "legacy-blocked-reflection",
       linkedIssueId: historicalIssueId,
-      failureReason: "Execution issue moved to blocked",
+      failureReason: "Execution issue moved to cancelled",
       completedAt: new Date(),
     });
     await db.insert(heartbeatRuns).values({
