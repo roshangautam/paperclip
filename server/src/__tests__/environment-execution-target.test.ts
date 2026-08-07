@@ -58,6 +58,41 @@ describe("resolveEnvironmentExecutionTarget", () => {
     });
   });
 
+  it("honors provider-defined workspace sync for sandbox-compatible plugin leases", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
+      driver: "sandbox",
+      config: {
+        provider: "paperclip.coder-sandbox-provider",
+        reuseLease: false,
+        timeoutMs: 30_000,
+      },
+    });
+
+    const target = await resolveEnvironmentExecutionTarget({
+      db: {} as never,
+      companyId: "company-1",
+      adapterType: "codex_local",
+      environment: {
+        id: "env-coder-1",
+        driver: "sandbox",
+        config: {
+          provider: "paperclip.coder-sandbox-provider",
+        },
+      },
+      leaseId: "lease-coder-1",
+      leaseMetadata: {
+        workspaceRealization: { sync: { strategy: "provider_defined" } },
+      },
+      lease: null,
+      environmentRuntime: null,
+    });
+
+    expect(target).toMatchObject({
+      providerKey: "paperclip.coder-sandbox-provider",
+      syncWorkspace: false,
+    });
+  });
+
   it("keeps sandbox targets on bridge mode even when lease metadata includes a Paperclip API URL", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "sandbox",

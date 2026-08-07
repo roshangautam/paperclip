@@ -88,8 +88,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
       environmentId: input.environment.id ?? null,
       leaseId: input.leaseId ?? null,
       timeoutMs,
-      ...(parsed.driver === "plugin" &&
-      parseObject(workspaceRealization.sync).strategy === "provider_defined"
+      ...(parseObject(workspaceRealization.sync).strategy === "provider_defined"
         ? { syncWorkspace: false }
         : {}),
       // Run-log streaming defaults ON for sandbox environments so agent CLI
