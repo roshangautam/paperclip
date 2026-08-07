@@ -3634,7 +3634,10 @@ function createPluginEnvironmentDriver(
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });
-      return await environmentsSvc.releaseLease(input.lease.id, input.status);
+      return await environmentsSvc.releaseLease(input.lease.id, input.status, {
+        expectedCleanupClaimId: input.cleanupClaimId,
+        expectedStatus: input.cleanupClaimId ? "pending_cleanup" : input.lease.status,
+      });
     },
 
     async resumeRunLease(input) {
@@ -4096,14 +4099,21 @@ export function environmentRuntimeService(
           }
           continue;
         }
-        const claim = leaseRow.leasePolicy === "reuse_by_environment"
+        const requiresCleanupClaim =
+          leaseRow.leasePolicy === "reuse_by_environment" ||
+          (
+            leaseRow.leasePolicy === "ephemeral" &&
+            leaseRow.providerLeaseId !== null &&
+            (driver.driver === "sandbox" || driver.driver === "plugin")
+          );
+        const claim = requiresCleanupClaim
           ? await claimSandboxCleanup({
               leaseId: leaseRow.id,
               expectedStatus: "active",
               targetStatus,
             })
           : null;
-        if (leaseRow.leasePolicy === "reuse_by_environment" && !claim) continue;
+        if (requiresCleanupClaim && !claim) continue;
         const claimedLeaseRow = claim?.row ?? leaseRow;
 
         const leaseSnapshot = toEnvironmentLeaseSnapshot(claimedLeaseRow);

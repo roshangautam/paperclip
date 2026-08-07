@@ -3470,7 +3470,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
-  it("terminates the in-memory process before persisting cancellation status", async () => {
+  it("persists cancellation ownership before terminating the in-memory process", async () => {
     const { runId } = await seedRunFixture({
       agentStatus: "running",
       includeIssue: false,
@@ -3481,22 +3481,46 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       graceSec: 1,
       processGroupId: null,
     });
-    mockTerminateLocalService.mockResolvedValueOnce(undefined);
-    const updateSpy = vi.spyOn(db, "update");
-    updateSpy.mockImplementationOnce((() => {
-      throw new Error("db update unavailable");
-    }) as typeof db.update);
+    mockTerminateLocalService.mockImplementationOnce(async () => {
+      const [runDuringTermination] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      expect(runDuringTermination?.status).toBe("cancelled");
+    });
 
-    try {
-      await expect(heartbeat.cancelRun(runId)).rejects.toThrow("db update unavailable");
-      expect(mockTerminateLocalService).toHaveBeenCalledWith(
-        expect.objectContaining({ pid: 12345, processGroupId: null }),
-        { forceAfterMs: 1000 },
-      );
-      expect(runningProcesses.has(runId)).toBe(false);
-    } finally {
-      updateSpy.mockRestore();
-    }
+    await expect(heartbeat.cancelRun(runId)).resolves.toMatchObject({ status: "cancelled" });
+    expect(mockTerminateLocalService).toHaveBeenCalledWith(
+      expect.objectContaining({ pid: 12345, processGroupId: null }),
+      { forceAfterMs: 1000 },
+    );
+    expect(runningProcesses.has(runId)).toBe(false);
+  });
+
+  it("continues durable cancellation and lease cleanup when process termination fails", async () => {
+    const { runId, companyId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: false,
+    });
+    const { leaseId } = await seedEnvironmentLeaseFixture({
+      companyId,
+      runId,
+      issueId: null,
+    });
+    const heartbeat = heartbeatService(db);
+    runningProcesses.set(runId, {
+      child: { pid: 12345 } as ChildProcess,
+      graceSec: 1,
+      processGroupId: null,
+    });
+    mockTerminateLocalService.mockRejectedValueOnce(new Error("termination unavailable"));
+
+    await expect(heartbeat.cancelRun(runId)).resolves.toMatchObject({ status: "cancelled" });
+    await expect(heartbeat.getRun(runId)).resolves.toMatchObject({ status: "cancelled" });
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(lease?.status).toBe("expired");
+    expect(lease?.releasedAt).toBeTruthy();
+    expect(runningProcesses.has(runId)).toBe(false);
   });
 
   it("records manual cancellation stop metadata", async () => {
@@ -3568,7 +3592,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it.each([
     "direct run cancellation",
     "agent-wide cancellation",
-  ] as const)("records retryable lease cleanup before %s becomes terminal", async (cancellationPath) => {
+  ] as const)("records retryable lease cleanup after %s atomically becomes terminal", async (cancellationPath) => {
     const { agentId, runId, companyId } = await seedRunFixture({
       agentStatus: cancellationPath === "agent-wide cancellation" ? "paused" : "running",
       includeIssue: false,
@@ -3599,7 +3623,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await expect(heartbeat.cancelRun(runId)).resolves.toMatchObject({ status: "cancelled" });
     }
 
-    expect(runStatusesDuringRelease).toEqual(["running"]);
+    expect(runStatusesDuringRelease).toEqual(["cancelled"]);
     await expect(heartbeat.getRun(runId)).resolves.toMatchObject({ status: "cancelled" });
     const [pendingLease] = await db
       .select()
@@ -3644,6 +3668,106 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "expired",
       cleanupStatus: "success",
     });
+  });
+
+  it("does not allow normal finalization to overwrite cancellation while provider cleanup is in flight", async () => {
+    const { runId, companyId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: false,
+    });
+    const { pluginId, leaseId } = await seedRetryableSandboxLeaseFixture({
+      companyId,
+      runId,
+      issueId: null,
+    });
+    let allowProviderRelease!: () => void;
+    const providerReleaseAllowed = new Promise<void>((resolve) => {
+      allowProviderRelease = resolve;
+    });
+    let markProviderReleaseStarted!: () => void;
+    const providerReleaseStarted = new Promise<void>((resolve) => {
+      markProviderReleaseStarted = resolve;
+    });
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        expect(method).toBe("environmentReleaseLease");
+        markProviderReleaseStarted();
+        await providerReleaseAllowed;
+      }),
+    } as unknown as PluginWorkerManager;
+    const heartbeat = heartbeatService(db, { pluginWorkerManager: workerManager });
+
+    const cancellation = heartbeat.cancelRun(runId);
+    await providerReleaseStarted;
+
+    const normalFinalization = await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+      .returning();
+    expect(normalFinalization).toEqual([]);
+    const [claimedLease] = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leaseId));
+    expect(claimedLease).toMatchObject({
+      status: "pending_cleanup",
+      cleanupClaimId: expect.any(String),
+    });
+
+    allowProviderRelease();
+    await expect(cancellation).resolves.toMatchObject({ status: "cancelled" });
+    await expect(heartbeat.getRun(runId)).resolves.toMatchObject({ status: "cancelled" });
+    expect(workerManager.call).toHaveBeenCalledTimes(1);
+  });
+
+  it("invokes provider cleanup once when two cancellations race for the same run", async () => {
+    const { runId, companyId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: false,
+    });
+    const { pluginId, leaseId } = await seedRetryableSandboxLeaseFixture({
+      companyId,
+      runId,
+      issueId: null,
+    });
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        expect(method).toBe("environmentReleaseLease");
+      }),
+    } as unknown as PluginWorkerManager;
+    const heartbeat = heartbeatService(db, { pluginWorkerManager: workerManager });
+
+    const results = await Promise.all([
+      heartbeat.cancelRun(runId),
+      heartbeat.cancelRun(runId),
+    ]);
+
+    expect(results).toEqual([
+      expect.objectContaining({ status: "cancelled" }),
+      expect.objectContaining({ status: "cancelled" }),
+    ]);
+    expect(workerManager.call).toHaveBeenCalledTimes(1);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(lease).toMatchObject({ status: "expired", cleanupStatus: "success" });
+  });
+
+  it("counts only the agent-wide cancellation that atomically claims a run", async () => {
+    const { agentId } = await seedRunFixture({
+      agentStatus: "paused",
+      includeIssue: false,
+    });
+    const firstHeartbeat = heartbeatService(db);
+    const secondHeartbeat = heartbeatService(db);
+
+    const counts = await Promise.all([
+      firstHeartbeat.cancelActiveForAgent(agentId),
+      secondHeartbeat.cancelActiveForAgent(agentId),
+    ]);
+
+    expect([...counts].sort((left, right) => left - right)).toEqual([0, 1]);
   });
 
   it("records operator interrupt cancellation metadata without changing terminal status", async () => {
