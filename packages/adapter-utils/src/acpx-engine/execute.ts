@@ -1504,7 +1504,13 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const { agent, runId, config, context, onLog } = ctx;
   const promptTemplate = asString(config.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-  const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
+  const configuredInstructionsReferencePath = asString(config.instructionsReferencePath, "").trim();
+  const instructionsReferencePath = configuredInstructionsReferencePath || instructionsFilePath;
+  const instructionsDir = instructionsReferencePath
+    ? `${configuredInstructionsReferencePath
+      ? path.posix.dirname(instructionsReferencePath)
+      : path.dirname(instructionsReferencePath)}/`
+    : "";
   let instructionsPrefix = "";
   const commandNotes: string[] = [];
   if (instructionsFilePath) {
@@ -1512,7 +1518,7 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
       const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
       instructionsPrefix =
         `${instructionsContents}\n\n` +
-        `The above agent instructions were loaded from ${instructionsFilePath}. ` +
+        `The above agent instructions were loaded from ${instructionsReferencePath}. ` +
         `Resolve any relative file references from ${instructionsDir}.\n\n`;
       commandNotes.push(
         `Loaded agent instructions from ${instructionsFilePath}`,

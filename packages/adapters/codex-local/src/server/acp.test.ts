@@ -1,8 +1,23 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
+
+const { prepareAdapterExecutionTargetRuntime } = vi.hoisted(() => ({
+  prepareAdapterExecutionTargetRuntime: vi.fn(),
+}));
+
+vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>(
+    "@paperclipai/adapter-utils/execution-target",
+  );
+  return {
+    ...actual,
+    prepareAdapterExecutionTargetRuntime,
+  };
+});
+
 import {
   buildCodexAcpConfig,
   createCodexAcpExecutor,
@@ -47,6 +62,7 @@ function setNodeVersion(version: string): void {
 }
 
 afterEach(async () => {
+  prepareAdapterExecutionTargetRuntime.mockReset();
   setNodeVersion(originalNodeVersion);
   if (originalPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
   else process.env.PAPERCLIP_HOME = originalPaperclipHome;
@@ -486,6 +502,84 @@ describe("codex_local ACP lane", () => {
       service_tier: "fast",
       features: { fast_mode: true },
     });
+  });
+
+  it("stages the complete instruction bundle for sandbox ACP without synchronizing the workspace", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-instructions-");
+    const workspaceDir = path.join(root, "workspace");
+    const instructionsDir = path.join(root, "instructions");
+    const instructionsFilePath = path.join(instructionsDir, "AGENTS.md");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    await fs.mkdir(instructionsDir, { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, "workspace-only.txt"), "do not sync\n", "utf8");
+    await fs.writeFile(instructionsFilePath, "Read SOUL.md and TOOLS.md.\n", "utf8");
+    await fs.writeFile(path.join(instructionsDir, "SOUL.md"), "Be precise.\n", "utf8");
+    await fs.writeFile(path.join(instructionsDir, "TOOLS.md"), "Use available tools.\n", "utf8");
+
+    const restoreWorkspace = vi.fn(async () => undefined);
+    let stagedFiles: string[] = [];
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => {
+      const assets = input.assets ?? [];
+      stagedFiles = await fs.readdir(assets[0]!.localDir);
+      return {
+        target: input.target,
+        workspaceRemoteDir: "/remote/workspace",
+        runtimeRootDir: "/remote/workspace/.paperclip-runtime/codex",
+        assetDirs: {
+          instructions: "/remote/workspace/.paperclip-runtime/codex/instructions",
+        },
+        restoreWorkspace,
+      };
+    });
+
+    const runtimes: FakeRuntime[] = [];
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => {
+        const runtime = new FakeRuntime(options);
+        runtimes.push(runtime);
+        return runtime as never;
+      },
+    });
+
+    const result = await execute(buildContext(workspaceDir, {
+      config: {
+        engine: "acp",
+        cwd: workspaceDir,
+        stateDir: path.join(root, "state"),
+        instructionsFilePath,
+        instructionsRootPath: instructionsDir,
+        instructionsEntryFile: "AGENTS.md",
+        promptTemplate: "Do the assigned work.",
+      },
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "test-sandbox",
+        remoteCwd: "/remote/workspace",
+      },
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(stagedFiles.sort()).toEqual(["AGENTS.md", "SOUL.md", "TOOLS.md"]);
+    expect(prepareAdapterExecutionTargetRuntime).toHaveBeenCalledTimes(1);
+    const preparation = prepareAdapterExecutionTargetRuntime.mock.calls[0]?.[0];
+    expect(preparation?.target).toMatchObject({
+      kind: "remote",
+      transport: "sandbox",
+      remoteCwd: "/remote/workspace",
+      syncWorkspace: false,
+    });
+    expect(preparation?.assets).toEqual([{ key: "instructions", localDir: instructionsDir }]);
+    expect(preparation?.assets).not.toContainEqual(expect.objectContaining({ key: "workspace" }));
+    const prompt = runtimes[0]?.startInputs[0]?.text ?? "";
+    expect(prompt).toContain(
+      "The above agent instructions were loaded from /remote/workspace/.paperclip-runtime/codex/instructions/AGENTS.md.",
+    );
+    expect(prompt).toContain(
+      "Resolve any relative file references from /remote/workspace/.paperclip-runtime/codex/instructions/.",
+    );
+    expect(prompt).not.toContain(instructionsDir);
+    expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 
   it("classifies ACP refresh-token auth failures", async () => {

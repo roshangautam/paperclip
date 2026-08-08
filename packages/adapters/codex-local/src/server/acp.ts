@@ -16,6 +16,7 @@ import {
 import { inferOpenAiCompatibleBiller } from "@paperclipai/adapter-utils";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
+  prepareAdapterExecutionTargetRuntime,
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
@@ -32,6 +33,7 @@ import {
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
 import { classifyCodexAuthRefreshFailure } from "./parse.js";
+import { resolveCodexInstructionsBundle } from "./instructions-bundle.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const packageRootDir = path.resolve(moduleDir, "../..");
@@ -208,11 +210,58 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
       currentExecutor = createAcpxEngineExecutor(withCodexAcpDefaults(options));
       executor = currentExecutor;
     }
-    const result = await currentExecutor({
-      ...ctx,
-      config: buildCodexAcpConfig(ctx.config),
+    const config = buildCodexAcpConfig(ctx.config);
+    const target = readAdapterExecutionTarget({
+      executionTarget: ctx.executionTarget,
+      legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
     });
-    return withCodexAuthRefreshFailureClassification(result);
+    const instructionsBundle = resolveCodexInstructionsBundle(config);
+    if (
+      target?.kind !== "remote" ||
+      target.transport !== "sandbox" ||
+      !instructionsBundle.rootPath ||
+      !instructionsBundle.entryRelativePath
+    ) {
+      const result = await currentExecutor({ ...ctx, config });
+      return withCodexAuthRefreshFailureClassification(result);
+    }
+
+    const runtimeTarget = { ...target, syncWorkspace: false as const };
+    const workspaceContext = parseObject(ctx.context.paperclipWorkspace);
+    const workspaceLocalDir =
+      asString(workspaceContext.cwd, "").trim() ||
+      asString(config.cwd, "").trim() ||
+      process.cwd();
+    const preparedRuntime = await prepareAdapterExecutionTargetRuntime({
+      runId: ctx.runId,
+      target: runtimeTarget,
+      adapterKey: "codex",
+      workspaceLocalDir,
+      assets: [{ key: "instructions", localDir: instructionsBundle.rootPath }],
+      onProgress: (line) => ctx.onLog("stdout", line),
+      onRuntimeProgress: ctx.onRuntimeProgress,
+    });
+    const remoteInstructionsDir =
+      preparedRuntime.assetDirs.instructions ??
+      path.posix.join(runtimeTarget.remoteCwd, ".paperclip-runtime", "codex", "instructions");
+    const instructionsReferencePath = path.posix.join(
+      remoteInstructionsDir,
+      instructionsBundle.entryRelativePath,
+    );
+
+    try {
+      const result = await currentExecutor({
+        ...ctx,
+        executionTarget: runtimeTarget,
+        config: {
+          ...config,
+          instructionsReferencePath,
+        },
+      });
+      return withCodexAuthRefreshFailureClassification(result);
+    } finally {
+      await preparedRuntime.restoreWorkspace((line) => ctx.onLog("stdout", line));
+    }
   };
 }
 

@@ -91,6 +91,7 @@ import {
   formatCodexAcpFallbackMessage,
   resolveCodexExecutionEngineForRun,
 } from "./acp.js";
+import { resolveCodexInstructionsBundle } from "./instructions-bundle.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeCodexAcp = createCodexAcpExecutor();
@@ -147,47 +148,6 @@ function signalCodexChild(
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
   const raw = env[key];
   return typeof raw === "string" && raw.trim().length > 0;
-}
-
-type CodexInstructionsBundle = {
-  filePath: string;
-  rootPath: string | null;
-  entryRelativePath: string | null;
-};
-
-function resolveCodexInstructionsBundle(config: Record<string, unknown>): CodexInstructionsBundle {
-  const configuredFilePath = asString(config.instructionsFilePath, "").trim();
-  const configuredRootPath = asString(config.instructionsRootPath, "").trim();
-  const configuredEntryFile = asString(config.instructionsEntryFile, "").trim();
-  const rootPath = configuredRootPath ? path.resolve(configuredRootPath) : null;
-  const filePath = configuredFilePath || (
-    rootPath && configuredEntryFile
-      ? path.resolve(rootPath, configuredEntryFile)
-      : ""
-  );
-
-  if (!rootPath || !filePath) {
-    return { filePath, rootPath: null, entryRelativePath: null };
-  }
-
-  const entryPath = configuredEntryFile
-    ? path.resolve(rootPath, configuredEntryFile)
-    : path.resolve(filePath);
-  const entryRelativePath = path.relative(rootPath, entryPath);
-  if (
-    !entryRelativePath ||
-    entryRelativePath === ".." ||
-    entryRelativePath.startsWith(`..${path.sep}`) ||
-    path.isAbsolute(entryRelativePath)
-  ) {
-    return { filePath, rootPath: null, entryRelativePath: null };
-  }
-
-  return {
-    filePath,
-    rootPath,
-    entryRelativePath: entryRelativePath.split(path.sep).join(path.posix.sep),
-  };
 }
 
 function resolveCodexBillingType(env: Record<string, string>): "api" | "subscription" {
