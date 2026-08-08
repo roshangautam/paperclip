@@ -202,7 +202,7 @@ export function pluginRegistryService(db: Db) {
       id: string,
       data: {
         packageName?: string;
-        packagePath?: string;
+        packagePath?: string | null;
         version?: string;
         manifest?: PaperclipPluginManifestV1;
       },

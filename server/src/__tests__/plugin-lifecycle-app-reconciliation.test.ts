@@ -165,10 +165,10 @@ describe("plugin lifecycle App reconciliation", () => {
       upgradePlugin: upgradePlugin as PluginLoader["upgradePlugin"],
     });
 
-    await expect(manager.upgrade("plugin-1", "1.1.0", "/plugins/example")).resolves.toMatchObject({ status: "ready" });
+    await expect(manager.upgrade("plugin-1", undefined, "/plugins/example")).resolves.toMatchObject({ status: "ready" });
 
     expect(upgradePlugin).toHaveBeenCalledWith("plugin-1", {
-      version: "1.1.0",
+      version: undefined,
       localPath: "/plugins/example",
     });
     expect(reconcilePluginApplications).toHaveBeenCalledTimes(1);

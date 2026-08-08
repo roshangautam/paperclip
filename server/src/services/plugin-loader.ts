@@ -1820,7 +1820,10 @@ export function pluginLoader(
       // 4. Update the existing record
       await registry.update(pluginId, {
         packageName: discovered.packageName,
-        packagePath: discovered.packagePath,
+        packagePath:
+          discovered.source === "local-filesystem"
+            ? discovered.packagePath
+            : null,
         version: discovered.version,
         manifest: newManifest,
       });
