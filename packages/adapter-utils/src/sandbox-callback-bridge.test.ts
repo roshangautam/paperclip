@@ -12,18 +12,23 @@ import {
   createFileSystemSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
+  DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
   sandboxCallbackBridgeDirectories,
   syncSandboxCallbackBridgeEntrypoint,
   startSandboxCallbackBridgeServer,
   startSandboxCallbackBridgeWorker,
 } from "./sandbox-callback-bridge.js";
-import type { RunProcessResult } from "./server-utils.js";
+import { MAX_CAPTURE_BYTES, type RunProcessResult } from "./server-utils.js";
 
 const execFile = promisify(execFileCallback);
 
 describe("sandbox callback bridge", () => {
   const cleanupDirs: string[] = [];
   const cleanupFns: Array<() => Promise<void>> = [];
+
+  it("uses the execution capture limit for bridge responses", () => {
+    expect(DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES).toBe(MAX_CAPTURE_BYTES);
+  });
 
   function createExecRunner() {
     return {

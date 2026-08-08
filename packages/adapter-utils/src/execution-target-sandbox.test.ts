@@ -758,7 +758,7 @@ describe("sandbox adapter execution targets", () => {
     }));
   });
 
-  it("strips inherited host identity env before sandbox execution", async () => {
+  it("strips inherited identity and host-only env before sandbox execution", async () => {
     vi.stubEnv("PATH", "/host/bin:/usr/bin");
     vi.stubEnv("HOME", "/Users/local");
     vi.stubEnv("TMPDIR", "/var/folders/local/T");
@@ -787,6 +787,8 @@ describe("sandbox adapter execution targets", () => {
         PATH: "/host/bin:/usr/bin",
         HOME: "/Users/local",
         TMPDIR: "/var/folders/local/T",
+        AGENT_HOME: "/host/agent-home",
+        GITHUB_APP_PRIVATE_KEY_FILE: "/host/github-app.pem",
         SAFE_VALUE: "visible",
       },
       timeoutSec: 5,

@@ -16,6 +16,11 @@ const REMOTE_EXECUTION_ENV_IDENTITY_KEYS = new Set([
   "XDG_RUNTIME_DIR",
 ]);
 
+const REMOTE_EXECUTION_HOST_ONLY_ENV_KEYS = new Set([
+  "AGENT_HOME",
+  "GITHUB_APP_PRIVATE_KEY_FILE",
+]);
+
 function readEnvValueCaseInsensitive(env: NodeJS.ProcessEnv, key: string): string | undefined {
   const direct = env[key];
   if (typeof direct === "string") return direct;
@@ -35,6 +40,9 @@ export function sanitizeRemoteExecutionEnv(
   const sanitized: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
     const normalizedKey = key.toUpperCase();
+    if (REMOTE_EXECUTION_HOST_ONLY_ENV_KEYS.has(normalizedKey)) {
+      continue;
+    }
     if (!REMOTE_EXECUTION_ENV_IDENTITY_KEYS.has(normalizedKey)) {
       sanitized[key] = value;
       continue;
