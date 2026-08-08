@@ -5,14 +5,14 @@ import path from "node:path";
 
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
-import type { RunProcessResult } from "./server-utils.js";
+import { MAX_CAPTURE_BYTES, type RunProcessResult } from "./server-utils.js";
 
 const DEFAULT_BRIDGE_TOKEN_BYTES = 24;
 const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
 const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
 const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
-const DEFAULT_BRIDGE_MAX_BODY_BYTES = 256 * 1024;
+const DEFAULT_BRIDGE_MAX_BODY_BYTES = MAX_CAPTURE_BYTES;
 const REMOTE_WRITE_BASE64_CHUNK_SIZE = 32 * 1024;
 const SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT = "paperclip-bridge-server.mjs";
 const SANDBOX_EXEC_CHANNEL_ENV = "PAPERCLIP_SANDBOX_EXEC_CHANNEL";
