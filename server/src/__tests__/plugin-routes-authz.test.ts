@@ -436,10 +436,14 @@ describe.sequential("plugin install and upgrade authz", () => {
 
     const res = await request(app)
       .post(`/api/plugins/${pluginId}/upgrade`)
-      .send({ version: "1.1.0" });
+      .send({ version: "1.1.0", localPath: "/plugins/example" });
 
     expect(res.status).toBe(200);
-    expect(mockLifecycle.upgrade).toHaveBeenCalledWith(pluginId, "1.1.0");
+    expect(mockLifecycle.upgrade).toHaveBeenCalledWith(
+      pluginId,
+      "1.1.0",
+      "/plugins/example",
+    );
   }, 20_000);
 });
 

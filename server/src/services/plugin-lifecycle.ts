@@ -188,7 +188,7 @@ export interface PluginLifecycleManager {
    * If the upgrade adds new capabilities, transitions to `upgrade_pending`.
    * Otherwise, transitions to `ready` directly.
    */
-  upgrade(pluginId: string, version?: string): Promise<PluginRecord>;
+  upgrade(pluginId: string, version?: string, localPath?: string): Promise<PluginRecord>;
 
   /**
    * Start the worker process for a plugin that is already in `ready` state.
@@ -710,10 +710,11 @@ export function pluginLifecycleManager(
      *
      * @param pluginId - The UUID of the plugin to upgrade.
      * @param version - Optional target version specifier.
+     * @param localPath - Optional server-local path for a local plugin replacement.
      * @returns The updated `PluginRecord`.
      * @throws {BadRequest} If the plugin is not in a ready or upgrade_pending state.
      */
-    async upgrade(pluginId: string, version?: string): Promise<PluginRecord> {
+    async upgrade(pluginId: string, version?: string, localPath?: string): Promise<PluginRecord> {
       const plugin = await requirePlugin(pluginId);
 
       // Can only upgrade plugins that are ready or already in upgrade_pending
@@ -725,7 +726,7 @@ export function pluginLifecycleManager(
       }
 
       log.info(
-        { pluginId, pluginKey: plugin.pluginKey, targetVersion: version },
+        { pluginId, pluginKey: plugin.pluginKey, targetVersion: version, localPath },
         "plugin lifecycle: upgrade requested",
       );
 
@@ -733,7 +734,7 @@ export function pluginLifecycleManager(
 
       // 1. Download and validate new package via loader
       const { oldManifest, newManifest, discovered } =
-        await pluginLoaderInstance.upgradePlugin(pluginId, { version });
+        await pluginLoaderInstance.upgradePlugin(pluginId, { version, localPath });
 
       log.info(
         {

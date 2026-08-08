@@ -2176,6 +2176,7 @@ export function pluginRoutes(
    *
    * Request body (optional):
    * - version: Target version (defaults to latest)
+   * - localPath: Server-local plugin directory to upgrade from
    *
    * If the upgrade adds new capabilities, the plugin transitions to
    * 'upgrade_pending' state for board approval. Otherwise, it goes
@@ -2187,8 +2188,9 @@ export function pluginRoutes(
   router.post("/plugins/:pluginId/upgrade", async (req, res) => {
     assertInstanceAdmin(req);
     const { pluginId } = req.params;
-    const body = req.body as { version?: string } | undefined;
+    const body = req.body as { version?: string; localPath?: string } | undefined;
     const version = body?.version;
+    const localPath = body?.localPath;
 
     const plugin = await resolvePlugin(registry, pluginId);
     if (!plugin) {
@@ -2202,7 +2204,7 @@ export function pluginRoutes(
       // 2. Compare capabilities
       // 3. If new capabilities, mark as upgrade_pending
       // 4. Otherwise, transition to ready
-      const result = await lifecycle.upgrade(plugin.id, version);
+      const result = await lifecycle.upgrade(plugin.id, version, localPath);
       await logPluginMutationActivity(req, "plugin.upgraded", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,

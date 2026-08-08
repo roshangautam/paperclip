@@ -210,6 +210,20 @@ describe("openapi routes", () => {
         name: { type: "string" },
       },
     });
+    expect(res.body.paths["/api/plugins/{pluginId}/upgrade"].post.requestBody).toMatchObject({
+      required: false,
+      content: {
+        "application/json": {
+          schema: {
+            type: "object",
+            properties: {
+              version: { type: "string" },
+              localPath: { type: "string" },
+            },
+          },
+        },
+      },
+    });
     expect(res.body.paths["/api/companies/{companyId}/folders"].post.responses["201"]).toBeDefined();
     expect(res.body.paths["/api/companies/{companyId}/folders/items/move"].post.summary).toBe(
       "Move an item into or out of a folder",
