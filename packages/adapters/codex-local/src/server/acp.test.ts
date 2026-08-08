@@ -217,6 +217,52 @@ function buildContext(root: string, overrides: Partial<AdapterExecutionContext> 
   };
 }
 
+async function buildSandboxInstructionsContext(
+  root: string,
+  restoreWorkspace: ReturnType<typeof vi.fn>,
+): Promise<AdapterExecutionContext> {
+  const workspaceDir = path.join(root, "workspace");
+  const instructionsDir = path.join(root, "instructions");
+  const instructionsFilePath = path.join(instructionsDir, "AGENTS.md");
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.mkdir(instructionsDir, { recursive: true });
+  await fs.writeFile(instructionsFilePath, "Use the staged instructions.\n", "utf8");
+
+  prepareAdapterExecutionTargetRuntime.mockResolvedValue({
+    target: {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "test-sandbox",
+      remoteCwd: "/remote/workspace",
+      syncWorkspace: false,
+    },
+    workspaceRemoteDir: "/remote/workspace",
+    runtimeRootDir: "/remote/workspace/.paperclip-runtime/codex",
+    assetDirs: {
+      instructions: "/remote/workspace/.paperclip-runtime/codex/instructions",
+    },
+    restoreWorkspace,
+  });
+
+  return buildContext(workspaceDir, {
+    config: {
+      engine: "acp",
+      cwd: workspaceDir,
+      stateDir: path.join(root, "state"),
+      instructionsFilePath,
+      instructionsRootPath: instructionsDir,
+      instructionsEntryFile: "AGENTS.md",
+      promptTemplate: "Do the assigned work.",
+    },
+    executionTarget: {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "test-sandbox",
+      remoteCwd: "/remote/workspace",
+    },
+  });
+}
+
 describe("codex_local ACP lane", () => {
   it("defaults to ACP when prerequisites pass and falls back to CLI only for auto resolution", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-default-");
@@ -579,6 +625,74 @@ describe("codex_local ACP lane", () => {
       "Resolve any relative file references from /remote/workspace/.paperclip-runtime/codex/instructions/.",
     );
     expect(prompt).not.toContain(instructionsDir);
+    expect(restoreWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses the initialized ACPX executor across repeated calls", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-cached-executor-");
+    const runtimes: FakeRuntime[] = [];
+    let createRuntimeOptionReads = 0;
+    const execute = createCodexAcpExecutor({
+      get createRuntime() {
+        createRuntimeOptionReads += 1;
+        return (options: FakeRuntimeOptions) => {
+          const runtime = new FakeRuntime(options);
+          runtimes.push(runtime);
+          return runtime as never;
+        };
+      },
+    });
+
+    const first = await execute(buildContext(root));
+    await execute(buildContext(root, {
+      runtime: {
+        sessionId: first.sessionId ?? null,
+        sessionParams: first.sessionParams ?? null,
+        sessionDisplayId: first.sessionDisplayId ?? null,
+        taskKey: "PAP-1",
+      },
+    }));
+
+    expect(createRuntimeOptionReads).toBe(1);
+    expect(runtimes).toHaveLength(2);
+  });
+
+  it("restores a sandbox after executor failure and preserves the executor result", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-executor-failure-");
+    const restoreWorkspace = vi.fn(async () => undefined);
+    const context = await buildSandboxInstructionsContext(root, restoreWorkspace);
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+        options,
+        [],
+        {
+          status: "failed",
+          error: { message: "executor failed before completion" },
+        } as unknown as FakeRuntimeTurnResult,
+      ) as never,
+    });
+
+    const result = await execute(context);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorMessage: "executor failed before completion",
+    });
+    expect(restoreWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("propagates sandbox restore failure after successful execution", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-restore-failure-");
+    const restoreError = new Error("sandbox restore failed");
+    const restoreWorkspace = vi.fn(async () => {
+      throw restoreError;
+    });
+    const context = await buildSandboxInstructionsContext(root, restoreWorkspace);
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+    });
+
+    await expect(execute(context)).rejects.toBe(restoreError);
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 

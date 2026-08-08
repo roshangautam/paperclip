@@ -1627,7 +1627,7 @@ export function executionWorkspaceService(db: Db) {
             where ${environmentLeases.companyId} = ${input.companyId}
               and ${environmentLeases.executionWorkspaceId} = ${executionWorkspaces.id}
               and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
-              and ${environmentLeases.status} in ('active', 'released', 'retained', 'pending_cleanup')
+              and ${environmentLeases.status} in ('active', 'released', 'retained', 'failed', 'pending_cleanup')
           )`,
           sql`not exists (
             select 1

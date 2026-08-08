@@ -583,69 +583,72 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(svc.getById(otherExecutionWorkspaceId)).resolves.toMatchObject({ status: "active" });
   });
 
-  it("keeps a workspace active while failed reusable sandbox cleanup remains pending", async () => {
-    const companyId = randomUUID();
-    const projectId = randomUUID();
-    const executionWorkspaceId = randomUUID();
-    const environmentId = randomUUID();
-    const leaseId = randomUUID();
+  it.each(["pending_cleanup", "failed"] as const)(
+    "keeps a workspace active while a reusable sandbox lease is %s",
+    async (leaseStatus) => {
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+      const environmentId = randomUUID();
+      const leaseId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: "PAP",
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Pending cleanup",
-      status: "in_progress",
-    });
-    await db.insert(executionWorkspaces).values({
-      id: executionWorkspaceId,
-      companyId,
-      projectId,
-      mode: "isolated_workspace",
-      strategyType: "cloud_sandbox",
-      name: "Cleanup pending",
-      status: "active",
-      providerType: "cloud_sandbox",
-    });
-    await db.insert(environments).values({
-      id: environmentId,
-      name: `Pending cleanup ${environmentId}`,
-      driver: "sandbox",
-      status: "active",
-      config: {},
-      envVars: {},
-    });
-    await db.insert(environmentLeases).values({
-      id: leaseId,
-      companyId,
-      environmentId,
-      executionWorkspaceId,
-      status: "pending_cleanup",
-      leasePolicy: "reuse_by_environment",
-      cleanupStatus: "failed",
-      failureReason: "provider_unavailable",
-    });
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: "PAP",
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Pending cleanup",
+        status: "in_progress",
+      });
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "cloud_sandbox",
+        name: "Cleanup pending",
+        status: "active",
+        providerType: "cloud_sandbox",
+      });
+      await db.insert(environments).values({
+        id: environmentId,
+        name: `Pending cleanup ${environmentId}`,
+        driver: "sandbox",
+        status: "active",
+        config: {},
+        envVars: {},
+      });
+      await db.insert(environmentLeases).values({
+        id: leaseId,
+        companyId,
+        environmentId,
+        executionWorkspaceId,
+        status: leaseStatus,
+        leasePolicy: "reuse_by_environment",
+        cleanupStatus: "failed",
+        failureReason: "provider_unavailable",
+      });
 
-    await expect(svc.markIdleAfterTerminalIssueCleanup({
-      companyId,
-      executionWorkspaceId,
-    })).resolves.toBeNull();
-    await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({ status: "active" });
+      await expect(svc.markIdleAfterTerminalIssueCleanup({
+        companyId,
+        executionWorkspaceId,
+      })).resolves.toBeNull();
+      await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({ status: "active" });
 
-    await db
-      .update(environmentLeases)
-      .set({ status: "expired", cleanupStatus: "success", updatedAt: new Date() })
-      .where(eq(environmentLeases.id, leaseId));
-    await expect(svc.markIdleAfterTerminalIssueCleanup({
-      companyId,
-      executionWorkspaceId,
-    })).resolves.toMatchObject({ status: "idle" });
-  });
+      await db
+        .update(environmentLeases)
+        .set({ status: "expired", cleanupStatus: "success", updatedAt: new Date() })
+        .where(eq(environmentLeases.id, leaseId));
+      await expect(svc.markIdleAfterTerminalIssueCleanup({
+        companyId,
+        executionWorkspaceId,
+      })).resolves.toMatchObject({ status: "idle" });
+    },
+  );
 
   it.each(["queued", "running"])(
     "keeps a workspace active while a %s heartbeat owns it",
@@ -785,6 +788,52 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       status: "idle",
       cleanupReason: null,
     });
+  });
+
+  it("keeps a terminal heartbeat transition when workspace reconciliation fails", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Workspace owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+      contextSnapshot: {
+        issueId: randomUUID(),
+        executionWorkspaceId: "malformed-workspace-id",
+      },
+    });
+
+    await expect(heartbeatService(db).cancelRun(runId)).resolves.toMatchObject({
+      id: runId,
+      status: "cancelled",
+    });
+    await expect(
+      db.select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+    ).resolves.toEqual({ status: "cancelled" });
   });
 
   it("reconciles a forward branch record, comments on the source issue, and resolves matching workspace recovery", async () => {
