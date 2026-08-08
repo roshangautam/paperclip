@@ -2192,8 +2192,16 @@ export function pluginRoutes(
     const version = body?.version;
     const localPath = body?.localPath;
 
+    if (version !== undefined && typeof version !== "string") {
+      res.status(400).json({ error: "version must be a string" });
+      return;
+    }
     if (localPath !== undefined && typeof localPath !== "string") {
       res.status(400).json({ error: "localPath must be a string" });
+      return;
+    }
+    if (version !== undefined && localPath !== undefined) {
+      res.status(400).json({ error: "version cannot be combined with localPath" });
       return;
     }
 

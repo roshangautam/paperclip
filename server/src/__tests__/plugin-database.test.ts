@@ -572,6 +572,34 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     expect(plugin?.packagePath).toBe(path.resolve(newPackageRoot));
   });
 
+  it("rejects version upgrades for plugins with a persisted local package path", async () => {
+    const pluginManifest = manifest("paperclip.local-version-upgrade");
+    const packageRoot = await createInstallablePluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${derivePluginDatabaseNamespace(pluginManifest.id)}.upgrade_rows (id uuid PRIMARY KEY);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+    await db
+      .update(plugins)
+      .set({ packagePath: packageRoot })
+      .where(eq(plugins.id, pluginId));
+
+    const loader = pluginLoader(db, {
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    await expect(loader.upgradePlugin(pluginId, { version: "1.1.0" }))
+      .rejects.toThrow(/version cannot be combined with a local plugin source/i);
+
+    const [plugin] = await db
+      .select()
+      .from(plugins)
+      .where(eq(plugins.id, pluginId));
+    expect(plugin?.version).toBe(pluginManifest.version);
+    expect(plugin?.packagePath).toBe(packageRoot);
+  });
+
   it("refreshes persisted manifests from disk before activation", async () => {
     const staleManifest = manifest("paperclip.refresh");
     const refreshedManifest: PaperclipPluginManifestV1 = {

@@ -224,6 +224,13 @@ describe("openapi routes", () => {
         },
       },
     });
+    expect(res.body.paths["/api/plugins/{pluginId}/upgrade"].post.responses["401"]).toBeUndefined();
+    expect(Object.keys(res.body.paths["/api/plugins/{pluginId}/upgrade"].post.responses).sort()).toEqual([
+      "200",
+      "400",
+      "403",
+      "404",
+    ]);
     expect(res.body.paths["/api/companies/{companyId}/folders"].post.responses["201"]).toBeDefined();
     expect(res.body.paths["/api/companies/{companyId}/folders/items/move"].post.summary).toBe(
       "Move an item into or out of a folder",

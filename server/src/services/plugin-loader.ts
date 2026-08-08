@@ -1774,6 +1774,10 @@ export function pluginLoader(
         version,
       } = upgradeOptions;
 
+      if (version !== undefined && localPath !== undefined) {
+        throw new Error("version cannot be combined with a local plugin source");
+      }
+
       log.info(
         { pluginId, packageName, version, localPath },
         "plugin-loader: upgrading plugin",

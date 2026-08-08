@@ -436,14 +436,50 @@ describe.sequential("plugin install and upgrade authz", () => {
 
     const res = await request(app)
       .post(`/api/plugins/${pluginId}/upgrade`)
-      .send({ version: "1.1.0", localPath: "/plugins/example" });
+      .send({ version: "1.1.0" });
 
     expect(res.status).toBe(200);
     expect(mockLifecycle.upgrade).toHaveBeenCalledWith(
       pluginId,
       "1.1.0",
-      "/plugins/example",
+      undefined,
     );
+  }, 20_000);
+
+  it("rejects non-string upgrade versions before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ version: { invalid: true } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/version must be a string/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects upgrades that combine a version with a local path", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ version: "1.1.0", localPath: "/plugins/example" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/version cannot be combined with localPath/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
   }, 20_000);
 
   it("rejects invalid local upgrade paths before invoking the lifecycle", async () => {
