@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -89,10 +89,15 @@ describe("codex remote execution", () => {
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
     const codexHomeDir = path.join(rootDir, "codex-home");
+    const instructionsDir = path.join(rootDir, "instructions");
     const managedRemoteWorkspace = "/remote/workspace/.paperclip-runtime/runs/run-1/workspace";
     await mkdir(workspaceDir, { recursive: true });
     await mkdir(codexHomeDir, { recursive: true });
-    await writeFile(path.join(rootDir, "instructions.md"), "Use the remote workspace.\n", "utf8");
+    await mkdir(instructionsDir, { recursive: true });
+    await writeFile(path.join(instructionsDir, "AGENTS.md"), "Use the remote workspace.\n", "utf8");
+    await writeFile(path.join(instructionsDir, "HEARTBEAT.md"), "Check current work.\n", "utf8");
+    await writeFile(path.join(instructionsDir, "SOUL.md"), "Be precise.\n", "utf8");
+    await writeFile(path.join(instructionsDir, "TOOLS.md"), "Use available tools.\n", "utf8");
     await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
     const alternateWorkspaceDir = path.join(rootDir, "alternate-workspace");
     await mkdir(alternateWorkspaceDir, { recursive: true });
@@ -114,6 +119,9 @@ describe("codex remote execution", () => {
       },
       config: {
         command: "codex",
+        instructionsFilePath: path.join(instructionsDir, "AGENTS.md"),
+        instructionsRootPath: instructionsDir,
+        instructionsEntryFile: "AGENTS.md",
         env: {
           CODEX_HOME: codexHomeDir,
         },
@@ -164,16 +172,26 @@ describe("codex remote execution", () => {
       localDir: workspaceDir,
       remoteDir: managedRemoteWorkspace,
     }));
-    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(1);
-    expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
+    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(2);
+    expect(syncDirectoryToSsh).toHaveBeenNthCalledWith(1, expect.objectContaining({
       localDir: codexHomeDir,
       remoteDir: `${managedRemoteWorkspace}/.paperclip-runtime/codex/home`,
       followSymlinks: true,
     }));
+    expect(syncDirectoryToSsh).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      localDir: instructionsDir,
+      remoteDir: `${managedRemoteWorkspace}/.paperclip-runtime/codex/instructions`,
+    }));
+    expect((await readdir(instructionsDir)).sort()).toEqual([
+      "AGENTS.md",
+      "HEARTBEAT.md",
+      "SOUL.md",
+      "TOOLS.md",
+    ]);
 
     expect(runChildProcess).toHaveBeenCalledTimes(1);
     const call = runChildProcess.mock.calls[0] as unknown as
-      | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
+      | [string, string, string[], { env: Record<string, string>; stdin: string; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
     expect(call?.[2]).not.toContain("--skip-git-repo-check");
     expect(call?.[3].env.CODEX_HOME).toBe(`${managedRemoteWorkspace}/.paperclip-runtime/codex/home`);
@@ -195,12 +213,76 @@ describe("codex remote execution", () => {
     expect(call?.[3].env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:4310");
     expect(call?.[3].env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
+    expect(call?.[3].stdin).toContain(
+      `The above agent instructions were loaded from ${managedRemoteWorkspace}/.paperclip-runtime/codex/instructions/AGENTS.md.`,
+    );
+    expect(call?.[3].stdin).toContain(
+      `Resolve any relative file references from ${managedRemoteWorkspace}/.paperclip-runtime/codex/instructions/.`,
+    );
+    expect(call?.[3].stdin).not.toContain(instructionsDir);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({
       localDir: workspaceDir,
       remoteDir: managedRemoteWorkspace,
     }));
+  });
+
+  it("keeps managed instruction references on local paths for local execution", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-local-instructions-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    const instructionsDir = path.join(rootDir, "instructions");
+    const instructionsFilePath = path.join(instructionsDir, "AGENTS.md");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    await mkdir(instructionsDir, { recursive: true });
+    await writeFile(instructionsFilePath, "Use local references.\n", "utf8");
+    await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+
+    await execute({
+      runId: "run-local-instructions",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "codex",
+        engine: "cli",
+        instructionsFilePath,
+        instructionsRootPath: instructionsDir,
+        instructionsEntryFile: "AGENTS.md",
+        env: { CODEX_HOME: codexHomeDir },
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      onLog: async () => {},
+    });
+
+    expect(syncDirectoryToSsh).not.toHaveBeenCalled();
+    const call = runChildProcess.mock.calls[0] as unknown as
+      | [string, string, string[], { stdin: string }]
+      | undefined;
+    expect(call?.[3].stdin).toContain(
+      `The above agent instructions were loaded from ${instructionsFilePath}.`,
+    );
+    expect(call?.[3].stdin).toContain(
+      `Resolve any relative file references from ${instructionsDir}/.`,
+    );
   });
 
   it("does not resume saved Codex sessions for remote SSH execution without a matching remote identity", async () => {

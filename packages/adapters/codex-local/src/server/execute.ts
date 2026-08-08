@@ -149,6 +149,47 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
   return typeof raw === "string" && raw.trim().length > 0;
 }
 
+type CodexInstructionsBundle = {
+  filePath: string;
+  rootPath: string | null;
+  entryRelativePath: string | null;
+};
+
+function resolveCodexInstructionsBundle(config: Record<string, unknown>): CodexInstructionsBundle {
+  const configuredFilePath = asString(config.instructionsFilePath, "").trim();
+  const configuredRootPath = asString(config.instructionsRootPath, "").trim();
+  const configuredEntryFile = asString(config.instructionsEntryFile, "").trim();
+  const rootPath = configuredRootPath ? path.resolve(configuredRootPath) : null;
+  const filePath = configuredFilePath || (
+    rootPath && configuredEntryFile
+      ? path.resolve(rootPath, configuredEntryFile)
+      : ""
+  );
+
+  if (!rootPath || !filePath) {
+    return { filePath, rootPath: null, entryRelativePath: null };
+  }
+
+  const entryPath = configuredEntryFile
+    ? path.resolve(rootPath, configuredEntryFile)
+    : path.resolve(filePath);
+  const entryRelativePath = path.relative(rootPath, entryPath);
+  if (
+    !entryRelativePath ||
+    entryRelativePath === ".." ||
+    entryRelativePath.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(entryRelativePath)
+  ) {
+    return { filePath, rootPath: null, entryRelativePath: null };
+  }
+
+  return {
+    filePath,
+    rootPath,
+    entryRelativePath: entryRelativePath.split(path.sep).join(path.posix.sep),
+  };
+}
+
 function resolveCodexBillingType(env: Record<string, string>): "api" | "subscription" {
   // Codex uses API-key auth when OPENAI_API_KEY is present; otherwise rely on local login/session auth.
   return hasNonEmptyEnvValue(env, "OPENAI_API_KEY") ? "api" : "subscription";
@@ -498,6 +539,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  const instructionsBundle = resolveCodexInstructionsBundle(config);
   const configuredCodexHome =
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
@@ -665,6 +707,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 // small and still uploaded.
                 exclude: ["tmp", ".tmp", "sessions", "shell_snapshots"],
               },
+              ...(instructionsBundle.rootPath && instructionsBundle.entryRelativePath
+                ? [{
+                    key: "instructions",
+                    localDir: instructionsBundle.rootPath,
+                  }]
+                : []),
             ],
           });
         })()
@@ -877,8 +925,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Codex session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
       );
     }
-    const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-    const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
+    const instructionsFilePath = instructionsBundle.filePath;
+    const remoteInstructionsFilePath =
+      executionTargetIsRemote && instructionsBundle.entryRelativePath
+        ? preparedExecutionTargetRuntime?.assetDirs.instructions
+          ? path.posix.join(
+              preparedExecutionTargetRuntime.assetDirs.instructions,
+              instructionsBundle.entryRelativePath,
+            )
+          : null
+        : null;
+    const promptInstructionsFilePath = remoteInstructionsFilePath ?? instructionsFilePath;
+    const instructionsDir = promptInstructionsFilePath
+      ? `${remoteInstructionsFilePath
+        ? path.posix.dirname(promptInstructionsFilePath)
+        : path.dirname(promptInstructionsFilePath)}/`
+      : "";
     let instructionsPrefix = "";
     let instructionsChars = 0;
     if (instructionsFilePath) {
@@ -886,7 +948,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
         instructionsPrefix =
           `${instructionsContents}\n\n` +
-          `The above agent instructions were loaded from ${instructionsFilePath}. ` +
+          `The above agent instructions were loaded from ${promptInstructionsFilePath}. ` +
           `Resolve any relative file references from ${instructionsDir}.\n\n`;
         instructionsChars = instructionsPrefix.length;
       } catch (err) {
