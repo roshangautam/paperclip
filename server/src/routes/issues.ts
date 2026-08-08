@@ -4366,6 +4366,12 @@ export function issueRoutes(
         executionWorkspaceId: issue.executionWorkspaceId ?? null,
         failureReason: `issue_terminal_${issue.status}`,
       });
+      if (issue.executionWorkspaceId) {
+        await executionWorkspacesSvc.markIdleAfterTerminalIssueCleanup({
+          companyId: issue.companyId,
+          executionWorkspaceId: issue.executionWorkspaceId,
+        });
+      }
     } catch (err) {
       logger.warn(
         { err, issueId: issue.id, executionWorkspaceId: issue.executionWorkspaceId ?? null },

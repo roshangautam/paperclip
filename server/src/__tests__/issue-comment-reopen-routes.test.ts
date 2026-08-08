@@ -83,6 +83,13 @@ const mockExternalObjectService = vi.hoisted(() => ({
   syncCommentSafely: vi.fn(async () => undefined),
   syncIssueSafely: vi.fn(async () => undefined),
 }));
+const mockEnvironmentRuntimeService = vi.hoisted(() => ({
+  destroyReusableSandboxLeases: vi.fn(async () => []),
+}));
+const mockExecutionWorkspaceService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null),
+  markIdleAfterTerminalIssueCleanup: vi.fn(async () => null),
+}));
 
 vi.mock("@paperclipai/shared/telemetry", () => ({
   trackAgentTaskCompleted: vi.fn(),
@@ -107,6 +114,14 @@ vi.mock("../services/agents.js", () => ({
 
 vi.mock("../services/feedback.js", () => ({
   feedbackService: () => mockFeedbackService,
+}));
+
+vi.mock("../services/environment-runtime.js", () => ({
+  environmentRuntimeService: () => mockEnvironmentRuntimeService,
+}));
+
+vi.mock("../services/execution-workspaces.js", () => ({
+  executionWorkspaceService: () => mockExecutionWorkspaceService,
 }));
 
 vi.mock("../services/heartbeat.js", () => ({
@@ -136,7 +151,7 @@ vi.mock("../services/index.js", () => ({
   }),
   documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
   documentService: () => ({}),
-  executionWorkspaceService: () => ({}),
+  executionWorkspaceService: () => mockExecutionWorkspaceService,
   feedbackService: () => mockFeedbackService,
   goalService: () => ({}),
   heartbeatService: () => mockHeartbeatService,
@@ -266,6 +281,9 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueTreeControlService.getActivePauseHoldGate.mockReset();
     mockExternalObjectService.syncCommentSafely.mockReset();
     mockExternalObjectService.syncIssueSafely.mockReset();
+    mockEnvironmentRuntimeService.destroyReusableSandboxLeases.mockReset();
+    mockExecutionWorkspaceService.getById.mockReset();
+    mockExecutionWorkspaceService.markIdleAfterTerminalIssueCleanup.mockReset();
     mockTxInsertValues.mockReset();
     mockTxInsert.mockReset();
     mockDbSelect.mockReset();
@@ -291,6 +309,9 @@ describe.sequential("issue comment reopen routes", () => {
     mockHeartbeatService.cancelRun.mockResolvedValue(null);
     mockExternalObjectService.syncCommentSafely.mockResolvedValue(undefined);
     mockExternalObjectService.syncIssueSafely.mockResolvedValue(undefined);
+    mockEnvironmentRuntimeService.destroyReusableSandboxLeases.mockResolvedValue([]);
+    mockExecutionWorkspaceService.getById.mockResolvedValue(null);
+    mockExecutionWorkspaceService.markIdleAfterTerminalIssueCleanup.mockResolvedValue(null);
     mockLogActivity.mockResolvedValue(undefined);
     mockFeedbackService.listIssueVotesForUser.mockResolvedValue([]);
     mockFeedbackService.saveIssueVote.mockResolvedValue({
@@ -1733,6 +1754,7 @@ describe.sequential("issue comment reopen routes", () => {
     const issue = {
       ...makeIssue("in_progress"),
       executionRunId: "run-1",
+      executionWorkspaceId: "55555555-5555-4555-8555-555555555555",
     };
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
@@ -1752,6 +1774,16 @@ describe.sequential("issue comment reopen routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    expect(mockEnvironmentRuntimeService.destroyReusableSandboxLeases).toHaveBeenCalledWith({
+      companyId: "company-1",
+      issueId: issue.id,
+      executionWorkspaceId: issue.executionWorkspaceId,
+      failureReason: "issue_terminal_done",
+    });
+    expect(mockExecutionWorkspaceService.markIdleAfterTerminalIssueCleanup).toHaveBeenCalledWith({
+      companyId: "company-1",
+      executionWorkspaceId: issue.executionWorkspaceId,
+    });
   });
 
   it("writes decision ids into executionState and inserts the decision inside the transaction", async () => {
@@ -1837,6 +1869,7 @@ describe.sequential("issue comment reopen routes", () => {
       ...makeIssue("todo"),
       status: "in_review",
       assigneeAgentId: reviewerAgentId,
+      executionWorkspaceId: "55555555-5555-4555-8555-555555555555",
       executionPolicy: policy,
       executionState: {
         status: "pending",
@@ -1905,6 +1938,16 @@ describe.sequential("issue comment reopen routes", () => {
       }),
       mockTx,
     );
+    expect(mockEnvironmentRuntimeService.destroyReusableSandboxLeases).toHaveBeenCalledWith({
+      companyId: "company-1",
+      issueId: issue.id,
+      executionWorkspaceId: issue.executionWorkspaceId,
+      failureReason: "issue_terminal_done",
+    });
+    expect(mockExecutionWorkspaceService.markIdleAfterTerminalIssueCleanup).toHaveBeenCalledWith({
+      companyId: "company-1",
+      executionWorkspaceId: issue.executionWorkspaceId,
+    });
   });
 
   it("auto-approves a reviewer comment with structured review metadata", async () => {

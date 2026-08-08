@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
+import { environmentLeases, executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
   ExecutionWorkspace,
   ExecutionWorkspaceSummary,
@@ -1600,6 +1600,43 @@ export function executionWorkspaceService(db: Db) {
         .update(executionWorkspaces)
         .set({ ...patch, updatedAt: new Date() })
         .where(eq(executionWorkspaces.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return row ? toExecutionWorkspace(row) : null;
+    },
+
+    markIdleAfterTerminalIssueCleanup: async (input: {
+      companyId: string;
+      executionWorkspaceId: string;
+    }) => {
+      const now = new Date();
+      const row = await db
+        .update(executionWorkspaces)
+        .set({
+          status: "idle",
+          cleanupReason: null,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(executionWorkspaces.id, input.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, input.companyId),
+          eq(executionWorkspaces.status, "active"),
+          sql`not exists (
+            select 1
+            from ${environmentLeases}
+            where ${environmentLeases.companyId} = ${input.companyId}
+              and ${environmentLeases.executionWorkspaceId} = ${executionWorkspaces.id}
+              and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+              and ${environmentLeases.status} in ('active', 'released', 'retained', 'pending_cleanup')
+          )`,
+          sql`not exists (
+            select 1
+            from ${heartbeatRuns}
+            where ${heartbeatRuns.companyId} = ${input.companyId}
+              and ${heartbeatRuns.status} in ('queued', 'running')
+              and ${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaces.id}::text
+          )`,
+        ))
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toExecutionWorkspace(row) : null;
