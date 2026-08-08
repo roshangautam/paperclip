@@ -445,6 +445,24 @@ describe.sequential("plugin install and upgrade authz", () => {
       "/plugins/example",
     );
   }, 20_000);
+
+  it("rejects invalid local upgrade paths before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ localPath: { invalid: true } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/localPath must be a string/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
 });
 
 describe.sequential("scoped plugin API routes", () => {

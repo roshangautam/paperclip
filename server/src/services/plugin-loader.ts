@@ -1816,6 +1816,7 @@ export function pluginLoader(
       // 4. Update the existing record
       await registry.update(pluginId, {
         packageName: discovered.packageName,
+        packagePath: discovered.packagePath,
         version: discovered.version,
         manifest: newManifest,
       });

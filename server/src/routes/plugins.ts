@@ -2192,6 +2192,11 @@ export function pluginRoutes(
     const version = body?.version;
     const localPath = body?.localPath;
 
+    if (localPath !== undefined && typeof localPath !== "string") {
+      res.status(400).json({ error: "localPath must be a string" });
+      return;
+    }
+
     const plugin = await resolvePlugin(registry, pluginId);
     if (!plugin) {
       res.status(404).json({ error: "Plugin not found" });
