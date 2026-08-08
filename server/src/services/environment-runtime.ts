@@ -8,6 +8,7 @@ import {
   companySecretVersions,
   environmentLeases,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import type {
   Environment,
@@ -30,6 +31,7 @@ import {
 } from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
 import { environmentService } from "./environments.js";
+import { executionWorkspaceService } from "./execution-workspaces.js";
 import {
   collectEnvironmentSecretRefs,
   parseEnvironmentDriverConfig,
@@ -838,6 +840,7 @@ function createSandboxEnvironmentDriver(
   const pluginWorkerReadyTimeoutMs = options.pluginWorkerReadyTimeoutMs ?? DEFAULT_PLUGIN_SANDBOX_WORKER_READY_TIMEOUT_MS;
   const pluginWorkerReadyPollMs = options.pluginWorkerReadyPollMs ?? DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS;
   const environmentsSvc = environmentService(db);
+  const executionWorkspacesSvc = executionWorkspaceService(db);
 
   function secretBindingTargetForLease(lease: EnvironmentLease) {
     return lease.metadata?.[LEASE_SCOPED_SECRET_BINDINGS_KEY] === true
@@ -1686,47 +1689,92 @@ function createSandboxEnvironmentDriver(
     deleteBindings?: boolean;
     failureReason?: string;
   }): Promise<EnvironmentLease | null> {
+    let finalizedLease: EnvironmentLease | null;
     if (
       !input.release.cleanupClaimId ||
       input.release.lease.leasePolicy !== "reuse_by_environment"
     ) {
-      return await persistSandboxRelease(input);
+      finalizedLease = await persistSandboxRelease(input);
+    } else {
+      finalizedLease = await db.transaction(async (tx) => {
+        const transactionDb = tx as unknown as Db;
+        const claimedRow = await tx
+          .select()
+          .from(environmentLeases)
+          .where(and(
+            eq(environmentLeases.id, input.release.lease.id),
+            eq(environmentLeases.status, "pending_cleanup"),
+            eq(environmentLeases.cleanupClaimId, input.release.cleanupClaimId!),
+          ))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!claimedRow) return null;
+
+        const claimedLease = toEnvironmentLeaseSnapshot(claimedRow);
+        const pendingTarget = String(claimedLease.metadata?.[PENDING_CLEANUP_RELEASE_STATUS_KEY]);
+        if (input.release.status === "released" && pendingTarget === "expired") {
+          return await environmentService(transactionDb).releaseLease(claimedLease.id, "pending_cleanup", {
+            failureReason: claimedLease.failureReason ?? "reusable_lease_destroy_requested",
+            cleanupStatus: "failed",
+            expectedCleanupClaimId: input.release.cleanupClaimId,
+            expectedStatus: "pending_cleanup",
+            metadata: claimedLease.metadata,
+          });
+        }
+
+        return await persistSandboxRelease({
+          ...input,
+          release: {
+            ...input.release,
+            lease: claimedLease,
+          },
+        }, transactionDb);
+      });
     }
 
-    return await db.transaction(async (tx) => {
-      const transactionDb = tx as unknown as Db;
-      const claimedRow = await tx
-        .select()
-        .from(environmentLeases)
+    await reconcileExecutionWorkspaceAfterSandboxCleanup(finalizedLease);
+    return finalizedLease;
+  }
+
+  async function reconcileExecutionWorkspaceAfterSandboxCleanup(
+    lease: EnvironmentLease | null,
+  ) {
+    if (!lease?.executionWorkspaceId || !lease.issueId) return;
+    if (
+      lease.status === "pending_cleanup" ||
+      (lease.leasePolicy === "reuse_by_environment" &&
+        (lease.status === "active" || lease.status === "released" || lease.status === "retained"))
+    ) {
+      return;
+    }
+
+    try {
+      const issueStatus = await db
+        .select({ status: issues.status })
+        .from(issues)
         .where(and(
-          eq(environmentLeases.id, input.release.lease.id),
-          eq(environmentLeases.status, "pending_cleanup"),
-          eq(environmentLeases.cleanupClaimId, input.release.cleanupClaimId!),
+          eq(issues.id, lease.issueId),
+          eq(issues.companyId, lease.companyId),
+          eq(issues.executionWorkspaceId, lease.executionWorkspaceId),
         ))
-        .for("update")
-        .then((rows) => rows[0] ?? null);
-      if (!claimedRow) return null;
+        .then((rows) => rows[0]?.status ?? null);
+      if (issueStatus !== "done" && issueStatus !== "cancelled") return;
 
-      const claimedLease = toEnvironmentLeaseSnapshot(claimedRow);
-      const pendingTarget = String(claimedLease.metadata?.[PENDING_CLEANUP_RELEASE_STATUS_KEY]);
-      if (input.release.status === "released" && pendingTarget === "expired") {
-        return await environmentService(transactionDb).releaseLease(claimedLease.id, "pending_cleanup", {
-          failureReason: claimedLease.failureReason ?? "reusable_lease_destroy_requested",
-          cleanupStatus: "failed",
-          expectedCleanupClaimId: input.release.cleanupClaimId,
-          expectedStatus: "pending_cleanup",
-          metadata: claimedLease.metadata,
-        });
-      }
-
-      return await persistSandboxRelease({
-        ...input,
-        release: {
-          ...input.release,
-          lease: claimedLease,
+      await executionWorkspacesSvc.markIdleAfterTerminalIssueCleanup({
+        companyId: lease.companyId,
+        executionWorkspaceId: lease.executionWorkspaceId,
+      });
+    } catch (err) {
+      logger.warn(
+        {
+          err,
+          leaseId: lease.id,
+          issueId: lease.issueId,
+          executionWorkspaceId: lease.executionWorkspaceId,
         },
-      }, transactionDb);
-    });
+        "failed to reconcile execution workspace after sandbox cleanup",
+      );
+    }
   }
 
   async function resolveSandboxProviderPlugin(input: { provider: string }) {

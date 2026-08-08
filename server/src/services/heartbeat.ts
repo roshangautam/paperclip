@@ -7654,6 +7654,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
       publishRunLifecyclePluginEvent(updated);
+      await reconcileTerminalIssueExecutionWorkspace(updated);
     }
 
     return updated;
@@ -7691,6 +7692,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
       publishRunLifecyclePluginEvent(updated);
+      await reconcileTerminalIssueExecutionWorkspace(updated);
       return { run: updated, updated: true as const };
     }
 
@@ -7738,6 +7740,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
       publishRunLifecyclePluginEvent(updated);
+      await reconcileTerminalIssueExecutionWorkspace(updated);
       return { run: updated, updated: true as const };
     }
 
@@ -7748,6 +7751,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
 
     return { run: current, updated: false as const };
+  }
+
+  async function reconcileTerminalIssueExecutionWorkspace(
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    if (!isHeartbeatRunTerminalStatus(run.status)) return;
+
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    const executionWorkspaceId = readNonEmptyString(context.executionWorkspaceId);
+    if (!issueId || !executionWorkspaceId) return;
+
+    try {
+      const issueStatus = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(and(
+          eq(issues.id, issueId),
+          eq(issues.companyId, run.companyId),
+          eq(issues.executionWorkspaceId, executionWorkspaceId),
+        ))
+        .then((rows) => rows[0]?.status ?? null);
+      if (issueStatus !== "done" && issueStatus !== "cancelled") return;
+
+      await executionWorkspacesSvc.markIdleAfterTerminalIssueCleanup({
+        companyId: run.companyId,
+        executionWorkspaceId,
+      });
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id, issueId, executionWorkspaceId },
+        "failed to reconcile execution workspace after terminal heartbeat",
+      );
+    }
   }
 
   function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect) {

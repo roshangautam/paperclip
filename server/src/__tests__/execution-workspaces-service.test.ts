@@ -15,6 +15,7 @@ import {
   environmentLeases,
   environments,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -32,6 +33,7 @@ import {
   mergeExecutionWorkspaceConfig,
   readExecutionWorkspaceConfig,
 } from "../services/execution-workspaces.ts";
+import { heartbeatService } from "../services/heartbeat.ts";
 import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
@@ -232,6 +234,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   afterEach(async () => {
     await db.delete(environmentLeases);
     await db.delete(workspaceRuntimeServices);
+    await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
@@ -711,6 +714,78 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       })).resolves.toMatchObject({ status: "idle" });
     },
   );
+
+  it("idles a terminal issue workspace when its owning heartbeat becomes terminal", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const issueId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Workspace owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Terminal heartbeat reconciliation",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Heartbeat-owned terminal workspace",
+      status: "active",
+      providerType: "git_worktree",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Completed while heartbeat was running",
+      status: "done",
+      priority: "medium",
+      executionWorkspaceId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+      contextSnapshot: { issueId, executionWorkspaceId },
+    });
+
+    await expect(svc.markIdleAfterTerminalIssueCleanup({
+      companyId,
+      executionWorkspaceId,
+    })).resolves.toBeNull();
+
+    await heartbeatService(db).cancelRun(runId);
+
+    await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({
+      status: "idle",
+      cleanupReason: null,
+    });
+  });
 
   it("reconciles a forward branch record, comments on the source issue, and resolves matching workspace recovery", async () => {
     const repoRoot = await createTempRepo();

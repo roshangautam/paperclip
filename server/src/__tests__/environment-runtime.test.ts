@@ -23,6 +23,7 @@ import {
   environments,
   executionWorkspaces,
   heartbeatRuns,
+  issues,
   plugins,
   projects,
   secretAccessEvents,
@@ -38,6 +39,7 @@ import {
 } from "@paperclipai/plugin-sdk";
 import { environmentRuntimeService, findReusableSandboxLeaseId } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
+import { executionWorkspaceService } from "../services/execution-workspaces.ts";
 import { realizePluginEnvironmentWorkspace } from "../services/plugin-environment-driver.ts";
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.ts";
 import { secretService } from "../services/secrets.ts";
@@ -202,6 +204,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(environments);
+    await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(plugins);
     await db.delete(companySecretVersions);
@@ -4355,6 +4358,81 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
       status: "released",
       cleanupStatus: "success",
+    });
+  });
+
+  it("idles a terminal issue workspace after pending reusable cleanup succeeds", async () => {
+    const {
+      pluginId,
+      companyId,
+      runId,
+      executionWorkspaceId,
+      reusableLease,
+    } = await seedReusablePluginSandboxLease();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal issue awaiting sandbox cleanup",
+      status: "done",
+      priority: "medium",
+      executionWorkspaceId,
+    });
+    await db
+      .update(environmentLeases)
+      .set({ issueId })
+      .where(eq(environmentLeases.id, reusableLease.id));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const unavailableRuntime = environmentRuntimeService(db, {
+      pluginWorkerManager: {
+        isRunning: vi.fn((id: string) => id === pluginId),
+        call: vi.fn(async (_pluginId: string, method: string) => {
+          expect(method).toBe("environmentDestroyLease");
+          throw new Error("provider cleanup unavailable");
+        }),
+      } as unknown as PluginWorkerManager,
+    });
+    const pending = await unavailableRuntime.releaseRunLeases(runId, "failed");
+    expect(pending[0]?.lease).toMatchObject({
+      id: reusableLease.id,
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+    });
+    const workspaces = executionWorkspaceService(db);
+    await expect(workspaces.markIdleAfterTerminalIssueCleanup({
+      companyId,
+      executionWorkspaceId,
+    })).resolves.toBeNull();
+
+    await db
+      .update(environmentLeases)
+      .set({ updatedAt: new Date(0) })
+      .where(eq(environmentLeases.id, reusableLease.id));
+    const recoveredRuntime = environmentRuntimeService(db, {
+      pluginWorkerManager: {
+        isRunning: vi.fn((id: string) => id === pluginId),
+        call: vi.fn(async (_pluginId: string, method: string) => {
+          expect(method).toBe("environmentDestroyLease");
+        }),
+      } as unknown as PluginWorkerManager,
+    });
+
+    await expect(recoveredRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 1,
+      cleaned: 1,
+      pending: 0,
+    });
+    await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+    });
+    await expect(workspaces.getById(executionWorkspaceId)).resolves.toMatchObject({
+      status: "idle",
+      cleanupReason: null,
     });
   });
 
