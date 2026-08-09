@@ -2942,7 +2942,31 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
-  it("persists terminal run destroy intent while a same-run reusable resume owns the adoption claim", async () => {
+  it.each([
+    {
+      runStatus: "released" as const,
+      pendingTarget: "released" as const,
+      cleanupMethod: "environmentReleaseLease",
+      finalStatus: "released" as const,
+      failureReason: null,
+      finalOwner: true,
+    },
+    {
+      runStatus: "failed" as const,
+      pendingTarget: "expired" as const,
+      cleanupMethod: "environmentDestroyLease",
+      finalStatus: "expired" as const,
+      failureReason: "adapter_or_run_failure",
+      finalOwner: false,
+    },
+  ])("persists $pendingTarget cleanup intent while a same-run reusable resume owns the adoption claim", async ({
+    runStatus,
+    pendingTarget,
+    cleanupMethod,
+    finalStatus,
+    failureReason,
+    finalOwner,
+  }) => {
     const { pluginId, companyId, agentId, environment, runId, executionWorkspaceId, reusableLease } =
       await seedReusablePluginSandboxLease();
     let resumeStarted!: () => void;
@@ -2964,7 +2988,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             metadata: reusableLease.metadata,
           };
         }
-        if (method === "environmentDestroyLease") return undefined;
+        if (method === cleanupMethod) return undefined;
         throw new Error(`Unexpected plugin method: ${method}`);
       }),
     } as unknown as PluginWorkerManager;
@@ -2983,18 +3007,18 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     }).then(() => null, (error: unknown) => error);
     await resumeStartedPromise;
 
-    await runtimeWithPlugin.releaseRunLeases(runId, "failed");
+    await runtimeWithPlugin.releaseRunLeases(runId, runStatus);
     const [destroyRequestedOwner] = await db
       .select()
       .from(environmentLeases)
       .where(eq(environmentLeases.id, reusableLease.id));
     expect(destroyRequestedOwner).toMatchObject({
       status: "pending_cleanup",
-      failureReason: "adapter_or_run_failure",
+      failureReason,
       cleanupClaimId: null,
       reusableResourceOwner: true,
       reusableAdoptionClaimId: expect.any(String),
-      metadata: expect.objectContaining({ pendingCleanupReleaseStatus: "expired" }),
+      metadata: expect.objectContaining({ pendingCleanupReleaseStatus: pendingTarget }),
     });
 
     finishResume();
@@ -3023,17 +3047,17 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
     expect(workerManager.call.mock.calls.map((call) => call[1])).toEqual([
       "environmentResumeLease",
-      "environmentDestroyLease",
+      cleanupMethod,
     ]);
     const [destroyedOwner] = await db
       .select()
       .from(environmentLeases)
       .where(eq(environmentLeases.id, reusableLease.id));
     expect(destroyedOwner).toMatchObject({
-      status: "expired",
-      failureReason: "adapter_or_run_failure",
+      status: finalStatus,
+      failureReason,
       cleanupStatus: "success",
-      reusableResourceOwner: false,
+      reusableResourceOwner: finalOwner,
       reusableAdoptionClaimId: null,
     });
   });

@@ -486,6 +486,7 @@ export function environmentService(db: Db) {
                   )})
                   or (
                     ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+                    and ${environmentLeases.reusableResourceOwner} = true
                     and ${environmentLeases.status} in (${sql.join(
                       DELETE_BLOCKING_REUSABLE_LEASE_STATUSES.map((status) => sql`${status}`),
                       sql`, `,
@@ -555,6 +556,7 @@ export function environmentService(db: Db) {
             activeCount: sql<number>`count(*) filter (where ${environmentLeases.status} = 'active')::int`,
             reusableCount: sql<number>`count(*) filter (
               where ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+                and ${environmentLeases.reusableResourceOwner} = true
                 and ${environmentLeases.status} in (${sql.join(
                   DELETE_BLOCKING_REUSABLE_LEASE_STATUSES.map((status) => sql`${status}`),
                   sql`, `,
@@ -570,6 +572,7 @@ export function environmentService(db: Db) {
                 inArray(environmentLeases.status, [...DELETE_BLOCKING_LEASE_STATUSES]),
                 and(
                   eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+                  eq(environmentLeases.reusableResourceOwner, true),
                   inArray(environmentLeases.status, [...DELETE_BLOCKING_REUSABLE_LEASE_STATUSES]),
                 ),
               ),

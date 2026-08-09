@@ -4340,8 +4340,9 @@ export function environmentRuntimeService(
           : undefined,
       });
       if (!claim) {
-        const destroyRequest = await requestReusableSandboxDestroy(
+        const destroyRequest = await requestReusableSandboxCleanup(
           leaseRow.id,
+          "expired",
           input.failureReason ?? "reusable_lease_destroyed",
           input.terminalWorkspaceReconciliation
             ? {
@@ -4556,9 +4557,10 @@ export function environmentRuntimeService(
     });
   }
 
-  async function requestReusableSandboxDestroy(
+  async function requestReusableSandboxCleanup(
     leaseId: string,
-    failureReason: string,
+    targetStatus: Extract<EnvironmentLeaseStatus, "released" | "expired">,
+    failureReason?: string,
     terminalWorkspaceReconciliation?: {
       companyId: string;
       executionWorkspaceId: string;
@@ -4586,12 +4588,12 @@ export function environmentRuntimeService(
             else ${claimedAt.toISOString()}::timestamptz
           end
         `,
-        failureReason,
+        ...(failureReason !== undefined ? { failureReason } : {}),
         updatedAt: claimedAt,
         metadata: sql<Record<string, unknown>>`
           coalesce(${environmentLeases.metadata}, '{}'::jsonb)
           || ${JSON.stringify({
-            [PENDING_CLEANUP_RELEASE_STATUS_KEY]: "expired",
+            [PENDING_CLEANUP_RELEASE_STATUS_KEY]: targetStatus,
           })}::jsonb
         `,
       })
@@ -4783,13 +4785,15 @@ export function environmentRuntimeService(
               deferredClaim,
               environment ? "environment_driver_unavailable" : "environment_unavailable",
             );
-          } else if (
-            leaseRow.leasePolicy === "reuse_by_environment" &&
-            targetStatus !== "released"
-          ) {
-            await requestReusableSandboxDestroy(
+          } else if (leaseRow.leasePolicy === "reuse_by_environment") {
+            await requestReusableSandboxCleanup(
               leaseRow.id,
-              status === "failed" ? "adapter_or_run_failure" : "lease_expired",
+              status === "released" ? "released" : "expired",
+              status === "failed"
+                ? "adapter_or_run_failure"
+                : status === "expired"
+                  ? "lease_expired"
+                  : undefined,
             );
           }
           continue;
@@ -4810,13 +4814,15 @@ export function environmentRuntimeService(
             })
           : null;
         if (requiresCleanupClaim && !claim) {
-          if (
-            leaseRow.leasePolicy === "reuse_by_environment" &&
-            targetStatus !== "released"
-          ) {
-            await requestReusableSandboxDestroy(
+          if (leaseRow.leasePolicy === "reuse_by_environment") {
+            await requestReusableSandboxCleanup(
               leaseRow.id,
-              status === "failed" ? "adapter_or_run_failure" : "lease_expired",
+              status === "released" ? "released" : "expired",
+              status === "failed"
+                ? "adapter_or_run_failure"
+                : status === "expired"
+                  ? "lease_expired"
+                  : undefined,
             );
           }
           continue;
