@@ -1285,7 +1285,15 @@ export function pluginLoader(
 
     return {
       async commit() {
-        await rm(staged.root, { recursive: true, force: true });
+        try {
+          await rm(staged.root, { recursive: true, force: true });
+        } catch (error) {
+          // The live directory and registry mutation are already committed.
+          // Prevent callers' finally blocks from retrying this best-effort
+          // cleanup and converting a successful mutation into a failure.
+          staged.preserveRoot = true;
+          throw error;
+        }
       },
       async rollback() {
         const rejectedDir = path.join(staged.root, `rejected-${randomUUID()}`);
@@ -2074,6 +2082,10 @@ export function pluginLoader(
             : candidate;
 
           const newManifest = discovered.manifest!;
+          const isInPlaceLocalUpgrade =
+            discovered.source === "local-filesystem"
+            && activePlugin.packagePath !== null
+            && path.resolve(discovered.packagePath) === path.resolve(activePlugin.packagePath);
 
           // 2. Validate it's the same plugin ID
           if (newManifest.id !== oldManifest.id) {
@@ -2125,6 +2137,12 @@ export function pluginLoader(
                 staged
                   ? `Restored previous managed plugins but failed to restore registry metadata for ${pluginId}`
                   : `Failed to restore registry metadata for local plugin ${pluginId}`,
+              );
+            }
+            if (isInPlaceLocalUpgrade) {
+              throw new PluginArtifactRollbackError(
+                [error],
+                `Cannot restore previous local plugin files after failed in-place upgrade at ${discovered.packagePath}`,
               );
             }
             throw error;
