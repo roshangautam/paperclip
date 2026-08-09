@@ -22,6 +22,7 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  stopPaperclipBridgeThenRestoreWorkspace,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -1346,16 +1347,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       return toResult(initial, false, false);
     } finally {
-      if (paperclipBridge) {
-        await paperclipBridge.stop();
-      }
-      if (restoreRemoteWorkspace) {
-        await onLog(
+      await stopPaperclipBridgeThenRestoreWorkspace({
+        paperclipBridge,
+        restoreRemoteWorkspace,
+        beforeRestore: () => onLog(
           "stdout",
           `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-        );
-        await restoreRemoteWorkspace();
-      }
+        ),
+      });
     }
   } finally {
     // Restore the managed config.toml so PAPERCLIP_CODEX_PROVIDERS changes

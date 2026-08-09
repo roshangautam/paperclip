@@ -22,6 +22,7 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  stopPaperclipBridgeThenRestoreWorkspace,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -748,16 +749,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     return toResult(initial);
   } finally {
-    if (paperclipBridge) {
-      await paperclipBridge.stop();
-    }
-    if (restoreRemoteWorkspace) {
-      await onLog(
+    await stopPaperclipBridgeThenRestoreWorkspace({
+      paperclipBridge,
+      restoreRemoteWorkspace,
+      beforeRestore: () => onLog(
         "stdout",
         `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-      );
-      await restoreRemoteWorkspace();
-    }
+      ),
+    });
     if (localSkillsDir) {
       await fs.rm(localSkillsDir, { recursive: true, force: true }).catch(() => undefined);
     }

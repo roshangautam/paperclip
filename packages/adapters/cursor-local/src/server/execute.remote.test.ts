@@ -8,6 +8,7 @@ const {
   ensureCommandResolvable,
   resolveCommandForLogs,
   prepareWorkspaceForSshExecution,
+  removeDirectoryFromSsh,
   restoreWorkspaceFromSshExecution,
   runSshCommand,
   syncDirectoryToSsh,
@@ -29,6 +30,7 @@ const {
   ensureCommandResolvable: vi.fn(async () => undefined),
   resolveCommandForLogs: vi.fn(async () => "ssh://fixture@127.0.0.1:2222/remote/workspace :: agent"),
   prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
+  removeDirectoryFromSsh: vi.fn(async () => undefined),
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
   runSshCommand: vi.fn(async () => ({
     stdout: "/home/agent",
@@ -65,6 +67,7 @@ vi.mock("@paperclipai/adapter-utils/ssh", async () => {
   return {
     ...actual,
     prepareWorkspaceForSshExecution,
+    removeDirectoryFromSsh,
     restoreWorkspaceFromSshExecution,
     runSshCommand,
     syncDirectoryToSsh,
@@ -203,6 +206,11 @@ describe("cursor remote execution", () => {
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
+    expect(removeDirectoryFromSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/remote/workspace/.paperclip-runtime/runs/run-1",
+    }));
+    expect(restoreWorkspaceFromSshExecution.mock.invocationCallOrder[0])
+      .toBeLessThan(removeDirectoryFromSsh.mock.invocationCallOrder[0]!);
   });
 
   it("resumes saved Cursor sessions for remote SSH execution only when the identity matches", async () => {

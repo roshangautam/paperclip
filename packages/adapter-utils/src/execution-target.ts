@@ -224,6 +224,37 @@ export interface AdapterExecutionTargetPaperclipBridgeHandle {
   stop(): Promise<void>;
 }
 
+export async function stopPaperclipBridgeThenRestoreWorkspace(input: {
+  paperclipBridge: AdapterExecutionTargetPaperclipBridgeHandle | null;
+  restoreRemoteWorkspace: (() => Promise<void>) | null;
+  beforeRestore?: () => void | Promise<void>;
+}): Promise<void> {
+  let bridgeStopError: unknown;
+  if (input.paperclipBridge) {
+    try {
+      await input.paperclipBridge.stop();
+    } catch (error) {
+      const cleanupOnlyBridgeFailure = Boolean(
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE &&
+        "remoteExecutionMayStillBeActive" in error &&
+        error.remoteExecutionMayStillBeActive === false,
+      );
+      if (!cleanupOnlyBridgeFailure) throw error;
+      bridgeStopError = error;
+    }
+  }
+
+  if (input.restoreRemoteWorkspace) {
+    await input.beforeRestore?.();
+    await input.restoreRemoteWorkspace();
+  }
+
+  if (bridgeStopError) throw bridgeStopError;
+}
+
 export interface AdapterExecutionTargetProcessSessionBridgeHandle {
   agentCommand: string;
   stop(): Promise<void>;
