@@ -3,6 +3,7 @@ import { GIT_ARCHIVE_EXCLUDES } from "./git-workspace-sync.js";
 import {
   type SshRemoteExecutionSpec,
   prepareWorkspaceForSshExecution,
+  removeDirectoryFromSsh,
   restoreWorkspaceFromSshExecution,
   syncDirectoryToSsh,
 } from "./ssh.js";
@@ -75,14 +76,23 @@ export async function prepareRemoteManagedRuntime(input: {
   // child task wires it into the workspace/asset transfers.
   onProgress?: RuntimeProgressSink;
 }): Promise<PreparedRemoteManagedRuntime> {
+  if (
+    input.runId.length === 0 ||
+    input.runId === "." ||
+    input.runId === ".." ||
+    path.posix.basename(input.runId) !== input.runId ||
+    input.runId.includes("\0")
+  ) {
+    throw new Error("runId must be a single safe path segment");
+  }
   const baseWorkspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
-  const workspaceRemoteDir = path.posix.join(
+  const runRootDir = path.posix.join(
     baseWorkspaceRemoteDir,
     ".paperclip-runtime",
     "runs",
     input.runId,
-    "workspace",
   );
+  const workspaceRemoteDir = path.posix.join(runRootDir, "workspace");
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
 
   const preparedWorkspace = await prepareWorkspaceForSshExecution({
@@ -97,6 +107,17 @@ export async function prepareRemoteManagedRuntime(input: {
   });
 
   const assetDirs: Record<string, string> = {};
+  const restoreWorkspace = async (onProgress?: RuntimeProgressSink) => {
+    await restoreWorkspaceFromSshExecution({
+      spec: input.spec,
+      localDir: input.workspaceLocalDir,
+      remoteDir: workspaceRemoteDir,
+      baselineSnapshot,
+      restoreGitHistory: preparedWorkspace.gitBacked,
+      onProgress,
+    });
+    await removeDirectoryFromSsh({ spec: input.spec, remoteDir: runRootDir });
+  };
   try {
     for (const asset of input.assets ?? []) {
       const remoteDir = path.posix.join(runtimeRootDir, asset.key);
@@ -112,14 +133,7 @@ export async function prepareRemoteManagedRuntime(input: {
       });
     }
   } catch (error) {
-    await restoreWorkspaceFromSshExecution({
-      spec: input.spec,
-      localDir: input.workspaceLocalDir,
-      remoteDir: workspaceRemoteDir,
-      baselineSnapshot,
-      restoreGitHistory: preparedWorkspace.gitBacked,
-      onProgress: input.onProgress,
-    });
+    await restoreWorkspace(input.onProgress);
     throw error;
   }
 
@@ -129,15 +143,6 @@ export async function prepareRemoteManagedRuntime(input: {
     workspaceRemoteDir,
     runtimeRootDir,
     assetDirs,
-    restoreWorkspace: async (onProgress?: RuntimeProgressSink) => {
-      await restoreWorkspaceFromSshExecution({
-        spec: input.spec,
-        localDir: input.workspaceLocalDir,
-        remoteDir: workspaceRemoteDir,
-        baselineSnapshot,
-        restoreGitHistory: preparedWorkspace.gitBacked,
-        onProgress,
-      });
-    },
+    restoreWorkspace,
   };
 }

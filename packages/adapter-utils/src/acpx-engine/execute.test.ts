@@ -122,6 +122,7 @@ async function runExecutor(
     executionTransport?: Record<string, unknown>;
     authToken?: string;
     executionTarget?: Record<string, unknown>;
+    executionSessionTarget?: Record<string, unknown>;
     runtimeMcp?: AdapterRuntimeMcpAccess;
   } = {},
 ) {
@@ -148,6 +149,7 @@ async function runExecutor(
       executionTransport: options.executionTransport,
       authToken: options.authToken,
       executionTarget: options.executionTarget,
+      executionSessionTarget: options.executionSessionTarget,
       runtimeMcp: options.runtimeMcp,
       onLog: async (stream: "stdout" | "stderr", text: string) => {
         logs.push({ stream, text });
@@ -162,6 +164,56 @@ async function runExecutor(
 }
 
 describe("shared ACPX engine runtime behavior", () => {
+  it("executes in the invocation workspace while preserving the stable remote session identity", async () => {
+    const root = await makeTempRoot();
+    const localCwd = path.join(root, "worktree");
+    const stateDir = path.join(root, "state");
+    await fs.mkdir(localCwd, { recursive: true });
+
+    const stableTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "fake-plugin",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd: "/remote/workspace",
+    };
+    const run = (runId: string) => runExecutor(
+      { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+      {
+        executionTarget: {
+          ...stableTarget,
+          remoteCwd: `/remote/workspace/.paperclip-runtime/runs/${runId}/workspace`,
+        },
+        executionSessionTarget: stableTarget,
+      },
+    );
+
+    const first = await run("run-1");
+    const second = await run("run-2");
+
+    expect(first.runtimeOptions[0]?.cwd).toBe(
+      "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+    );
+    expect(second.runtimeOptions[0]?.cwd).toBe(
+      "/remote/workspace/.paperclip-runtime/runs/run-2/workspace",
+    );
+    expect(first.result.sessionParams).toMatchObject({
+      cwd: "/remote/workspace",
+      remoteExecution: {
+        transport: "sandbox",
+        providerKey: "fake-plugin",
+        environmentId: "env-1",
+        leaseId: "lease-1",
+        remoteCwd: "/remote/workspace",
+      },
+    });
+    expect(first.result.sessionParams?.configFingerprint).toBe(
+      second.result.sessionParams?.configFingerprint,
+    );
+    expect(first.result.sessionParams?.sessionKey).toBe(second.result.sessionParams?.sessionKey);
+  });
+
   it("sets Codex model, effort, and fast mode through CODEX_CONFIG without session config calls", async () => {
     const { configOptions, meta } = await runExecutor({
       agent: "codex",

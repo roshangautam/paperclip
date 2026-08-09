@@ -128,7 +128,10 @@ export interface AcpxEngineExecutorOptions {
 interface AcpxPreparedRuntime {
   acpxAgent: string;
   mode: "persistent" | "oneshot";
+  /** Invocation cwd used by the ACP runtime and agent process. */
   cwd: string;
+  /** Stable cwd persisted with the resumable session identity. */
+  sessionCwd: string;
   workspaceId: string;
   workspaceRepoUrl: string;
   workspaceRepoRef: string;
@@ -811,14 +814,14 @@ function buildCodexStartupConfig(input: {
 
 function isCompatibleSession(
   params: Record<string, unknown>,
-  runtime: Pick<AcpxPreparedRuntime, "fingerprint" | "sessionKey" | "cwd" | "mode" | "acpxAgent" | "remoteExecutionIdentity">,
+  runtime: Pick<AcpxPreparedRuntime, "fingerprint" | "sessionKey" | "sessionCwd" | "mode" | "acpxAgent" | "remoteExecutionIdentity">,
 ): boolean {
   if (asString(params.configFingerprint, "") !== runtime.fingerprint) return false;
   if (asString(params.sessionKey, "") !== runtime.sessionKey) return false;
   if (asString(params.agent, "") !== runtime.acpxAgent) return false;
   if (asString(params.mode, "") !== runtime.mode) return false;
   const savedCwd = asString(params.cwd, "");
-  if (!savedCwd || path.resolve(savedCwd) !== path.resolve(runtime.cwd)) return false;
+  if (!savedCwd || path.resolve(savedCwd) !== path.resolve(runtime.sessionCwd)) return false;
   const savedRemote = parseObject(params.remoteExecution);
   return stableJson(savedRemote) === stableJson(runtime.remoteExecutionIdentity ?? {});
 }
@@ -835,7 +838,7 @@ function buildSessionParams(input: {
     acpSessionId: handle.backendSessionId,
     agentSessionId: handle.agentSessionId,
     agent: prepared.acpxAgent,
-    cwd: prepared.cwd,
+    cwd: prepared.sessionCwd,
     mode: prepared.mode,
     stateDir: prepared.stateDir,
     configFingerprint: prepared.fingerprint,
@@ -1041,12 +1044,20 @@ async function buildRuntime(input: {
     executionTarget: input.ctx.executionTarget,
     legacyRemoteExecution: input.ctx.executionTransport?.remoteExecution,
   });
-  const remoteExecutionIdentity = adapterExecutionTargetSessionIdentity(executionTarget);
+  const executionSessionTarget = readAdapterExecutionTarget({
+    executionTarget: input.ctx.executionSessionTarget ?? executionTarget,
+  });
+  const executionIdentity = adapterExecutionTargetSessionIdentity(executionTarget);
+  const remoteExecutionIdentity = adapterExecutionTargetSessionIdentity(executionSessionTarget);
   const effectiveExecutionCwd =
+    executionIdentity && typeof executionIdentity.remoteCwd === "string"
+      ? executionIdentity.remoteCwd
+      : cwd;
+  const sessionCwd =
     remoteExecutionIdentity && typeof remoteExecutionIdentity.remoteCwd === "string"
       ? remoteExecutionIdentity.remoteCwd
       : cwd;
-  const executionTargetIsRemote = remoteExecutionIdentity !== null;
+  const executionTargetIsRemote = executionIdentity !== null;
   const shapedWorkspaceEnv = shapePaperclipWorkspaceEnvForExecution({
     workspaceCwd: effectiveWorkspaceCwd,
     workspaceWorktreePath,
@@ -1319,7 +1330,7 @@ async function buildRuntime(input: {
   const fingerprintInput = {
     acpxAgent,
     agentCommand: agentCommand ?? acpxAgent,
-    cwd: path.resolve(cwd),
+    cwd: path.resolve(sessionCwd),
     mode,
     permissionMode,
     nonInteractivePermissions,
@@ -1368,7 +1379,8 @@ async function buildRuntime(input: {
   return {
     acpxAgent,
     mode,
-    cwd,
+    cwd: effectiveExecutionCwd,
+    sessionCwd,
     workspaceId,
     workspaceRepoUrl,
     workspaceRepoRef,

@@ -1,8 +1,22 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
+
+const { prepareAdapterExecutionTargetRuntime } = vi.hoisted(() => ({
+  prepareAdapterExecutionTargetRuntime: vi.fn(),
+}));
+
+vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>(
+    "@paperclipai/adapter-utils/execution-target",
+  );
+  return {
+    ...actual,
+    prepareAdapterExecutionTargetRuntime,
+  };
+});
 import {
   buildClaudeAcpConfig,
   createClaudeAcpExecutor,
@@ -45,6 +59,8 @@ function setNodeVersion(version: string): void {
 }
 
 afterEach(async () => {
+  prepareAdapterExecutionTargetRuntime.mockReset();
+  vi.unstubAllEnvs();
   setNodeVersion(originalNodeVersion);
   await Promise.all(tempRoots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
@@ -368,6 +384,7 @@ describe("claude_local ACP lane", () => {
   });
 
   it("reports ACP prerequisites for the ACP lane", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
     const root = await makeTempRoot("paperclip-claude-acp-env-");
     const commandPath = path.join(root, "bin", "claude-agent-acp");
     await fs.mkdir(path.dirname(commandPath), { recursive: true });
@@ -454,6 +471,144 @@ describe("claude_local ACP lane", () => {
     const settings = JSON.parse(await fs.readFile(path.join(root, ".claude", "settings.local.json"), "utf8"));
     expect(settings.permissions.defaultMode).toBe("default");
     expect(settings.permissions.allow).toEqual(expect.arrayContaining(["Bash(curl:*)", "Bash(env)"]));
+  });
+
+  it("stages the complete instruction bundle for sandbox ACP without synchronizing the workspace", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-instructions-");
+    const workspaceDir = path.join(root, "workspace");
+    const instructionsDir = path.join(root, "instructions");
+    const instructionsFilePath = path.join(instructionsDir, "AGENTS.md");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    await fs.mkdir(instructionsDir, { recursive: true });
+    await fs.writeFile(instructionsFilePath, "Read SOUL.md.\n", "utf8");
+    await fs.writeFile(path.join(instructionsDir, "SOUL.md"), "Be precise.\n", "utf8");
+
+    const restoreWorkspace = vi.fn(async () => undefined);
+    let stagedFiles: string[] = [];
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => {
+      stagedFiles = await fs.readdir(input.assets?.[0]?.localDir ?? "");
+      return {
+        target: input.target,
+        workspaceRemoteDir: "/remote/prepared-workspace",
+        runtimeRootDir: "/remote/prepared-workspace/.paperclip-runtime/claude",
+        assetDirs: {
+          instructions: "/remote/prepared-workspace/.paperclip-runtime/claude/instructions",
+        },
+        restoreWorkspace,
+      };
+    });
+
+    const runtimes: FakeRuntime[] = [];
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => {
+        const runtime = new FakeRuntime(options);
+        runtimes.push(runtime);
+        return runtime as never;
+      },
+    });
+
+    const result = await execute(buildContext(workspaceDir, {
+      config: {
+        engine: "acp",
+        cwd: workspaceDir,
+        stateDir: path.join(root, "state"),
+        instructionsFilePath,
+        instructionsRootPath: instructionsDir,
+        instructionsEntryFile: "AGENTS.md",
+        promptTemplate: "Do the assigned work.",
+      },
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "test-sandbox",
+        remoteCwd: "/remote/workspace",
+      },
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(stagedFiles.sort()).toEqual(["AGENTS.md", "SOUL.md"]);
+    expect(prepareAdapterExecutionTargetRuntime).toHaveBeenCalledTimes(1);
+    const preparation = prepareAdapterExecutionTargetRuntime.mock.calls[0]?.[0];
+    expect(preparation?.target).toMatchObject({
+      kind: "remote",
+      transport: "sandbox",
+      remoteCwd: "/remote/workspace",
+      syncWorkspace: false,
+    });
+    expect(preparation?.assets).toEqual([{ key: "instructions", localDir: instructionsDir }]);
+    const prompt = runtimes[0]?.startInputs[0]?.text ?? "";
+    expect(prompt).toContain(
+      "The above agent instructions were loaded from /remote/prepared-workspace/.paperclip-runtime/claude/instructions/AGENTS.md.",
+    );
+    expect(prompt).toContain(
+      "Resolve any relative file references from /remote/prepared-workspace/.paperclip-runtime/claude/instructions/.",
+    );
+    expect(prompt).not.toContain(instructionsDir);
+    expect(runtimes[0]?.options.cwd).toBe("/remote/prepared-workspace");
+    expect(result.sessionParams).toMatchObject({
+      cwd: "/remote/workspace",
+      remoteExecution: { remoteCwd: "/remote/workspace" },
+    });
+    expect(restoreWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("executes SSH ACP in the prepared workspace while retaining the original session target", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-ssh-runtime-");
+    const workspaceDir = path.join(root, "workspace");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    const restoreWorkspace = vi.fn(async () => undefined);
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
+      target: input.target,
+      workspaceRemoteDir: "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+      runtimeRootDir: "/remote/workspace/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/claude",
+      assetDirs: {},
+      restoreWorkspace,
+    }));
+    const runtimes: FakeRuntime[] = [];
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => {
+        const runtime = new FakeRuntime(options);
+        runtimes.push(runtime);
+        return runtime as never;
+      },
+    });
+    const sshTarget = {
+      kind: "remote" as const,
+      transport: "ssh" as const,
+      remoteCwd: "/remote/workspace",
+      spec: {
+        host: "127.0.0.1",
+        port: 22,
+        username: "fixture",
+        remoteCwd: "/remote/workspace",
+        remoteWorkspacePath: "/remote/workspace",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+    };
+
+    const result = await execute(buildContext(workspaceDir, {
+      config: {
+        engine: "acp",
+        cwd: workspaceDir,
+        stateDir: path.join(root, "state"),
+        agentCommand: "claude-agent-acp",
+      },
+      executionTarget: sshTarget,
+    }));
+
+    expect(prepareAdapterExecutionTargetRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({ target: sshTarget, assets: undefined }),
+    );
+    expect(runtimes[0]?.options.cwd).toBe(
+      "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+    );
+    expect(result.sessionParams).toMatchObject({
+      cwd: "/remote/workspace",
+      remoteExecution: { remoteCwd: "/remote/workspace" },
+    });
+    expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 
   it("resumes compatible ACP sessions on later Claude ACP runs", async () => {

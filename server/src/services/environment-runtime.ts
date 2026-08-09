@@ -7,6 +7,7 @@ import {
   companySecrets,
   companySecretVersions,
   environmentLeases,
+  executionWorkspaces,
   heartbeatRuns,
   issues,
 } from "@paperclipai/db";
@@ -3834,6 +3835,7 @@ export function environmentRuntimeService(
   } = {},
 ) {
   const environmentsSvc = environmentService(db);
+  const executionWorkspacesSvc = executionWorkspaceService(db);
   const runtimeStartedAt = new Date();
   const drivers = new Map<string, EnvironmentRuntimeDriver>();
 
@@ -3879,6 +3881,45 @@ export function environmentRuntimeService(
       );
     }
     return driver;
+  }
+
+  async function reconcileTerminalExecutionWorkspaces() {
+    const candidates = await db
+      .select({
+        companyId: executionWorkspaces.companyId,
+        executionWorkspaceId: executionWorkspaces.id,
+      })
+      .from(executionWorkspaces)
+      .where(and(
+        eq(executionWorkspaces.status, "active"),
+        sql`exists (
+          select 1 from ${issues}
+          where ${issues.companyId} = ${executionWorkspaces.companyId}
+            and (${issues.id} = ${executionWorkspaces.sourceIssueId}
+              or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
+            and ${issues.status} in ('done', 'cancelled')
+        )`,
+        sql`not exists (
+          select 1 from ${issues}
+          where ${issues.companyId} = ${executionWorkspaces.companyId}
+            and (${issues.id} = ${executionWorkspaces.sourceIssueId}
+              or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
+            and ${issues.status} not in ('done', 'cancelled')
+        )`,
+      ))
+      .orderBy(asc(executionWorkspaces.updatedAt))
+      .limit(SANDBOX_CLEANUP_RETRY_BATCH_SIZE);
+
+    for (const candidate of candidates) {
+      try {
+        await executionWorkspacesSvc.markIdleAfterTerminalIssueCleanup(candidate);
+      } catch (error) {
+        logger.warn(
+          { err: error, executionWorkspaceId: candidate.executionWorkspaceId },
+          "failed to recover terminal issue execution workspace",
+        );
+      }
+    }
   }
 
   async function claimSandboxCleanup(input: {
@@ -4346,6 +4387,8 @@ export function environmentRuntimeService(
           clearInterval(claimRenewal);
         }
       }
+
+      await reconcileTerminalExecutionWorkspaces();
 
       return {
         attempted,

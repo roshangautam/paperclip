@@ -15,9 +15,12 @@ import {
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
+  overrideAdapterExecutionTargetRemoteCwd,
+  prepareAdapterExecutionTargetRuntime,
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
+import { resolveManagedInstructionsBundle } from "@paperclipai/adapter-utils/instructions-bundle";
 import {
   DEFAULT_ACP_ENGINE_MODE,
   DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
@@ -185,10 +188,61 @@ export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}):
       currentExecutor = createAcpxEngineExecutor(withClaudeAcpDefaults(options));
       executor = currentExecutor;
     }
-    return currentExecutor({
-      ...ctx,
-      config: buildClaudeAcpConfig(ctx.config),
+    const config = buildClaudeAcpConfig(ctx.config);
+    const target = readAdapterExecutionTarget({
+      executionTarget: ctx.executionTarget,
+      legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
     });
+    const instructionsBundle = resolveManagedInstructionsBundle(config);
+    if (target?.kind !== "remote") {
+      return currentExecutor({ ...ctx, config });
+    }
+
+    const runtimeTarget = target.transport === "sandbox"
+      ? { ...target, syncWorkspace: false as const }
+      : target;
+    const workspaceContext = parseObject(ctx.context.paperclipWorkspace);
+    const workspaceLocalDir =
+      asString(workspaceContext.cwd, "").trim() ||
+      asString(config.cwd, "").trim() ||
+      process.cwd();
+    const preparedRuntime = await prepareAdapterExecutionTargetRuntime({
+      runId: ctx.runId,
+      target: runtimeTarget,
+      adapterKey: "claude",
+      workspaceLocalDir,
+      assets:
+        instructionsBundle.rootPath && instructionsBundle.entryRelativePath
+          ? [{ key: "instructions", localDir: instructionsBundle.rootPath }]
+          : undefined,
+      onProgress: (line) => ctx.onLog("stdout", line),
+      onRuntimeProgress: ctx.onRuntimeProgress,
+    });
+    const executionRemoteCwd = preparedRuntime.workspaceRemoteDir ?? runtimeTarget.remoteCwd;
+    const executionTarget =
+      overrideAdapterExecutionTargetRemoteCwd(runtimeTarget, executionRemoteCwd) ?? runtimeTarget;
+    const instructionsReferencePath =
+      instructionsBundle.rootPath && instructionsBundle.entryRelativePath
+        ? path.posix.join(
+            preparedRuntime.assetDirs.instructions ??
+              path.posix.join(executionRemoteCwd, ".paperclip-runtime", "claude", "instructions"),
+            instructionsBundle.entryRelativePath,
+          )
+        : null;
+
+    try {
+      return await currentExecutor({
+        ...ctx,
+        executionTarget,
+        executionSessionTarget: target,
+        config: {
+          ...config,
+          ...(instructionsReferencePath ? { instructionsReferencePath } : {}),
+        },
+      });
+    } finally {
+      await preparedRuntime.restoreWorkspace((line) => ctx.onLog("stdout", line));
+    }
   };
 }
 

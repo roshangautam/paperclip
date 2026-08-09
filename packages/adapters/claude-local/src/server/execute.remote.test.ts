@@ -8,6 +8,7 @@ const {
   ensureCommandResolvable,
   resolveCommandForLogs,
   prepareWorkspaceForSshExecution,
+  removeDirectoryFromSsh,
   restoreWorkspaceFromSshExecution,
   syncDirectoryToSsh,
   startAdapterExecutionTargetPaperclipBridge,
@@ -28,6 +29,7 @@ const {
   ensureCommandResolvable: vi.fn(async () => undefined),
   resolveCommandForLogs: vi.fn(async () => "ssh://fixture@127.0.0.1:2222/remote/workspace :: claude"),
   prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
+  removeDirectoryFromSsh: vi.fn(async () => undefined),
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
   syncDirectoryToSsh: vi.fn(async () => undefined),
   startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => ({
@@ -59,6 +61,7 @@ vi.mock("@paperclipai/adapter-utils/ssh", async () => {
   return {
     ...actual,
     prepareWorkspaceForSshExecution,
+    removeDirectoryFromSsh,
     restoreWorkspaceFromSshExecution,
     syncDirectoryToSsh,
   };
@@ -169,9 +172,13 @@ describe("claude remote execution", () => {
       localDir: workspaceDir,
       remoteDir: managedRemoteWorkspace,
     }));
-    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(1);
+    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(2);
     expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
       remoteDir: `${managedRemoteWorkspace}/.paperclip-runtime/claude/skills`,
+      followSymlinks: true,
+    }));
+    expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: `${managedRemoteWorkspace}/.paperclip-runtime/claude/mcp-config`,
       followSymlinks: true,
     }));
     expect(runChildProcess).toHaveBeenCalledTimes(1);
@@ -216,6 +223,11 @@ describe("claude remote execution", () => {
       localDir: workspaceDir,
       remoteDir: managedRemoteWorkspace,
     }));
+    expect(removeDirectoryFromSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/remote/workspace/.paperclip-runtime/runs/run-1",
+    }));
+    expect(restoreWorkspaceFromSshExecution.mock.invocationCallOrder[0])
+      .toBeLessThan(removeDirectoryFromSsh.mock.invocationCallOrder[0]!);
   });
 
   it("does not resume saved Claude sessions for remote SSH execution without a matching remote identity", async () => {

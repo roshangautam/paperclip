@@ -4436,6 +4436,49 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
+  it("recovers a terminal issue workspace after lease finalization wins a process crash", async () => {
+    const { companyId, runId, executionWorkspaceId, reusableLease } =
+      await seedReusablePluginSandboxLease();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal issue finalized before workspace reconciliation",
+      status: "done",
+      priority: "medium",
+      executionWorkspaceId,
+    });
+    await db
+      .update(environmentLeases)
+      .set({
+        issueId,
+        status: "expired",
+        cleanupStatus: "success",
+        updatedAt: new Date(),
+      })
+      .where(eq(environmentLeases.id, reusableLease.id));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const recoveredRuntime = environmentRuntimeService(db);
+    await expect(recoveredRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 0,
+      cleaned: 0,
+      pending: 0,
+    });
+    await expect(executionWorkspaceService(db).getById(executionWorkspaceId)).resolves.toMatchObject({
+      status: "idle",
+      cleanupReason: null,
+    });
+    await expect(recoveredRuntime.retryPendingSandboxCleanups()).resolves.toEqual({
+      attempted: 0,
+      cleaned: 0,
+      pending: 0,
+    });
+  });
+
   it("destroys reusable plugin-backed sandbox leases when a run fails", async () => {
     const { pluginId, runId, reusableLease } = await seedReusablePluginSandboxLease();
     const workerManager = {

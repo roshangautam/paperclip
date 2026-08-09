@@ -569,10 +569,10 @@ describe("codex_local ACP lane", () => {
       stagedFiles = await fs.readdir(assets[0]!.localDir);
       return {
         target: input.target,
-        workspaceRemoteDir: "/remote/workspace",
-        runtimeRootDir: "/remote/workspace/.paperclip-runtime/codex",
+        workspaceRemoteDir: "/remote/prepared-workspace",
+        runtimeRootDir: "/remote/prepared-workspace/.paperclip-runtime/codex",
         assetDirs: {
-          instructions: "/remote/workspace/.paperclip-runtime/codex/instructions",
+          instructions: "/remote/prepared-workspace/.paperclip-runtime/codex/instructions",
         },
         restoreWorkspace,
       };
@@ -619,12 +619,17 @@ describe("codex_local ACP lane", () => {
     expect(preparation?.assets).not.toContainEqual(expect.objectContaining({ key: "workspace" }));
     const prompt = runtimes[0]?.startInputs[0]?.text ?? "";
     expect(prompt).toContain(
-      "The above agent instructions were loaded from /remote/workspace/.paperclip-runtime/codex/instructions/AGENTS.md.",
+      "The above agent instructions were loaded from /remote/prepared-workspace/.paperclip-runtime/codex/instructions/AGENTS.md.",
     );
     expect(prompt).toContain(
-      "Resolve any relative file references from /remote/workspace/.paperclip-runtime/codex/instructions/.",
+      "Resolve any relative file references from /remote/prepared-workspace/.paperclip-runtime/codex/instructions/.",
     );
     expect(prompt).not.toContain(instructionsDir);
+    expect(runtimes[0]?.options.cwd).toBe("/remote/prepared-workspace");
+    expect(result.sessionParams).toMatchObject({
+      cwd: "/remote/workspace",
+      remoteExecution: { remoteCwd: "/remote/workspace" },
+    });
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 
@@ -641,10 +646,10 @@ describe("codex_local ACP lane", () => {
     const restoreWorkspace = vi.fn(async () => undefined);
     prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
       target: input.target,
-      workspaceRemoteDir: "/remote/workspace",
-      runtimeRootDir: "/remote/workspace/.paperclip-runtime/codex",
+      workspaceRemoteDir: "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+      runtimeRootDir: "/remote/workspace/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/codex",
       assetDirs: {
-        instructions: "/remote/workspace/.paperclip-runtime/codex/instructions",
+        instructions: "/remote/workspace/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/codex/instructions",
       },
       restoreWorkspace,
     }));
@@ -693,11 +698,18 @@ describe("codex_local ACP lane", () => {
     expect(preparation?.assets).toEqual([{ key: "instructions", localDir: instructionsDir }]);
     const prompt = runtimes[0]?.startInputs[0]?.text ?? "";
     expect(prompt).toContain(
-      "The above agent instructions were loaded from /remote/workspace/.paperclip-runtime/codex/instructions/AGENTS.md.",
+      "The above agent instructions were loaded from /remote/workspace/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/codex/instructions/AGENTS.md.",
     );
     expect(prompt).toContain(
-      "Resolve any relative file references from /remote/workspace/.paperclip-runtime/codex/instructions/.",
+      "Resolve any relative file references from /remote/workspace/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/codex/instructions/.",
     );
+    expect(runtimes[0]?.options.cwd).toBe(
+      "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+    );
+    expect(result.sessionParams).toMatchObject({
+      cwd: "/remote/workspace",
+      remoteExecution: { remoteCwd: "/remote/workspace" },
+    });
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 

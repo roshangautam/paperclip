@@ -611,6 +611,13 @@ describe("ssh env-lab fixture", () => {
 
     expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
     await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("dirty remote\n");
+    const runRoot = path.posix.dirname(prepared.workspaceRemoteDir);
+    const cleanupStatus = await runSshCommand(
+      config,
+      `if [ -e ${JSON.stringify(runRoot)} ]; then printf present; else printf absent; fi`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+    expect(cleanupStatus.stdout).toBe("absent");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("propagates remote commits to the local worktree with no git remote configured (no-remote-git contract)", async () => {

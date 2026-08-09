@@ -1011,6 +1011,20 @@ async function clearRemoteDirectory(input: {
   });
 }
 
+export async function removeDirectoryFromSsh(input: {
+  spec: SshConnectionConfig;
+  remoteDir: string;
+}): Promise<void> {
+  const remoteDir = input.remoteDir.trim();
+  if (!remoteDir || remoteDir === "/" || remoteDir === "." || remoteDir === "..") {
+    throw new Error(`Refusing to remove unsafe SSH directory: ${JSON.stringify(input.remoteDir)}`);
+  }
+  await runSshScript(input.spec, `rm -rf -- ${shellQuote(remoteDir)}`, {
+    timeoutMs: 30_000,
+    maxBuffer: 256 * 1024,
+  });
+}
+
 async function removeDeletedPathsOnSsh(input: {
   spec: SshConnectionConfig;
   remoteDir: string;

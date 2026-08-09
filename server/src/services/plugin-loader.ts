@@ -25,8 +25,9 @@
  * @see PLUGIN_SPEC.md §12 — Process Model
  */
 import { existsSync } from "node:fs";
-import { readdir, readFile, rm, stat } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -282,6 +283,11 @@ export interface PluginInstallOptions {
   installDir?: string;
 }
 
+export interface PluginUpgradeOptions extends Omit<PluginInstallOptions, "installDir"> {
+  /** Called after the replacement package is accepted, immediately before its files are promoted. */
+  beforePromote?: () => Promise<void>;
+}
+
 // ---------------------------------------------------------------------------
 // Runtime options — services needed for initializing loaded plugins
 // ---------------------------------------------------------------------------
@@ -471,7 +477,7 @@ export interface PluginLoader {
    *
    * @see PLUGIN_SPEC.md §25.3 — Upgrade Lifecycle
    */
-  upgradePlugin(pluginId: string, options: Omit<PluginInstallOptions, "installDir">): Promise<{
+  upgradePlugin(pluginId: string, options: PluginUpgradeOptions): Promise<{
     oldManifest: PaperclipPluginManifestV1;
     newManifest: PaperclipPluginManifestV1;
     discovered: DiscoveredPlugin;
@@ -1150,6 +1156,79 @@ export function pluginLoader(
     }
   }
 
+  async function stageManagedPluginDirectory(): Promise<{
+    root: string;
+    directory: string;
+  }> {
+    const parentDir = path.dirname(localPluginDir);
+    await mkdir(parentDir, { recursive: true });
+    const root = await mkdtemp(path.join(parentDir, `.${path.basename(localPluginDir)}.upgrade-`));
+    const directory = path.join(root, "next");
+    if (existsSync(localPluginDir)) {
+      await cp(localPluginDir, directory, { recursive: true });
+    } else {
+      await mkdir(directory, { recursive: true });
+    }
+    return { root, directory };
+  }
+
+  async function promoteManagedPluginDirectory(staged: {
+    root: string;
+    directory: string;
+  }): Promise<{
+    commit(): Promise<void>;
+    rollback(): Promise<void>;
+  }> {
+    const previousDir = path.join(staged.root, "previous");
+    let hadPrevious = false;
+    try {
+      await rename(localPluginDir, previousDir);
+      hadPrevious = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+
+    try {
+      await rename(staged.directory, localPluginDir);
+    } catch (error) {
+      if (hadPrevious) await rename(previousDir, localPluginDir).catch(() => undefined);
+      throw error;
+    }
+
+    return {
+      async commit() {
+        await rm(staged.root, { recursive: true, force: true });
+      },
+      async rollback() {
+        const rejectedDir = path.join(staged.root, `rejected-${randomUUID()}`);
+        await rename(localPluginDir, rejectedDir);
+        try {
+          if (hadPrevious) await rename(previousDir, localPluginDir);
+        } catch (error) {
+          await rename(rejectedDir, localPluginDir).catch(() => undefined);
+          throw error;
+        }
+        await rm(staged.root, { recursive: true, force: true });
+      },
+    };
+  }
+
+  let managedUpgradeQueue: Promise<void> = Promise.resolve();
+
+  async function withManagedUpgradeLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = managedUpgradeQueue;
+    let release!: () => void;
+    managedUpgradeQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Internal helpers
   // -------------------------------------------------------------------------
@@ -1750,7 +1829,7 @@ export function pluginLoader(
      */
     async upgradePlugin(
       pluginId: string,
-      upgradeOptions: Omit<PluginInstallOptions, "installDir">,
+      upgradeOptions: PluginUpgradeOptions,
     ): Promise<{
       oldManifest: PaperclipPluginManifestV1;
       newManifest: PaperclipPluginManifestV1;
@@ -1764,14 +1843,14 @@ export function pluginLoader(
       } | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
 
-      const oldManifest = plugin.manifestJson;
       const {
-        packageName = plugin.packageName,
+        packageName: requestedPackageName,
         // For local-path installs, fall back to the stored packagePath so
         // `upgradePlugin` can re-read the manifest from disk without needing
         // the caller to re-supply the path every time.
         localPath = plugin.packagePath ?? undefined,
         version,
+        beforePromote,
       } = upgradeOptions;
 
       if (version !== undefined && localPath !== undefined) {
@@ -1779,60 +1858,107 @@ export function pluginLoader(
       }
 
       log.info(
-        { pluginId, packageName, version, localPath },
+        { pluginId, packageName: requestedPackageName ?? plugin.packageName, version, localPath },
         "plugin-loader: upgrading plugin",
       );
 
-      // 1. Fetch/Install the new version
-      const discovered = await fetchAndValidate({
-        packageName,
-        localPath,
-        version,
-        installDir: localPluginDir,
-      });
+      const performUpgrade = async () => {
+        const activePlugin = localPath
+          ? plugin
+          : (await registry.getById(pluginId)) as typeof plugin;
+        if (!activePlugin) throw new Error(`Plugin not found: ${pluginId}`);
+        const oldManifest = activePlugin.manifestJson;
+        const packageName = requestedPackageName ?? activePlugin.packageName;
 
-      const newManifest = discovered.manifest!;
+        // npm upgrades are validated in a sibling copy so rejected packages
+        // cannot overwrite the files used by the running worker. Managed npm
+        // upgrades are serialized because each promotion swaps the full directory.
+        const staged = localPath ? null : await stageManagedPluginDirectory();
+        let promoted: Awaited<ReturnType<typeof promoteManagedPluginDirectory>> | null = null;
+        let discovered: DiscoveredPlugin;
+        try {
+          const candidate = await fetchAndValidate({
+            packageName,
+            localPath,
+            version,
+            installDir: staged?.directory ?? localPluginDir,
+          });
+          discovered = staged
+            ? {
+                ...candidate,
+                packagePath: resolveManagedInstallPackageDir(localPluginDir, candidate.packageName),
+              }
+            : candidate;
 
-      // 2. Validate it's the same plugin ID
-      if (newManifest.id !== oldManifest.id) {
-        throw new Error(
-          `Upgrade failed: new manifest ID '${newManifest.id}' does not match existing plugin ID '${oldManifest.id}'`,
-        );
-      }
+          const newManifest = discovered.manifest!;
 
-      // 3. Detect capability escalation — new capabilities not in the old manifest
-      const oldCaps = new Set(oldManifest.capabilities ?? []);
-      const newCaps = newManifest.capabilities ?? [];
-      const escalated = newCaps.filter((c) => !oldCaps.has(c));
+          // 2. Validate it's the same plugin ID
+          if (newManifest.id !== oldManifest.id) {
+            throw new Error(
+              `Upgrade failed: new manifest ID '${newManifest.id}' does not match existing plugin ID '${oldManifest.id}'`,
+            );
+          }
 
-      if (escalated.length > 0) {
-        log.warn(
-          { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
-          "plugin-loader: upgrade introduces new capabilities — requires admin approval",
-        );
-        throw new Error(
-          `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${escalated.join(", ")}. ` +
-            `The previous version declared [${[...oldCaps].join(", ")}]. ` +
-            `Please review and approve the capability escalation before upgrading.`,
-        );
-      }
+          // 3. Detect capability escalation — new capabilities not in the old manifest
+          const oldCaps = new Set(oldManifest.capabilities ?? []);
+          const newCaps = newManifest.capabilities ?? [];
+          const escalated = newCaps.filter((c) => !oldCaps.has(c));
 
-      // 4. Update the existing record
-      await registry.update(pluginId, {
-        packageName: discovered.packageName,
-        packagePath:
-          discovered.source === "local-filesystem"
-            ? discovered.packagePath
-            : null,
-        version: discovered.version,
-        manifest: newManifest,
-      });
+          if (escalated.length > 0) {
+            log.warn(
+              { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
+              "plugin-loader: upgrade introduces new capabilities — requires admin approval",
+            );
+            throw new Error(
+              `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${escalated.join(", ")}. ` +
+                `The previous version declared [${[...oldCaps].join(", ")}]. ` +
+                `Please review and approve the capability escalation before upgrading.`,
+            );
+          }
 
-      return {
-        oldManifest,
-        newManifest,
-        discovered,
+          await beforePromote?.();
+          if (staged) promoted = await promoteManagedPluginDirectory(staged);
+
+          // 4. Update the existing record
+          try {
+            await registry.update(pluginId, {
+              packageName: discovered.packageName,
+              packagePath:
+                discovered.source === "local-filesystem"
+                  ? discovered.packagePath
+                  : null,
+              version: discovered.version,
+              manifest: newManifest,
+            });
+          } catch (error) {
+            await promoted?.rollback();
+            promoted = null;
+            throw error;
+          }
+
+          await promoted?.commit().catch((error) => {
+            log.warn(
+              { pluginId, err: error instanceof Error ? error.message : String(error) },
+              "plugin-loader: failed to remove npm upgrade rollback directory",
+            );
+          });
+          promoted = null;
+
+          return {
+            oldManifest,
+            newManifest,
+            discovered,
+          };
+        } finally {
+          if (staged && !promoted) {
+            await rm(staged.root, { recursive: true, force: true });
+          }
+        }
       };
+
+      return localPath
+        ? performUpgrade()
+        : withManagedUpgradeLock(performUpgrade);
     },
 
     // -----------------------------------------------------------------------

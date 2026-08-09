@@ -8,6 +8,7 @@ const {
   ensureCommandResolvable,
   resolveCommandForLogs,
   prepareWorkspaceForSshExecution,
+  removeDirectoryFromSsh,
   restoreWorkspaceFromSshExecution,
   syncDirectoryToSsh,
   startAdapterExecutionTargetPaperclipBridge,
@@ -24,6 +25,7 @@ const {
   ensureCommandResolvable: vi.fn(async () => undefined),
   resolveCommandForLogs: vi.fn(async () => "/usr/bin/codex"),
   prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
+  removeDirectoryFromSsh: vi.fn(async () => undefined),
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
   syncDirectoryToSsh: vi.fn(async () => undefined),
   startAdapterExecutionTargetPaperclipBridge: vi.fn(async () => ({
@@ -55,6 +57,7 @@ vi.mock("@paperclipai/adapter-utils/ssh", async () => {
   return {
     ...actual,
     prepareWorkspaceForSshExecution,
+    removeDirectoryFromSsh,
     restoreWorkspaceFromSshExecution,
     syncDirectoryToSsh,
   };
@@ -226,6 +229,11 @@ describe("codex remote execution", () => {
       localDir: workspaceDir,
       remoteDir: managedRemoteWorkspace,
     }));
+    expect(removeDirectoryFromSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/remote/workspace/.paperclip-runtime/runs/run-1",
+    }));
+    expect(restoreWorkspaceFromSshExecution.mock.invocationCallOrder[0])
+      .toBeLessThan(removeDirectoryFromSsh.mock.invocationCallOrder[0]!);
   });
 
   it("keeps managed instruction references on local paths for local execution", async () => {

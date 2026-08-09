@@ -162,6 +162,11 @@ export interface AdapterExecutionContext {
   runtimeCommandSpec?: AdapterRuntimeCommandSpec | null;
   executionTarget?: AdapterExecutionTarget | null;
   /**
+   * Stable target used to identify resumable remote sessions when
+   * `executionTarget` points at an invocation-specific managed workspace.
+   */
+  executionSessionTarget?: AdapterExecutionTarget | null;
+  /**
    * Legacy remote transport view. Prefer `executionTarget`, which is the
    * provider-neutral contract produced by core runtime code.
    */

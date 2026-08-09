@@ -154,12 +154,15 @@ describe("plugin lifecycle App reconciliation", () => {
       ...basePlugin,
       manifestJson: oldManifest,
     } as PluginRecord;
-    const upgradePlugin = vi.fn().mockResolvedValue({
-      oldManifest,
-      newManifest,
-      discovered: {
-        version: "1.1.0",
-      },
+    const upgradePlugin = vi.fn().mockImplementation(async (_pluginId, options) => {
+      await options.beforePromote?.();
+      return {
+        oldManifest,
+        newManifest,
+        discovered: {
+          version: "1.1.0",
+        },
+      };
     });
     const manager = lifecycle({
       upgradePlugin: upgradePlugin as PluginLoader["upgradePlugin"],
@@ -170,6 +173,7 @@ describe("plugin lifecycle App reconciliation", () => {
     expect(upgradePlugin).toHaveBeenCalledWith("plugin-1", {
       version: undefined,
       localPath: "/plugins/example",
+      beforePromote: expect.any(Function),
     });
     expect(reconcilePluginApplications).toHaveBeenCalledTimes(1);
   });

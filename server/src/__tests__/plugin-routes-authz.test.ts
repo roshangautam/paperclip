@@ -51,6 +51,7 @@ async function createApp(
     jobDeps?: unknown;
     toolDeps?: unknown;
     bridgeDeps?: unknown;
+    jsonStrict?: boolean;
     captureJsonContext?: (context: unknown, body: unknown) => void;
   } = {},
 ) {
@@ -65,7 +66,7 @@ async function createApp(
   };
 
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ strict: routeOverrides.jsonStrict ?? true }));
   if (routeOverrides.captureJsonContext) {
     app.use((_req, res, next) => {
       const originalJson = res.json.bind(res);
@@ -515,6 +516,61 @@ describe.sequential("plugin install and upgrade authz", () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/localPath must not be blank/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects unknown upgrade request fields before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ localpath: "/plugins/example" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/unknown upgrade request field: localpath/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects array upgrade request bodies before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send([{ localPath: "/plugins/example" }]);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/upgrade request body must be an object/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects scalar upgrade request bodies before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    }, {}, { jsonStrict: false });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .set("Content-Type", "application/json")
+      .send(JSON.stringify("latest"));
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/upgrade request body must be an object/i);
     expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
   }, 20_000);
 });

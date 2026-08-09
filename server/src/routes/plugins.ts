@@ -2188,9 +2188,24 @@ export function pluginRoutes(
   router.post("/plugins/:pluginId/upgrade", async (req, res) => {
     assertInstanceAdmin(req);
     const { pluginId } = req.params;
-    const body = req.body as { version?: string; localPath?: string } | undefined;
-    const version = body?.version;
-    const localPath = body?.localPath;
+    const rawBody: unknown = req.body;
+    if (
+      rawBody !== undefined &&
+      (rawBody === null || typeof rawBody !== "object" || Array.isArray(rawBody))
+    ) {
+      res.status(400).json({ error: "Upgrade request body must be an object" });
+      return;
+    }
+
+    const body = (rawBody ?? {}) as Record<string, unknown>;
+    const unknownKeys = Object.keys(body).filter((key) => key !== "version" && key !== "localPath");
+    if (unknownKeys.length > 0) {
+      res.status(400).json({ error: `Unknown upgrade request field: ${unknownKeys.sort().join(", ")}` });
+      return;
+    }
+
+    const version = body.version;
+    const localPath = body.localPath;
 
     if (version !== undefined && typeof version !== "string") {
       res.status(400).json({ error: "version must be a string" });

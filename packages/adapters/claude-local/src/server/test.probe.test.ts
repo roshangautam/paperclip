@@ -106,7 +106,7 @@ describe("claude sandbox hello probe diagnostics", () => {
       exitCode: 1,
       stdout: [
         initLine,
-        '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Claude usage limit reached. Please try again later.","session_id":"abc"}',
+        '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"API Error: 429 rate limit exceeded. Please try again later.","session_id":"abc"}',
       ].join("\n"),
       stderr: "",
     };

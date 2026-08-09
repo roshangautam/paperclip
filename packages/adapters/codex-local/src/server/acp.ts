@@ -16,6 +16,7 @@ import {
 import { inferOpenAiCompatibleBiller } from "@paperclipai/adapter-utils";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
+  overrideAdapterExecutionTargetRemoteCwd,
   prepareAdapterExecutionTargetRuntime,
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetCwd,
@@ -216,11 +217,7 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
       legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
     });
     const instructionsBundle = resolveCodexInstructionsBundle(config);
-    if (
-      target?.kind !== "remote" ||
-      !instructionsBundle.rootPath ||
-      !instructionsBundle.entryRelativePath
-    ) {
+    if (target?.kind !== "remote") {
       const result = await currentExecutor({ ...ctx, config });
       return withCodexAuthRefreshFailureClassification(result);
     }
@@ -238,25 +235,33 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
       target: runtimeTarget,
       adapterKey: "codex",
       workspaceLocalDir,
-      assets: [{ key: "instructions", localDir: instructionsBundle.rootPath }],
+      assets:
+        instructionsBundle.rootPath && instructionsBundle.entryRelativePath
+          ? [{ key: "instructions", localDir: instructionsBundle.rootPath }]
+          : undefined,
       onProgress: (line) => ctx.onLog("stdout", line),
       onRuntimeProgress: ctx.onRuntimeProgress,
     });
-    const remoteInstructionsDir =
-      preparedRuntime.assetDirs.instructions ??
-      path.posix.join(runtimeTarget.remoteCwd, ".paperclip-runtime", "codex", "instructions");
-    const instructionsReferencePath = path.posix.join(
-      remoteInstructionsDir,
-      instructionsBundle.entryRelativePath,
-    );
+    const executionRemoteCwd = preparedRuntime.workspaceRemoteDir ?? runtimeTarget.remoteCwd;
+    const executionTarget =
+      overrideAdapterExecutionTargetRemoteCwd(runtimeTarget, executionRemoteCwd) ?? runtimeTarget;
+    const instructionsReferencePath =
+      instructionsBundle.rootPath && instructionsBundle.entryRelativePath
+        ? path.posix.join(
+            preparedRuntime.assetDirs.instructions ??
+              path.posix.join(executionRemoteCwd, ".paperclip-runtime", "codex", "instructions"),
+            instructionsBundle.entryRelativePath,
+          )
+        : null;
 
     try {
       const result = await currentExecutor({
         ...ctx,
-        executionTarget: runtimeTarget,
+        executionTarget,
+        executionSessionTarget: target,
         config: {
           ...config,
-          instructionsReferencePath,
+          ...(instructionsReferencePath ? { instructionsReferencePath } : {}),
         },
       });
       return withCodexAuthRefreshFailureClassification(result);

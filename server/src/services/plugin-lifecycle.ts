@@ -730,11 +730,35 @@ export function pluginLifecycleManager(
         "plugin lifecycle: upgrade requested",
       );
 
-      // 1. Download and validate new package via loader
-      const { oldManifest, newManifest, discovered } =
-        await pluginLoaderInstance.upgradePlugin(pluginId, { version, localPath });
-
-      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
+      // 1. Download and validate before stopping the active worker. The loader
+      // invokes this hook only after accepting the replacement manifest.
+      let runtimeDeactivated = false;
+      let upgradeResult: Awaited<ReturnType<PluginLoader["upgradePlugin"]>>;
+      try {
+        upgradeResult = await pluginLoaderInstance.upgradePlugin(pluginId, {
+          version,
+          localPath,
+          beforePromote: async () => {
+            await deactivatePluginRuntime(pluginId, plugin.pluginKey);
+            runtimeDeactivated = true;
+          },
+        });
+      } catch (error) {
+        if (runtimeDeactivated) {
+          await activateReadyPlugin(pluginId).catch((reactivationError) => {
+            log.error(
+              {
+                pluginId,
+                pluginKey: plugin.pluginKey,
+                err: reactivationError instanceof Error ? reactivationError.message : String(reactivationError),
+              },
+              "plugin lifecycle: failed to reactivate previous plugin after upgrade rollback",
+            );
+          });
+        }
+        throw error;
+      }
+      const { oldManifest, newManifest, discovered } = upgradeResult;
 
       log.info(
         {
