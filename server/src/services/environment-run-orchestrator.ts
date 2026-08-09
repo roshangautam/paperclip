@@ -158,12 +158,13 @@ function transientSensitiveEnvEntries(
     .sort(([, a], [, b]) => b.length - a.length);
 }
 
+function transientEnvValueVariants(value: string): string[] {
+  return Array.from(new Set([value, JSON.stringify(value).slice(1, -1)]));
+}
+
 function transientEnvValues(env: Record<string, string> | undefined): string[] {
   return Array.from(new Set(
-    transientSensitiveEnvEntries(env).flatMap(([, value]) => [
-      value,
-      JSON.stringify(value).slice(1, -1),
-    ]),
+    transientSensitiveEnvEntries(env).flatMap(([, value]) => transientEnvValueVariants(value)),
   )).sort((a, b) => b.length - a.length);
 }
 
@@ -172,7 +173,8 @@ function transientEnvKeyInText(
   env: Record<string, string> | undefined,
 ): string | null {
   return transientSensitiveEnvEntries(env)
-    .find(([, value]) => text.includes(value))?.[0] ?? null;
+    .find(([, value]) => transientEnvValueVariants(value)
+      .some((candidate) => text.includes(candidate)))?.[0] ?? null;
 }
 
 function redactTransientEnvText(text: string, env: Record<string, string> | undefined): string {

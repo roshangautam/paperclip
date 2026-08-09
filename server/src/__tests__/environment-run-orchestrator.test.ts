@@ -404,6 +404,27 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(mockResolveEnvironmentExecutionTarget).not.toHaveBeenCalled();
   });
 
+  it("rejects a realization cwd containing a JSON-escaped multiline transient value", async () => {
+    const privateKey = "-----BEGIN PRIVATE KEY-----\ntransient-key-material\n-----END PRIVATE KEY-----";
+    const escapedPrivateKey = JSON.stringify(privateKey).slice(1, -1);
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({
+        cwd: `/workspace/${escapedPrivateKey}/project`,
+      }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await expect(orchestrator.realizeForRun(makeRealizeInput({
+      env: { GITHUB_APP_PRIVATE_KEY: privateKey },
+    }))).rejects.toMatchObject({
+      code: "workspace_realization_failed",
+      message: expect.stringContaining("GITHUB_APP_PRIVATE_KEY"),
+    });
+
+    expect(mockUpdateLeaseMetadata).not.toHaveBeenCalled();
+    expect(mockResolveEnvironmentExecutionTarget).not.toHaveBeenCalled();
+  });
+
   it("does not invoke or persist non-data realization metadata properties", async () => {
     const token = "github_pat_metadata_descriptor_token";
     const metadata = {} as Record<PropertyKey, unknown>;
