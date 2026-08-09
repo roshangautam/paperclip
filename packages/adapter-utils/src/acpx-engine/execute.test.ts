@@ -185,6 +185,41 @@ async function runExecutor(
   return { logs, meta, runtimeOptions, configOptions, result };
 }
 
+function mockSuccessfulRemoteBridges() {
+  const paperclipStop = vi.fn(async () => undefined);
+  const processStop = vi.fn(async () => undefined);
+  remoteBridgeMocks.startPaperclipBridge.mockResolvedValueOnce({
+    env: {},
+    stop: paperclipStop,
+  });
+  remoteBridgeMocks.startProcessSessionBridge.mockResolvedValueOnce({
+    agentCommand: "/tmp/fake-acp-proxy.mjs",
+    stop: processStop,
+  });
+  return { paperclipStop, processStop };
+}
+
+function remoteSandboxTarget() {
+  return {
+    kind: "remote",
+    transport: "sandbox",
+    providerKey: "test-sandbox",
+    remoteCwd: "/remote/workspace",
+    runner: { execute: async () => { throw new Error("not reached"); } },
+  };
+}
+
+async function rejectedWith(
+  execution: Promise<unknown>,
+): Promise<AggregateError & Record<string, unknown>> {
+  try {
+    await execution;
+  } catch (error) {
+    return error as AggregateError & Record<string, unknown>;
+  }
+  throw new Error("Expected execution to reject");
+}
+
 describe("shared ACPX engine runtime behavior", () => {
   it("fails closed when session initialization and remote bridge shutdown both fail", async () => {
     const root = await makeTempRoot();
@@ -241,6 +276,183 @@ describe("shared ACPX engine runtime behavior", () => {
       cause: ensureError,
     });
     await expect(execution).rejects.toThrow("ACP remote bridge shutdown failed");
+    expect(processStop).toHaveBeenCalledOnce();
+    expect(paperclipStop).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when configure-session runtime close fails", async () => {
+    const root = await makeTempRoot();
+    const configError = new Error("session config failed");
+    const closeError = new Error("runtime close failed after config error");
+    const { paperclipStop, processStop } = mockSuccessfulRemoteBridges();
+    const close = vi.fn(async () => {
+      throw closeError;
+    });
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => {
+          throw new Error("not reached");
+        },
+        setConfigOption: async () => {
+          throw configError;
+        },
+        close,
+      }) as never,
+    });
+
+    const error = await rejectedWith(execute({
+      runId: "run-config-close-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        model: "custom-model",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: remoteSandboxTarget(),
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never));
+
+    expect(error).toMatchObject({
+      code: "acp_remote_bridge_shutdown_failed",
+      cause: configError,
+      operationError: configError,
+      remoteExecutionMayStillBeActive: true,
+    });
+    expect(error.errors).toEqual([
+      expect.objectContaining({
+        cause: closeError,
+        remoteExecutionMayStillBeActive: true,
+      }),
+    ]);
+    expect(close).toHaveBeenCalledOnce();
+    expect(processStop).toHaveBeenCalledOnce();
+    expect(paperclipStop).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when terminal runtime close fails", async () => {
+    const root = await makeTempRoot();
+    const closeError = new Error("runtime close failed after completed turn");
+    const { paperclipStop, processStop } = mockSuccessfulRemoteBridges();
+    const close = vi.fn(async () => {
+      throw closeError;
+    });
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            yield { type: "done", stopReason: "end_turn" };
+          })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close,
+      }) as never,
+    });
+
+    const error = await rejectedWith(execute({
+      runId: "run-terminal-close-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: remoteSandboxTarget(),
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never));
+
+    expect(error).toMatchObject({
+      code: "acp_remote_bridge_shutdown_failed",
+      remoteExecutionMayStillBeActive: true,
+    });
+    expect(error).not.toHaveProperty("operationError");
+    expect(error.errors).toEqual([
+      expect.objectContaining({
+        cause: closeError,
+        remoteExecutionMayStillBeActive: true,
+      }),
+    ]);
+    expect(close).toHaveBeenCalledOnce();
+    expect(processStop).toHaveBeenCalledOnce();
+    expect(paperclipStop).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when exception-path runtime close fails", async () => {
+    const root = await makeTempRoot();
+    const turnError = new Error("turn event stream failed");
+    const closeError = new Error("runtime close failed after turn error");
+    const { paperclipStop, processStop } = mockSuccessfulRemoteBridges();
+    const cancel = vi.fn(async () => undefined);
+    const close = vi.fn(async () => {
+      throw closeError;
+    });
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            throw turnError;
+          })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel,
+        }),
+        close,
+      }) as never,
+    });
+
+    const error = await rejectedWith(execute({
+      runId: "run-exception-close-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: remoteSandboxTarget(),
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never));
+
+    expect(error).toMatchObject({
+      code: "acp_remote_bridge_shutdown_failed",
+      cause: turnError,
+      operationError: turnError,
+      remoteExecutionMayStillBeActive: true,
+    });
+    expect(error.errors).toEqual([
+      expect.objectContaining({
+        cause: closeError,
+        remoteExecutionMayStillBeActive: true,
+      }),
+    ]);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
     expect(processStop).toHaveBeenCalledOnce();
     expect(paperclipStop).toHaveBeenCalledOnce();
   });
