@@ -376,36 +376,37 @@ describe("resolveExecutionRunAdapterConfig", () => {
     expect(resolveEnvBindings).not.toHaveBeenCalled();
   });
 
-  it("rejects inline sensitive env values for low-trust runs", async () => {
-    await expect(resolveExecutionRunAdapterConfig({
-      companyId: "company-1",
-      agentId: "agent-1",
-      issueId: "issue-1",
-      executionRunConfig: {
-        env: {
-          OPENAI_API_KEY: "inline-secret",
+  it.each(["OPENAI_API_KEY", "GH_TOKEN"])(
+    "rejects inline sensitive %s values for low-trust runs",
+    async (envKey) => {
+      await expect(resolveExecutionRunAdapterConfig({
+        companyId: "company-1",
+        agentId: "agent-1",
+        issueId: "issue-1",
+        executionRunConfig: {
+          env: { [envKey]: "inline-secret" },
         },
-      },
-      projectEnv: null,
-      trustPreset: {
-        kind: "low_trust_review",
-        preset: LOW_TRUST_REVIEW_PRESET,
-        boundary: {
-          mode: LOW_TRUST_REVIEW_PRESET,
-          companyId: "company-1",
-          issueIds: ["issue-1"],
+        projectEnv: null,
+        trustPreset: {
+          kind: "low_trust_review",
+          preset: LOW_TRUST_REVIEW_PRESET,
+          boundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: "company-1",
+            issueIds: ["issue-1"],
+          },
+          sourcePresets: {},
         },
-        sourcePresets: {},
-      },
-      secretsSvc: {
-        resolveAdapterConfigForRuntime: vi.fn(),
-        resolveEnvBindings: vi.fn(),
-      } as any,
-    })).rejects.toMatchObject({
-      status: 422,
-      details: { code: "low_trust_inline_sensitive_env_denied" },
-    });
-  });
+        secretsSvc: {
+          resolveAdapterConfigForRuntime: vi.fn(),
+          resolveEnvBindings: vi.fn(),
+        } as any,
+      })).rejects.toMatchObject({
+        status: 422,
+        details: { code: "low_trust_inline_sensitive_env_denied" },
+      });
+    },
+  );
 
   it("fails push-capability preflight when no GitHub write credential is bound at agent or project scope", async () => {
     await expect(resolveExecutionRunAdapterConfig({
@@ -771,6 +772,59 @@ describe("resolveExecutionRunAdapterConfig", () => {
     });
     expect(resolveAdapterConfigForRuntime).toHaveBeenCalledOnce();
     expect(resolveEnvBindings).toHaveBeenCalledOnce();
+  });
+
+  it("does not let an environment token mask an unresolved agent-scoped token", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
+      config: { env: {} },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+    const resolveEnvBindings = vi.fn().mockResolvedValue({
+      env: { GITHUB_TOKEN: "environment-token-must-not-satisfy-agent-scope" },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+    const collectMissingRuntimeBindings = vi.fn().mockResolvedValue([]);
+
+    const error = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      environmentId: "environment-1",
+      environmentEnv: { GITHUB_TOKEN: "environment-token-must-not-satisfy-agent-scope" },
+      executionRunConfig: {
+        env: {
+          GITHUB_TOKEN: {
+            type: "user_secret_ref",
+            key: "github_token",
+            required: false,
+          },
+        },
+      },
+      projectEnv: null,
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+        collectMissingRuntimeBindings,
+      } as any,
+    }).then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+
+    expect(error).toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          reason: "push_write_credential_missing",
+          requiredEnvKeys: GITHUB_PUSH_CREDENTIAL_REQUIRED_KEYS,
+          missingBindings: [],
+        },
+      },
+    });
+    expect(JSON.stringify(error)).not.toContain("environment-token-must-not-satisfy-agent-scope");
   });
 });
 

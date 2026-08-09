@@ -640,7 +640,7 @@ export function requiresPushCapabilityPreflight(input: {
 }
 
 const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
-  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
+  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|(?:^|[-_])token(?:$|[-_])|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 
 function isPaperclipRuntimeEnvKey(key: string) {
   return key.startsWith("PAPERCLIP_");
@@ -910,6 +910,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       : undefined,
     { adapterType: input.adapterType ?? null },
   );
+  const resolvedAgentEnv = parseObject(resolvedConfig.env);
   if (Object.keys(environmentEnvResolution.env).length > 0) {
     resolvedConfig.env = {
       ...environmentEnvResolution.env,
@@ -937,6 +938,17 @@ export async function resolveExecutionRunAdapterConfig(input: {
           : undefined,
       )
     : { env: {}, secretKeys: new Set<string>(), manifest: [] };
+  if (requiredScopedEnvBinding) {
+    const resolvedRequiredScopedEnv = {
+      ...(requiredScopedEnvBinding.consumerScopes.includes("agent") ? resolvedAgentEnv : {}),
+      ...(requiredScopedEnvBinding.consumerScopes.includes("project") ? projectEnvResolution.env : {}),
+    };
+    if (!requiredScopedEnvBindingsSatisfied(
+      (key) => readNonEmptyString(resolvedRequiredScopedEnv[key]) !== null,
+    )) {
+      throw requiredScopedConfigurationFailure(requiredScopedEnvBinding);
+    }
+  }
   if (Object.keys(projectEnvResolution.env).length > 0) {
     resolvedConfig.env = {
       ...parseObject(resolvedConfig.env),
