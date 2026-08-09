@@ -652,6 +652,11 @@ export interface PluginEnvironmentDestroyLeaseParams extends PluginEnvironmentRe
 
 export interface PluginEnvironmentRealizeWorkspaceParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
+  /**
+   * Run-scoped environment values needed only while realizing the workspace.
+   * Providers must not persist these values in lease or realization metadata.
+   */
+  env?: Record<string, string>;
   workspace: {
     localPath?: string;
     remotePath?: string;
@@ -667,6 +672,8 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
 
 export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
+  /** Host-generated, non-secret workspace realization context for this lease. */
+  workspaceRealization?: Record<string, unknown>;
   command: string;
   args?: string[];
   cwd?: string;

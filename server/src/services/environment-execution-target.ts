@@ -108,6 +108,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
                 command: commandInput.command,
                 args: commandInput.args,
                 cwd: commandInput.cwd ?? remoteCwd,
+                workspaceRealization,
                 env: commandInput.env,
                 stdin: commandInput.stdin,
                 timeoutMs: commandInput.timeoutMs,

@@ -1772,7 +1772,21 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             },
           };
         }
+        if (method === "environmentRealizeWorkspace") {
+          expect(params.env).toEqual({ GH_TOKEN: "transient-sandbox-token" });
+          return {
+            cwd: "/workspace",
+            metadata: {
+              workspaceRealization: {
+                sync: { strategy: "provider_defined" },
+              },
+            },
+          };
+        }
         if (method === "environmentExecute") {
+          expect(params.workspaceRealization).toEqual({
+            rebuild: { repoUrl: "https://github.com/example/sandbox-project.git" },
+          });
           expect(params.config).toEqual(expect.objectContaining({
             image: "fake:test",
             timeoutMs: 1234,
@@ -1821,9 +1835,22 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       heartbeatRunId: runId,
       persistedExecutionWorkspace: null,
     });
+    const realized = await runtimeWithPlugin.realizeWorkspace({
+      environment,
+      lease: acquired.lease,
+      env: { GH_TOKEN: "transient-sandbox-token" },
+      workspace: {
+        localPath: "/tmp/project",
+        remotePath: "/workspace",
+        mode: "ephemeral",
+      },
+    });
     const executed = await runtimeWithPlugin.execute({
       environment,
       lease: acquired.lease,
+      workspaceRealization: {
+        rebuild: { repoUrl: "https://github.com/example/sandbox-project.git" },
+      },
       command: "printf",
       args: ["ok"],
       cwd: "/workspace",
@@ -1833,6 +1860,14 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
     expect(acquired.lease.provider).toBe("fake-plugin");
     expect(acquired.lease.metadata?.provider).toBe("fake-plugin");
+    expect(realized).toMatchObject({
+      cwd: "/workspace",
+      metadata: {
+        workspaceRealization: {
+          sync: { strategy: "provider_defined" },
+        },
+      },
+    });
 
     const {
       sandboxProviderConfig: _storedProviderConfig,
@@ -7018,6 +7053,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const realized = await runtimeWithPlugin.realizeWorkspace({
       environment,
       lease: acquired.lease,
+      env: { GH_TOKEN: "transient-plugin-token" },
       workspace: {
         localPath: "/tmp/project",
         mode: "ephemeral",
@@ -7026,6 +7062,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const executed = await runtimeWithPlugin.execute({
       environment,
       lease: acquired.lease,
+      workspaceRealization: {
+        rebuild: { repoUrl: "https://github.com/example/plugin-project.git" },
+      },
       command: "echo",
       args: ["ok"],
       cwd: realized.cwd,
@@ -7080,6 +7119,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         localPath: "/tmp/project",
         mode: "ephemeral",
       },
+      env: { GH_TOKEN: "transient-plugin-token" },
     }), undefined);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.objectContaining({
       driverKey: "fake-plugin",
@@ -7088,6 +7128,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       command: "echo",
       args: ["ok"],
       cwd: "/workspace/project",
+      workspaceRealization: {
+        rebuild: { repoUrl: "https://github.com/example/plugin-project.git" },
+      },
       env: { FOO: "bar" },
     }), 91000);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", {

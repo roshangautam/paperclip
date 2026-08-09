@@ -41,11 +41,44 @@ import {
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
+  selectWorkspaceRealizationEnv,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
 
 const execFile = promisify(execFileCallback);
+
+describe("selectWorkspaceRealizationEnv", () => {
+  it("selects only non-empty host-side GitHub realization credentials", () => {
+    expect(selectWorkspaceRealizationEnv({
+      GH_TOKEN: "gh-token",
+      GITHUB_TOKEN: "github-token",
+      GITHUB_APP_ID: "12345",
+      GITHUB_INSTALLATION_ID: "67890",
+      GITHUB_APP_INSTALLATION_ID: "67891",
+      GITHUB_APP_PRIVATE_KEY: "private-key",
+      GITHUB_APP_PRIVATE_KEY_FILE: "/host/github-app.pem",
+      OPENAI_API_KEY: "must-not-cross-boundary",
+      EMPTY: "",
+    })).toEqual({
+      GH_TOKEN: "gh-token",
+      GITHUB_TOKEN: "github-token",
+      GITHUB_APP_ID: "12345",
+      GITHUB_INSTALLATION_ID: "67890",
+      GITHUB_APP_INSTALLATION_ID: "67891",
+      GITHUB_APP_PRIVATE_KEY: "private-key",
+      GITHUB_APP_PRIVATE_KEY_FILE: "/host/github-app.pem",
+    });
+  });
+
+  it("omits absent, blank, and non-string credentials", () => {
+    expect(selectWorkspaceRealizationEnv({
+      GH_TOKEN: "   ",
+      GITHUB_TOKEN: 123,
+    })).toBeUndefined();
+    expect(selectWorkspaceRealizationEnv(undefined)).toBeUndefined();
+  });
+});
 
 function buildResolvedWorkspace(overrides: Partial<ResolvedWorkspaceForRun> = {}): ResolvedWorkspaceForRun {
   return {

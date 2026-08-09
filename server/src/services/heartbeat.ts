@@ -356,6 +356,32 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participan
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
 const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
+const PUSH_CAPABILITY_ALTERNATIVE_ENV_KEY_SETS = [
+  ["GITHUB_APP_ID", "GITHUB_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
+  ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
+  ["GITHUB_APP_ID", "GITHUB_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY_FILE"],
+  ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY_FILE"],
+] as const;
+const WORKSPACE_REALIZATION_ENV_KEYS = [
+  ...PUSH_CAPABILITY_ENV_KEYS,
+  "GITHUB_APP_ID",
+  "GITHUB_INSTALLATION_ID",
+  "GITHUB_APP_INSTALLATION_ID",
+  "GITHUB_APP_PRIVATE_KEY",
+  "GITHUB_APP_PRIVATE_KEY_FILE",
+] as const;
+
+export function selectWorkspaceRealizationEnv(
+  env: Record<string, unknown> | null | undefined,
+): Record<string, string> | undefined {
+  const selected = Object.fromEntries(
+    WORKSPACE_REALIZATION_ENV_KEYS.flatMap((key) => {
+      const value = env?.[key];
+      return typeof value === "string" && value.trim().length > 0 ? [[key, value]] : [];
+    }),
+  );
+  return Object.keys(selected).length > 0 ? selected : undefined;
+}
 // Keep this in sync with local adapters that require a git workspace before launch.
 const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "claude_local",
@@ -671,8 +697,9 @@ export async function resolveExecutionRunAdapterConfig(input: {
   secretsSvc: RuntimeConfigSecretResolver;
   trustPreset?: TrustPresetResolution;
   requiredScopedEnvBinding?: {
-    keys: string[];
-    consumerScopes: Array<"agent" | "project">;
+    keys: readonly string[];
+    alternativeKeySets?: readonly (readonly string[])[];
+    consumerScopes: readonly ("agent" | "project")[];
     reason: string;
     remediation: string;
   };
@@ -692,14 +719,21 @@ export async function resolveExecutionRunAdapterConfig(input: {
     assertLowTrustEnvConfigAllowed(routineEnv, "routine.env");
   }
   const requiredScopedEnvBinding = input.requiredScopedEnvBinding ?? null;
+  const requiredScopedEnvKeys = requiredScopedEnvBinding
+    ? [...new Set([
+        ...requiredScopedEnvBinding.keys,
+        ...(requiredScopedEnvBinding.alternativeKeySets ?? []).flat(),
+      ])]
+    : [];
+  const isRequiredScopedEnvKeyConfigured = (key: string) => requiredScopedEnvBinding !== null
+    && ((requiredScopedEnvBinding.consumerScopes.includes("agent")
+      && isConfiguredEnvBindingValue(agentEnv[key]))
+      || (requiredScopedEnvBinding.consumerScopes.includes("project")
+        && isConfiguredEnvBindingValue(projectEnv?.[key])));
   const requiredScopedBindingsConfigured = requiredScopedEnvBinding
-    ? requiredScopedEnvBinding.keys.some((key) => (
-      requiredScopedEnvBinding.consumerScopes.includes("agent")
-      && isConfiguredEnvBindingValue(agentEnv[key])
-    ) || (
-      requiredScopedEnvBinding.consumerScopes.includes("project")
-      && isConfiguredEnvBindingValue(projectEnv?.[key])
-    ))
+    ? requiredScopedEnvBinding.keys.some(isRequiredScopedEnvKeyConfigured)
+      || (requiredScopedEnvBinding.alternativeKeySets ?? []).some((keySet) =>
+        keySet.length > 0 && keySet.every(isRequiredScopedEnvKeyConfigured))
     : false;
   if (requiredScopedEnvBinding && !requiredScopedBindingsConfigured) {
     throw new ConfigurationIncompleteFailure(`configuration incomplete: ${requiredScopedEnvBinding.remediation}`, {
@@ -710,7 +744,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
         issueId: input.issueId ?? null,
         projectId: input.projectId ?? null,
         routineId: input.routineId ?? null,
-        requiredEnvKeys: requiredScopedEnvBinding.keys,
+        requiredEnvKeys: requiredScopedEnvKeys,
         requiredScopes: requiredScopedEnvBinding.consumerScopes,
         missingBindings: [],
       },
@@ -789,7 +823,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       );
     }
     if (requiredScopedEnvBinding) {
-      const requiredEnvKeys = new Set(requiredScopedEnvBinding.keys);
+      const requiredEnvKeys = new Set(requiredScopedEnvKeys);
       const requiredScopes = new Set(requiredScopedEnvBinding.consumerScopes);
       const requiredMissingBindings = missingBindings.filter((binding) =>
         requiredScopes.has(binding.consumerType as "agent" | "project")
@@ -807,7 +841,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
               issueId: input.issueId ?? null,
               projectId: input.projectId ?? null,
               routineId: input.routineId ?? null,
-              requiredEnvKeys: requiredScopedEnvBinding.keys,
+              requiredEnvKeys: requiredScopedEnvKeys,
               requiredScopes: requiredScopedEnvBinding.consumerScopes,
               missingBindings: requiredMissingBindings,
             },
@@ -12501,10 +12535,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       requiredScopedEnvBinding: pushCapabilityPreflightRequired
         ? {
             keys: [...PUSH_CAPABILITY_ENV_KEYS],
+            alternativeKeySets: PUSH_CAPABILITY_ALTERNATIVE_ENV_KEY_SETS,
             consumerScopes: ["agent", "project"],
             reason: "push_write_credential_missing",
             remediation:
-              "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
+              "GitHub PR workflow requires GH_TOKEN, GITHUB_TOKEN, or a complete GitHub App identity bound at project or agent scope.",
           }
         : undefined,
     });
@@ -13020,6 +13055,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       executionWorkspace,
       effectiveExecutionWorkspaceMode,
       persistedExecutionWorkspace,
+      env: selectWorkspaceRealizationEnv(parseObject(resolvedConfig.env)),
     });
     activeEnvironmentLease = {
       ...activeEnvironmentLease,

@@ -242,7 +242,10 @@ describe("resolveEnvironmentExecutionTarget", () => {
       leaseId: "lease-coder-1",
       leaseMetadata: {
         providerMetadata: { remoteCwd: "/home/coder/workspace", shellCommand: "bash" },
-        workspaceRealization: { sync: { strategy: "provider_defined" } },
+        workspaceRealization: {
+          sync: { strategy: "provider_defined" },
+          rebuild: { repoUrl: "https://github.com/example/project.git" },
+        },
       },
       lease: {} as never,
       environmentRuntime: { execute } as never,
@@ -271,6 +274,10 @@ describe("resolveEnvironmentExecutionTarget", () => {
       command: "bash",
       args: ["-lc", "pwd"],
       cwd: "/home/coder/workspace",
+      workspaceRealization: {
+        sync: { strategy: "provider_defined" },
+        rebuild: { repoUrl: "https://github.com/example/project.git" },
+      },
     }));
     expect(result).toMatchObject({ exitCode: 0, stdout: "ok" });
   });

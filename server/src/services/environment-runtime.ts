@@ -204,6 +204,7 @@ export interface EnvironmentDriverLeaseInput {
 }
 
 export interface EnvironmentDriverRealizeWorkspaceInput extends EnvironmentDriverLeaseInput {
+  env?: Record<string, string>;
   workspace: {
     localPath?: string;
     remotePath?: string;
@@ -213,6 +214,7 @@ export interface EnvironmentDriverRealizeWorkspaceInput extends EnvironmentDrive
 }
 
 export interface EnvironmentDriverExecuteInput extends EnvironmentDriverLeaseInput {
+  workspaceRealization?: Record<string, unknown>;
   command: string;
   args?: string[];
   cwd?: string;
@@ -3424,6 +3426,7 @@ function createSandboxEnvironmentDriver(
               metadata: input.lease.metadata ?? undefined,
               expiresAt: input.lease.expiresAt?.toISOString() ?? null,
             },
+            env: input.env,
             workspace: input.workspace,
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)));
         }
@@ -3472,6 +3475,7 @@ function createSandboxEnvironmentDriver(
             command: input.command,
             args: input.args,
             cwd: input.cwd,
+            workspaceRealization: input.workspaceRealization,
             env: input.env,
             stdin: input.stdin,
             timeoutMs: input.timeoutMs,
@@ -4142,6 +4146,7 @@ function createPluginEnvironmentDriver(
             metadata: input.lease.metadata ?? undefined,
             expiresAt: input.lease.expiresAt?.toISOString() ?? null,
           },
+          env: input.env,
           workspace: input.workspace,
         },
       });
@@ -4193,6 +4198,7 @@ function createPluginEnvironmentDriver(
           command: input.command,
           args: input.args,
           cwd: input.cwd,
+          workspaceRealization: input.workspaceRealization,
           env: input.env,
           stdin: input.stdin,
           timeoutMs: input.timeoutMs,
