@@ -816,6 +816,20 @@ describe("codex_local ACP lane", () => {
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 
+  it("restores a sandbox when executor construction fails", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-construction-failure-");
+    const restoreWorkspace = vi.fn(async () => undefined);
+    const context = await buildSandboxInstructionsContext(root, restoreWorkspace);
+    const execute = createCodexAcpExecutor({
+      get createRuntime(): never {
+        throw new Error("executor construction failed");
+      },
+    });
+
+    await expect(execute(context)).rejects.toThrow("executor construction failed");
+    expect(restoreWorkspace).toHaveBeenCalledOnce();
+  });
+
   it("returns sandbox restore failure after successful execution", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-restore-failure-");
     const restoreError = new Error("sandbox restore failed");

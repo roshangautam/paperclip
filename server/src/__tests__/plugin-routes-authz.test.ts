@@ -498,7 +498,7 @@ describe.sequential("plugin install and upgrade authz", () => {
 
     const res = await request(app)
       .post(`/api/plugins/${pluginId}/upgrade`)
-      .send({ localPath: "/plugins/example" });
+      .send({ localPath: "  /plugins/example  " });
 
     expect(res.status).toBe(200);
     expect(mockLifecycle.upgrade).toHaveBeenCalledWith(

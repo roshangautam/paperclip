@@ -2216,17 +2216,18 @@ export function pluginRoutes(
     }
 
     const version = body.version;
-    const localPath = body.localPath;
+    const rawLocalPath = body.localPath;
 
     if (version !== undefined && typeof version !== "string") {
       res.status(400).json({ error: "version must be a string" });
       return;
     }
-    if (localPath !== undefined && typeof localPath !== "string") {
+    if (rawLocalPath !== undefined && typeof rawLocalPath !== "string") {
       res.status(400).json({ error: "localPath must be a string" });
       return;
     }
-    if (localPath !== undefined && localPath.trim().length === 0) {
+    const localPath = rawLocalPath?.trim();
+    if (localPath !== undefined && localPath.length === 0) {
       res.status(400).json({ error: "localPath must not be blank" });
       return;
     }

@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import path from "node:path";
 import { asString } from "./server-utils.js";
 
@@ -19,6 +20,14 @@ export function resolveManagedInstructionsBundle(config: Record<string, unknown>
   );
 
   if (!rootPath || !filePath) {
+    return { filePath, rootPath: null, entryRelativePath: null };
+  }
+
+  try {
+    if (!statSync(rootPath).isDirectory()) {
+      return { filePath, rootPath: null, entryRelativePath: null };
+    }
+  } catch {
     return { filePath, rootPath: null, entryRelativePath: null };
   }
 

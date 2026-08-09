@@ -591,6 +591,33 @@ describe("claude_local ACP lane", () => {
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 
+  it("restores a sandbox when executor construction fails", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-construction-failure-");
+    const restoreWorkspace = vi.fn(async () => undefined);
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
+      target: input.target,
+      workspaceRemoteDir: "/remote/workspace",
+      runtimeRootDir: "/remote/workspace/.paperclip-runtime/claude",
+      assetDirs: {},
+      restoreWorkspace,
+    }));
+    const execute = createClaudeAcpExecutor({
+      get createRuntime(): never {
+        throw new Error("executor construction failed");
+      },
+    });
+
+    await expect(execute(buildContext(root, {
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "test-sandbox",
+        remoteCwd: "/remote/workspace",
+      },
+    }))).rejects.toThrow("executor construction failed");
+    expect(restoreWorkspace).toHaveBeenCalledOnce();
+  });
+
   it("closes a prepared remote ACP handle before restoring its run-scoped workspace", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-remote-handle-");
     const lifecycle: string[] = [];

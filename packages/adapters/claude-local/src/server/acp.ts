@@ -289,11 +289,11 @@ export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}):
     // Prepared remote workspaces are run-scoped and may be deleted by
     // restoreWorkspace below. Keep their ACP process handles run-scoped too,
     // even when an adapter config enables warm handles for durable workspaces.
-    const remoteExecutor = await createExecutor({ ...options, warmHandles: new Map() });
     const remoteConfig = { ...config, warmHandleIdleMs: 0 };
 
     let result: AdapterExecutionResult;
     try {
+      const remoteExecutor = await createExecutor({ ...options, warmHandles: new Map() });
       result = await remoteExecutor({
         ...ctx,
         executionTarget,
