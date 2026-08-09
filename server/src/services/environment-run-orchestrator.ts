@@ -493,7 +493,7 @@ export function environmentRunOrchestrator(
             environment,
             lease,
             command: "bash",
-            args: ["-lc", provisionCommand],
+            args: ["-lc", `set -euo pipefail\n${provisionCommand}`],
             cwd: realizedCwd,
             env: {
               SHELL: "/bin/bash",

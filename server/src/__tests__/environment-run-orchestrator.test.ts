@@ -417,6 +417,8 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
       workspace: expect.objectContaining({ remotePath: "/home/coder/workspace" }),
     }));
     expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
+      command: "bash",
+      args: ["-lc", "set -euo pipefail\npnpm install"],
       cwd: "/home/coder/workspace",
     }));
   });
@@ -641,7 +643,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
 
     expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
       command: "bash",
-      args: ["-lc", "npm install -g @google/gemini-cli"],
+      args: ["-lc", "set -euo pipefail\nnpm install -g @google/gemini-cli"],
     }));
     expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
   });
