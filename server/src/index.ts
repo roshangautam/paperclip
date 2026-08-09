@@ -66,6 +66,7 @@ import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
+import { serverVersion } from "./version.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -695,6 +696,7 @@ export async function startServer(): Promise<StartedServer> {
     bindHost: config.host,
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
+    hostVersion: serverVersion,
     pluginMigrationDb: pluginMigrationDb as any,
     betterAuthHandler,
     resolveSession,
