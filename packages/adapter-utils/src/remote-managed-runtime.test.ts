@@ -183,9 +183,12 @@ describe("SSH remote managed runtime cleanup", () => {
       assets: [{ key: "instructions", localDir: assetDir }],
     })).rejects.toMatchObject({
       code: "acp_remote_run_cleanup_failed",
+      cause: stagingError,
       workspaceRestored: true,
       operationError: stagingError,
       remoteRunDir: "/remote/workspace/.paperclip-runtime/runs/run-1",
+      message:
+        "asset upload failed\nRemote run workspace cleanup failed after successful sync-back: delete failed",
     });
 
     expect(sshMocks.restoreWorkspaceFromSshExecution).toHaveBeenCalledOnce();

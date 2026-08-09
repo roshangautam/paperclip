@@ -224,8 +224,16 @@ export async function prepareRemoteManagedRuntime(input: {
         "workspaceRestored" in restoreError &&
         restoreError.workspaceRestored === true
       ) {
-        Object.assign(restoreError, { operationError: error });
-        throw restoreError;
+        throw Object.assign(
+          new Error(
+            `${errorMessageFromUnknown(error)}\n${errorMessageFromUnknown(restoreError)}`,
+          ),
+          restoreError,
+          {
+            cause: error,
+            operationError: error,
+          },
+        );
       }
       throw remoteWorkspaceCleanupFailure(
         error,
