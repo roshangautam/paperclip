@@ -172,6 +172,7 @@ function toEnvironmentLease(row: EnvironmentLeaseRow): EnvironmentLease {
       ENVIRONMENT_LEASE_CLEANUP_STATUSES,
       "environment lease cleanup status",
     ),
+    reusableResourceOwner: row.reusableResourceOwner,
     metadata: cloneRecord(row.metadata),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -652,6 +653,7 @@ export function environmentService(db: Db) {
       provider?: string | null;
       providerLeaseId?: string | null;
       expiresAt?: Date | null;
+      reusableResourceOwner?: boolean;
       metadata?: Record<string, unknown> | null;
     }): Promise<EnvironmentLease> => {
       const now = new Date();
@@ -674,6 +676,8 @@ export function environmentService(db: Db) {
           releasedAt: null,
           failureReason: null,
           cleanupStatus: null,
+          reusableResourceOwner: input.reusableResourceOwner ?? false,
+          reusableAdoptionClaimId: null,
           metadata: input.metadata ?? null,
           createdAt: now,
           updatedAt: now,
@@ -695,6 +699,7 @@ export function environmentService(db: Db) {
         metadata?: Record<string, unknown> | null;
         expectedCleanupClaimId?: string;
         expectedStatus?: EnvironmentLeaseStatus;
+        clearReusableResourceOwner?: boolean;
       },
     ) => {
       const now = new Date();
@@ -710,6 +715,12 @@ export function environmentService(db: Db) {
           ...(options?.metadata !== undefined ? { metadata: options.metadata } : {}),
           cleanupClaimId: null,
           cleanupClaimedAt: null,
+          ...(options?.clearReusableResourceOwner
+            ? {
+                reusableResourceOwner: false,
+                reusableAdoptionClaimId: null,
+              }
+            : {}),
         })
         .where(
           and(
