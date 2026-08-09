@@ -92,7 +92,7 @@ describe("ssh env-lab fixture", () => {
     }
   });
 
-  it.each(["", " ", "/", ".", ".."])(
+  it.each(["", " ", "/", "/.", "/..", "//", "/tmp/..", ".", ".."])(
     "refuses to recursively remove unsafe remote directory %j",
     async (remoteDir) => {
       await expect(removeDirectoryFromSsh({
@@ -109,6 +109,29 @@ describe("ssh env-lab fixture", () => {
       })).rejects.toThrow("Refusing to remove unsafe SSH directory");
     },
   );
+
+  it("recursively removes a normalized safe remote directory", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH safe directory removal test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const removeDir = path.posix.join(started.workspaceDir, "remove-me");
+    await runSshCommand(config, `mkdir -p ${JSON.stringify(removeDir)}`);
+
+    await removeDirectoryFromSsh({
+      spec: config,
+      remoteDir: `${removeDir}/child/..`,
+    });
+
+    const result = await runSshCommand(
+      config,
+      `test ! -e ${JSON.stringify(removeDir)} && printf removed`,
+    );
+    expect(result.stdout).toBe("removed");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("starts an isolated sshd fixture and executes commands through it", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));

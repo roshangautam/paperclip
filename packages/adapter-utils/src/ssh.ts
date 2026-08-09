@@ -1016,10 +1016,16 @@ export async function removeDirectoryFromSsh(input: {
   remoteDir: string;
 }): Promise<void> {
   const remoteDir = input.remoteDir.trim();
-  if (!remoteDir || remoteDir === "/" || remoteDir === "." || remoteDir === "..") {
+  const normalizedRemoteDir = path.posix.normalize(remoteDir);
+  if (
+    !remoteDir ||
+    normalizedRemoteDir === "/" ||
+    normalizedRemoteDir === "." ||
+    normalizedRemoteDir === ".."
+  ) {
     throw new Error(`Refusing to remove unsafe SSH directory: ${JSON.stringify(input.remoteDir)}`);
   }
-  await runSshScript(input.spec, `rm -rf -- ${shellQuote(remoteDir)}`, {
+  await runSshScript(input.spec, `rm -rf -- ${shellQuote(normalizedRemoteDir)}`, {
     timeoutMs: 30_000,
     maxBuffer: 256 * 1024,
   });
