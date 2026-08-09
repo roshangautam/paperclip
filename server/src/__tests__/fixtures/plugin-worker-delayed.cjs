@@ -20,7 +20,7 @@ rl.on("line", (line) => {
       id: message.id,
       result: {
         ok: true,
-        supportedMethods: ["environmentExecute"],
+        supportedMethods: ["environmentExecute", "environmentRealizeWorkspace"],
       },
     });
     return;
@@ -41,6 +41,31 @@ rl.on("line", (line) => {
         },
       });
     }, delayMs);
+    return;
+  }
+
+  if (method === "environmentRealizeWorkspace") {
+    const secret = message.params?.env?.GITHUB_APP_PRIVATE_KEY ?? "";
+    process.stdout.write(`not-json:${JSON.stringify(secret)}\n`);
+    process.stderr.write(`${secret}\n`);
+    send({
+      jsonrpc: "2.0",
+      method: "log",
+      params: {
+        level: "warn",
+        message: `provider received ${secret}`,
+        meta: { serialized: JSON.stringify({ secret }) },
+      },
+      paperclipInvocationId: message.paperclipInvocation?.id,
+    });
+    if (message.params?.config?.crash) {
+      process.exit(1);
+    }
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: { cwd: "/workspace/project", metadata: {} },
+    });
     return;
   }
 

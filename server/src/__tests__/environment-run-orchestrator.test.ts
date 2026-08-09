@@ -467,6 +467,31 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(JSON.stringify((thrown as EnvironmentRunError).cause)).not.toContain(token);
   });
 
+  it("redacts JSON-escaped multiline transient values from provider output", async () => {
+    const privateKey = "-----BEGIN PRIVATE KEY-----\ntransient-key-material\n-----END PRIVATE KEY-----";
+    const serializedSecret = JSON.stringify({ privateKey });
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({
+        cwd: "/workspace/project",
+        metadata: {
+          workspaceRealization: { providerOutput: serializedSecret },
+        },
+      }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    const result = await orchestrator.realizeForRun(makeRealizeInput({
+      env: { GITHUB_APP_PRIVATE_KEY: privateKey },
+    }));
+
+    expect(result.workspaceRealization).toEqual({
+      providerOutput: '{"privateKey":"***REDACTED***"}',
+    });
+    expect(JSON.stringify(mockUpdateLeaseMetadata.mock.calls)).not.toContain(
+      JSON.stringify(privateKey).slice(1, -1),
+    );
+  });
+
   it("target resolution failure: resolveEnvironmentExecutionTarget throws → EnvironmentRunError with code transport_resolution_failed", async () => {
     mockResolveEnvironmentExecutionTarget.mockRejectedValue(new Error("network error"));
 

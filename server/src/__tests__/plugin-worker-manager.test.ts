@@ -2,6 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { logger } from "../middleware/logger.js";
 import {
   createHostClientHandlers,
   JsonRpcCallError,
@@ -143,6 +144,54 @@ describe("plugin-worker-manager stderr failure context", () => {
     } finally {
       vi.restoreAllMocks();
       await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("suppresses worker output after forwarding realization secrets", async () => {
+    const childLogger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const childSpy = vi.spyOn(logger, "child").mockReturnValue(childLogger as any);
+    const privateKey = "-----BEGIN PRIVATE KEY-----\ntransient-key-material\n-----END PRIVATE KEY-----";
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      await expect(handle.call("environmentRealizeWorkspace", {
+        driverKey: "coder",
+        companyId: "company-1",
+        environmentId: "environment-1",
+        config: { crash: true },
+        lease: { providerLeaseId: "lease-1" },
+        env: { GITHUB_APP_PRIVATE_KEY: privateKey },
+        workspace: {},
+      })).rejects.toThrow("Worker process exited");
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const logged = JSON.stringify(
+        Object.values(childLogger).flatMap((method) => method.mock.calls),
+      );
+      expect(logged).not.toContain("transient-key-material");
+      expect(logged).not.toContain(JSON.stringify(privateKey).slice(1, -1));
+      expect(logged).not.toContain("provider received");
+      expect(logged).not.toContain("[plugin stderr]");
+    } finally {
+      await handle.stop().catch(() => undefined);
+      childSpy.mockRestore();
     }
   });
 

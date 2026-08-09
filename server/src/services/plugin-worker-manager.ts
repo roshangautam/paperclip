@@ -91,6 +91,9 @@ const CRASH_WINDOW_MS = 10 * 60 * 1_000;
 /** Maximum number of stderr characters retained for worker failure context. */
 const MAX_STDERR_EXCERPT_CHARS = 8_000;
 
+const SENSITIVE_ENV_KEY_RE =
+  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -210,7 +213,12 @@ interface PendingRequest {
 
 interface ActiveInvocation {
   scope: PluginInvocationScope;
+  suppressWorkerOutput: boolean;
   timer?: ReturnType<typeof setTimeout>;
+}
+
+interface WorkerMessageContext extends WorkerHostCallContext {
+  suppressWorkerOutput?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +400,7 @@ export function createPluginWorkerHandle(
   const pendingRequests = new Map<string | number, PendingRequest>();
   let nextRequestId = 1;
   const activeInvocations = new Map<string, ActiveInvocation>();
+  let suppressUnscopedWorkerOutput = false;
 
   // Optional methods reported by the worker during initialization
   let supportedMethods: string[] = [];
@@ -457,7 +466,11 @@ export function createPluginWorkerHandle(
       message = parseMessage(line);
     } catch (err) {
       if (err instanceof JsonRpcParseError) {
-        log.warn({ rawLine: line.slice(0, 200) }, "unparseable message from worker");
+        if (suppressUnscopedWorkerOutput) {
+          log.warn("unparseable message from worker; output suppressed");
+        } else {
+          log.warn({ rawLine: line.slice(0, 200) }, "unparseable message from worker");
+        }
       } else {
         log.warn({ err }, "error parsing worker message");
       }
@@ -504,6 +517,14 @@ export function createPluginWorkerHandle(
     return typeof value === "object" && value !== null && !Array.isArray(value);
   }
 
+  function containsSensitiveEnv(params: unknown): boolean {
+    if (!isRecord(params) || !isRecord(params.env)) return false;
+    for (const [key, value] of Object.entries(params.env)) {
+      if (SENSITIVE_ENV_KEY_RE.test(key) && typeof value === "string" && value.length > 0) return true;
+    }
+    return false;
+  }
+
   function deriveInvocationScope(
     method: HostToWorkerMethodName | string,
     params: unknown,
@@ -531,12 +552,16 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
+  function registerInvocation(
+    scope: PluginInvocationScope,
+    suppressWorkerOutput: boolean,
+    ttlMs?: number,
+  ): PluginInvocationContext {
     const invocation: PluginInvocationContext = {
       id: randomUUID(),
       scope,
     };
-    const entry: ActiveInvocation = { scope };
+    const entry: ActiveInvocation = { scope, suppressWorkerOutput };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
@@ -554,18 +579,23 @@ export function createPluginWorkerHandle(
     activeInvocations.delete(invocation.id);
   }
 
-  function contextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerHostCallContext {
+  function contextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerMessageContext {
     const invocationId = readNonEmptyString(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
     if (!invocationId) {
       const hasActiveInvocation = activeInvocations.size > 0 ||
         Array.from(pendingRequests.values()).some((pending) => pending.invocationId);
-      return hasActiveInvocation ? { invalidInvocationScope: true } : {};
+      return hasActiveInvocation || suppressUnscopedWorkerOutput
+        ? { invalidInvocationScope: true }
+        : {};
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
-    return { invocationScope: entry.scope };
+    return {
+      invocationScope: entry.scope,
+      suppressWorkerOutput: entry.suppressWorkerOutput,
+    };
   }
 
   /**
@@ -594,7 +624,11 @@ export function createPluginWorkerHandle(
     }
 
     try {
-      const result = await handler(request.params, contextForWorkerMessage(request));
+      const context = contextForWorkerMessage(request);
+      const result = await handler(request.params, {
+        ...(context.invocationScope ? { invocationScope: context.invocationScope } : {}),
+        ...(context.invalidInvocationScope ? { invalidInvocationScope: true } : {}),
+      });
       sendMessage({
         jsonrpc: JSONRPC_VERSION,
         id: request.id,
@@ -626,6 +660,8 @@ export function createPluginWorkerHandle(
    */
   function handleWorkerNotification(notification: JsonRpcNotification): void {
     if (notification.method === "log") {
+      const context = contextForWorkerMessage(notification);
+      if (context.invalidInvocationScope || context.suppressWorkerOutput) return;
       const params = notification.params as {
         level?: string;
         message?: string;
@@ -749,6 +785,7 @@ export function createPluginWorkerHandle(
     if (child.stderr) {
       stderrReadline = createInterface({ input: child.stderr });
       stderrReadline.on("line", (line: string) => {
+        if (suppressUnscopedWorkerOutput) return;
         stderrExcerpt = appendStderrExcerpt(stderrExcerpt, line);
         log.warn({ stream: "stderr" }, `[plugin stderr] ${line}`);
       });
@@ -933,6 +970,7 @@ export function createPluginWorkerHandle(
     intentionalStop = false;
     setStatus("starting");
     stderrExcerpt = "";
+    suppressUnscopedWorkerOutput = false;
 
     const child = spawnProcess();
     childProcess = child;
@@ -1133,8 +1171,12 @@ export function createPluginWorkerHandle(
 
       const id = nextRequestId++;
       const timeout = timeoutMs ?? Math.min(rpcTimeoutMs, MAX_RPC_TIMEOUT_MS);
+      const suppressWorkerOutput = containsSensitiveEnv(params);
+      if (suppressWorkerOutput) suppressUnscopedWorkerOutput = true;
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+      const invocation = invocationScope
+        ? registerInvocation(invocationScope, suppressWorkerOutput)
+        : null;
 
       // Guard against double-settlement. When a process exits all pending
       // requests are rejected via rejectAllPending(), but the timeout timer
@@ -1265,8 +1307,12 @@ export function createPluginWorkerHandle(
 
     notify(method: string, params: unknown) {
       if (status !== "running") return;
+      const suppressWorkerOutput = containsSensitiveEnv(params);
+      if (suppressWorkerOutput) suppressUnscopedWorkerOutput = true;
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS) : null;
+      const invocation = invocationScope
+        ? registerInvocation(invocationScope, suppressWorkerOutput, MAX_RPC_TIMEOUT_MS)
+        : null;
       try {
         sendMessage({
           jsonrpc: JSONRPC_VERSION,

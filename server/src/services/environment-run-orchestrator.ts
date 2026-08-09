@@ -160,8 +160,11 @@ function transientSensitiveEnvEntries(
 
 function transientEnvValues(env: Record<string, string> | undefined): string[] {
   return Array.from(new Set(
-    transientSensitiveEnvEntries(env).map(([, value]) => value),
-  ));
+    transientSensitiveEnvEntries(env).flatMap(([, value]) => [
+      value,
+      JSON.stringify(value).slice(1, -1),
+    ]),
+  )).sort((a, b) => b.length - a.length);
 }
 
 function transientEnvKeyInText(
