@@ -50,6 +50,7 @@ import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import {
   getPluginUiContributionMetadata,
   listMissingDeclaredPluginEntrypoints,
+  PluginSourceValidationError,
   pluginLoader,
   REPO_ROOT,
   withPluginMutationLock,
@@ -161,7 +162,12 @@ const PLUGIN_SCOPED_API_RESPONSE_HEADER_ALLOWLIST = new Set([
 
 function sendPluginLifecycleError(res: Response, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
-  res.status(error instanceof HttpError ? error.status : 500).json({ error: message });
+  const status = error instanceof HttpError
+    ? error.status
+    : error instanceof PluginSourceValidationError
+      ? 400
+      : 500;
+  res.status(status).json({ error: message });
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

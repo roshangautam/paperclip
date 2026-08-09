@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { badRequest } from "../errors.js";
+import { PluginSourceValidationError } from "../services/plugin-loader.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -508,7 +509,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     );
   }, 20_000);
 
-  it("preserves lifecycle HTTP errors and reports unexpected upgrade failures as server errors", async () => {
+  it("reports source validation and lifecycle HTTP errors without masking unexpected upgrade failures", async () => {
     mockRegistry.getById.mockResolvedValue({
       id: pluginId,
       pluginKey: "paperclip.example",
@@ -516,13 +517,17 @@ describe.sequential("plugin install and upgrade authz", () => {
     });
     const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
 
+    mockLifecycle.upgrade.mockRejectedValueOnce(new PluginSourceValidationError("invalid replacement manifest"));
+    const invalidSource = await request(app).post(`/api/plugins/${pluginId}/upgrade`).send({});
     mockLifecycle.upgrade.mockRejectedValueOnce(badRequest("invalid lifecycle state"));
-    const expected = await request(app).post(`/api/plugins/${pluginId}/upgrade`).send({});
+    const invalidState = await request(app).post(`/api/plugins/${pluginId}/upgrade`).send({});
     mockLifecycle.upgrade.mockRejectedValueOnce(new Error("registry unavailable"));
     const unexpected = await request(app).post(`/api/plugins/${pluginId}/upgrade`).send({});
 
-    expect(expected.status).toBe(400);
-    expect(expected.body.error).toBe("invalid lifecycle state");
+    expect(invalidSource.status).toBe(400);
+    expect(invalidSource.body.error).toBe("invalid replacement manifest");
+    expect(invalidState.status).toBe(400);
+    expect(invalidState.body.error).toBe("invalid lifecycle state");
     expect(unexpected.status).toBe(500);
     expect(unexpected.body.error).toBe("registry unavailable");
   }, 20_000);

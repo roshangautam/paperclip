@@ -290,8 +290,43 @@ export interface PluginUpgradeOptions extends Omit<PluginInstallOptions, "instal
   beforeCommit?: () => Promise<void>;
 }
 
+/** A requested plugin source or replacement package failed validation. */
+export class PluginSourceValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PluginSourceValidationError";
+  }
+}
+
 /** An attempted package rollback could not restore a coherent live plugin tree. */
 export class PluginArtifactRollbackError extends AggregateError {}
+
+const NPM_SOURCE_VALIDATION_ERROR_CODES = new Set([
+  "E404",
+  "EINVALIDPACKAGENAME",
+  "EINVALIDTAGNAME",
+  "ENOVERSIONS",
+  "ETARGET",
+]);
+
+function getErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code.toUpperCase() : null;
+}
+
+function isNpmSourceValidationFailure(error: unknown): boolean {
+  const fields = [
+    getErrorCode(error),
+    error instanceof Error ? error.message : String(error),
+    typeof (error as { stderr?: unknown })?.stderr === "string"
+      ? (error as { stderr: string }).stderr
+      : null,
+  ].filter((value): value is string => Boolean(value));
+  const output = fields.join("\n").toUpperCase();
+  return [...NPM_SOURCE_VALIDATION_ERROR_CODES].some((code) =>
+    new RegExp(`\\b${code}\\b`).test(output));
+}
 
 function includeOperationFailureInRollbackError(
   operationError: unknown,
@@ -1179,7 +1214,7 @@ export function pluginLoader(
 
     const uniqueRequested = new Set(requestedRoutePaths);
     if (uniqueRequested.size !== requestedRoutePaths.length) {
-      throw new Error(`Plugin ${manifest.id} declares duplicate page routePath values`);
+      throw new PluginSourceValidationError(`Plugin ${manifest.id} declares duplicate page routePath values`);
     }
 
     const installedPlugins = await registry.listInstalled();
@@ -1190,7 +1225,7 @@ export function pluginLoader(
       const installedRoutePaths = new Set(getDeclaredPageRoutePaths(installedManifest));
       const conflictingRoute = requestedRoutePaths.find((routePath) => installedRoutePaths.has(routePath));
       if (conflictingRoute) {
-        throw new Error(
+        throw new PluginSourceValidationError(
           `Plugin ${manifest.id} routePath "${conflictingRoute}" conflicts with installed plugin ${plugin.pluginKey}`,
         );
       }
@@ -1361,7 +1396,7 @@ export function pluginLoader(
     const { packageName, localPath, version, installDir } = installOptions;
 
     if (!packageName && !localPath) {
-      throw new Error("Either packageName or localPath must be provided");
+      throw new PluginSourceValidationError("Either packageName or localPath must be provided");
     }
 
     const targetInstallDir = installDir ?? localPluginDir;
@@ -1374,7 +1409,7 @@ export function pluginLoader(
       // Local path install — validate the directory exists
       const absLocalPath = path.resolve(localPath);
       if (!existsSync(absLocalPath)) {
-        throw new Error(`Local plugin path does not exist: ${absLocalPath}`);
+        throw new PluginSourceValidationError(`Local plugin path does not exist: ${absLocalPath}`);
       }
       resolvedPackagePath = absLocalPath;
       const pkgJson = await readPackageJson(absLocalPath);
@@ -1408,7 +1443,10 @@ export function pluginLoader(
           { timeout: 120_000 }, // 2 minute timeout for npm install
         );
       } catch (err) {
-        throw new Error(`npm install failed for ${spec}: ${String(err)}`);
+        const message = `npm install failed for ${spec}: ${String(err)}`;
+        throw isNpmSourceValidationFailure(err)
+          ? new PluginSourceValidationError(message)
+          : new Error(message);
       }
 
       if (!existsSync(resolvedPackagePath)) {
@@ -1421,7 +1459,9 @@ export function pluginLoader(
     // Step 3: Read and validate plugin manifest
     // Note: this.loadManifest (used via current context)
     const pkgJson = await readPackageJson(resolvedPackagePath);
-    if (!pkgJson) throw new Error(`Missing package.json at ${resolvedPackagePath}`);
+    if (!pkgJson) {
+      throw new PluginSourceValidationError(`Missing package.json at ${resolvedPackagePath}`);
+    }
 
     if (localPath) {
       await ensureLocalPluginBuilt(resolvedPackagePath, pkgJson);
@@ -1432,7 +1472,7 @@ export function pluginLoader(
       const manualBuildHint = localPath
         ? formatLocalPluginManualBuildHint(resolvedPackagePath, pkgJson)
         : "";
-      throw new Error(
+      throw new PluginSourceValidationError(
         `Package ${resolvedPackageName} at ${resolvedPackagePath} does not appear to be a Paperclip plugin (no manifest found).${manualBuildHint}`,
       );
     }
@@ -1441,7 +1481,7 @@ export function pluginLoader(
 
     // Step 4: Reject incompatible plugin API versions
     if (!manifestValidator.getSupportedVersions().includes(manifest.apiVersion)) {
-      throw new Error(
+      throw new PluginSourceValidationError(
         `Plugin ${manifest.id} declares apiVersion ${manifest.apiVersion} which is not supported by this host. ` +
           `Supported versions: ${manifestValidator.getSupportedVersions().join(", ")}`,
       );
@@ -1450,7 +1490,7 @@ export function pluginLoader(
     // Step 5: Validate manifest capabilities are consistent
     const capResult = capabilityValidator.validateManifestCapabilities(manifest);
     if (!capResult.allowed) {
-      throw new Error(
+      throw new PluginSourceValidationError(
         `Plugin ${manifest.id} manifest has inconsistent capabilities. ` +
           `Missing required capabilities for declared features: ${capResult.missing.join(", ")}`,
       );
@@ -1462,7 +1502,7 @@ export function pluginLoader(
     const minimumHostVersion = getMinimumHostVersion(manifest);
     if (minimumHostVersion && hostVersion) {
       if (compareSemver(hostVersion, minimumHostVersion) < 0) {
-        throw new Error(
+        throw new PluginSourceValidationError(
           `Plugin ${manifest.id} requires host version ${minimumHostVersion} or newer, ` +
             `but this server is running ${hostVersion}`,
         );
@@ -1997,7 +2037,7 @@ export function pluginLoader(
       } = upgradeOptions;
 
       if (version !== undefined && localPath !== undefined) {
-        throw new Error("version cannot be combined with a local plugin source");
+        throw new PluginSourceValidationError("version cannot be combined with a local plugin source");
       }
 
       log.info(
@@ -2037,7 +2077,7 @@ export function pluginLoader(
 
           // 2. Validate it's the same plugin ID
           if (newManifest.id !== oldManifest.id) {
-            throw new Error(
+            throw new PluginSourceValidationError(
               `Upgrade failed: new manifest ID '${newManifest.id}' does not match existing plugin ID '${oldManifest.id}'`,
             );
           }
@@ -2727,7 +2767,7 @@ function resolveManagedInstallPackageDir(localPluginDir: string, packageName: st
     ...(packageName.startsWith("@") ? packageName.split("/") : [packageName]),
   );
   if (packageDir === nodeModulesDir || !isPathInsideDir(packageDir, nodeModulesDir)) {
-    throw new Error(
+    throw new PluginSourceValidationError(
       `Plugin package name "${packageName}" escapes the managed node_modules directory`,
     );
   }

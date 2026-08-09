@@ -47,7 +47,11 @@ vi.mock("../services/plugin-registry.js", () => ({
   pluginRegistryService: () => mocks.registry,
 }));
 
-import { PluginArtifactRollbackError, pluginLoader } from "../services/plugin-loader.js";
+import {
+  PluginArtifactRollbackError,
+  PluginSourceValidationError,
+  pluginLoader,
+} from "../services/plugin-loader.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -151,6 +155,72 @@ describe("pluginLoader npm upgrades", () => {
 
     expect(mocks.execFile).not.toHaveBeenCalled();
     expect(mocks.registry.install).not.toHaveBeenCalled();
+  });
+
+  it("classifies a missing local replacement as a source validation failure", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-local-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    mocks.registry.getById.mockResolvedValue({
+      id: "plugin-1",
+      packageName: "paperclip-example",
+      packagePath: null,
+      manifestJson: manifest("1.0.0"),
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    const failure = await loader.upgradePlugin("plugin-1", {
+      localPath: path.join(localPluginDir, "missing"),
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PluginSourceValidationError);
+    expect((failure as Error).message).toContain("Local plugin path does not exist");
+    expect(mocks.registry.update).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes unresolved npm packages from operational npm failures", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-failure-"));
+    cleanupPaths.add(localPluginDir);
+    mocks.registry.getById.mockResolvedValue({
+      id: "plugin-1",
+      packageName: "paperclip-example",
+      packagePath: null,
+      manifestJson: manifest("1.0.0"),
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+    const unresolved = Object.assign(new Error("npm install failed"), {
+      code: 1,
+      stderr: "npm error code ETARGET",
+    });
+    mocks.execFile.mockImplementationOnce((_file, _args, _options, callback) => {
+      callback(unresolved, "", unresolved.stderr);
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+
+    const unresolvedFailure = await loader.upgradePlugin("plugin-1", {
+      version: "missing-version",
+    }).catch((error: unknown) => error);
+    expect(unresolvedFailure).toBeInstanceOf(PluginSourceValidationError);
+
+    const npmUnavailable = Object.assign(new Error("spawn npm ENOENT"), { code: "ENOENT" });
+    mocks.execFile.mockImplementationOnce((_file, _args, _options, callback) => {
+      callback(npmUnavailable, "", "");
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+
+    const operationalFailure = await loader.upgradePlugin("plugin-1", {
+      version: "1.1.0",
+    }).catch((error: unknown) => error);
+    expect(operationalFailure).toBeInstanceOf(Error);
+    expect(operationalFailure).not.toBeInstanceOf(PluginSourceValidationError);
+    expect((operationalFailure as Error).message).toContain("spawn npm ENOENT");
   });
 
   it("keeps consecutive version upgrades on the npm source", async () => {
@@ -1135,8 +1205,10 @@ describe("pluginLoader npm upgrades", () => {
     } as unknown as PluginWorkerManager;
     const lifecycle = pluginLifecycleManager({} as never, { loader, workerManager });
 
-    await expect(lifecycle.upgrade("plugin-1", "1.1.0"))
-      .rejects.toThrow("does not match existing plugin ID");
+    const failure = await lifecycle.upgrade("plugin-1", "1.1.0")
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PluginSourceValidationError);
+    expect((failure as Error).message).toContain("does not match existing plugin ID");
 
     expect(await readFile(path.join(packageRoot, "manifest.js"), "utf8"))
       .toBe(`export default ${JSON.stringify(activeManifest)};\n`);
