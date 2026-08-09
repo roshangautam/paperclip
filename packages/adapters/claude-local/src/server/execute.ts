@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
+  ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
   overrideAdapterExecutionTargetRemoteCwd,
@@ -394,7 +395,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (
         engineSelection.explicit
         || (typeof err === "object" && err !== null && "code" in err
-          && err.code === ACP_WORKSPACE_RESTORE_ERROR_CODE)
+          && (err.code === ACP_WORKSPACE_RESTORE_ERROR_CODE
+            || err.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE))
       ) throw err;
       const reason = err instanceof Error ? err.message : String(err);
       await ctx.onLog(

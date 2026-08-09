@@ -5,6 +5,7 @@ import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type Adapter
 import { buildCodexAuthInboundProvision } from "./codex-auth-merge-scripts.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import {
+  ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
   overrideAdapterExecutionTargetRemoteCwd,
@@ -446,7 +447,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (
         engineSelection.explicit
         || (typeof err === "object" && err !== null && "code" in err
-          && err.code === ACP_WORKSPACE_RESTORE_ERROR_CODE)
+          && (err.code === ACP_WORKSPACE_RESTORE_ERROR_CODE
+            || err.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE))
       ) throw err;
       const reason = err instanceof Error ? err.message : String(err);
       await ctx.onLog(

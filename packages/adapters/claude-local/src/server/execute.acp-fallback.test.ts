@@ -152,6 +152,23 @@ describe("claude_local ACP startup fallback", () => {
     );
   });
 
+  it("does not rerun through the CLI when ACP throws after remote bridge shutdown fails", async () => {
+    executeClaudeAcp.mockRejectedValueOnce(Object.assign(
+      new Error("ACP remote bridge shutdown failed after the turn completed"),
+      { code: "acp_remote_bridge_shutdown_failed", remoteExecutionMayStillBeActive: false },
+    ));
+    const ctx = buildContext();
+
+    await expect(execute(ctx as never)).rejects.toMatchObject({
+      code: "acp_remote_bridge_shutdown_failed",
+    });
+    expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+    expect(ctx.onLog).not.toHaveBeenCalledWith(
+      "stderr",
+      expect.stringContaining("falling back to Claude CLI"),
+    );
+  });
+
   it("keeps explicit ACP strict when startup fails", async () => {
     const ctx = buildContext({ engine: "acp" });
 
