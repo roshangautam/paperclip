@@ -15,13 +15,14 @@ import {
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import { inferOpenAiCompatibleBiller } from "@paperclipai/adapter-utils";
 import {
-  ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
   ensureAdapterExecutionTargetCommandResolvable,
   overrideAdapterExecutionTargetRemoteCwd,
   prepareAdapterExecutionTargetRuntime,
   readAdapterExecutionTarget,
+  remoteBridgeShutdownMayLeaveExecutionActive,
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
+import { ACP_REMOTE_RUN_CLEANUP_ERROR_CODE } from "@paperclipai/adapter-utils/remote-managed-runtime";
 import {
   DEFAULT_ACP_ENGINE_MODE,
   DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
@@ -80,12 +81,32 @@ function acpWorkspaceRestoreError(executionError: unknown, restoreError: unknown
   );
 }
 
-function isRemoteBridgeShutdownFailure(error: unknown): boolean {
+function isRestoredRemoteRunCleanupFailure(error: unknown): boolean {
   return Boolean(
     error &&
     typeof error === "object" &&
     "code" in error &&
-    error.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
+    error.code === ACP_REMOTE_RUN_CLEANUP_ERROR_CODE &&
+    "workspaceRestored" in error &&
+    error.workspaceRestored === true,
+  );
+}
+
+function acpRemoteRunCleanupError(executionError: unknown, cleanupError: unknown): Error {
+  return Object.assign(
+    new Error(
+      `${errorMessageFromUnknown(executionError)}\n${errorMessageFromUnknown(cleanupError)}`,
+    ),
+    {
+      code: ACP_REMOTE_RUN_CLEANUP_ERROR_CODE,
+      cause: executionError,
+      executionError,
+      cleanupError,
+      workspaceRestored: true,
+      ...(cleanupError && typeof cleanupError === "object" && "remoteRunDir" in cleanupError
+        ? { remoteRunDir: cleanupError.remoteRunDir }
+        : {}),
+    },
   );
 }
 
@@ -103,6 +124,10 @@ function withAcpWorkspaceRestoreFailure(
   error: unknown,
 ): AdapterExecutionResult {
   const restoreMessage = errorMessageFromUnknown(error);
+  const cleanupOnly = isRestoredRemoteRunCleanupFailure(error);
+  const failureCode = cleanupOnly
+    ? ACP_REMOTE_RUN_CLEANUP_ERROR_CODE
+    : ACP_WORKSPACE_RESTORE_ERROR_CODE;
   const teardownMessage = `ACP workspace restore failed: ${restoreMessage}`;
   const existingErrorMessage =
     typeof result.errorMessage === "string" && result.errorMessage.trim().length > 0
@@ -118,14 +143,15 @@ function withAcpWorkspaceRestoreFailure(
     ...result,
     exitCode: result.exitCode === null || result.exitCode === 0 ? 1 : result.exitCode,
     errorMessage: existingErrorMessage
-      ? `${existingErrorMessage}\n${teardownMessage}`
-      : teardownMessage,
-    errorCode: ACP_WORKSPACE_RESTORE_ERROR_CODE,
+      ? `${existingErrorMessage}\n${cleanupOnly ? restoreMessage : teardownMessage}`
+      : cleanupOnly ? restoreMessage : teardownMessage,
+    errorCode: failureCode,
     resultJson: {
       ...(result.resultJson ?? {}),
-      workspaceRestoreFailure: {
-        code: ACP_WORKSPACE_RESTORE_ERROR_CODE,
+      [cleanupOnly ? "remoteRunCleanupFailure" : "workspaceRestoreFailure"]: {
+        code: failureCode,
         message: restoreMessage,
+        ...(cleanupOnly ? { workspaceRestored: true } : {}),
         ...(executionError ? { executionError } : {}),
       },
     },
@@ -347,12 +373,15 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
         },
       }));
     } catch (executionError) {
-      if (isRemoteBridgeShutdownFailure(executionError)) {
+      if (remoteBridgeShutdownMayLeaveExecutionActive(executionError)) {
         throw remoteBridgeWorkspaceRestoreError(executionError);
       }
       try {
         await preparedRuntime.restoreWorkspace((line) => ctx.onLog("stdout", line));
       } catch (restoreError) {
+        if (isRestoredRemoteRunCleanupFailure(restoreError)) {
+          throw acpRemoteRunCleanupError(executionError, restoreError);
+        }
         try {
           await ctx.onLog(
             "stderr",

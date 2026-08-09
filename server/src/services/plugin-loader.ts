@@ -2081,19 +2081,21 @@ export function pluginLoader(
                     `Failed to restore previous managed plugins after upgrade failure at ${staged?.root}`,
                   );
               }
-              try {
-                await registry.update(pluginId, {
-                  packageName: activePlugin.packageName,
-                  packagePath: activePlugin.packagePath,
-                  version: oldManifest.version,
-                  manifest: oldManifest,
-                });
-              } catch (registryRollbackError) {
-                throw new PluginArtifactRollbackError(
-                  [error, registryRollbackError],
-                  `Restored previous managed plugins but failed to restore registry metadata for ${pluginId}`,
-                );
-              }
+            }
+            try {
+              await registry.update(pluginId, {
+                packageName: activePlugin.packageName,
+                packagePath: activePlugin.packagePath,
+                version: oldManifest.version,
+                manifest: oldManifest,
+              });
+            } catch (registryRollbackError) {
+              throw new PluginArtifactRollbackError(
+                [error, registryRollbackError],
+                staged
+                  ? `Restored previous managed plugins but failed to restore registry metadata for ${pluginId}`
+                  : `Failed to restore registry metadata for local plugin ${pluginId}`,
+              );
             }
             throw error;
           }

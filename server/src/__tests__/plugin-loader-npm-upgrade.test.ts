@@ -795,6 +795,79 @@ describe("pluginLoader npm upgrades", () => {
     );
   });
 
+  it("restores local-path registry metadata when activation fails before commit", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-local-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const activePackageName = "paperclip-example-active";
+    const replacementPackageName = "paperclip-example-replacement";
+    const activeManifest = manifest("1.0.0");
+    const replacementManifest = manifest("1.1.0");
+    const activePackageRoot = await writeInstalledPackage(
+      localPluginDir,
+      activePackageName,
+      activeManifest,
+    );
+    const replacementPackageRoot = await writeInstalledPackage(
+      localPluginDir,
+      replacementPackageName,
+      replacementManifest,
+    );
+    let currentPlugin = {
+      id: "plugin-1",
+      pluginKey: activeManifest.id,
+      status: "ready",
+      packageName: activePackageName,
+      packagePath: activePackageRoot,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+    } as PluginRecord;
+    mocks.registry.getById.mockImplementation(async () => currentPlugin);
+    mocks.registry.update.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = {
+        ...currentPlugin,
+        packageName: update.packageName ?? currentPlugin.packageName,
+        packagePath: update.packagePath === undefined ? currentPlugin.packagePath : update.packagePath,
+        version: update.version ?? currentPlugin.version,
+        manifestJson: update.manifest ?? currentPlugin.manifestJson,
+      };
+      return currentPlugin;
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+    const activationError = new Error("activation failed");
+
+    await expect(loader.upgradePlugin("plugin-1", {
+      localPath: replacementPackageRoot,
+      beforeCommit: async () => {
+        throw activationError;
+      },
+    })).rejects.toBe(activationError);
+
+    expect(mocks.registry.update).toHaveBeenCalledTimes(2);
+    expect(mocks.registry.update).toHaveBeenNthCalledWith(1, "plugin-1", {
+      packageName: replacementPackageName,
+      packagePath: replacementPackageRoot,
+      version: replacementManifest.version,
+      manifest: replacementManifest,
+    });
+    expect(mocks.registry.update).toHaveBeenNthCalledWith(2, "plugin-1", {
+      packageName: activePackageName,
+      packagePath: activePackageRoot,
+      version: activeManifest.version,
+      manifest: activeManifest,
+    });
+    expect(currentPlugin).toMatchObject({
+      packageName: activePackageName,
+      packagePath: activePackageRoot,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+    });
+    expect(mocks.execFile).not.toHaveBeenCalled();
+  });
+
   it("restores the previous managed package and metadata when activation fails before commit", async () => {
     const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
     cleanupPaths.add(localPluginDir);

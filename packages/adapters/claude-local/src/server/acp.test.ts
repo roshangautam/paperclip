@@ -715,7 +715,10 @@ describe("claude_local ACP lane", () => {
     }));
     const bridgeShutdownError = Object.assign(
       new Error("ACP remote bridge shutdown failed"),
-      { code: "acp_remote_bridge_shutdown_failed" },
+      {
+        code: "acp_remote_bridge_shutdown_failed",
+        remoteExecutionMayStillBeActive: true,
+      },
     );
     const execute = createClaudeAcpExecutor({
       createRuntime: () => {
@@ -737,6 +740,40 @@ describe("claude_local ACP lane", () => {
       cause: bridgeShutdownError,
     });
     expect(restoreWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("restores a sandbox after cleanup-only remote bridge shutdown failure", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-bridge-artifact-cleanup-failure-");
+    const restoreWorkspace = vi.fn(async () => undefined);
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
+      target: input.target,
+      workspaceRemoteDir: "/remote/workspace",
+      runtimeRootDir: "/remote/workspace/.paperclip-runtime/claude",
+      assetDirs: {},
+      restoreWorkspace,
+    }));
+    const bridgeShutdownError = Object.assign(
+      new Error("ACP remote bridge artifact cleanup failed"),
+      {
+        code: "acp_remote_bridge_shutdown_failed",
+        remoteExecutionMayStillBeActive: false,
+      },
+    );
+    const execute = createClaudeAcpExecutor({
+      createRuntime: () => {
+        throw bridgeShutdownError;
+      },
+    });
+
+    await expect(execute(buildContext(root, {
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "test-sandbox",
+        remoteCwd: "/remote/workspace",
+      },
+    }))).rejects.toBe(bridgeShutdownError);
+    expect(restoreWorkspace).toHaveBeenCalledOnce();
   });
 
   it("executes SSH ACP in the prepared workspace while retaining the original session target", async () => {

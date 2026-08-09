@@ -836,7 +836,10 @@ describe("codex_local ACP lane", () => {
     const context = await buildSandboxInstructionsContext(root, restoreWorkspace);
     const bridgeShutdownError = Object.assign(
       new Error("ACP remote bridge shutdown failed"),
-      { code: "acp_remote_bridge_shutdown_failed" },
+      {
+        code: "acp_remote_bridge_shutdown_failed",
+        remoteExecutionMayStillBeActive: true,
+      },
     );
     const execute = createCodexAcpExecutor({
       createRuntime: () => {
@@ -849,6 +852,27 @@ describe("codex_local ACP lane", () => {
       cause: bridgeShutdownError,
     });
     expect(restoreWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("restores a sandbox after cleanup-only remote bridge shutdown failure", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-bridge-artifact-cleanup-failure-");
+    const restoreWorkspace = vi.fn(async () => undefined);
+    const context = await buildSandboxInstructionsContext(root, restoreWorkspace);
+    const bridgeShutdownError = Object.assign(
+      new Error("ACP remote bridge artifact cleanup failed"),
+      {
+        code: "acp_remote_bridge_shutdown_failed",
+        remoteExecutionMayStillBeActive: false,
+      },
+    );
+    const execute = createCodexAcpExecutor({
+      createRuntime: () => {
+        throw bridgeShutdownError;
+      },
+    });
+
+    await expect(execute(context)).rejects.toBe(bridgeShutdownError);
+    expect(restoreWorkspace).toHaveBeenCalledOnce();
   });
 
   it("returns sandbox restore failure after successful execution", async () => {

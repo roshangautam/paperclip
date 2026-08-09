@@ -17,6 +17,7 @@ import {
   formatAdapterExecutionTimeoutErrorMessage,
   formatAdapterExecutionTimeoutStartLogLine,
   readAdapterExecutionTarget,
+  remoteBridgeShutdownMayLeaveExecutionActive,
   resolveAdapterExecutionTargetTimeout,
   startAdapterExecutionTargetPaperclipBridge,
   startAdapterExecutionTargetProcessSessionBridge,
@@ -1335,6 +1336,9 @@ async function buildRuntime(input: {
           code: ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
           operationError: err,
           cleanupError,
+          remoteExecutionMayStillBeActive:
+            !isRemoteBridgeShutdownFailure(cleanupError) ||
+            remoteBridgeShutdownMayLeaveExecutionActive(cleanupError),
         },
       );
     }
@@ -1501,7 +1505,12 @@ async function cleanupRemoteBridges(
     const label = index === 0 ? "process-session bridge" : "Paperclip callback bridge";
     return [Object.assign(
       new Error(`${label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`),
-      { cause: result.reason },
+      {
+        cause: result.reason,
+        remoteExecutionMayStillBeActive:
+          !isRemoteBridgeShutdownFailure(result.reason) ||
+          remoteBridgeShutdownMayLeaveExecutionActive(result.reason),
+      },
     )];
   });
   if (failures.length > 0) {
@@ -1509,6 +1518,8 @@ async function cleanupRemoteBridges(
       new AggregateError(failures, "ACP remote bridge shutdown failed"),
       {
         code: ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
+        remoteExecutionMayStillBeActive: failures.some((failure) =>
+          failure.remoteExecutionMayStillBeActive !== false),
         ...(operationError === undefined
           ? {}
           : { cause: operationError, operationError }),

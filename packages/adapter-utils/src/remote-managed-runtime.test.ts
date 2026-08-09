@@ -118,7 +118,7 @@ describe("SSH remote managed runtime cleanup", () => {
   it("fails closed when preparation and run-root cleanup both fail", async () => {
     const preparationError = new Error("upload failed");
     sshMocks.prepareWorkspaceForSshExecution.mockRejectedValueOnce(preparationError);
-    sshMocks.removeDirectoryFromSsh.mockRejectedValueOnce(new Error("cleanup failed"));
+    sshMocks.removeDirectoryFromSsh.mockRejectedValue(new Error("cleanup failed"));
 
     await expect(prepareRuntime()).rejects.toMatchObject({
       code: "acp_workspace_restore_failed",
@@ -158,14 +158,29 @@ describe("SSH remote managed runtime cleanup", () => {
     });
   });
 
-  it("treats sync-back as authoritative when only run-root deletion fails", async () => {
+  it("retries run-root deletion after a successful sync-back", async () => {
     const prepared = await prepareRuntime();
-    const progress = vi.fn(async () => undefined);
     sshMocks.removeDirectoryFromSsh.mockRejectedValueOnce(new Error("delete failed"));
 
-    await expect(prepared.restoreWorkspace(progress)).resolves.toBeUndefined();
+    await expect(prepared.restoreWorkspace()).resolves.toBeUndefined();
 
     expect(sshMocks.restoreWorkspaceFromSshExecution).toHaveBeenCalledOnce();
+    expect(sshMocks.removeDirectoryFromSsh).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces exhausted run-root cleanup without invalidating sync-back", async () => {
+    const prepared = await prepareRuntime();
+    const progress = vi.fn(async () => undefined);
+    sshMocks.removeDirectoryFromSsh.mockRejectedValue(new Error("delete failed"));
+
+    await expect(prepared.restoreWorkspace(progress)).rejects.toMatchObject({
+      code: "acp_remote_run_cleanup_failed",
+      workspaceRestored: true,
+      remoteRunDir: "/remote/workspace/.paperclip-runtime/runs/run-1",
+    });
+
+    expect(sshMocks.restoreWorkspaceFromSshExecution).toHaveBeenCalledOnce();
+    expect(sshMocks.removeDirectoryFromSsh).toHaveBeenCalledTimes(3);
     expect(progress).toHaveBeenCalledWith(expect.stringContaining("delete failed"));
   });
 });

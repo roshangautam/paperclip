@@ -49,9 +49,14 @@ function errorMessageFromUnknown(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function labeledCleanupFailure(label: string, error: unknown): Error {
+function labeledCleanupFailure(
+  label: string,
+  error: unknown,
+  remoteExecutionMayStillBeActive: boolean,
+): Error {
   return Object.assign(new Error(`${label}: ${errorMessageFromUnknown(error)}`), {
     cause: error,
+    remoteExecutionMayStillBeActive,
   });
 }
 
@@ -62,21 +67,44 @@ function remoteBridgeShutdownError(
 ): Error {
   return Object.assign(new AggregateError(failures, message), {
     code: ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
+    remoteExecutionMayStillBeActive: failures.some((failure) => (
+      !("remoteExecutionMayStillBeActive" in failure) ||
+      failure.remoteExecutionMayStillBeActive !== false
+    )),
     ...(operationError === undefined
       ? {}
       : { cause: operationError, operationError }),
   });
 }
 
+export function remoteBridgeShutdownMayLeaveExecutionActive(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    error.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE &&
+    (!("remoteExecutionMayStillBeActive" in error) ||
+      error.remoteExecutionMayStillBeActive !== false),
+  );
+}
+
 async function collectCleanupFailures(
-  operations: Array<{ label: string; run: () => void | Promise<void> }>,
+  operations: Array<{
+    label: string;
+    run: () => void | Promise<void>;
+    remoteExecutionMayStillBeActive: boolean;
+  }>,
 ): Promise<Error[]> {
   const failures: Error[] = [];
   for (const operation of operations) {
     try {
       await operation.run();
     } catch (error) {
-      failures.push(labeledCleanupFailure(operation.label, error));
+      failures.push(labeledCleanupFailure(
+        operation.label,
+        error,
+        operation.remoteExecutionMayStillBeActive,
+      ));
     }
   }
   return failures;
@@ -1586,12 +1614,14 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       const failures = await collectCleanupFailures([
         {
           label: "close local process-session bridge server",
+          remoteExecutionMayStillBeActive: false,
           run: () => new Promise<void>((resolve, reject) => {
             server.close((error) => error ? reject(error) : resolve());
           }),
         },
         {
           label: "send remote process-session stdin end",
+          remoteExecutionMayStillBeActive: true,
           run: () => client.writeTextFile(
             path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
             jsonLine({ type: "stdinEnd" }),
@@ -1599,10 +1629,12 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
         },
         {
           label: "remove remote process-session directory",
+          remoteExecutionMayStillBeActive: false,
           run: () => client.remove(sessionDir),
         },
         {
           label: "remove local process-session proxy directory",
+          remoteExecutionMayStillBeActive: false,
           run: () => fs.rm(proxyDir, { recursive: true, force: true }),
         },
       ]);
@@ -1856,9 +1888,21 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     const startedServer = server;
     const startedWorker = worker;
     const failures = await collectCleanupFailures([
-      ...(startedServer ? [{ label: "stop callback bridge server", run: () => startedServer.stop() }] : []),
-      ...(startedWorker ? [{ label: "stop callback bridge worker", run: () => startedWorker.stop() }] : []),
-      { label: "remove callback bridge asset", run: () => bridgeAsset.cleanup() },
+      ...(startedServer ? [{
+        label: "stop callback bridge server",
+        remoteExecutionMayStillBeActive: true,
+        run: () => startedServer.stop(),
+      }] : []),
+      ...(startedWorker ? [{
+        label: "stop callback bridge worker",
+        remoteExecutionMayStillBeActive: false,
+        run: () => startedWorker.stop(),
+      }] : []),
+      {
+        label: "remove callback bridge asset",
+        remoteExecutionMayStillBeActive: false,
+        run: () => bridgeAsset.cleanup(),
+      },
     ]);
     if (failures.length > 0) {
       throw remoteBridgeShutdownError(
@@ -1891,9 +1935,21 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     runLogTail,
     stop: async () => {
       const failures = await collectCleanupFailures([
-        { label: "stop callback bridge server", run: () => server.stop() },
-        { label: "stop callback bridge worker", run: () => worker.stop() },
-        { label: "remove callback bridge asset", run: () => bridgeAsset.cleanup() },
+        {
+          label: "stop callback bridge server",
+          remoteExecutionMayStillBeActive: true,
+          run: () => server.stop(),
+        },
+        {
+          label: "stop callback bridge worker",
+          remoteExecutionMayStillBeActive: false,
+          run: () => worker.stop(),
+        },
+        {
+          label: "remove callback bridge asset",
+          remoteExecutionMayStillBeActive: false,
+          run: () => bridgeAsset.cleanup(),
+        },
       ]);
       if (failures.length > 0) {
         throw remoteBridgeShutdownError(

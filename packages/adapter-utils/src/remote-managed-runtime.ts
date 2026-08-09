@@ -11,6 +11,8 @@ import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 import type { RuntimeProgressSink } from "./runtime-progress.js";
 
 const ACP_WORKSPACE_RESTORE_ERROR_CODE = "acp_workspace_restore_failed";
+export const ACP_REMOTE_RUN_CLEANUP_ERROR_CODE = "acp_remote_run_cleanup_failed";
+const REMOTE_RUN_CLEANUP_ATTEMPTS = 3;
 
 function errorMessageFromUnknown(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -32,6 +34,22 @@ function remoteWorkspaceCleanupFailure(
       restoreError: cleanupError,
     },
   );
+}
+
+async function removeRemoteRunRoot(input: {
+  spec: SshRemoteExecutionSpec;
+  remoteDir: string;
+}): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < REMOTE_RUN_CLEANUP_ATTEMPTS; attempt += 1) {
+    try {
+      await removeDirectoryFromSsh(input);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
 }
 
 export interface RemoteManagedRuntimeAsset {
@@ -136,7 +154,7 @@ export async function prepareRemoteManagedRuntime(input: {
     });
   } catch (preparationError) {
     try {
-      await removeDirectoryFromSsh({ spec: input.spec, remoteDir: runRootDir });
+      await removeRemoteRunRoot({ spec: input.spec, remoteDir: runRootDir });
     } catch (cleanupError) {
       throw remoteWorkspaceCleanupFailure(
         preparationError,
@@ -158,7 +176,7 @@ export async function prepareRemoteManagedRuntime(input: {
       onProgress,
     });
     try {
-      await removeDirectoryFromSsh({ spec: input.spec, remoteDir: runRootDir });
+      await removeRemoteRunRoot({ spec: input.spec, remoteDir: runRootDir });
     } catch (cleanupError) {
       try {
         await onProgress?.(
@@ -167,6 +185,17 @@ export async function prepareRemoteManagedRuntime(input: {
       } catch {
         // Sync-back already succeeded, so warning delivery remains best-effort.
       }
+      throw Object.assign(
+        new Error(
+          `Remote run workspace cleanup failed after successful sync-back: ${errorMessageFromUnknown(cleanupError)}`,
+        ),
+        {
+          code: ACP_REMOTE_RUN_CLEANUP_ERROR_CODE,
+          cause: cleanupError,
+          workspaceRestored: true,
+          remoteRunDir: runRootDir,
+        },
+      );
     }
   };
   try {
