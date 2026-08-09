@@ -15,9 +15,14 @@ import {
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
+  overrideAdapterExecutionTargetRemoteCwd,
+  prepareAdapterExecutionTargetRuntime,
   readAdapterExecutionTarget,
+  remoteBridgeShutdownMayLeaveExecutionActive,
   resolveAdapterExecutionTargetCwd,
 } from "@paperclipai/adapter-utils/execution-target";
+import { ACP_REMOTE_RUN_CLEANUP_ERROR_CODE } from "@paperclipai/adapter-utils/remote-managed-runtime";
+import { resolveManagedInstructionsBundle } from "@paperclipai/adapter-utils/instructions-bundle";
 import {
   DEFAULT_ACP_ENGINE_MODE,
   DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
@@ -53,6 +58,103 @@ type ClaudeAcpExecutorOptions = Omit<
 >;
 
 type ClaudeAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
+
+export const ACP_WORKSPACE_RESTORE_ERROR_CODE = "acp_workspace_restore_failed";
+
+function errorMessageFromUnknown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function acpWorkspaceRestoreError(executionError: unknown, restoreError: unknown): Error {
+  return Object.assign(
+    new Error(
+      `${errorMessageFromUnknown(executionError)}\nACP workspace restore failed: ${errorMessageFromUnknown(restoreError)}`,
+    ),
+    {
+      code: ACP_WORKSPACE_RESTORE_ERROR_CODE,
+      cause: executionError,
+      executionError,
+      restoreError,
+    },
+  );
+}
+
+function isRestoredRemoteRunCleanupFailure(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    error.code === ACP_REMOTE_RUN_CLEANUP_ERROR_CODE &&
+    "workspaceRestored" in error &&
+    error.workspaceRestored === true,
+  );
+}
+
+function acpRemoteRunCleanupError(executionError: unknown, cleanupError: unknown): Error {
+  return Object.assign(
+    new Error(
+      `${errorMessageFromUnknown(executionError)}\n${errorMessageFromUnknown(cleanupError)}`,
+    ),
+    {
+      code: ACP_REMOTE_RUN_CLEANUP_ERROR_CODE,
+      cause: executionError,
+      executionError,
+      cleanupError,
+      workspaceRestored: true,
+      ...(cleanupError && typeof cleanupError === "object" && "remoteRunDir" in cleanupError
+        ? { remoteRunDir: cleanupError.remoteRunDir }
+        : {}),
+    },
+  );
+}
+
+function remoteBridgeWorkspaceRestoreError(executionError: unknown): Error {
+  return acpWorkspaceRestoreError(
+    executionError,
+    new Error(
+      "Workspace restore was skipped because ACP remote bridge shutdown failed and remote execution may still be active.",
+    ),
+  );
+}
+
+function withAcpWorkspaceRestoreFailure(
+  result: AdapterExecutionResult,
+  error: unknown,
+): AdapterExecutionResult {
+  const restoreMessage = errorMessageFromUnknown(error);
+  const cleanupOnly = isRestoredRemoteRunCleanupFailure(error);
+  const failureCode = cleanupOnly
+    ? ACP_REMOTE_RUN_CLEANUP_ERROR_CODE
+    : ACP_WORKSPACE_RESTORE_ERROR_CODE;
+  const teardownMessage = `ACP workspace restore failed: ${restoreMessage}`;
+  const existingErrorMessage =
+    typeof result.errorMessage === "string" && result.errorMessage.trim().length > 0
+      ? result.errorMessage
+      : null;
+  const executionError = existingErrorMessage || result.errorCode
+    ? {
+        code: result.errorCode ?? null,
+        message: existingErrorMessage,
+      }
+    : null;
+  return {
+    ...result,
+    exitCode: result.exitCode === null || result.exitCode === 0 ? 1 : result.exitCode,
+    errorMessage: existingErrorMessage
+      ? `${existingErrorMessage}\n${cleanupOnly ? restoreMessage : teardownMessage}`
+      : cleanupOnly ? restoreMessage : teardownMessage,
+    errorCode: failureCode,
+    resultJson: {
+      ...(result.resultJson ?? {}),
+      [cleanupOnly ? "remoteRunCleanupFailure" : "workspaceRestoreFailure"]: {
+        code: failureCode,
+        message: restoreMessage,
+        ...(cleanupOnly ? { workspaceRestored: true } : {}),
+        ...(executionError ? { executionError } : {}),
+      },
+    },
+  };
+}
 
 function normalizeEngine(value: unknown): ClaudeEngineSelection {
   const raw = typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -178,17 +280,100 @@ function withClaudeAcpDefaults(options: ClaudeAcpExecutorOptions): AcpxEngineExe
 
 export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}): ClaudeAcpExecutor {
   let executor: ClaudeAcpExecutor | null = null;
+  const createExecutor = async (executorOptions: ClaudeAcpExecutorOptions) => {
+    const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
+    return createAcpxEngineExecutor(withClaudeAcpDefaults(executorOptions));
+  };
   return async (ctx) => {
-    let currentExecutor = executor;
-    if (!currentExecutor) {
-      const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
-      currentExecutor = createAcpxEngineExecutor(withClaudeAcpDefaults(options));
-      executor = currentExecutor;
-    }
-    return currentExecutor({
-      ...ctx,
-      config: buildClaudeAcpConfig(ctx.config),
+    const config = buildClaudeAcpConfig(ctx.config);
+    const target = readAdapterExecutionTarget({
+      executionTarget: ctx.executionTarget,
+      legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
     });
+    const instructionsBundle = resolveManagedInstructionsBundle(config);
+    if (target?.kind !== "remote") {
+      let currentExecutor = executor;
+      if (!currentExecutor) {
+        currentExecutor = await createExecutor(options);
+        executor = currentExecutor;
+      }
+      return currentExecutor({ ...ctx, config });
+    }
+
+    const workspaceContext = parseObject(ctx.context.paperclipWorkspace);
+    const workspaceLocalDir =
+      asString(workspaceContext.cwd, "").trim() ||
+      asString(config.cwd, "").trim() ||
+      process.cwd();
+    const preparedRuntime = await prepareAdapterExecutionTargetRuntime({
+      runId: ctx.runId,
+      target,
+      adapterKey: "claude",
+      workspaceLocalDir,
+      assets:
+        instructionsBundle.rootPath && instructionsBundle.entryRelativePath
+          ? [{ key: "instructions", localDir: instructionsBundle.rootPath }]
+          : undefined,
+      onProgress: (line) => ctx.onLog("stdout", line),
+      onRuntimeProgress: ctx.onRuntimeProgress,
+    });
+    const executionRemoteCwd = preparedRuntime.workspaceRemoteDir ?? target.remoteCwd;
+    const executionTarget =
+      overrideAdapterExecutionTargetRemoteCwd(target, executionRemoteCwd) ?? target;
+    const instructionsReferencePath =
+      instructionsBundle.rootPath && instructionsBundle.entryRelativePath
+        ? path.posix.join(
+            preparedRuntime.assetDirs.instructions ??
+              path.posix.join(executionRemoteCwd, ".paperclip-runtime", "claude", "instructions"),
+            instructionsBundle.entryRelativePath,
+          )
+        : null;
+    // Prepared remote workspaces are run-scoped and may be deleted by
+    // restoreWorkspace below. Keep their ACP process handles run-scoped too,
+    // even when an adapter config enables warm handles for durable workspaces.
+    const remoteConfig = { ...config, warmHandleIdleMs: 0 };
+
+    let result: AdapterExecutionResult;
+    try {
+      const remoteExecutor = await createExecutor({ ...options, warmHandles: new Map() });
+      result = await remoteExecutor({
+        ...ctx,
+        executionTarget,
+        executionSessionTarget: target,
+        config: {
+          ...remoteConfig,
+          ...(instructionsReferencePath ? { instructionsReferencePath } : {}),
+        },
+      });
+    } catch (executionError) {
+      if (remoteBridgeShutdownMayLeaveExecutionActive(executionError)) {
+        throw remoteBridgeWorkspaceRestoreError(executionError);
+      }
+      try {
+        await preparedRuntime.restoreWorkspace((line) => ctx.onLog("stdout", line));
+      } catch (restoreError) {
+        if (isRestoredRemoteRunCleanupFailure(restoreError)) {
+          throw acpRemoteRunCleanupError(executionError, restoreError);
+        }
+        try {
+          await ctx.onLog(
+            "stderr",
+            `[paperclip] ACP workspace restore also failed after an execution error: ${errorMessageFromUnknown(restoreError)}\n`,
+          );
+        } catch {
+          // Reporting is best-effort; the coded restoration failure remains authoritative.
+        }
+        throw acpWorkspaceRestoreError(executionError, restoreError);
+      }
+      throw executionError;
+    }
+
+    try {
+      await preparedRuntime.restoreWorkspace((line) => ctx.onLog("stdout", line));
+    } catch (restoreError) {
+      return withAcpWorkspaceRestoreFailure(result, restoreError);
+    }
+    return result;
   };
 }
 

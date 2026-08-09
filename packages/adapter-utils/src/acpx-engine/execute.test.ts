@@ -3,10 +3,32 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
+
+const remoteBridgeMocks = vi.hoisted(() => ({
+  startPaperclipBridge: vi.fn(),
+  startProcessSessionBridge: vi.fn(),
+}));
+
+vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>(
+    "@paperclipai/adapter-utils/execution-target",
+  );
+  remoteBridgeMocks.startPaperclipBridge.mockImplementation(
+    actual.startAdapterExecutionTargetPaperclipBridge,
+  );
+  remoteBridgeMocks.startProcessSessionBridge.mockImplementation(
+    actual.startAdapterExecutionTargetProcessSessionBridge,
+  );
+  return {
+    ...actual,
+    startAdapterExecutionTargetPaperclipBridge: remoteBridgeMocks.startPaperclipBridge,
+    startAdapterExecutionTargetProcessSessionBridge: remoteBridgeMocks.startProcessSessionBridge,
+  };
+});
 import {
   createAcpxEngineExecutor,
   findAncestorBin,
@@ -122,6 +144,7 @@ async function runExecutor(
     executionTransport?: Record<string, unknown>;
     authToken?: string;
     executionTarget?: Record<string, unknown>;
+    executionSessionTarget?: Record<string, unknown>;
     runtimeMcp?: AdapterRuntimeMcpAccess;
   } = {},
 ) {
@@ -148,6 +171,7 @@ async function runExecutor(
       executionTransport: options.executionTransport,
       authToken: options.authToken,
       executionTarget: options.executionTarget,
+      executionSessionTarget: options.executionSessionTarget,
       runtimeMcp: options.runtimeMcp,
       onLog: async (stream: "stdout" | "stderr", text: string) => {
         logs.push({ stream, text });
@@ -161,7 +185,399 @@ async function runExecutor(
   return { logs, meta, runtimeOptions, configOptions, result };
 }
 
+function mockSuccessfulRemoteBridges() {
+  const paperclipStop = vi.fn(async () => undefined);
+  const processStop = vi.fn(async () => undefined);
+  remoteBridgeMocks.startPaperclipBridge.mockResolvedValueOnce({
+    env: {},
+    stop: paperclipStop,
+  });
+  remoteBridgeMocks.startProcessSessionBridge.mockResolvedValueOnce({
+    agentCommand: "/tmp/fake-acp-proxy.mjs",
+    stop: processStop,
+  });
+  return { paperclipStop, processStop };
+}
+
+function remoteSandboxTarget() {
+  return {
+    kind: "remote",
+    transport: "sandbox",
+    providerKey: "test-sandbox",
+    remoteCwd: "/remote/workspace",
+    runner: { execute: async () => { throw new Error("not reached"); } },
+  };
+}
+
+async function rejectedWith(
+  execution: Promise<unknown>,
+): Promise<AggregateError & Record<string, unknown>> {
+  try {
+    await execution;
+  } catch (error) {
+    return error as AggregateError & Record<string, unknown>;
+  }
+  throw new Error("Expected execution to reject");
+}
+
 describe("shared ACPX engine runtime behavior", () => {
+  it("stops the callback bridge when its startup log callback fails", async () => {
+    const root = await makeTempRoot();
+    const logError = new Error("callback bridge startup log failed");
+    const paperclipStop = vi.fn(async () => undefined);
+    remoteBridgeMocks.startPaperclipBridge.mockResolvedValueOnce({
+      env: {},
+      stop: paperclipStop,
+    });
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => buildRuntime() as never,
+    });
+
+    const execution = execute({
+      runId: "run-callback-bridge-log-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: remoteSandboxTarget(),
+      onLog: async (stream: string) => {
+        if (stream === "stdout") throw logError;
+      },
+      onMeta: async () => {},
+    } as never);
+
+    await expect(execution).rejects.toBe(logError);
+    expect(paperclipStop).toHaveBeenCalledOnce();
+    expect(remoteBridgeMocks.startProcessSessionBridge).not.toHaveBeenCalled();
+  });
+
+  it("stops both remote bridges when the initial post-build log callback fails", async () => {
+    const root = await makeTempRoot();
+    const logError = new Error("initial executor log failed");
+    const { paperclipStop, processStop } = mockSuccessfulRemoteBridges();
+    const createRuntime = vi.fn(() => buildRuntime() as never);
+    const execute = createAcpxEngineExecutor({ createRuntime });
+
+    const result = await execute({
+      runId: "run-initial-log-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: remoteSandboxTarget(),
+      onLog: async (stream: string) => {
+        if (stream === "stderr") throw logError;
+      },
+      onMeta: async () => {},
+    } as never);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "acpx_runtime_error",
+      errorMessage: "initial executor log failed",
+      resultJson: { phase: "setup" },
+    });
+    expect(createRuntime).not.toHaveBeenCalled();
+    expect(processStop).toHaveBeenCalledOnce();
+    expect(paperclipStop).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when session initialization and remote bridge shutdown both fail", async () => {
+    const root = await makeTempRoot();
+    const ensureError = new Error("session initialization failed");
+    const stopError = new Error("process bridge stop failed");
+    const paperclipStop = vi.fn(async () => undefined);
+    const processStop = vi.fn(async () => {
+      throw stopError;
+    });
+    remoteBridgeMocks.startPaperclipBridge.mockResolvedValueOnce({
+      env: {},
+      stop: paperclipStop,
+    });
+    remoteBridgeMocks.startProcessSessionBridge.mockResolvedValueOnce({
+      agentCommand: "/tmp/fake-acp-proxy.mjs",
+      stop: processStop,
+    });
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => {
+          throw ensureError;
+        },
+        startTurn: () => {
+          throw new Error("not reached");
+        },
+        close: async () => {},
+      }) as never,
+    });
+
+    const execution = execute({
+      runId: "run-bridge-cleanup-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "test-sandbox",
+        remoteCwd: "/remote/workspace",
+        runner: { execute: async () => { throw new Error("not reached"); } },
+      },
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    await expect(execution).rejects.toMatchObject({
+      code: "acp_remote_bridge_shutdown_failed",
+      cause: ensureError,
+    });
+    await expect(execution).rejects.toThrow("ACP remote bridge shutdown failed");
+    expect(processStop).toHaveBeenCalledOnce();
+    expect(paperclipStop).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when configure-session runtime close fails", async () => {
+    const root = await makeTempRoot();
+    const configError = new Error("session config failed");
+    const closeError = new Error("runtime close failed after config error");
+    const { paperclipStop, processStop } = mockSuccessfulRemoteBridges();
+    const close = vi.fn(async () => {
+      throw closeError;
+    });
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => {
+          throw new Error("not reached");
+        },
+        setConfigOption: async () => {
+          throw configError;
+        },
+        close,
+      }) as never,
+    });
+
+    const error = await rejectedWith(execute({
+      runId: "run-config-close-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        model: "custom-model",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: remoteSandboxTarget(),
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never));
+
+    expect(error).toMatchObject({
+      code: "acp_remote_bridge_shutdown_failed",
+      cause: configError,
+      operationError: configError,
+      remoteExecutionMayStillBeActive: true,
+    });
+    expect(error.errors).toEqual([
+      expect.objectContaining({
+        cause: closeError,
+        remoteExecutionMayStillBeActive: true,
+      }),
+    ]);
+    expect(close).toHaveBeenCalledOnce();
+    expect(processStop).toHaveBeenCalledOnce();
+    expect(paperclipStop).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when terminal runtime close fails", async () => {
+    const root = await makeTempRoot();
+    const closeError = new Error("runtime close failed after completed turn");
+    const { paperclipStop, processStop } = mockSuccessfulRemoteBridges();
+    const close = vi.fn(async () => {
+      throw closeError;
+    });
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            yield { type: "done", stopReason: "end_turn" };
+          })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close,
+      }) as never,
+    });
+
+    const error = await rejectedWith(execute({
+      runId: "run-terminal-close-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: remoteSandboxTarget(),
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never));
+
+    expect(error).toMatchObject({
+      code: "acp_remote_bridge_shutdown_failed",
+      remoteExecutionMayStillBeActive: true,
+    });
+    expect(error).not.toHaveProperty("operationError");
+    expect(error.errors).toEqual([
+      expect.objectContaining({
+        cause: closeError,
+        remoteExecutionMayStillBeActive: true,
+      }),
+    ]);
+    expect(close).toHaveBeenCalledOnce();
+    expect(processStop).toHaveBeenCalledOnce();
+    expect(paperclipStop).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when exception-path runtime close fails", async () => {
+    const root = await makeTempRoot();
+    const turnError = new Error("turn event stream failed");
+    const closeError = new Error("runtime close failed after turn error");
+    const { paperclipStop, processStop } = mockSuccessfulRemoteBridges();
+    const cancel = vi.fn(async () => undefined);
+    const close = vi.fn(async () => {
+      throw closeError;
+    });
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            throw turnError;
+          })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel,
+        }),
+        close,
+      }) as never,
+    });
+
+    const error = await rejectedWith(execute({
+      runId: "run-exception-close-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: remoteSandboxTarget(),
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never));
+
+    expect(error).toMatchObject({
+      code: "acp_remote_bridge_shutdown_failed",
+      cause: turnError,
+      operationError: turnError,
+      remoteExecutionMayStillBeActive: true,
+    });
+    expect(error.errors).toEqual([
+      expect.objectContaining({
+        cause: closeError,
+        remoteExecutionMayStillBeActive: true,
+      }),
+    ]);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(processStop).toHaveBeenCalledOnce();
+    expect(paperclipStop).toHaveBeenCalledOnce();
+  });
+
+  it("executes in the invocation workspace while preserving the stable remote session identity", async () => {
+    const root = await makeTempRoot();
+    const localCwd = path.join(root, "worktree");
+    const stateDir = path.join(root, "state");
+    await fs.mkdir(localCwd, { recursive: true });
+
+    const stableTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "fake-plugin",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd: "/remote/workspace",
+    };
+    const run = (runId: string) => runExecutor(
+      { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+      {
+        executionTarget: {
+          ...stableTarget,
+          remoteCwd: `/remote/workspace/.paperclip-runtime/runs/${runId}/workspace`,
+        },
+        executionSessionTarget: stableTarget,
+      },
+    );
+
+    const first = await run("run-1");
+    const second = await run("run-2");
+
+    expect(first.runtimeOptions[0]?.cwd).toBe(
+      "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+    );
+    expect(second.runtimeOptions[0]?.cwd).toBe(
+      "/remote/workspace/.paperclip-runtime/runs/run-2/workspace",
+    );
+    expect(first.result.sessionParams).toMatchObject({
+      cwd: "/remote/workspace",
+      remoteExecution: {
+        transport: "sandbox",
+        providerKey: "fake-plugin",
+        environmentId: "env-1",
+        leaseId: "lease-1",
+        remoteCwd: "/remote/workspace",
+      },
+    });
+    expect(first.result.sessionParams?.configFingerprint).toBe(
+      second.result.sessionParams?.configFingerprint,
+    );
+    expect(first.result.sessionParams?.sessionKey).toBe(second.result.sessionParams?.sessionKey);
+  });
+
   it("sets Codex model, effort, and fast mode through CODEX_CONFIG without session config calls", async () => {
     const { configOptions, meta } = await runExecutor({
       agent: "codex",
@@ -952,6 +1368,74 @@ describe("shared ACPX engine runtime behavior", () => {
       if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer);
     }
     warmHandles.clear();
+  });
+
+  it("refreshes the staged instructions path when a compatible disk session resumes", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const instructionsFilePath = path.join(root, "AGENTS.md");
+    await fs.writeFile(instructionsFilePath, "Follow the managed instructions.\n", "utf8");
+    const prompts: string[] = [];
+    const ensureSessionInputs: Array<Record<string, unknown>> = [];
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async (input: Record<string, unknown>) => {
+          ensureSessionInputs.push(input);
+          return {
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          };
+        },
+        startTurn: (input: { text: string }) => {
+          prompts.push(input.text);
+          return {
+            events: (async function* () {
+              yield { type: "done", stopReason: "end_turn" };
+            })(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          };
+        },
+        close: async () => {},
+      }) as never,
+    });
+    const call = async (runId: string, instructionsReferencePath: string, sessionParams?: unknown) =>
+      execute({
+        runId,
+        agent: { id: "agent-1", companyId: "company-1" },
+        runtime: { taskKey: "issue-1", sessionParams },
+        config: {
+          agent: "custom",
+          agentCommand: "node ./fake-acp.js",
+          stateDir,
+          mode: "persistent",
+          warmHandleIdleMs: 0,
+          instructionsFilePath,
+          instructionsReferencePath,
+        },
+        context: {
+          taskId: "issue-1",
+          paperclipWake: {
+            reason: "comment",
+            issue: { id: "issue-1", identifier: "TEST-1" },
+          },
+        },
+        onLog: async () => {},
+        onMeta: async () => {},
+      } as never);
+
+    const firstReference = "/remote/runs/run-1/instructions/AGENTS.md";
+    const secondReference = "/remote/runs/run-2/instructions/AGENTS.md";
+    const first = await call("run-1", firstReference);
+    await call("run-2", secondReference, first.sessionParams);
+
+    expect(ensureSessionInputs[1]?.resumeSessionId).toBe("backend-session");
+    expect(prompts[0]).toContain("Follow the managed instructions.");
+    expect(prompts[0]).toContain(firstReference);
+    expect(prompts[1]).toContain(secondReference);
+    expect(prompts[1]).not.toContain(firstReference);
+    expect(prompts[1]).not.toContain("Follow the managed instructions.");
   });
 
   it("keeps custom scratch and temp values in the session fingerprint", async () => {

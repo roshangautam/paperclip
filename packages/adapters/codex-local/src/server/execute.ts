@@ -5,6 +5,7 @@ import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type Adapter
 import { buildCodexAuthInboundProvision } from "./codex-auth-merge-scripts.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import {
+  ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
   overrideAdapterExecutionTargetRemoteCwd,
@@ -21,7 +22,9 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  stopPaperclipBridgeThenRestoreWorkspace,
 } from "@paperclipai/adapter-utils/execution-target";
+import { ACP_REMOTE_RUN_CLEANUP_ERROR_CODE } from "@paperclipai/adapter-utils/remote-managed-runtime";
 import {
   asString,
   asNumber,
@@ -87,10 +90,12 @@ import {
   resolveCodexInactivityTimeout,
 } from "./output-inactivity-monitor.js";
 import {
+  ACP_WORKSPACE_RESTORE_ERROR_CODE,
   createCodexAcpExecutor,
   formatCodexAcpFallbackMessage,
   resolveCodexExecutionEngineForRun,
 } from "./acp.js";
+import { resolveCodexInstructionsBundle } from "./instructions-bundle.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeCodexAcp = createCodexAcpExecutor();
@@ -441,7 +446,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       return await executeCodexAcp(ctx);
     } catch (err) {
-      if (engineSelection.explicit) throw err;
+      if (
+        engineSelection.explicit
+        || (typeof err === "object" && err !== null && "code" in err
+          && (err.code === ACP_WORKSPACE_RESTORE_ERROR_CODE
+            || err.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE
+            || err.code === ACP_REMOTE_RUN_CLEANUP_ERROR_CODE))
+      ) throw err;
       const reason = err instanceof Error ? err.message : String(err);
       await ctx.onLog(
         "stderr",
@@ -498,6 +509,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  const instructionsBundle = resolveCodexInstructionsBundle(config);
   const configuredCodexHome =
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
@@ -665,6 +677,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 // small and still uploaded.
                 exclude: ["tmp", ".tmp", "sessions", "shell_snapshots"],
               },
+              ...(instructionsBundle.rootPath && instructionsBundle.entryRelativePath
+                ? [{
+                    key: "instructions",
+                    localDir: instructionsBundle.rootPath,
+                  }]
+                : []),
             ],
           });
         })()
@@ -877,8 +895,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Codex session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
       );
     }
-    const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-    const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
+    const instructionsFilePath = instructionsBundle.filePath;
+    const remoteInstructionsFilePath =
+      executionTargetIsRemote && instructionsBundle.entryRelativePath
+        ? preparedExecutionTargetRuntime?.assetDirs.instructions
+          ? path.posix.join(
+              preparedExecutionTargetRuntime.assetDirs.instructions,
+              instructionsBundle.entryRelativePath,
+            )
+          : null
+        : null;
+    const promptInstructionsFilePath = remoteInstructionsFilePath ?? instructionsFilePath;
+    const instructionsDir = promptInstructionsFilePath
+      ? `${remoteInstructionsFilePath
+        ? path.posix.dirname(promptInstructionsFilePath)
+        : path.dirname(promptInstructionsFilePath)}/`
+      : "";
     let instructionsPrefix = "";
     let instructionsChars = 0;
     if (instructionsFilePath) {
@@ -886,7 +918,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
         instructionsPrefix =
           `${instructionsContents}\n\n` +
-          `The above agent instructions were loaded from ${instructionsFilePath}. ` +
+          `The above agent instructions were loaded from ${promptInstructionsFilePath}. ` +
           `Resolve any relative file references from ${instructionsDir}.\n\n`;
         instructionsChars = instructionsPrefix.length;
       } catch (err) {
@@ -1317,16 +1349,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       return toResult(initial, false, false);
     } finally {
-      if (paperclipBridge) {
-        await paperclipBridge.stop();
-      }
-      if (restoreRemoteWorkspace) {
-        await onLog(
+      await stopPaperclipBridgeThenRestoreWorkspace({
+        paperclipBridge,
+        restoreRemoteWorkspace,
+        beforeRestore: () => onLog(
           "stdout",
           `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-        );
-        await restoreRemoteWorkspace();
-      }
+        ),
+      });
     }
   } finally {
     // Restore the managed config.toml so PAPERCLIP_CODEX_PROVIDERS changes

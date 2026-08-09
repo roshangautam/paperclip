@@ -35,6 +35,7 @@
  * @see PLUGIN_SPEC.md §12 — Process Model
  * @see PLUGIN_SPEC.md §12.5 — Graceful Shutdown Policy
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import type { Db } from "@paperclipai/db";
 import type {
@@ -43,7 +44,12 @@ import type {
   PaperclipPluginManifestV1,
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "./plugin-registry.js";
-import { pluginLoader, type PluginLoader } from "./plugin-loader.js";
+import {
+  PluginArtifactRollbackError,
+  pluginLoader,
+  type PluginLoader,
+  withPluginMutationLock,
+} from "./plugin-loader.js";
 import type { PluginWorkerManager, WorkerStartOptions } from "./plugin-worker-manager.js";
 import { toolAccessService } from "./tool-access.js";
 import { badRequest, notFound } from "../errors.js";
@@ -87,6 +93,44 @@ const VALID_TRANSITIONS: Record<string, readonly PluginStatus[]> = {
 };
 
 const APP_RECONCILIATION_RETRY_DELAYS_MS = [250, 1_000, 5_000] as const;
+const pluginLifecycleLocks = new Map<string, Promise<void>>();
+const heldPluginLifecycleLocks = new AsyncLocalStorage<ReadonlyMap<string, symbol>>();
+// Async resources can outlive the operation that created them, so only an
+// actively held token may bypass the queue as a same-chain reentrant call.
+const activePluginLifecycleLockTokens = new Set<symbol>();
+
+async function withPluginLifecycleLock<T>(
+  pluginId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const heldLocks = heldPluginLifecycleLocks.getStore();
+  const heldLockToken = heldLocks?.get(pluginId);
+  if (heldLockToken && activePluginLifecycleLockTokens.has(heldLockToken)) {
+    return operation();
+  }
+
+  const previous = pluginLifecycleLocks.get(pluginId) ?? Promise.resolve();
+  let release!: () => void;
+  const marker = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  pluginLifecycleLocks.set(pluginId, marker);
+  await previous;
+
+  const lockToken = Symbol(pluginId);
+  const nextHeldLocks = new Map(heldLocks);
+  nextHeldLocks.set(pluginId, lockToken);
+  activePluginLifecycleLockTokens.add(lockToken);
+  try {
+    return await heldPluginLifecycleLocks.run(nextHeldLocks, operation);
+  } finally {
+    activePluginLifecycleLockTokens.delete(lockToken);
+    release();
+    if (pluginLifecycleLocks.get(pluginId) === marker) {
+      pluginLifecycleLocks.delete(pluginId);
+    }
+  }
+}
 
 /**
  * Check whether a transition from `from` → `to` is valid.
@@ -188,7 +232,7 @@ export interface PluginLifecycleManager {
    * If the upgrade adds new capabilities, transitions to `upgrade_pending`.
    * Otherwise, transitions to `ready` directly.
    */
-  upgrade(pluginId: string, version?: string): Promise<PluginRecord>;
+  upgrade(pluginId: string, version?: string, localPath?: string): Promise<PluginRecord>;
 
   /**
    * Start the worker process for a plugin that is already in `ready` state.
@@ -519,11 +563,44 @@ export function pluginLifecycleManager(
     await stopWorkerIfRunning(pluginId, pluginKey);
   }
 
+  async function failClosedAfterArtifactRollback(
+    pluginId: string,
+    pluginKey: string,
+    error: PluginArtifactRollbackError,
+  ): Promise<void> {
+    const current = await requirePlugin(pluginId).catch(() => null);
+    if (!current) return;
+
+    const lastError = `Plugin package rollback failed: ${error.message}`;
+    const failClosed = current.status === "error"
+      ? registry.updateStatus(pluginId, { status: "error", lastError }).then((failed) => {
+          if (!failed) throw notFound(`Plugin not found after status update: ${pluginId}`);
+          return failed as PluginRecord;
+        })
+      : transition(pluginId, "error", lastError, current);
+    await failClosed.then((failed) => {
+      emitDomain("plugin.error", {
+        pluginId,
+        pluginKey: failed.pluginKey,
+        error: lastError,
+      });
+    }).catch((statusError) => {
+      log.error(
+        {
+          pluginId,
+          pluginKey,
+          err: statusError instanceof Error ? statusError.message : String(statusError),
+        },
+        "plugin lifecycle: failed to mark plugin errored after package rollback failure",
+      );
+    });
+  }
+
   // -----------------------------------------------------------------------
   // Public API
   // -----------------------------------------------------------------------
 
-  return {
+  const unlockedManager: PluginLifecycleManager = {
     // -- load -------------------------------------------------------------
     /**
      * load — Transitions a plugin to 'ready' status and starts its worker.
@@ -615,8 +692,7 @@ export function pluginLifecycleManager(
       // If already uninstalled and removeData, hard-delete
       if (plugin.status === "uninstalled") {
         if (removeData) {
-          await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
-          const deleted = await registry.uninstall(pluginId, true);
+          const deleted = await pluginLoaderInstance.uninstallPlugin(plugin, true);
           log.info(
             { pluginId, pluginKey: plugin.pluginKey },
             "plugin lifecycle: hard-deleted already-uninstalled plugin",
@@ -636,10 +712,26 @@ export function pluginLifecycleManager(
       }
 
       await deactivatePluginRuntime(pluginId, plugin.pluginKey);
-      await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
-
-      // Perform the uninstall via registry (handles soft/hard delete)
-      const result = await registry.uninstall(pluginId, removeData);
+      let result: PluginRecord | null;
+      try {
+        result = await pluginLoaderInstance.uninstallPlugin(plugin, removeData);
+      } catch (error) {
+        if (error instanceof PluginArtifactRollbackError) {
+          await failClosedAfterArtifactRollback(pluginId, plugin.pluginKey, error);
+        } else if (plugin.status === "ready") {
+          await activateReadyPlugin(pluginId).catch((reactivationError) => {
+            log.error(
+              {
+                pluginId,
+                pluginKey: plugin.pluginKey,
+                err: reactivationError instanceof Error ? reactivationError.message : String(reactivationError),
+              },
+              "plugin lifecycle: failed to reactivate plugin after uninstall rollback",
+            );
+          });
+        }
+        throw error;
+      }
 
       log.info(
         { pluginId, pluginKey: plugin.pluginKey, removeData },
@@ -710,30 +802,136 @@ export function pluginLifecycleManager(
      *
      * @param pluginId - The UUID of the plugin to upgrade.
      * @param version - Optional target version specifier.
+     * @param localPath - Optional server-local path for a local plugin replacement.
      * @returns The updated `PluginRecord`.
-     * @throws {BadRequest} If the plugin is not in a ready or upgrade_pending state.
+     * @throws {BadRequest} If the plugin is not in a ready state.
      */
-    async upgrade(pluginId: string, version?: string): Promise<PluginRecord> {
+    async upgrade(pluginId: string, version?: string, localPath?: string): Promise<PluginRecord> {
       const plugin = await requirePlugin(pluginId);
 
-      // Can only upgrade plugins that are ready or already in upgrade_pending
-      if (plugin.status !== "ready" && plugin.status !== "upgrade_pending") {
+      // Retrying an upgrade_pending plugin would compare the pending manifest
+      // against itself and bypass approval for newly added capabilities.
+      if (plugin.status !== "ready") {
         throw badRequest(
           `Cannot upgrade plugin in status '${plugin.status}'. ` +
-            `Plugin must be in 'ready' or 'upgrade_pending' status to be upgraded.`,
+            `Plugin must be in 'ready' status to be upgraded.`,
         );
       }
 
       log.info(
-        { pluginId, pluginKey: plugin.pluginKey, targetVersion: version },
+        { pluginId, pluginKey: plugin.pluginKey, targetVersion: version, localPath },
         "plugin lifecycle: upgrade requested",
       );
 
-      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
+      // 1. Download and validate before stopping the active worker. The loader
+      // invokes this hook only after accepting the replacement manifest.
+      let runtimeDeactivated = false;
+      let replacementActivationAttempted = false;
+      let addedCaps: PaperclipPluginManifestV1["capabilities"] = [];
+      let upgradePendingPersisted = false;
+      let upgradedPlugin: PluginRecord | null = null;
+      let upgradeResult: Awaited<ReturnType<PluginLoader["upgradePlugin"]>>;
+      try {
+        upgradeResult = await pluginLoaderInstance.upgradePlugin(pluginId, {
+          version,
+          localPath,
+          beforePromote: async (newManifest) => {
+            addedCaps = newManifest.capabilities.filter(
+              (cap) => !plugin.manifestJson.capabilities.includes(cap),
+            );
+            await deactivatePluginRuntime(pluginId, plugin.pluginKey);
+            runtimeDeactivated = true;
+            if (addedCaps.length > 0) {
+              const pending = await registry.updateStatus(pluginId, {
+                status: "upgrade_pending",
+                lastError: null,
+              });
+              if (!pending) throw notFound(`Plugin not found after status update: ${pluginId}`);
+              upgradePendingPersisted = true;
+            }
+          },
+          beforeCommit: async () => {
+            const updated = await requirePlugin(pluginId);
+            if (addedCaps.length > 0) {
+              log.info(
+                { pluginId, pluginKey: updated.pluginKey, addedCaps },
+                "plugin lifecycle: new capabilities detected, transitioning to upgrade_pending",
+              );
+              log.info(
+                { pluginId, pluginKey: updated.pluginKey, from: plugin.status, to: "upgrade_pending" },
+                `plugin lifecycle: ${plugin.status} → upgrade_pending`,
+              );
+              emitter.emit("plugin.status_changed", {
+                pluginId,
+                pluginKey: updated.pluginKey,
+                previousStatus: plugin.status,
+                newStatus: "upgrade_pending" as PluginStatus,
+              });
+              await reconcileAfterTransition(pluginId, updated.pluginKey, "upgrade_pending");
+              emitDomain("plugin.upgrade_pending", {
+                pluginId,
+                pluginKey: updated.pluginKey,
+              });
+              upgradedPlugin = updated;
+              return;
+            }
 
-      // 1. Download and validate new package via loader
-      const { oldManifest, newManifest, discovered } =
-        await pluginLoaderInstance.upgradePlugin(pluginId, { version });
+            const ready = await transition(pluginId, "ready", null, updated);
+            replacementActivationAttempted = true;
+            await activateReadyPlugin(pluginId);
+            await reconcileAfterTransition(pluginId, ready.pluginKey, "ready");
+            emitDomain("plugin.loaded", {
+              pluginId,
+              pluginKey: ready.pluginKey,
+            });
+            emitDomain("plugin.enabled", {
+              pluginId,
+              pluginKey: ready.pluginKey,
+            });
+            upgradedPlugin = ready;
+          },
+        });
+      } catch (error) {
+        if (runtimeDeactivated) {
+          if (error instanceof PluginArtifactRollbackError) {
+            await failClosedAfterArtifactRollback(pluginId, plugin.pluginKey, error);
+            throw error;
+          }
+          const current = await requirePlugin(pluginId).catch(() => null);
+          let restored = current?.status === "ready";
+          const shouldRestoreReady =
+            (upgradePendingPersisted && current?.status === "upgrade_pending")
+            || (replacementActivationAttempted && current?.status === "error");
+          if (shouldRestoreReady) {
+            restored = await registry.updateStatus(pluginId, {
+              status: "ready",
+              lastError: null,
+            }).then((result) => Boolean(result)).catch((restoreError) => {
+              log.error(
+                {
+                  pluginId,
+                  pluginKey: plugin.pluginKey,
+                  err: restoreError instanceof Error ? restoreError.message : String(restoreError),
+                },
+                "plugin lifecycle: failed to restore ready status after upgrade rollback",
+              );
+              return false;
+            });
+          }
+          if (restored) await activateReadyPlugin(pluginId).catch((reactivationError) => {
+            log.error(
+              {
+                pluginId,
+                pluginKey: plugin.pluginKey,
+                err: reactivationError instanceof Error ? reactivationError.message : String(reactivationError),
+              },
+              "plugin lifecycle: failed to reactivate previous plugin after upgrade rollback",
+            );
+          });
+        }
+        throw error;
+      }
+      const { oldManifest, newManifest } = upgradeResult;
 
       log.info(
         {
@@ -745,45 +943,9 @@ export function pluginLifecycleManager(
         "plugin lifecycle: package upgraded on disk",
       );
 
-      // 2. Compare capabilities
-      const addedCaps = newManifest.capabilities.filter(
-        (cap) => !oldManifest.capabilities.includes(cap),
-      );
-
-      // 3. Transition state
-      if (addedCaps.length > 0) {
-        // New capabilities require operator approval — worker stays stopped
-        log.info(
-          { pluginId, pluginKey: plugin.pluginKey, addedCaps },
-          "plugin lifecycle: new capabilities detected, transitioning to upgrade_pending",
-        );
-        // Skip the inner stopWorkerIfRunning since we already stopped above
-        const result = await transition(pluginId, "upgrade_pending", null, plugin);
-        emitDomain("plugin.upgrade_pending", {
-          pluginId,
-          pluginKey: result.pluginKey,
-        });
-        return result;
-      } else {
-        const result = await transition(pluginId, "ready", null, {
-          ...plugin,
-          version: discovered.version,
-          manifestJson: newManifest,
-        } as PluginRecord);
-        await activateReadyPlugin(pluginId);
-        await reconcileAfterTransition(pluginId, result.pluginKey, "ready");
-
-        emitDomain("plugin.loaded", {
-          pluginId,
-          pluginKey: result.pluginKey,
-        });
-        emitDomain("plugin.enabled", {
-          pluginId,
-          pluginKey: result.pluginKey,
-        });
-
-        return result;
-      }
+      // Lifecycle activation and reconciliation completed before the loader
+      // discarded its rollback copy of the previous managed package tree.
+      return upgradedPlugin ?? await requirePlugin(pluginId);
     },
 
     // -- startWorker ------------------------------------------------------
@@ -923,5 +1085,23 @@ export function pluginLifecycleManager(
     once(event, listener) {
       emitter.once(event, listener);
     },
+  };
+
+  return {
+    ...unlockedManager,
+    load: (pluginId) => withPluginLifecycleLock(pluginId, () => unlockedManager.load(pluginId)),
+    enable: (pluginId) => withPluginLifecycleLock(pluginId, () => unlockedManager.enable(pluginId)),
+    disable: (pluginId, reason) => withPluginLifecycleLock(pluginId, () => unlockedManager.disable(pluginId, reason)),
+    unload: (pluginId, removeData) => withPluginMutationLock(
+      () => withPluginLifecycleLock(pluginId, () => unlockedManager.unload(pluginId, removeData)),
+    ),
+    markError: (pluginId, error) => withPluginLifecycleLock(pluginId, () => unlockedManager.markError(pluginId, error)),
+    markUpgradePending: (pluginId) => withPluginLifecycleLock(pluginId, () => unlockedManager.markUpgradePending(pluginId)),
+    upgrade: (pluginId, version, localPath) => withPluginMutationLock(
+      () => withPluginLifecycleLock(pluginId, () => unlockedManager.upgrade(pluginId, version, localPath)),
+    ),
+    startWorker: (pluginId, workerOptions) => withPluginLifecycleLock(pluginId, () => unlockedManager.startWorker(pluginId, workerOptions)),
+    stopWorker: (pluginId) => withPluginLifecycleLock(pluginId, () => unlockedManager.stopWorker(pluginId)),
+    restartWorker: (pluginId) => withPluginLifecycleLock(pluginId, () => unlockedManager.restartWorker(pluginId)),
   };
 }

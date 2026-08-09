@@ -1369,6 +1369,7 @@ describe("effective run execution workspace config freshness", () => {
   it.each([
     { name: "missing", status: null },
     { name: "archived", status: "archived" },
+    { name: "cleanup failed", status: "cleanup_failed" },
   ])("fails loudly when the inherited workspace row is $name", async ({ status }) => {
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-old",
@@ -2014,6 +2015,37 @@ describe("effective run session config freshness", () => {
     expect(decision.reset).toBe(true);
     expect(decision.changedCategories).toContain("instructions");
     expect(next.fingerprints.sessionFingerprint.canonicalJson).not.toContain("Version two instructions");
+  });
+
+  it("fingerprints the explicit instructions path when the entry file does not match", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-fingerprint-"));
+    const instructionsPath = path.join(root, "managed-instructions.md");
+    const entryPath = path.join(root, "AGENTS.md");
+    await fs.writeFile(instructionsPath, "Managed instructions version one.\n", "utf8");
+    await fs.writeFile(entryPath, "Entry instructions version one.\n", "utf8");
+    const effectiveAdapterConfig = {
+      command: "codex",
+      model: "gpt-5.4-mini",
+      instructionsBundleMode: "managed",
+      instructionsRootPath: root,
+      instructionsEntryFile: "AGENTS.md",
+      instructionsFilePath: instructionsPath,
+    };
+    const base = await buildSessionConfigMetadata({ effectiveAdapterConfig });
+
+    await fs.writeFile(entryPath, "Entry instructions version two.\n", "utf8");
+    const entryChanged = await buildSessionConfigMetadata({ effectiveAdapterConfig });
+
+    expect(entryChanged.categoryFingerprints.instructions).toBe(
+      base.categoryFingerprints.instructions,
+    );
+
+    await fs.writeFile(instructionsPath, "Managed instructions version two.\n", "utf8");
+    const instructionsChanged = await buildSessionConfigMetadata({ effectiveAdapterConfig });
+
+    expect(instructionsChanged.categoryFingerprints.instructions).not.toBe(
+      base.categoryFingerprints.instructions,
+    );
   });
 
   it("does not read unbounded legacy instructions paths for config fingerprints", async () => {

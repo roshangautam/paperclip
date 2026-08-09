@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
+import { environmentLeases, executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
   ExecutionWorkspace,
   ExecutionWorkspaceSummary,
@@ -1600,6 +1600,147 @@ export function executionWorkspaceService(db: Db) {
         .update(executionWorkspaces)
         .set({ ...patch, updatedAt: new Date() })
         .where(eq(executionWorkspaces.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return row ? toExecutionWorkspace(row) : null;
+    },
+
+    claimTerminalIssueCleanup: async (input: {
+      companyId: string;
+      executionWorkspaceId: string;
+    }) => {
+      const row = await db
+        .update(executionWorkspaces)
+        .set({
+          status: "cleanup_failed",
+          cleanupReason: "terminal_issue_workspace_reconciliation",
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(executionWorkspaces.id, input.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, input.companyId),
+          eq(executionWorkspaces.status, "active"),
+          sql`exists (
+            select 1 from ${issues}
+            where ${issues.companyId} = ${input.companyId}
+              and (${issues.id} = ${executionWorkspaces.sourceIssueId}
+                or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
+              and ${issues.status} in ('done', 'cancelled')
+          )`,
+          sql`not exists (
+            select 1 from ${issues}
+            where ${issues.companyId} = ${input.companyId}
+              and (${issues.id} = ${executionWorkspaces.sourceIssueId}
+                or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
+              and ${issues.status} not in ('done', 'cancelled')
+          )`,
+          sql`not exists (
+            select 1 from ${heartbeatRuns}
+            where ${heartbeatRuns.companyId} = ${input.companyId}
+              and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
+              and ${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaces.id}::text
+          )`,
+          sql`not exists (
+            select 1 from ${environmentLeases}
+            where ${environmentLeases.companyId} = ${input.companyId}
+              and ${environmentLeases.executionWorkspaceId} = ${executionWorkspaces.id}
+              and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+              and ${environmentLeases.status} = 'pending_cleanup'
+          )`,
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return row ? toExecutionWorkspace(row) : null;
+    },
+
+    markIdleAfterTerminalIssueCleanup: async (input: {
+      companyId: string;
+      executionWorkspaceId: string;
+    }) => {
+      const now = new Date();
+      const reactivatedRow = await db
+        .update(executionWorkspaces)
+        .set({
+          status: "active",
+          cleanupReason: null,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(executionWorkspaces.id, input.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, input.companyId),
+          eq(executionWorkspaces.status, "cleanup_failed"),
+          eq(executionWorkspaces.cleanupReason, "terminal_issue_workspace_reconciliation"),
+          or(
+            sql`exists (
+              select 1
+              from ${issues}
+              where ${issues.companyId} = ${input.companyId}
+                and (${issues.id} = ${executionWorkspaces.sourceIssueId}
+                  or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
+                and ${issues.status} not in ('done', 'cancelled')
+            )`,
+            sql`exists (
+              select 1
+              from ${heartbeatRuns}
+              where ${heartbeatRuns.companyId} = ${input.companyId}
+                and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
+                and ${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaces.id}::text
+            )`,
+          ),
+          sql`not exists (
+            select 1
+            from ${environmentLeases}
+            where ${environmentLeases.companyId} = ${input.companyId}
+              and ${environmentLeases.executionWorkspaceId} = ${executionWorkspaces.id}
+              and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+              and ${environmentLeases.status} = 'pending_cleanup'
+          )`,
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (reactivatedRow) return toExecutionWorkspace(reactivatedRow);
+
+      const row = await db
+        .update(executionWorkspaces)
+        .set({
+          status: "idle",
+          cleanupReason: null,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(executionWorkspaces.id, input.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, input.companyId),
+          or(
+            eq(executionWorkspaces.status, "active"),
+            and(
+              eq(executionWorkspaces.status, "cleanup_failed"),
+              eq(executionWorkspaces.cleanupReason, "terminal_issue_workspace_reconciliation"),
+            ),
+          ),
+          sql`not exists (
+            select 1
+            from ${environmentLeases}
+            where ${environmentLeases.companyId} = ${input.companyId}
+              and ${environmentLeases.executionWorkspaceId} = ${executionWorkspaces.id}
+              and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+              and ${environmentLeases.status} in ('active', 'released', 'retained', 'failed', 'pending_cleanup')
+          )`,
+          sql`not exists (
+            select 1
+            from ${heartbeatRuns}
+            where ${heartbeatRuns.companyId} = ${input.companyId}
+              and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
+              and ${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaces.id}::text
+          )`,
+          sql`not exists (
+            select 1
+            from ${issues}
+            where ${issues.companyId} = ${input.companyId}
+              and (${issues.id} = ${executionWorkspaces.sourceIssueId}
+                or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
+              and ${issues.status} not in ('done', 'cancelled')
+          )`,
+        ))
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toExecutionWorkspace(row) : null;

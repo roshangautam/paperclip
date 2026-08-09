@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +8,7 @@ const {
   ensureCommandResolvable,
   resolveCommandForLogs,
   prepareWorkspaceForSshExecution,
+  removeDirectoryFromSsh,
   restoreWorkspaceFromSshExecution,
   runSshCommand,
   syncDirectoryToSsh,
@@ -29,6 +30,7 @@ const {
   ensureCommandResolvable: vi.fn(async () => undefined),
   resolveCommandForLogs: vi.fn(async () => "ssh://fixture@127.0.0.1:2222/remote/workspace :: agent"),
   prepareWorkspaceForSshExecution: vi.fn(async () => ({ gitBacked: false })),
+  removeDirectoryFromSsh: vi.fn(async () => undefined),
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
   runSshCommand: vi.fn(async () => ({
     stdout: "/home/agent",
@@ -65,6 +67,7 @@ vi.mock("@paperclipai/adapter-utils/ssh", async () => {
   return {
     ...actual,
     prepareWorkspaceForSshExecution,
+    removeDirectoryFromSsh,
     restoreWorkspaceFromSshExecution,
     runSshCommand,
     syncDirectoryToSsh,
@@ -203,6 +206,63 @@ describe("cursor remote execution", () => {
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
+    expect(removeDirectoryFromSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/remote/workspace/.paperclip-runtime/runs/run-1",
+    }));
+    expect(restoreWorkspaceFromSshExecution.mock.invocationCallOrder[0])
+      .toBeLessThan(removeDirectoryFromSsh.mock.invocationCallOrder[0]!);
+  });
+
+  it("removes the local skills directory when remote workspace restore fails", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-remote-restore-fail-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    restoreWorkspaceFromSshExecution.mockRejectedValueOnce(new Error("restore failed"));
+
+    await expect(execute({
+      runId: "run-restore-fail",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Cursor Builder",
+        adapterType: "cursor",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "agent",
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+    })).rejects.toThrow("restore failed");
+
+    const skillsSyncCalls = syncDirectoryToSsh.mock.calls as unknown as Array<[{ localDir: string }]>;
+    const skillsSyncInput = skillsSyncCalls[0]?.[0];
+    expect(skillsSyncInput?.localDir).toBeTruthy();
+    await expect(access(skillsSyncInput!.localDir!)).rejects.toThrow();
   });
 
   it("resumes saved Cursor sessions for remote SSH execution only when the identity matches", async () => {

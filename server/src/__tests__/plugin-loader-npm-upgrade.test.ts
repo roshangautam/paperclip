@@ -1,0 +1,1362 @@
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { PaperclipPluginManifestV1, PluginRecord } from "@paperclipai/shared";
+
+const mocks = vi.hoisted(() => ({
+  execFile: vi.fn(
+    (
+      _file: string,
+      _args: string[],
+      _options: unknown,
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      callback(null, "", "");
+      return { kill: vi.fn(), on: vi.fn() };
+    },
+  ),
+  registry: {
+    getById: vi.fn(),
+    install: vi.fn(),
+    listInstalled: vi.fn(),
+    update: vi.fn(),
+    updateStatus: vi.fn(),
+    uninstall: vi.fn(),
+  },
+  renameFailure: vi.fn((_from: string, _to: string): Error | undefined => undefined),
+  rmFailure: vi.fn((_target: string): Error | undefined => undefined),
+}));
+
+vi.mock("node:child_process", () => ({
+  execFile: mocks.execFile,
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rename: async (from: string, to: string) => {
+      const error = mocks.renameFailure(from, to);
+      if (error) throw error;
+      return actual.rename(from, to);
+    },
+    rm: async (target: string, options: { recursive?: boolean; force?: boolean }) => {
+      const error = mocks.rmFailure(String(target));
+      if (error) throw error;
+      return actual.rm(target, options);
+    },
+  };
+});
+
+vi.mock("../services/plugin-registry.js", () => ({
+  pluginRegistryService: () => mocks.registry,
+}));
+
+import {
+  PluginArtifactRollbackError,
+  PluginSourceValidationError,
+  pluginLoader,
+} from "../services/plugin-loader.js";
+import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
+import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+
+const cleanupPaths = new Set<string>();
+
+function manifest(version: string): PaperclipPluginManifestV1 {
+  return {
+    id: "paperclip.example",
+    apiVersion: 1,
+    version,
+    displayName: "Example plugin",
+    description: "Exercises consecutive npm plugin upgrades.",
+    author: "Paperclip",
+    categories: ["automation"],
+    capabilities: ["agent.tools.register"],
+    entrypoints: { worker: "./worker.js" },
+  };
+}
+
+async function writeInstalledPackage(
+  localPluginDir: string,
+  packageName: string,
+  pluginManifest: PaperclipPluginManifestV1,
+): Promise<string> {
+  const packageRoot = path.join(localPluginDir, "node_modules", packageName);
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    path.join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: packageName,
+      version: pluginManifest.version,
+      type: "module",
+      paperclipPlugin: { manifest: "./manifest.js" },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    path.join(packageRoot, "manifest.js"),
+    `export default ${JSON.stringify(pluginManifest)};\n`,
+    "utf8",
+  );
+  await writeFile(path.join(packageRoot, "worker.js"), "export {};\n", "utf8");
+  return packageRoot;
+}
+
+function runtimeServices(workerManager: PluginWorkerManager, lifecycleManager: unknown) {
+  return {
+    workerManager,
+    eventBus: {
+      forPlugin: vi.fn(() => ({})),
+      subscriptionCount: vi.fn(() => 0),
+      clearPlugin: vi.fn(),
+    },
+    jobScheduler: {
+      registerPlugin: vi.fn().mockResolvedValue(undefined),
+      unregisterPlugin: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn(),
+    },
+    jobStore: {
+      syncJobDeclarations: vi.fn().mockResolvedValue(undefined),
+    },
+    toolDispatcher: {
+      registerPluginTools: vi.fn(),
+      unregisterPluginTools: vi.fn(),
+    },
+    lifecycleManager,
+    buildHostHandlers: vi.fn(() => ({})),
+    instanceInfo: {
+      instanceId: "test-instance",
+      hostVersion: "1.0.0",
+    },
+  };
+}
+
+describe("pluginLoader npm upgrades", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.renameFailure.mockReturnValue(undefined);
+    mocks.rmFailure.mockReturnValue(undefined);
+    mocks.registry.listInstalled.mockResolvedValue([]);
+  });
+
+  afterEach(async () => {
+    await Promise.all([...cleanupPaths].map((cleanupPath) => rm(cleanupPath, { recursive: true, force: true })));
+    cleanupPaths.clear();
+  });
+
+  it("rejects npm package paths that escape the managed node_modules directory", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-containment-"));
+    cleanupPaths.add(localPluginDir);
+    const db = {
+      transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback(db)),
+    };
+    const loader = pluginLoader(db as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    await expect(loader.installPlugin({ packageName: "../../outside-plugin" }))
+      .rejects.toThrow("escapes the managed node_modules directory");
+
+    expect(mocks.execFile).not.toHaveBeenCalled();
+    expect(mocks.registry.install).not.toHaveBeenCalled();
+  });
+
+  it("classifies a missing local replacement as a source validation failure", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-local-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    mocks.registry.getById.mockResolvedValue({
+      id: "plugin-1",
+      packageName: "paperclip-example",
+      packagePath: null,
+      manifestJson: manifest("1.0.0"),
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    const failure = await loader.upgradePlugin("plugin-1", {
+      localPath: path.join(localPluginDir, "missing"),
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PluginSourceValidationError);
+    expect((failure as Error).message).toContain("Local plugin path does not exist");
+    expect(mocks.registry.update).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes unresolved npm packages from operational npm failures", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-failure-"));
+    cleanupPaths.add(localPluginDir);
+    mocks.registry.getById.mockResolvedValue({
+      id: "plugin-1",
+      packageName: "paperclip-example",
+      packagePath: null,
+      manifestJson: manifest("1.0.0"),
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+    const unresolved = Object.assign(new Error("npm install failed"), {
+      code: 1,
+      stderr: "npm error code ETARGET",
+    });
+    mocks.execFile.mockImplementationOnce((_file, _args, _options, callback) => {
+      callback(unresolved, "", unresolved.stderr);
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+
+    const unresolvedFailure = await loader.upgradePlugin("plugin-1", {
+      version: "missing-version",
+    }).catch((error: unknown) => error);
+    expect(unresolvedFailure).toBeInstanceOf(PluginSourceValidationError);
+
+    const npmUnavailable = Object.assign(new Error("spawn npm ENOENT"), { code: "ENOENT" });
+    mocks.execFile.mockImplementationOnce((_file, _args, _options, callback) => {
+      callback(npmUnavailable, "", "");
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+
+    const operationalFailure = await loader.upgradePlugin("plugin-1", {
+      version: "1.1.0",
+    }).catch((error: unknown) => error);
+    expect(operationalFailure).toBeInstanceOf(Error);
+    expect(operationalFailure).not.toBeInstanceOf(PluginSourceValidationError);
+    expect((operationalFailure as Error).message).toContain("spawn npm ENOENT");
+  });
+
+  it("keeps consecutive version upgrades on the npm source", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const packageRoot = await writeInstalledPackage(localPluginDir, packageName, manifest("1.1.0"));
+    let currentPlugin = {
+      id: "plugin-1",
+      packageName,
+      packagePath: null as string | null,
+      manifestJson: manifest("1.0.0"),
+    };
+    mocks.registry.getById.mockImplementation(async () => currentPlugin);
+    mocks.registry.update.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = {
+        ...currentPlugin,
+        packageName: update.packageName ?? currentPlugin.packageName,
+        packagePath: update.packagePath === undefined ? currentPlugin.packagePath : update.packagePath,
+        manifestJson: update.manifest ?? currentPlugin.manifestJson,
+      };
+      return currentPlugin;
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    await expect(loader.upgradePlugin("plugin-1", { version: "1.1.0" })).resolves.toMatchObject({
+      discovered: { source: "npm", version: "1.1.0" },
+    });
+    expect(mocks.registry.update).toHaveBeenLastCalledWith(
+      "plugin-1",
+      expect.objectContaining({ packagePath: null, version: "1.1.0" }),
+    );
+    expect(currentPlugin.packagePath).toBeNull();
+
+    const nextManifest = manifest("1.2.0");
+    await writeFile(
+      path.join(packageRoot, "manifest.js"),
+      `export default ${JSON.stringify(nextManifest)};\n`,
+      "utf8",
+    );
+    const future = new Date(Date.now() + 2_000);
+    await utimes(path.join(packageRoot, "manifest.js"), future, future);
+
+    await expect(loader.upgradePlugin("plugin-1", { version: "1.2.0" })).resolves.toMatchObject({
+      discovered: { source: "npm", version: "1.2.0" },
+    });
+    expect(mocks.registry.update).toHaveBeenLastCalledWith(
+      "plugin-1",
+      expect.objectContaining({ packagePath: null, version: "1.2.0" }),
+    );
+    expect(mocks.execFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not fail a committed npm upgrade when rollback-directory cleanup fails", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-cleanup-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    const currentPlugin = {
+      id: "plugin-1",
+      packageName,
+      packagePath: null,
+      manifestJson: activeManifest,
+    };
+    mocks.registry.getById.mockResolvedValue(currentPlugin);
+    mocks.registry.update.mockResolvedValue(currentPlugin);
+    mocks.execFile.mockImplementationOnce((_file, args, _options, callback) => {
+      void writeInstalledPackage(args[3]!, packageName, manifest("1.1.0")).then(
+        () => callback(null, "", ""),
+        (error: Error) => callback(error, "", ""),
+      );
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+    let failedCleanupRoot: string | undefined;
+    mocks.rmFailure.mockImplementation((target) => {
+      if (!target.includes(`.${path.basename(localPluginDir)}.upgrade-`)) return undefined;
+      failedCleanupRoot = target;
+      return new Error("cleanup denied");
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    await expect(loader.upgradePlugin("plugin-1", { version: "1.1.0" }))
+      .resolves.toMatchObject({ newManifest: { version: "1.1.0" } });
+
+    expect(failedCleanupRoot).toBeDefined();
+    expect(mocks.rmFailure.mock.calls.filter(([target]) => target === failedCleanupRoot))
+      .toHaveLength(1);
+    mocks.rmFailure.mockReturnValue(undefined);
+    cleanupPaths.add(failedCleanupRoot!);
+  });
+
+  it("checks queued upgrades against the manifest installed by the previous upgrade", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const initialManifest = {
+      ...manifest("1.0.0"),
+      capabilities: ["agent.tools.register", "companies.read"] as PaperclipPluginManifestV1["capabilities"],
+    };
+    await writeInstalledPackage(localPluginDir, packageName, initialManifest);
+    let currentPlugin = {
+      id: "plugin-1",
+      packageName,
+      packagePath: null as string | null,
+      manifestJson: initialManifest,
+    };
+    mocks.registry.getById.mockImplementation(async () => currentPlugin);
+    mocks.registry.update.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = {
+        ...currentPlugin,
+        packageName: update.packageName ?? currentPlugin.packageName,
+        packagePath: update.packagePath === undefined ? currentPlugin.packagePath : update.packagePath,
+        manifestJson: update.manifest ?? currentPlugin.manifestJson,
+      };
+      return currentPlugin;
+    });
+    mocks.execFile.mockImplementation(
+      (_file, args, _options, callback) => {
+        const version = args[1]!.split("@").at(-1)!;
+        const stagedPackageRoot = path.join(args[3]!, "node_modules", packageName);
+        const candidate = {
+          ...manifest(version),
+          capabilities: version === "1.1.0"
+            ? ["companies.read"]
+            : ["companies.read", "agent.tools.register"],
+        };
+        void writeFile(
+          path.join(stagedPackageRoot, "manifest.js"),
+          `export default ${JSON.stringify(candidate)};\n`,
+          "utf8",
+        ).then(
+          () => callback(null, "", ""),
+          (error: Error) => callback(error, "", ""),
+        );
+        return { kill: vi.fn(), on: vi.fn() };
+      },
+    );
+
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+    let releaseFirst!: () => void;
+    const holdFirst = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstReady!: () => void;
+    const firstAtPromotion = new Promise<void>((resolve) => {
+      firstReady = resolve;
+    });
+
+    const first = loader.upgradePlugin("plugin-1", {
+      version: "1.1.0",
+      beforePromote: async () => {
+        firstReady();
+        await holdFirst;
+      },
+    });
+    await firstAtPromotion;
+    const second = loader.upgradePlugin("plugin-1", { version: "1.2.0" });
+    releaseFirst();
+
+    await expect(first).resolves.toMatchObject({
+      newManifest: { version: "1.1.0", capabilities: ["companies.read"] },
+    });
+    await expect(second).resolves.toMatchObject({
+      oldManifest: { version: "1.1.0", capabilities: ["companies.read"] },
+      newManifest: { version: "1.2.0", capabilities: ["companies.read", "agent.tools.register"] },
+    });
+    expect(mocks.registry.update).toHaveBeenCalledTimes(2);
+  });
+
+  it("restores the active npm package when registry persistence fails", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    const packageRoot = await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    await writeFile(path.join(packageRoot, "worker.js"), "export const marker = 'active';\n", "utf8");
+    mocks.registry.getById.mockResolvedValue({
+      id: "plugin-1",
+      packageName,
+      packagePath: null,
+      manifestJson: activeManifest,
+    });
+    mocks.registry.update.mockRejectedValueOnce(new Error("registry persistence failed"));
+    mocks.execFile.mockImplementationOnce((_file, args, _options, callback) => {
+      const stagedInstallDir = args[3]!;
+      void writeInstalledPackage(stagedInstallDir, packageName, manifest("1.1.0")).then(
+        async (stagedPackageRoot) => {
+          await writeFile(
+            path.join(stagedPackageRoot, "worker.js"),
+            "export const marker = 'replacement';\n",
+            "utf8",
+          );
+          callback(null, "", "");
+        },
+        (error: Error) => callback(error, "", ""),
+      );
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    await expect(loader.upgradePlugin("plugin-1", { version: "1.1.0" }))
+      .rejects.toThrow("registry persistence failed");
+
+    await expect(readFile(path.join(packageRoot, "manifest.js"), "utf8"))
+      .resolves.toBe(`export default ${JSON.stringify(activeManifest)};\n`);
+    await expect(readFile(path.join(packageRoot, "worker.js"), "utf8"))
+      .resolves.toBe("export const marker = 'active';\n");
+  });
+
+  it("preserves the previous npm tree when promotion and restoration both fail", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    const packageRoot = await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    await writeFile(path.join(packageRoot, "worker.js"), "export const marker = 'active';\n", "utf8");
+    mocks.registry.getById.mockResolvedValue({
+      id: "plugin-1",
+      packageName,
+      packagePath: null,
+      manifestJson: activeManifest,
+    });
+    mocks.execFile.mockImplementationOnce((_file, args, _options, callback) => {
+      void writeInstalledPackage(args[3]!, packageName, manifest("1.1.0")).then(
+        () => callback(null, "", ""),
+        (error: Error) => callback(error, "", ""),
+      );
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+    mocks.renameFailure.mockImplementation((from, to) => {
+      if (to !== localPluginDir) return undefined;
+      if (from.endsWith(`${path.sep}next`)) return new Error("promotion failed");
+      if (from.endsWith(`${path.sep}previous`)) return new Error("restoration failed");
+      return undefined;
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    await expect(loader.upgradePlugin("plugin-1", { version: "1.1.0" }))
+      .rejects.toThrow("preserved recovery files");
+
+    const restoreCall = mocks.renameFailure.mock.calls.find(([from]) =>
+      from.endsWith(`${path.sep}previous`));
+    expect(restoreCall).toBeDefined();
+    const preservedRoot = path.dirname(restoreCall![0]);
+    cleanupPaths.add(preservedRoot);
+    await expect(readFile(
+      path.join(preservedRoot, "previous", "node_modules", packageName, "worker.js"),
+      "utf8",
+    )).resolves.toBe("export const marker = 'active';\n");
+  });
+
+  it("keeps npm installs locked through registry persistence before an upgrade", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const existingPackageName = "paperclip-example";
+    const installedPackageName = "paperclip-second";
+    const existingManifest = manifest("1.0.0");
+    const installedManifest = {
+      ...manifest("1.0.0"),
+      id: "paperclip.second",
+      displayName: "Second plugin",
+    };
+    await writeInstalledPackage(localPluginDir, existingPackageName, existingManifest);
+
+    let currentPlugin = {
+      id: "plugin-1",
+      packageName: existingPackageName,
+      packagePath: null as string | null,
+      manifestJson: existingManifest,
+    };
+    mocks.registry.getById.mockImplementation(async () => currentPlugin);
+    mocks.registry.update.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = {
+        ...currentPlugin,
+        packageName: update.packageName ?? currentPlugin.packageName,
+        packagePath: update.packagePath === undefined ? currentPlugin.packagePath : update.packagePath,
+        manifestJson: update.manifest ?? currentPlugin.manifestJson,
+      };
+      return currentPlugin;
+    });
+
+    let markInstallPersistenceStarted!: () => void;
+    const installPersistenceStarted = new Promise<void>((resolve) => {
+      markInstallPersistenceStarted = resolve;
+    });
+    let releaseInstallPersistence!: () => void;
+    const holdInstallPersistence = new Promise<void>((resolve) => {
+      releaseInstallPersistence = resolve;
+    });
+    mocks.registry.install.mockImplementation(async () => {
+      markInstallPersistenceStarted();
+      await holdInstallPersistence;
+      return { id: "plugin-2" };
+    });
+    mocks.execFile.mockImplementation((_file, args, _options, callback) => {
+      const spec = args[1]!;
+      const installDir = args[3]!;
+      const packageName = spec.startsWith(`${existingPackageName}@`)
+        ? existingPackageName
+        : installedPackageName;
+      const packageManifest = packageName === existingPackageName
+        ? manifest("1.1.0")
+        : installedManifest;
+      void writeInstalledPackage(installDir, packageName, packageManifest).then(
+        () => callback(null, "", ""),
+        (error: Error) => callback(error, "", ""),
+      );
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+
+    const db = {
+      transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback(db)),
+    };
+    const loader = pluginLoader(db as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    const install = loader.installPlugin({ packageName: installedPackageName });
+    await installPersistenceStarted;
+    const upgrade = loader.upgradePlugin("plugin-1", { version: "1.1.0" });
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(mocks.execFile).toHaveBeenCalledTimes(1);
+    expect(mocks.registry.update).not.toHaveBeenCalled();
+
+    releaseInstallPersistence();
+    await expect(install).resolves.toMatchObject({
+      packageName: installedPackageName,
+      version: "1.0.0",
+    });
+    await expect(upgrade).resolves.toMatchObject({
+      newManifest: { version: "1.1.0" },
+    });
+
+    expect(mocks.execFile.mock.calls.map((call) => call[1][1])).toEqual([
+      installedPackageName,
+      `${existingPackageName}@1.1.0`,
+    ]);
+    await expect(
+      readFile(path.join(localPluginDir, "node_modules", installedPackageName, "worker.js"), "utf8"),
+    ).resolves.toBe("export {};\n");
+  });
+
+  it("rejects a duplicate npm install without changing the live package", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    const packageRoot = await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    await writeFile(path.join(packageRoot, "worker.js"), "export const marker = 'active';\n", "utf8");
+
+    mocks.registry.install.mockRejectedValueOnce(new Error(`Plugin already installed: ${activeManifest.id}`));
+    mocks.execFile.mockImplementationOnce((_file, args, _options, callback) => {
+      const stagedInstallDir = args[3]!;
+      void writeInstalledPackage(stagedInstallDir, packageName, manifest("2.0.0")).then(
+        async (stagedPackageRoot) => {
+          await writeFile(
+            path.join(stagedPackageRoot, "worker.js"),
+            "export const marker = 'replacement';\n",
+            "utf8",
+          );
+          callback(null, "", "");
+        },
+        (error: Error) => callback(error, "", ""),
+      );
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+
+    const db = {
+      transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback(db)),
+    };
+    const loader = pluginLoader(db as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    await expect(loader.installPlugin({ packageName, version: "2.0.0" }))
+      .rejects.toThrow(`Plugin already installed: ${activeManifest.id}`);
+
+    expect(mocks.execFile.mock.calls[0]?.[1][3]).not.toBe(localPluginDir);
+    await expect(readFile(path.join(packageRoot, "manifest.js"), "utf8"))
+      .resolves.toBe(`export default ${JSON.stringify(activeManifest)};\n`);
+    await expect(readFile(path.join(packageRoot, "worker.js"), "utf8"))
+      .resolves.toBe("export const marker = 'active';\n");
+  });
+
+  it("does not resurrect a package cleaned up during another plugin upgrade", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const upgradedPackageName = "paperclip-example";
+    const removedPackageName = "paperclip-removed";
+    const activeManifest = manifest("1.0.0");
+    await writeInstalledPackage(localPluginDir, upgradedPackageName, activeManifest);
+    await writeInstalledPackage(localPluginDir, removedPackageName, {
+      ...manifest("1.0.0"),
+      id: "paperclip.removed",
+      displayName: "Removed plugin",
+    });
+    await writeFile(
+      path.join(localPluginDir, "package.json"),
+      JSON.stringify({ dependencies: { [upgradedPackageName]: "1.0.0", [removedPackageName]: "1.0.0" } }),
+      "utf8",
+    );
+
+    let currentPlugin = {
+      id: "plugin-1",
+      packageName: upgradedPackageName,
+      packagePath: null as string | null,
+      manifestJson: activeManifest,
+    };
+    mocks.registry.getById.mockImplementation(async () => currentPlugin);
+    mocks.registry.update.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = {
+        ...currentPlugin,
+        packageName: update.packageName ?? currentPlugin.packageName,
+        packagePath: update.packagePath === undefined ? currentPlugin.packagePath : update.packagePath,
+        manifestJson: update.manifest ?? currentPlugin.manifestJson,
+      };
+      return currentPlugin;
+    });
+    mocks.execFile.mockImplementation((_file, args, _options, callback) => {
+      if (args[0] === "uninstall") {
+        callback(null, "", "");
+        return { kill: vi.fn(), on: vi.fn() };
+      }
+      const installDir = args[3]!;
+      void writeInstalledPackage(installDir, upgradedPackageName, manifest("1.1.0")).then(
+        () => callback(null, "", ""),
+        (error: Error) => callback(error, "", ""),
+      );
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+    let markUpgradeReady!: () => void;
+    const upgradeReady = new Promise<void>((resolve) => {
+      markUpgradeReady = resolve;
+    });
+    let releaseUpgrade!: () => void;
+    const holdUpgrade = new Promise<void>((resolve) => {
+      releaseUpgrade = resolve;
+    });
+    const upgrade = loader.upgradePlugin("plugin-1", {
+      version: "1.1.0",
+      beforePromote: async () => {
+        markUpgradeReady();
+        await holdUpgrade;
+      },
+    });
+    await upgradeReady;
+
+    const cleanup = loader.cleanupInstallArtifacts({
+      id: "plugin-2",
+      pluginKey: "paperclip.removed",
+      packageName: removedPackageName,
+      packagePath: null,
+    } as unknown as PluginRecord);
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(mocks.execFile).toHaveBeenCalledTimes(1);
+
+    releaseUpgrade();
+    await expect(upgrade).resolves.toMatchObject({ newManifest: { version: "1.1.0" } });
+    await expect(cleanup).resolves.toBeUndefined();
+
+    expect(mocks.execFile.mock.calls.map((call) => call[1][0])).toEqual(["install", "uninstall"]);
+    await expect(
+      readFile(path.join(localPluginDir, "node_modules", upgradedPackageName, "manifest.js"), "utf8"),
+    ).resolves.toBe(`export default ${JSON.stringify(manifest("1.1.0"))};\n`);
+    await expect(
+      readFile(path.join(localPluginDir, "node_modules", removedPackageName, "worker.js"), "utf8"),
+    ).rejects.toThrow();
+  });
+
+  it("keeps uninstall atomic with a concurrent reinstall", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    await writeFile(
+      path.join(localPluginDir, "package.json"),
+      JSON.stringify({ dependencies: { [packageName]: "1.0.0" } }),
+      "utf8",
+    );
+
+    let releaseUninstall!: () => void;
+    const holdUninstall = new Promise<void>((resolve) => {
+      releaseUninstall = resolve;
+    });
+    let markUninstallStarted!: () => void;
+    const uninstallStarted = new Promise<void>((resolve) => {
+      markUninstallStarted = resolve;
+    });
+    mocks.registry.uninstall.mockImplementation(async () => {
+      markUninstallStarted();
+      await holdUninstall;
+      return { id: "plugin-1", status: "uninstalled" };
+    });
+    mocks.registry.install.mockResolvedValue({ id: "plugin-1" });
+    mocks.execFile.mockImplementation((_file, args, _options, callback) => {
+      if (args[0] === "uninstall") {
+        callback(null, "", "");
+      } else {
+        void writeInstalledPackage(args[3]!, packageName, activeManifest).then(
+          () => callback(null, "", ""),
+          (error: Error) => callback(error, "", ""),
+        );
+      }
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+
+    const db = {
+      transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback(db)),
+    };
+    const loader = pluginLoader(db as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+    const plugin = {
+      id: "plugin-1",
+      pluginKey: activeManifest.id,
+      packageName,
+      packagePath: null,
+    } as unknown as PluginRecord;
+
+    const uninstall = loader.uninstallPlugin(plugin);
+    await uninstallStarted;
+    const reinstall = loader.installPlugin({ packageName });
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(mocks.execFile).toHaveBeenCalledTimes(1);
+    expect(mocks.registry.install).not.toHaveBeenCalled();
+
+    releaseUninstall();
+    await expect(uninstall).resolves.toMatchObject({ status: "uninstalled" });
+    await expect(reinstall).resolves.toMatchObject({ packageName, version: "1.0.0" });
+    expect(mocks.execFile.mock.calls.map((call) => call[1][0])).toEqual(["uninstall", "install"]);
+    expect(mocks.registry.uninstall.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.registry.install.mock.invocationCallOrder[0]!);
+  });
+
+  it("keeps live npm files when uninstall registry persistence fails", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    const packageRoot = await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    await writeFile(path.join(packageRoot, "worker.js"), "export const marker = 'active';\n", "utf8");
+    await writeFile(
+      path.join(localPluginDir, "package.json"),
+      JSON.stringify({ dependencies: { [packageName]: "1.0.0" } }),
+      "utf8",
+    );
+    mocks.registry.uninstall.mockRejectedValueOnce(new Error("registry uninstall failed"));
+    mocks.execFile.mockImplementationOnce((_file, args, _options, callback) => {
+      expect(args[0]).toBe("uninstall");
+      expect(args[3]).not.toBe(localPluginDir);
+      callback(null, "", "");
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+    const plugin = {
+      id: "plugin-1",
+      pluginKey: activeManifest.id,
+      status: "ready",
+      packageName,
+      packagePath: null,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+    } as PluginRecord;
+
+    await expect(loader.uninstallPlugin(plugin)).rejects.toThrow("registry uninstall failed");
+
+    await expect(readFile(path.join(packageRoot, "manifest.js"), "utf8"))
+      .resolves.toBe(`export default ${JSON.stringify(activeManifest)};\n`);
+    await expect(readFile(path.join(packageRoot, "worker.js"), "utf8"))
+      .resolves.toBe("export const marker = 'active';\n");
+  });
+
+  it("retains the uninstall failure when restoring live npm files also fails", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    await writeFile(
+      path.join(localPluginDir, "package.json"),
+      JSON.stringify({ dependencies: { [packageName]: "1.0.0" } }),
+      "utf8",
+    );
+    const uninstallError = new Error("registry uninstall failed");
+    const restorationError = new Error("restoration failed");
+    mocks.registry.uninstall.mockRejectedValueOnce(uninstallError);
+    mocks.execFile.mockImplementationOnce((_file, _args, _options, callback) => {
+      callback(null, "", "");
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+    mocks.renameFailure.mockImplementation((from, to) => {
+      if (from.endsWith(`${path.sep}previous`) && to === localPluginDir) {
+        return restorationError;
+      }
+      return undefined;
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+    const plugin = {
+      id: "plugin-1",
+      pluginKey: activeManifest.id,
+      status: "ready",
+      packageName,
+      packagePath: null,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+    } as PluginRecord;
+
+    let failure: unknown;
+    try {
+      await loader.uninstallPlugin(plugin);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(PluginArtifactRollbackError);
+    expect((failure as PluginArtifactRollbackError).errors)
+      .toEqual(expect.arrayContaining([uninstallError, restorationError]));
+    const restoreCall = mocks.renameFailure.mock.calls.find(([from]) =>
+      from.endsWith(`${path.sep}previous`));
+    expect(restoreCall).toBeDefined();
+    cleanupPaths.add(path.dirname(restoreCall![0]));
+  });
+
+  it("does not fall back to a stale managed package when a configured local source is missing", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    const missingPackagePath = path.join(localPluginDir, "missing-local-source");
+    const plugin = {
+      id: "plugin-1",
+      pluginKey: activeManifest.id,
+      status: "ready",
+      packageName,
+      packagePath: missingPackagePath,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+    } as PluginRecord;
+    mocks.registry.getById.mockResolvedValue(plugin);
+    const workerManager = {
+      startWorker: vi.fn().mockResolvedValue(undefined),
+    } as unknown as PluginWorkerManager;
+    const markError = vi.fn().mockResolvedValue(undefined);
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    }, runtimeServices(workerManager, { markError }) as never);
+
+    await expect(loader.loadSingle("plugin-1")).resolves.toMatchObject({
+      success: false,
+      error: `Configured local plugin source not found for plugin "${activeManifest.id}": ${missingPackagePath}`,
+    });
+
+    expect(workerManager.startWorker).not.toHaveBeenCalled();
+    expect(markError).toHaveBeenCalledWith(
+      "plugin-1",
+      expect.stringContaining("Configured local plugin source not found"),
+    );
+  });
+
+  it("restores local-path registry metadata when activation fails before commit", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-local-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const activePackageName = "paperclip-example-active";
+    const replacementPackageName = "paperclip-example-replacement";
+    const activeManifest = manifest("1.0.0");
+    const replacementManifest = manifest("1.1.0");
+    const activePackageRoot = await writeInstalledPackage(
+      localPluginDir,
+      activePackageName,
+      activeManifest,
+    );
+    const replacementPackageRoot = await writeInstalledPackage(
+      localPluginDir,
+      replacementPackageName,
+      replacementManifest,
+    );
+    let currentPlugin = {
+      id: "plugin-1",
+      pluginKey: activeManifest.id,
+      status: "ready",
+      packageName: activePackageName,
+      packagePath: activePackageRoot,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+    } as PluginRecord;
+    mocks.registry.getById.mockImplementation(async () => currentPlugin);
+    mocks.registry.update.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = {
+        ...currentPlugin,
+        packageName: update.packageName ?? currentPlugin.packageName,
+        packagePath: update.packagePath === undefined ? currentPlugin.packagePath : update.packagePath,
+        version: update.version ?? currentPlugin.version,
+        manifestJson: update.manifest ?? currentPlugin.manifestJson,
+      };
+      return currentPlugin;
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+    const activationError = new Error("activation failed");
+
+    await expect(loader.upgradePlugin("plugin-1", {
+      localPath: replacementPackageRoot,
+      beforeCommit: async () => {
+        throw activationError;
+      },
+    })).rejects.toBe(activationError);
+
+    expect(mocks.registry.update).toHaveBeenCalledTimes(2);
+    expect(mocks.registry.update).toHaveBeenNthCalledWith(1, "plugin-1", {
+      packageName: replacementPackageName,
+      packagePath: replacementPackageRoot,
+      version: replacementManifest.version,
+      manifest: replacementManifest,
+    });
+    expect(mocks.registry.update).toHaveBeenNthCalledWith(2, "plugin-1", {
+      packageName: activePackageName,
+      packagePath: activePackageRoot,
+      version: activeManifest.version,
+      manifest: activeManifest,
+    });
+    expect(currentPlugin).toMatchObject({
+      packageName: activePackageName,
+      packagePath: activePackageRoot,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+    });
+    expect(mocks.execFile).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when an in-place local upgrade cannot restore its previous files", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-local-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    const replacementManifest = {
+      ...manifest("1.1.0"),
+      capabilities: ["agent.tools.register", "companies.read"] as PaperclipPluginManifestV1["capabilities"],
+    };
+    const packageRoot = await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    let currentPlugin = {
+      id: "plugin-1",
+      pluginKey: activeManifest.id,
+      status: "ready",
+      packageName,
+      packagePath: packageRoot,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+      lastError: null as string | null,
+    } as PluginRecord;
+    await writeInstalledPackage(localPluginDir, packageName, replacementManifest);
+    let failPendingRead = true;
+    mocks.registry.getById.mockImplementation(async () => {
+      if (
+        failPendingRead
+        && currentPlugin.status === "upgrade_pending"
+        && currentPlugin.version === replacementManifest.version
+      ) {
+        failPendingRead = false;
+        throw new Error("failed to read pending plugin");
+      }
+      return currentPlugin;
+    });
+    mocks.registry.update.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = {
+        ...currentPlugin,
+        packageName: update.packageName ?? currentPlugin.packageName,
+        packagePath: update.packagePath === undefined ? currentPlugin.packagePath : update.packagePath,
+        version: update.version ?? currentPlugin.version,
+        manifestJson: update.manifest ?? currentPlugin.manifestJson,
+      };
+      return currentPlugin;
+    });
+    mocks.registry.updateStatus.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = { ...currentPlugin, ...update };
+      return currentPlugin;
+    });
+    let workerRunning = true;
+    const workerManager = {
+      isRunning: vi.fn(() => workerRunning),
+      getWorker: vi.fn(() => workerRunning ? {} : undefined),
+      stopWorker: vi.fn(async () => {
+        workerRunning = false;
+      }),
+      startWorker: vi.fn(async () => {
+        workerRunning = true;
+      }),
+    } as unknown as PluginWorkerManager;
+    const services = runtimeServices(workerManager, undefined);
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    }, services as never);
+    const lifecycle = pluginLifecycleManager({} as never, {
+      loader,
+      workerManager,
+      reconcilePluginApplications: vi.fn().mockResolvedValue(undefined),
+    });
+    services.lifecycleManager = lifecycle;
+
+    const failure = await lifecycle.upgrade("plugin-1").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PluginArtifactRollbackError);
+    expect((failure as Error).message).toContain("failed in-place upgrade");
+    expect(currentPlugin).toMatchObject({
+      status: "error",
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+      lastError: expect.stringContaining("Plugin package rollback failed"),
+    });
+    await expect(readFile(path.join(packageRoot, "manifest.js"), "utf8"))
+      .resolves.toBe(`export default ${JSON.stringify(replacementManifest)};\n`);
+    expect(workerManager.stopWorker).toHaveBeenCalledOnce();
+    expect(workerManager.startWorker).not.toHaveBeenCalled();
+    expect(workerRunning).toBe(false);
+  });
+
+  it("restores the previous managed package and metadata when activation fails before commit", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    const replacementManifest = manifest("1.1.0");
+    const packageRoot = await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    await writeFile(path.join(packageRoot, "worker.js"), "export const marker = 'active';\n", "utf8");
+    let currentPlugin = {
+      id: "plugin-1",
+      pluginKey: activeManifest.id,
+      status: "ready",
+      packageName,
+      packagePath: null as string | null,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+      lastError: null as string | null,
+    } as PluginRecord;
+    mocks.registry.getById.mockImplementation(async () => currentPlugin);
+    mocks.registry.update.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = {
+        ...currentPlugin,
+        packageName: update.packageName ?? currentPlugin.packageName,
+        packagePath: update.packagePath === undefined ? currentPlugin.packagePath : update.packagePath,
+        version: update.version ?? currentPlugin.version,
+        manifestJson: update.manifest ?? currentPlugin.manifestJson,
+      };
+      return currentPlugin;
+    });
+    mocks.registry.updateStatus.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = { ...currentPlugin, ...update };
+      return currentPlugin;
+    });
+    mocks.execFile.mockImplementationOnce((_file, args, _options, callback) => {
+      void writeInstalledPackage(args[3]!, packageName, replacementManifest).then(
+        async (stagedPackageRoot) => {
+          await writeFile(
+            path.join(stagedPackageRoot, "worker.js"),
+            "export const marker = 'replacement';\n",
+            "utf8",
+          );
+          callback(null, "", "");
+        },
+        (error: Error) => callback(error, "", ""),
+      );
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+    let workerRunning = true;
+    const workerManager = {
+      isRunning: vi.fn(() => workerRunning),
+      getWorker: vi.fn(() => workerRunning ? {} : undefined),
+      stopWorker: vi.fn(async () => {
+        workerRunning = false;
+      }),
+      startWorker: vi.fn()
+        .mockRejectedValueOnce(new Error("worker startup failed"))
+        .mockImplementationOnce(async () => {
+          workerRunning = true;
+        }),
+    } as unknown as PluginWorkerManager;
+    const services = runtimeServices(workerManager, undefined);
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    }, services as never);
+    const lifecycle = pluginLifecycleManager({} as never, {
+      loader,
+      workerManager,
+      reconcilePluginApplications: vi.fn().mockResolvedValue(undefined),
+    });
+    services.lifecycleManager = lifecycle;
+
+    await expect(lifecycle.upgrade("plugin-1", "1.1.0"))
+      .rejects.toThrow("worker startup failed");
+
+    await expect(readFile(path.join(packageRoot, "manifest.js"), "utf8"))
+      .resolves.toBe(`export default ${JSON.stringify(activeManifest)};\n`);
+    await expect(readFile(path.join(packageRoot, "worker.js"), "utf8"))
+      .resolves.toBe("export const marker = 'active';\n");
+    expect(currentPlugin).toMatchObject({
+      status: "ready",
+      version: "1.0.0",
+      manifestJson: activeManifest,
+      lastError: null,
+    });
+    expect(workerManager.startWorker).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed and preserves both package trees when activation rollback cannot restore", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    const replacementManifest = manifest("1.1.0");
+    const packageRoot = await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    await writeFile(path.join(packageRoot, "worker.js"), "export const marker = 'active';\n", "utf8");
+    let currentPlugin = {
+      id: "plugin-1",
+      pluginKey: activeManifest.id,
+      status: "ready",
+      packageName,
+      packagePath: null as string | null,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+      lastError: null as string | null,
+    } as PluginRecord;
+    mocks.registry.getById.mockImplementation(async () => currentPlugin);
+    mocks.registry.update.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = {
+        ...currentPlugin,
+        packageName: update.packageName ?? currentPlugin.packageName,
+        packagePath: update.packagePath === undefined ? currentPlugin.packagePath : update.packagePath,
+        version: update.version ?? currentPlugin.version,
+        manifestJson: update.manifest ?? currentPlugin.manifestJson,
+      };
+      return currentPlugin;
+    });
+    mocks.registry.updateStatus.mockImplementation(async (_pluginId, update) => {
+      currentPlugin = { ...currentPlugin, ...update };
+      return currentPlugin;
+    });
+    mocks.execFile.mockImplementationOnce((_file, args, _options, callback) => {
+      void writeInstalledPackage(args[3]!, packageName, replacementManifest).then(
+        async (stagedPackageRoot) => {
+          await writeFile(
+            path.join(stagedPackageRoot, "worker.js"),
+            "export const marker = 'replacement';\n",
+            "utf8",
+          );
+          callback(null, "", "");
+        },
+        (error: Error) => callback(error, "", ""),
+      );
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+    mocks.renameFailure.mockImplementation((from, to) => {
+      if (from.endsWith(`${path.sep}previous`) && to === localPluginDir) {
+        return new Error("restoration failed");
+      }
+      return undefined;
+    });
+    let workerRunning = true;
+    const workerManager = {
+      isRunning: vi.fn(() => workerRunning),
+      getWorker: vi.fn(() => workerRunning ? {} : undefined),
+      stopWorker: vi.fn(async () => {
+        workerRunning = false;
+      }),
+      startWorker: vi.fn().mockRejectedValue(new Error("worker startup failed")),
+    } as unknown as PluginWorkerManager;
+    const services = runtimeServices(workerManager, undefined);
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    }, services as never);
+    const lifecycle = pluginLifecycleManager({} as never, {
+      loader,
+      workerManager,
+      reconcilePluginApplications: vi.fn().mockResolvedValue(undefined),
+    });
+    services.lifecycleManager = lifecycle;
+
+    let failure: unknown;
+    try {
+      await lifecycle.upgrade("plugin-1", "1.1.0");
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(PluginArtifactRollbackError);
+    expect((failure as PluginArtifactRollbackError).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message: "worker startup failed" }),
+      expect.objectContaining({ message: "restoration failed" }),
+    ]));
+
+    const restoreCall = mocks.renameFailure.mock.calls.find(([from]) =>
+      from.endsWith(`${path.sep}previous`));
+    expect(restoreCall).toBeDefined();
+    const preservedRoot = path.dirname(restoreCall![0]);
+    cleanupPaths.add(preservedRoot);
+    const rejectedDir = (await readdir(preservedRoot)).find((entry) => entry.startsWith("rejected-"));
+    expect(rejectedDir).toBeDefined();
+    await expect(readFile(
+      path.join(preservedRoot, "previous", "node_modules", packageName, "worker.js"),
+      "utf8",
+    )).resolves.toBe("export const marker = 'active';\n");
+    await expect(readFile(
+      path.join(preservedRoot, rejectedDir!, "node_modules", packageName, "worker.js"),
+      "utf8",
+    )).resolves.toBe("export const marker = 'replacement';\n");
+    await expect(readFile(path.join(packageRoot, "worker.js"), "utf8")).rejects.toThrow();
+    expect(currentPlugin).toMatchObject({
+      status: "error",
+      version: "1.1.0",
+      manifestJson: replacementManifest,
+      lastError: expect.stringContaining("Plugin package rollback failed"),
+    });
+    expect(workerManager.startWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an npm replacement without changing active files or stopping its worker", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    const packageRoot = await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    await writeFile(path.join(packageRoot, "worker.js"), "export const marker = 'active';\n", "utf8");
+
+    const currentPlugin = {
+      id: "plugin-1",
+      pluginKey: activeManifest.id,
+      status: "ready",
+      packageName,
+      packagePath: null,
+      version: activeManifest.version,
+      manifestJson: activeManifest,
+    };
+    mocks.registry.getById.mockResolvedValue(currentPlugin);
+    mocks.execFile.mockImplementationOnce(
+      (_file, args, _options, callback) => {
+        const stagedInstallDir = args[3]!;
+        const stagedPackageRoot = path.join(stagedInstallDir, "node_modules", packageName);
+        void Promise.all([
+          writeFile(
+            path.join(stagedPackageRoot, "manifest.js"),
+            `export default ${JSON.stringify({ ...manifest("1.1.0"), id: "paperclip.other" })};\n`,
+            "utf8",
+          ),
+          writeFile(path.join(stagedPackageRoot, "worker.js"), "export const marker = 'rejected';\n", "utf8"),
+        ]).then(
+          () => callback(null, "", ""),
+          (error: Error) => callback(error, "", ""),
+        );
+        return { kill: vi.fn(), on: vi.fn() };
+      },
+    );
+
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+    const stopWorker = vi.fn();
+    const workerManager = {
+      isRunning: vi.fn().mockReturnValue(true),
+      getWorker: vi.fn().mockReturnValue({}),
+      stopWorker,
+    } as unknown as PluginWorkerManager;
+    const lifecycle = pluginLifecycleManager({} as never, { loader, workerManager });
+
+    const failure = await lifecycle.upgrade("plugin-1", "1.1.0")
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PluginSourceValidationError);
+    expect((failure as Error).message).toContain("does not match existing plugin ID");
+
+    expect(await readFile(path.join(packageRoot, "manifest.js"), "utf8"))
+      .toBe(`export default ${JSON.stringify(activeManifest)};\n`);
+    expect(await readFile(path.join(packageRoot, "worker.js"), "utf8"))
+      .toBe("export const marker = 'active';\n");
+    expect(stopWorker).not.toHaveBeenCalled();
+    expect(mocks.registry.update).not.toHaveBeenCalled();
+  });
+});

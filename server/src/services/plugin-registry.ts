@@ -202,6 +202,7 @@ export function pluginRegistryService(db: Db) {
       id: string,
       data: {
         packageName?: string;
+        packagePath?: string | null;
         version?: string;
         manifest?: PaperclipPluginManifestV1;
       },
@@ -213,6 +214,7 @@ export function pluginRegistryService(db: Db) {
         updatedAt: new Date(),
       };
       if (data.packageName !== undefined) setClause.packageName = data.packageName;
+      if (data.packagePath !== undefined) setClause.packagePath = data.packagePath;
       if (data.version !== undefined) setClause.version = data.version;
       if (data.manifest !== undefined) {
         setClause.manifestJson = data.manifest;

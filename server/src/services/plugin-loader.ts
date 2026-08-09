@@ -25,8 +25,9 @@
  * @see PLUGIN_SPEC.md §12 — Process Model
  */
 import { existsSync } from "node:fs";
-import { readdir, readFile, rm, stat } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -282,6 +283,63 @@ export interface PluginInstallOptions {
   installDir?: string;
 }
 
+export interface PluginUpgradeOptions extends Omit<PluginInstallOptions, "installDir"> {
+  /** Called after the replacement package is accepted, immediately before its files are promoted. */
+  beforePromote?: (manifest: PaperclipPluginManifestV1) => Promise<void>;
+  /** Called after files and registry metadata are updated, while the previous package is still recoverable. */
+  beforeCommit?: () => Promise<void>;
+}
+
+/** A requested plugin source or replacement package failed validation. */
+export class PluginSourceValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PluginSourceValidationError";
+  }
+}
+
+/** An attempted package rollback could not restore a coherent live plugin tree. */
+export class PluginArtifactRollbackError extends AggregateError {}
+
+const NPM_SOURCE_VALIDATION_ERROR_CODES = new Set([
+  "E404",
+  "EINVALIDPACKAGENAME",
+  "EINVALIDTAGNAME",
+  "ENOVERSIONS",
+  "ETARGET",
+]);
+
+function getErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code.toUpperCase() : null;
+}
+
+function isNpmSourceValidationFailure(error: unknown): boolean {
+  const fields = [
+    getErrorCode(error),
+    error instanceof Error ? error.message : String(error),
+    typeof (error as { stderr?: unknown })?.stderr === "string"
+      ? (error as { stderr: string }).stderr
+      : null,
+  ].filter((value): value is string => Boolean(value));
+  const output = fields.join("\n").toUpperCase();
+  return [...NPM_SOURCE_VALIDATION_ERROR_CODES].some((code) =>
+    new RegExp(`\\b${code}\\b`).test(output));
+}
+
+function includeOperationFailureInRollbackError(
+  operationError: unknown,
+  rollbackError: PluginArtifactRollbackError,
+): PluginArtifactRollbackError {
+  const rollbackErrors = rollbackError.errors as unknown[];
+  if (rollbackErrors.includes(operationError)) return rollbackError;
+  return new PluginArtifactRollbackError(
+    [operationError, ...rollbackErrors],
+    rollbackError.message,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Runtime options — services needed for initializing loaded plugins
 // ---------------------------------------------------------------------------
@@ -471,7 +529,7 @@ export interface PluginLoader {
    *
    * @see PLUGIN_SPEC.md §25.3 — Upgrade Lifecycle
    */
-  upgradePlugin(pluginId: string, options: Omit<PluginInstallOptions, "installDir">): Promise<{
+  upgradePlugin(pluginId: string, options: PluginUpgradeOptions): Promise<{
     oldManifest: PaperclipPluginManifestV1;
     newManifest: PaperclipPluginManifestV1;
     discovered: DiscoveredPlugin;
@@ -489,6 +547,14 @@ export interface PluginLoader {
    * source checkouts outside that directory are intentionally left alone.
    */
   cleanupInstallArtifacts(plugin: PluginRecord): Promise<void>;
+
+  /**
+   * Remove managed install artifacts and unregister the plugin as one mutation.
+   *
+   * Keeping both steps under the managed-directory lock prevents a concurrent
+   * install from recreating the registry row between cleanup and uninstall.
+   */
+  uninstallPlugin(plugin: PluginRecord, removeData?: boolean): Promise<PluginRecord | null>;
 
   /**
    * Get the local plugin directory this loader is configured to use.
@@ -575,6 +641,22 @@ export interface PluginLoader {
    * Whether runtime services are available for plugin activation.
    */
   hasRuntimeServices(): boolean;
+}
+
+let pluginMutationQueue: Promise<void> = Promise.resolve();
+
+export async function withPluginMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = pluginMutationQueue;
+  let release!: () => void;
+  pluginMutationQueue = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,7 +1214,7 @@ export function pluginLoader(
 
     const uniqueRequested = new Set(requestedRoutePaths);
     if (uniqueRequested.size !== requestedRoutePaths.length) {
-      throw new Error(`Plugin ${manifest.id} declares duplicate page routePath values`);
+      throw new PluginSourceValidationError(`Plugin ${manifest.id} declares duplicate page routePath values`);
     }
 
     const installedPlugins = await registry.listInstalled();
@@ -1143,10 +1225,158 @@ export function pluginLoader(
       const installedRoutePaths = new Set(getDeclaredPageRoutePaths(installedManifest));
       const conflictingRoute = requestedRoutePaths.find((routePath) => installedRoutePaths.has(routePath));
       if (conflictingRoute) {
-        throw new Error(
+        throw new PluginSourceValidationError(
           `Plugin ${manifest.id} routePath "${conflictingRoute}" conflicts with installed plugin ${plugin.pluginKey}`,
         );
       }
+    }
+  }
+
+  async function stageManagedPluginDirectory(): Promise<{
+    root: string;
+    directory: string;
+    preserveRoot: boolean;
+  }> {
+    const parentDir = path.dirname(localPluginDir);
+    await mkdir(parentDir, { recursive: true });
+    const root = await mkdtemp(path.join(parentDir, `.${path.basename(localPluginDir)}.upgrade-`));
+    const directory = path.join(root, "next");
+    if (existsSync(localPluginDir)) {
+      await cp(localPluginDir, directory, { recursive: true });
+    } else {
+      await mkdir(directory, { recursive: true });
+    }
+    return { root, directory, preserveRoot: false };
+  }
+
+  async function promoteManagedPluginDirectory(staged: {
+    root: string;
+    directory: string;
+    preserveRoot: boolean;
+  }): Promise<{
+    commit(): Promise<void>;
+    rollback(): Promise<void>;
+  }> {
+    const previousDir = path.join(staged.root, "previous");
+    let hadPrevious = false;
+    try {
+      await rename(localPluginDir, previousDir);
+      hadPrevious = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+
+    try {
+      await rename(staged.directory, localPluginDir);
+    } catch (error) {
+      if (hadPrevious) {
+        try {
+          await rename(previousDir, localPluginDir);
+        } catch (restoreError) {
+          staged.preserveRoot = true;
+          throw new PluginArtifactRollbackError(
+            [error, restoreError],
+            `Failed to promote managed plugins and restore the previous directory; preserved recovery files at ${staged.root}`,
+          );
+        }
+      }
+      throw error;
+    }
+
+    return {
+      async commit() {
+        try {
+          await rm(staged.root, { recursive: true, force: true });
+        } catch (error) {
+          // The live directory and registry mutation are already committed.
+          // Prevent callers' finally blocks from retrying this best-effort
+          // cleanup and converting a successful mutation into a failure.
+          staged.preserveRoot = true;
+          throw error;
+        }
+      },
+      async rollback() {
+        const rejectedDir = path.join(staged.root, `rejected-${randomUUID()}`);
+        try {
+          await rename(localPluginDir, rejectedDir);
+        } catch (error) {
+          staged.preserveRoot = true;
+          throw new PluginArtifactRollbackError(
+            [error],
+            `Failed to quarantine rejected managed plugins; preserved recovery files at ${staged.root}`,
+          );
+        }
+        try {
+          if (hadPrevious) await rename(previousDir, localPluginDir);
+        } catch (error) {
+          staged.preserveRoot = true;
+          throw new PluginArtifactRollbackError(
+            [error],
+            `Failed to restore previous managed plugins; preserved recovery files at ${staged.root}`,
+          );
+        }
+        await rm(staged.root, { recursive: true, force: true });
+      },
+    };
+  }
+
+  let managedPluginDirectoryQueue: Promise<void> = Promise.resolve();
+
+  async function withManagedPluginDirectoryLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = managedPluginDirectoryQueue;
+    let release!: () => void;
+    managedPluginDirectoryQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  async function cleanupInstallArtifactsUnlocked(
+    plugin: PluginRecord,
+    installDir = localPluginDir,
+  ): Promise<void> {
+    const managedTargets = new Set<string>();
+    const managedNodeModulesDir = resolveManagedInstallPackageDir(installDir, plugin.packageName);
+    const directManagedDir = path.join(installDir, plugin.packageName);
+
+    managedTargets.add(managedNodeModulesDir);
+    if (isPathInsideDir(directManagedDir, installDir)) {
+      managedTargets.add(directManagedDir);
+    }
+    if (plugin.packagePath && isPathInsideDir(plugin.packagePath, localPluginDir)) {
+      const relativePackagePath = path.relative(localPluginDir, path.resolve(plugin.packagePath));
+      managedTargets.add(path.resolve(installDir, relativePackagePath));
+    }
+
+    const packageJsonPath = path.join(installDir, "package.json");
+    if (existsSync(packageJsonPath)) {
+      try {
+        await execFileAsync(
+          "npm",
+          ["uninstall", plugin.packageName, "--prefix", installDir, "--ignore-scripts"],
+          { timeout: 120_000 },
+        );
+      } catch (err) {
+        log.warn(
+          {
+            pluginId: plugin.id,
+            pluginKey: plugin.pluginKey,
+            packageName: plugin.packageName,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          "plugin-loader: npm uninstall failed during cleanup, falling back to direct removal",
+        );
+      }
+    }
+
+    for (const target of managedTargets) {
+      if (!existsSync(target)) continue;
+      await rm(target, { recursive: true, force: true });
     }
   }
 
@@ -1174,7 +1404,7 @@ export function pluginLoader(
     const { packageName, localPath, version, installDir } = installOptions;
 
     if (!packageName && !localPath) {
-      throw new Error("Either packageName or localPath must be provided");
+      throw new PluginSourceValidationError("Either packageName or localPath must be provided");
     }
 
     const targetInstallDir = installDir ?? localPluginDir;
@@ -1187,7 +1417,7 @@ export function pluginLoader(
       // Local path install — validate the directory exists
       const absLocalPath = path.resolve(localPath);
       if (!existsSync(absLocalPath)) {
-        throw new Error(`Local plugin path does not exist: ${absLocalPath}`);
+        throw new PluginSourceValidationError(`Local plugin path does not exist: ${absLocalPath}`);
       }
       resolvedPackagePath = absLocalPath;
       const pkgJson = await readPackageJson(absLocalPath);
@@ -1203,6 +1433,8 @@ export function pluginLoader(
     } else {
       // npm install
       const spec = version ? `${packageName}@${version}` : packageName!;
+      resolvedPackageName = packageName!;
+      resolvedPackagePath = resolveManagedInstallPackageDir(targetInstallDir, resolvedPackageName);
 
       log.info(
         { spec, installDir: targetInstallDir },
@@ -1219,19 +1451,10 @@ export function pluginLoader(
           { timeout: 120_000 }, // 2 minute timeout for npm install
         );
       } catch (err) {
-        throw new Error(`npm install failed for ${spec}: ${String(err)}`);
-      }
-
-      // Resolve the package path after installation
-      const nodeModulesPath = path.join(targetInstallDir, "node_modules");
-      resolvedPackageName = packageName!;
-
-      // Handle scoped packages
-      if (resolvedPackageName.startsWith("@")) {
-        const [scope, name] = resolvedPackageName.split("/");
-        resolvedPackagePath = path.join(nodeModulesPath, scope!, name!);
-      } else {
-        resolvedPackagePath = path.join(nodeModulesPath, resolvedPackageName);
+        const message = `npm install failed for ${spec}: ${String(err)}`;
+        throw isNpmSourceValidationFailure(err)
+          ? new PluginSourceValidationError(message)
+          : new Error(message);
       }
 
       if (!existsSync(resolvedPackagePath)) {
@@ -1244,7 +1467,9 @@ export function pluginLoader(
     // Step 3: Read and validate plugin manifest
     // Note: this.loadManifest (used via current context)
     const pkgJson = await readPackageJson(resolvedPackagePath);
-    if (!pkgJson) throw new Error(`Missing package.json at ${resolvedPackagePath}`);
+    if (!pkgJson) {
+      throw new PluginSourceValidationError(`Missing package.json at ${resolvedPackagePath}`);
+    }
 
     if (localPath) {
       await ensureLocalPluginBuilt(resolvedPackagePath, pkgJson);
@@ -1255,7 +1480,7 @@ export function pluginLoader(
       const manualBuildHint = localPath
         ? formatLocalPluginManualBuildHint(resolvedPackagePath, pkgJson)
         : "";
-      throw new Error(
+      throw new PluginSourceValidationError(
         `Package ${resolvedPackageName} at ${resolvedPackagePath} does not appear to be a Paperclip plugin (no manifest found).${manualBuildHint}`,
       );
     }
@@ -1264,7 +1489,7 @@ export function pluginLoader(
 
     // Step 4: Reject incompatible plugin API versions
     if (!manifestValidator.getSupportedVersions().includes(manifest.apiVersion)) {
-      throw new Error(
+      throw new PluginSourceValidationError(
         `Plugin ${manifest.id} declares apiVersion ${manifest.apiVersion} which is not supported by this host. ` +
           `Supported versions: ${manifestValidator.getSupportedVersions().join(", ")}`,
       );
@@ -1273,7 +1498,7 @@ export function pluginLoader(
     // Step 5: Validate manifest capabilities are consistent
     const capResult = capabilityValidator.validateManifestCapabilities(manifest);
     if (!capResult.allowed) {
-      throw new Error(
+      throw new PluginSourceValidationError(
         `Plugin ${manifest.id} manifest has inconsistent capabilities. ` +
           `Missing required capabilities for declared features: ${capResult.missing.join(", ")}`,
       );
@@ -1285,7 +1510,7 @@ export function pluginLoader(
     const minimumHostVersion = getMinimumHostVersion(manifest);
     if (minimumHostVersion && hostVersion) {
       if (compareSemver(hostVersion, minimumHostVersion) < 0) {
-        throw new Error(
+        throw new PluginSourceValidationError(
           `Plugin ${manifest.id} requires host version ${minimumHostVersion} or newer, ` +
             `but this server is running ${hostVersion}`,
         );
@@ -1686,49 +1911,93 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async installPlugin(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
-      const discovered = await fetchAndValidate(installOptions);
-      const manifest = discovered.manifest!;
+      const targetInstallDir = path.resolve(installOptions.installDir ?? localPluginDir);
+      const mutatesManagedDirectory = !installOptions.localPath
+        && targetInstallDir === path.resolve(localPluginDir);
 
-      // Step 6: Persist install record and apply plugin-owned schema migrations
-      // in one database transaction. If migration validation fails, the plugin
-      // row, namespace record, migration ledger, and created schema all roll back.
-      const installDb = manifest.database ? migrationDb : db;
-      await installDb.transaction(async (tx) => {
-        const txDb = tx as unknown as Db;
-        const txRegistry = pluginRegistryService(txDb);
-        const installed = await txRegistry.install(
-          {
-            packageName: discovered.packageName,
-            packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
-          },
-          manifest,
-        );
+      const performInstall = async () => {
+        const staged = mutatesManagedDirectory ? await stageManagedPluginDirectory() : null;
+        const promotion: {
+          current: Awaited<ReturnType<typeof promoteManagedPluginDirectory>> | null;
+        } = { current: null };
+        try {
+          const candidate = await fetchAndValidate({
+            ...installOptions,
+            installDir: staged?.directory ?? installOptions.installDir,
+          });
+          const discovered = staged
+            ? {
+                ...candidate,
+                packagePath: resolveManagedInstallPackageDir(localPluginDir, candidate.packageName),
+              }
+            : candidate;
+          const manifest = discovered.manifest!;
 
-        if (!installed) {
-          throw new Error(`Plugin install did not return a registry row: ${manifest.id}`);
-        }
+          // Persist the plugin and its migrations before exposing staged npm files.
+          // Promotion stays inside the transaction so either side can roll back.
+          const installDb = manifest.database ? migrationDb : db;
+          try {
+            await installDb.transaction(async (tx) => {
+              const txDb = tx as unknown as Db;
+              const txRegistry = pluginRegistryService(txDb);
+              const installed = await txRegistry.install(
+                {
+                  packageName: discovered.packageName,
+                  packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
+                },
+                manifest,
+              );
 
-        if (manifest.database) {
-          await pluginDatabaseService(txDb).applyMigrations(
-            installed.id,
-            manifest,
-            discovered.packagePath,
-            { persistFailure: false },
+              if (!installed) {
+                throw new Error(`Plugin install did not return a registry row: ${manifest.id}`);
+              }
+
+              if (manifest.database) {
+                await pluginDatabaseService(txDb).applyMigrations(
+                  installed.id,
+                  manifest,
+                  candidate.packagePath,
+                  { persistFailure: false },
+                );
+              }
+
+              if (staged) promotion.current = await promoteManagedPluginDirectory(staged);
+            });
+          } catch (error) {
+            await promotion.current?.rollback();
+            promotion.current = null;
+            throw error;
+          }
+
+          await promotion.current?.commit().catch((error: unknown) => {
+            log.warn(
+              { pluginId: manifest.id, err: error instanceof Error ? error.message : String(error) },
+              "plugin-loader: failed to remove npm install rollback directory",
+            );
+          });
+          promotion.current = null;
+
+          log.info(
+            {
+              pluginId: manifest.id,
+              packageName: discovered.packageName,
+              version: discovered.version,
+              capabilities: manifest.capabilities,
+            },
+            "plugin-loader: plugin installed successfully",
           );
+
+          return discovered;
+        } finally {
+          if (staged && !promotion.current && !staged.preserveRoot) {
+            await rm(staged.root, { recursive: true, force: true });
+          }
         }
-      });
+      };
 
-      log.info(
-        {
-          pluginId: manifest.id,
-          packageName: discovered.packageName,
-          version: discovered.version,
-          capabilities: manifest.capabilities,
-        },
-        "plugin-loader: plugin installed successfully",
-      );
-
-      return discovered;
+      return mutatesManagedDirectory
+        ? withManagedPluginDirectoryLock(performInstall)
+        : performInstall();
     },
 
     // -----------------------------------------------------------------------
@@ -1750,7 +2019,7 @@ export function pluginLoader(
      */
     async upgradePlugin(
       pluginId: string,
-      upgradeOptions: Omit<PluginInstallOptions, "installDir">,
+      upgradeOptions: PluginUpgradeOptions,
     ): Promise<{
       oldManifest: PaperclipPluginManifestV1;
       newManifest: PaperclipPluginManifestV1;
@@ -1764,67 +2033,144 @@ export function pluginLoader(
       } | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
 
-      const oldManifest = plugin.manifestJson;
       const {
-        packageName = plugin.packageName,
+        packageName: requestedPackageName,
         // For local-path installs, fall back to the stored packagePath so
         // `upgradePlugin` can re-read the manifest from disk without needing
         // the caller to re-supply the path every time.
         localPath = plugin.packagePath ?? undefined,
         version,
+        beforePromote,
+        beforeCommit,
       } = upgradeOptions;
 
+      if (version !== undefined && localPath !== undefined) {
+        throw new PluginSourceValidationError("version cannot be combined with a local plugin source");
+      }
+
       log.info(
-        { pluginId, packageName, version, localPath },
+        { pluginId, packageName: requestedPackageName ?? plugin.packageName, version, localPath },
         "plugin-loader: upgrading plugin",
       );
 
-      // 1. Fetch/Install the new version
-      const discovered = await fetchAndValidate({
-        packageName,
-        localPath,
-        version,
-        installDir: localPluginDir,
-      });
+      const performUpgrade = async () => {
+        const activePlugin = localPath
+          ? plugin
+          : (await registry.getById(pluginId)) as typeof plugin;
+        if (!activePlugin) throw new Error(`Plugin not found: ${pluginId}`);
+        const oldManifest = activePlugin.manifestJson;
+        const packageName = requestedPackageName ?? activePlugin.packageName;
 
-      const newManifest = discovered.manifest!;
+        // npm upgrades are validated in a sibling copy so rejected packages
+        // cannot overwrite the files used by the running worker. Managed npm
+        // upgrades are serialized because each promotion swaps the full directory.
+        const staged = localPath ? null : await stageManagedPluginDirectory();
+        let promoted: Awaited<ReturnType<typeof promoteManagedPluginDirectory>> | null = null;
+        let discovered: DiscoveredPlugin;
+        try {
+          const candidate = await fetchAndValidate({
+            packageName,
+            localPath,
+            version,
+            installDir: staged?.directory ?? localPluginDir,
+          });
+          discovered = staged
+            ? {
+                ...candidate,
+                packagePath: resolveManagedInstallPackageDir(localPluginDir, candidate.packageName),
+              }
+            : candidate;
 
-      // 2. Validate it's the same plugin ID
-      if (newManifest.id !== oldManifest.id) {
-        throw new Error(
-          `Upgrade failed: new manifest ID '${newManifest.id}' does not match existing plugin ID '${oldManifest.id}'`,
-        );
-      }
+          const newManifest = discovered.manifest!;
+          const isInPlaceLocalUpgrade =
+            discovered.source === "local-filesystem"
+            && activePlugin.packagePath !== null
+            && path.resolve(discovered.packagePath) === path.resolve(activePlugin.packagePath);
 
-      // 3. Detect capability escalation — new capabilities not in the old manifest
-      const oldCaps = new Set(oldManifest.capabilities ?? []);
-      const newCaps = newManifest.capabilities ?? [];
-      const escalated = newCaps.filter((c) => !oldCaps.has(c));
+          // 2. Validate it's the same plugin ID
+          if (newManifest.id !== oldManifest.id) {
+            throw new PluginSourceValidationError(
+              `Upgrade failed: new manifest ID '${newManifest.id}' does not match existing plugin ID '${oldManifest.id}'`,
+            );
+          }
 
-      if (escalated.length > 0) {
-        log.warn(
-          { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
-          "plugin-loader: upgrade introduces new capabilities — requires admin approval",
-        );
-        throw new Error(
-          `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${escalated.join(", ")}. ` +
-            `The previous version declared [${[...oldCaps].join(", ")}]. ` +
-            `Please review and approve the capability escalation before upgrading.`,
-        );
-      }
+          await beforePromote?.(newManifest);
+          if (staged) promoted = await promoteManagedPluginDirectory(staged);
 
-      // 4. Update the existing record
-      await registry.update(pluginId, {
-        packageName: discovered.packageName,
-        version: discovered.version,
-        manifest: newManifest,
-      });
+          // 4. Update the existing record, but keep the previous package tree
+          // available until lifecycle activation/reconciliation succeeds.
+          try {
+            await registry.update(pluginId, {
+              packageName: discovered.packageName,
+              packagePath:
+                discovered.source === "local-filesystem"
+                  ? discovered.packagePath
+                  : null,
+              version: discovered.version,
+              manifest: newManifest,
+            });
+            await beforeCommit?.();
+          } catch (error) {
+            if (promoted) {
+              try {
+                await promoted.rollback();
+                promoted = null;
+              } catch (rollbackError) {
+                throw rollbackError instanceof PluginArtifactRollbackError
+                  ? includeOperationFailureInRollbackError(error, rollbackError)
+                  : new PluginArtifactRollbackError(
+                    [error, rollbackError],
+                    `Failed to restore previous managed plugins after upgrade failure at ${staged?.root}`,
+                  );
+              }
+            }
+            try {
+              await registry.update(pluginId, {
+                packageName: activePlugin.packageName,
+                packagePath: activePlugin.packagePath,
+                version: oldManifest.version,
+                manifest: oldManifest,
+              });
+            } catch (registryRollbackError) {
+              throw new PluginArtifactRollbackError(
+                [error, registryRollbackError],
+                staged
+                  ? `Restored previous managed plugins but failed to restore registry metadata for ${pluginId}`
+                  : `Failed to restore registry metadata for local plugin ${pluginId}`,
+              );
+            }
+            if (isInPlaceLocalUpgrade) {
+              throw new PluginArtifactRollbackError(
+                [error],
+                `Cannot restore previous local plugin files after failed in-place upgrade at ${discovered.packagePath}`,
+              );
+            }
+            throw error;
+          }
 
-      return {
-        oldManifest,
-        newManifest,
-        discovered,
+          await promoted?.commit().catch((error) => {
+            log.warn(
+              { pluginId, err: error instanceof Error ? error.message : String(error) },
+              "plugin-loader: failed to remove npm upgrade rollback directory",
+            );
+          });
+          promoted = null;
+
+          return {
+            oldManifest,
+            newManifest,
+            discovered,
+          };
+        } finally {
+          if (staged && !promoted && !staged.preserveRoot) {
+            await rm(staged.root, { recursive: true, force: true });
+          }
+        }
       };
+
+      return localPath
+        ? performUpgrade()
+        : withManagedPluginDirectoryLock(performUpgrade);
     },
 
     // -----------------------------------------------------------------------
@@ -1840,43 +2186,47 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async cleanupInstallArtifacts(plugin: PluginRecord): Promise<void> {
-      const managedTargets = new Set<string>();
-      const managedNodeModulesDir = resolveManagedInstallPackageDir(localPluginDir, plugin.packageName);
-      const directManagedDir = path.join(localPluginDir, plugin.packageName);
+      await withManagedPluginDirectoryLock(() => cleanupInstallArtifactsUnlocked(plugin));
+    },
 
-      managedTargets.add(managedNodeModulesDir);
-      if (isPathInsideDir(directManagedDir, localPluginDir)) {
-        managedTargets.add(directManagedDir);
-      }
-      if (plugin.packagePath && isPathInsideDir(plugin.packagePath, localPluginDir)) {
-        managedTargets.add(path.resolve(plugin.packagePath));
-      }
-
-      const packageJsonPath = path.join(localPluginDir, "package.json");
-      if (existsSync(packageJsonPath)) {
+    async uninstallPlugin(plugin: PluginRecord, removeData = false): Promise<PluginRecord | null> {
+      return withManagedPluginDirectoryLock(async () => {
+        const staged = await stageManagedPluginDirectory();
+        let promoted: Awaited<ReturnType<typeof promoteManagedPluginDirectory>> | null = null;
         try {
-          await execFileAsync(
-            "npm",
-            ["uninstall", plugin.packageName, "--prefix", localPluginDir, "--ignore-scripts"],
-            { timeout: 120_000 },
-          );
-        } catch (err) {
-          log.warn(
-            {
-              pluginId: plugin.id,
-              pluginKey: plugin.pluginKey,
-              packageName: plugin.packageName,
-              err: err instanceof Error ? err.message : String(err),
-            },
-            "plugin-loader: npm uninstall failed during cleanup, falling back to direct removal",
-          );
+          await cleanupInstallArtifactsUnlocked(plugin, staged.directory);
+          promoted = await promoteManagedPluginDirectory(staged);
+          let result: PluginRecord | null;
+          try {
+            result = await registry.uninstall(plugin.id, removeData) as PluginRecord | null;
+          } catch (error) {
+            try {
+              await promoted.rollback();
+              promoted = null;
+            } catch (rollbackError) {
+              throw rollbackError instanceof PluginArtifactRollbackError
+                ? includeOperationFailureInRollbackError(error, rollbackError)
+                : new PluginArtifactRollbackError(
+                  [error, rollbackError],
+                  `Failed to restore managed plugins after uninstall failure at ${staged.root}`,
+                );
+            }
+            throw error;
+          }
+          await promoted.commit().catch((error) => {
+            log.warn(
+              { pluginId: plugin.id, err: error instanceof Error ? error.message : String(error) },
+              "plugin-loader: failed to remove uninstall rollback directory",
+            );
+          });
+          promoted = null;
+          return result;
+        } finally {
+          if (!promoted && !staged.preserveRoot) {
+            await rm(staged.root, { recursive: true, force: true });
+          }
         }
-      }
-
-      for (const target of managedTargets) {
-        if (!existsSync(target)) continue;
-        await rm(target, { recursive: true, force: true });
-      }
+      });
     },
 
     // -----------------------------------------------------------------------
@@ -2409,8 +2759,11 @@ function resolvePluginPackageRoot(
   plugin: PluginRecord & { packagePath?: string | null },
   localPluginDir: string,
 ): string {
-  if (plugin.packagePath && existsSync(plugin.packagePath)) {
-    return path.resolve(plugin.packagePath);
+  if (plugin.packagePath) {
+    if (existsSync(plugin.packagePath)) return path.resolve(plugin.packagePath);
+    throw new Error(
+      `Configured local plugin source not found for plugin "${plugin.pluginKey}": ${plugin.packagePath}`,
+    );
   }
 
   const packageName = plugin.packageName;
@@ -2426,10 +2779,17 @@ function resolvePluginPackageRoot(
 }
 
 function resolveManagedInstallPackageDir(localPluginDir: string, packageName: string): string {
-  if (packageName.startsWith("@")) {
-    return path.join(localPluginDir, "node_modules", ...packageName.split("/"));
+  const nodeModulesDir = path.resolve(localPluginDir, "node_modules");
+  const packageDir = path.resolve(
+    nodeModulesDir,
+    ...(packageName.startsWith("@") ? packageName.split("/") : [packageName]),
+  );
+  if (packageDir === nodeModulesDir || !isPathInsideDir(packageDir, nodeModulesDir)) {
+    throw new PluginSourceValidationError(
+      `Plugin package name "${packageName}" escapes the managed node_modules directory`,
+    );
   }
-  return path.join(localPluginDir, "node_modules", packageName);
+  return packageDir;
 }
 
 function isPathInsideDir(candidatePath: string, parentDir: string): boolean {

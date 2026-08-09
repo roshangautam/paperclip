@@ -42,6 +42,91 @@ import type { LocalProcessSandboxOptions } from "./local-process-sandbox.js";
 
 export type { RuntimeProgressSink } from "./runtime-progress.js";
 
+export const ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE = "acp_remote_bridge_shutdown_failed";
+const ACP_WORKSPACE_RESTORE_ERROR_CODE = "acp_workspace_restore_failed";
+
+function errorMessageFromUnknown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function labeledCleanupFailure(
+  label: string,
+  error: unknown,
+  remoteExecutionMayStillBeActive: boolean,
+): Error {
+  return Object.assign(new Error(`${label}: ${errorMessageFromUnknown(error)}`), {
+    cause: error,
+    remoteExecutionMayStillBeActive,
+  });
+}
+
+function remoteBridgeShutdownError(
+  message: string,
+  failures: Error[],
+  operationError?: unknown,
+): Error {
+  return Object.assign(new AggregateError(failures, message), {
+    code: ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
+    remoteExecutionMayStillBeActive: failures.some((failure) => (
+      !("remoteExecutionMayStillBeActive" in failure) ||
+      failure.remoteExecutionMayStillBeActive !== false
+    )),
+    ...(operationError === undefined
+      ? {}
+      : { cause: operationError, operationError }),
+  });
+}
+
+export function remoteBridgeShutdownMayLeaveExecutionActive(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    error.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE &&
+    (!("remoteExecutionMayStillBeActive" in error) ||
+      error.remoteExecutionMayStillBeActive !== false),
+  );
+}
+
+async function collectCleanupFailures(
+  operations: Array<{
+    label: string;
+    run: () => void | Promise<void>;
+    remoteExecutionMayStillBeActive: boolean;
+  }>,
+): Promise<Error[]> {
+  const failures: Error[] = [];
+  for (const operation of operations) {
+    try {
+      await operation.run();
+    } catch (error) {
+      failures.push(labeledCleanupFailure(
+        operation.label,
+        error,
+        operation.remoteExecutionMayStillBeActive,
+      ));
+    }
+  }
+  return failures;
+}
+
+function workspaceRestoreFailure(
+  operationError: unknown,
+  restoreError: unknown,
+): Error {
+  return Object.assign(
+    new Error(
+      `${errorMessageFromUnknown(operationError)}\nACP workspace restore failed: ${errorMessageFromUnknown(restoreError)}`,
+    ),
+    {
+      code: ACP_WORKSPACE_RESTORE_ERROR_CODE,
+      cause: operationError,
+      operationError,
+      restoreError,
+    },
+  );
+}
+
 export interface AdapterLocalExecutionTarget {
   kind: "local";
   environmentId?: string | null;
@@ -137,6 +222,37 @@ export interface AdapterExecutionTargetPaperclipBridgeHandle {
    */
   runLogTail?: SandboxRunLogTailFactory | null;
   stop(): Promise<void>;
+}
+
+export async function stopPaperclipBridgeThenRestoreWorkspace(input: {
+  paperclipBridge: AdapterExecutionTargetPaperclipBridgeHandle | null;
+  restoreRemoteWorkspace: (() => Promise<void>) | null;
+  beforeRestore?: () => void | Promise<void>;
+}): Promise<void> {
+  let bridgeStopError: unknown;
+  if (input.paperclipBridge) {
+    try {
+      await input.paperclipBridge.stop();
+    } catch (error) {
+      const cleanupOnlyBridgeFailure = Boolean(
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE &&
+        "remoteExecutionMayStillBeActive" in error &&
+        error.remoteExecutionMayStillBeActive === false,
+      );
+      if (!cleanupOnlyBridgeFailure) throw error;
+      bridgeStopError = error;
+    }
+  }
+
+  if (input.restoreRemoteWorkspace) {
+    await input.beforeRestore?.();
+    await input.restoreRemoteWorkspace();
+  }
+
+  if (bridgeStopError) throw bridgeStopError;
 }
 
 export interface AdapterExecutionTargetProcessSessionBridgeHandle {
@@ -1158,17 +1274,26 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   });
   const provisionCommand = target.provisionCommand?.trim();
   if (provisionCommand) {
-    const result = await requireSandboxRunner(target).execute({
-      command: preferredSandboxShell(target),
-      args: shellCommandArgs(provisionCommand),
-      cwd: prepared.workspaceRemoteDir,
-      timeoutMs: 300_000,
-    });
-    if (result.timedOut || (result.exitCode ?? 1) !== 0) {
-      const detail = (result.stderr || result.stdout).trim().split(/\r?\n/, 1)[0]?.slice(0, 480);
-      throw new Error(
-        `Workspace provision command ${result.timedOut ? "timed out" : `exited ${result.exitCode ?? "?"}`}${detail ? `: ${detail}` : ""}`,
-      );
+    try {
+      const result = await requireSandboxRunner(target).execute({
+        command: preferredSandboxShell(target),
+        args: shellCommandArgs(provisionCommand),
+        cwd: prepared.workspaceRemoteDir,
+        timeoutMs: 300_000,
+      });
+      if (result.timedOut || (result.exitCode ?? 1) !== 0) {
+        const detail = (result.stderr || result.stdout).trim().split(/\r?\n/, 1)[0]?.slice(0, 480);
+        throw new Error(
+          `Workspace provision command ${result.timedOut ? "timed out" : `exited ${result.exitCode ?? "?"}`}${detail ? `: ${detail}` : ""}`,
+        );
+      }
+    } catch (provisionError) {
+      try {
+        await prepared.restoreWorkspace(input.onProgress);
+      } catch (restoreError) {
+        throw workspaceRestoreFailure(provisionError, restoreError);
+      }
+      throw provisionError;
     }
   }
   return {
@@ -1517,13 +1642,39 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       stopping = true;
       if (pollTimer) clearTimeout(pollTimer);
       for (const liveSocket of liveSockets) liveSocket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
-      await client.writeTextFile(
-        path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
-        jsonLine({ type: "stdinEnd" }),
-      ).catch(() => undefined);
-      await client.remove(sessionDir).catch(() => undefined);
-      await fs.rm(proxyDir, { recursive: true, force: true }).catch(() => undefined);
+      const failures = await collectCleanupFailures([
+        {
+          label: "close local process-session bridge server",
+          remoteExecutionMayStillBeActive: false,
+          run: () => new Promise<void>((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve());
+          }),
+        },
+        {
+          label: "send remote process-session stdin end",
+          remoteExecutionMayStillBeActive: true,
+          run: () => client.writeTextFile(
+            path.posix.join(stdinDir, `${String(stdinSeq + 1).padStart(12, "0")}.json`),
+            jsonLine({ type: "stdinEnd" }),
+          ),
+        },
+        {
+          label: "remove remote process-session directory",
+          remoteExecutionMayStillBeActive: false,
+          run: () => client.remove(sessionDir),
+        },
+        {
+          label: "remove local process-session proxy directory",
+          remoteExecutionMayStillBeActive: false,
+          run: () => fs.rm(proxyDir, { recursive: true, force: true }),
+        },
+      ]);
+      if (failures.length > 0) {
+        throw remoteBridgeShutdownError(
+          "ACP process-session bridge shutdown failed",
+          failures,
+        );
+      }
     },
   };
 }
@@ -1765,11 +1916,32 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       shellCommand,
     });
   } catch (error) {
-    await Promise.allSettled([
-      server?.stop(),
-      worker?.stop(),
-      bridgeAsset.cleanup(),
+    const startedServer = server;
+    const startedWorker = worker;
+    const failures = await collectCleanupFailures([
+      ...(startedServer ? [{
+        label: "stop callback bridge server",
+        remoteExecutionMayStillBeActive: true,
+        run: () => startedServer.stop(),
+      }] : []),
+      ...(startedWorker ? [{
+        label: "stop callback bridge worker",
+        remoteExecutionMayStillBeActive: false,
+        run: () => startedWorker.stop(),
+      }] : []),
+      {
+        label: "remove callback bridge asset",
+        remoteExecutionMayStillBeActive: false,
+        run: () => bridgeAsset.cleanup(),
+      },
     ]);
+    if (failures.length > 0) {
+      throw remoteBridgeShutdownError(
+        "Sandbox callback bridge startup failed and cleanup was incomplete",
+        failures,
+        error,
+      );
+    }
     throw error;
   }
 
@@ -1793,13 +1965,29 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     },
     runLogTail,
     stop: async () => {
-      await Promise.allSettled([
-        server?.stop(),
+      const failures = await collectCleanupFailures([
+        {
+          label: "stop callback bridge server",
+          remoteExecutionMayStillBeActive: true,
+          run: () => server.stop(),
+        },
+        {
+          label: "stop callback bridge worker",
+          remoteExecutionMayStillBeActive: false,
+          run: () => worker.stop(),
+        },
+        {
+          label: "remove callback bridge asset",
+          remoteExecutionMayStillBeActive: false,
+          run: () => bridgeAsset.cleanup(),
+        },
       ]);
-      await Promise.allSettled([
-        worker?.stop(),
-        bridgeAsset.cleanup(),
-      ]);
+      if (failures.length > 0) {
+        throw remoteBridgeShutdownError(
+          "Sandbox callback bridge shutdown failed",
+          failures,
+        );
+      }
     },
   };
 }

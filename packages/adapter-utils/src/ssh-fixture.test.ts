@@ -9,6 +9,7 @@ import {
   getSshEnvLabSupport,
   prepareWorkspaceForSshExecution,
   readSshEnvLabFixtureStatus,
+  removeDirectoryFromSsh,
   restoreWorkspaceFromSshExecution,
   runSshCommand,
   syncDirectoryFromSsh,
@@ -90,6 +91,47 @@ describe("ssh env-lab fixture", () => {
       await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
   });
+
+  it.each(["", " ", "/", "/.", "/..", "//", "/tmp/..", ".", ".."])(
+    "refuses to recursively remove unsafe remote directory %j",
+    async (remoteDir) => {
+      await expect(removeDirectoryFromSsh({
+        spec: {
+          host: "127.0.0.1",
+          port: 22,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          privateKey: null,
+          knownHosts: null,
+          strictHostKeyChecking: true,
+        },
+        remoteDir,
+      })).rejects.toThrow("Refusing to remove unsafe SSH directory");
+    },
+  );
+
+  it("recursively removes a normalized safe remote directory", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH safe directory removal test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const removeDir = path.posix.join(started.workspaceDir, "remove-me");
+    await runSshCommand(config, `mkdir -p ${JSON.stringify(removeDir)}`);
+
+    await removeDirectoryFromSsh({
+      spec: config,
+      remoteDir: `${removeDir}/child/..`,
+    });
+
+    const result = await runSshCommand(
+      config,
+      `test ! -e ${JSON.stringify(removeDir)} && printf removed`,
+    );
+    expect(result.stdout).toBe("removed");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("starts an isolated sshd fixture and executes commands through it", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
@@ -611,6 +653,13 @@ describe("ssh env-lab fixture", () => {
 
     expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
     await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("dirty remote\n");
+    const runRoot = path.posix.dirname(prepared.workspaceRemoteDir);
+    const cleanupStatus = await runSshCommand(
+      config,
+      `if [ -e ${JSON.stringify(runRoot)} ]; then printf present; else printf absent; fi`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+    expect(cleanupStatus.stdout).toBe("absent");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("propagates remote commits to the local worktree with no git remote configured (no-remote-git contract)", async () => {

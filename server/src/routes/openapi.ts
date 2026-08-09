@@ -4829,8 +4829,44 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/upgrade",
   tags: ["plugins"],
   summary: "Upgrade a plugin",
-  request: { params: z.object({ pluginId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: {
+    params: z.object({ pluginId: z.string() }),
+    body: {
+      content: {
+        "application/json": {
+          schema: {
+            oneOf: [
+              {
+                type: "object",
+                properties: { version: { type: "string" } },
+                required: ["version"],
+                additionalProperties: false,
+              },
+              {
+                type: "object",
+                properties: { localPath: { type: "string", minLength: 1, pattern: "\\S" } },
+                required: ["localPath"],
+                additionalProperties: false,
+              },
+              {
+                type: "object",
+                properties: {},
+                additionalProperties: false,
+              },
+            ],
+          },
+        },
+      },
+      required: false,
+    },
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    403: r.forbidden,
+    404: r.notFound,
+    500: r.serverError,
+  },
 });
 
 registry.registerPath({

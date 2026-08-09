@@ -50,8 +50,10 @@ import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import {
   getPluginUiContributionMetadata,
   listMissingDeclaredPluginEntrypoints,
+  PluginSourceValidationError,
   pluginLoader,
   REPO_ROOT,
+  withPluginMutationLock,
 } from "../services/plugin-loader.js";
 import { logActivity } from "../services/activity-log.js";
 import { publishGlobalLiveEvent } from "../services/live-events.js";
@@ -85,7 +87,7 @@ import {
   extractSecretRefBindingsFromConfig,
 } from "../services/plugin-secrets-handler.js";
 import { secretService } from "../services/secrets.js";
-import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { badRequest, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 
 /** UI slot declaration extracted from plugin manifest */
 type PluginUiSlotDeclaration = NonNullable<NonNullable<PaperclipPluginManifestV1["ui"]>["slots"]>[number];
@@ -157,6 +159,16 @@ const PLUGIN_SCOPED_API_RESPONSE_HEADER_ALLOWLIST = new Set([
   "last-modified",
   "x-request-id",
 ]);
+
+function sendPluginLifecycleError(res: Response, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  const status = error instanceof HttpError
+    ? error.status
+    : error instanceof PluginSourceValidationError
+      ? 400
+      : 500;
+  res.status(status).json({ error: message });
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const EXPERIMENTAL_BUNDLED_PLUGIN_PACKAGE_NAMES = new Set([
@@ -1173,18 +1185,30 @@ export function pluginRoutes(
         ? { localPath: trimmedPackage }
         : { packageName: trimmedPackage, version: version?.trim() };
 
-      const discovered = await loader.installPlugin(installOptions);
+      const installed = await withPluginMutationLock(async () => {
+        const discovered = await loader.installPlugin(installOptions);
+        if (!discovered.manifest) return null;
 
-      if (!discovered.manifest) {
+        const existingPlugin = await registry.getByKey(discovered.manifest.id);
+        if (!existingPlugin) return undefined;
+
+        await lifecycle.load(existingPlugin.id);
+        return {
+          existingPlugin,
+          updated: await registry.getById(existingPlugin.id),
+        };
+      });
+
+      if (installed === null) {
         res.status(500).json({ error: "Plugin installed but manifest is missing" });
         return;
       }
+      if (installed === undefined) {
+        res.status(500).json({ error: "Plugin installed but not found in registry" });
+        return;
+      }
 
-      // Transition to ready state
-      const existingPlugin = await registry.getByKey(discovered.manifest.id);
-      if (existingPlugin) {
-        await lifecycle.load(existingPlugin.id);
-        const updated = await registry.getById(existingPlugin.id);
+      const { existingPlugin, updated } = installed;
         await logPluginMutationActivity(req, "plugin.installed", existingPlugin.id, {
           pluginId: existingPlugin.id,
           pluginKey: existingPlugin.pluginKey,
@@ -1194,10 +1218,6 @@ export function pluginRoutes(
         });
         publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: existingPlugin.id, action: "installed" } });
         res.json(updated);
-      } else {
-        // This shouldn't happen since installPlugin already registers in the DB
-        res.status(500).json({ error: "Plugin installed but not found in registry" });
-      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
@@ -1969,8 +1989,7 @@ export function pluginRoutes(
       publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "uninstalled" } });
       res.json(result);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(400).json({ error: message });
+      sendPluginLifecycleError(res, err);
     }
   });
 
@@ -2004,8 +2023,7 @@ export function pluginRoutes(
       publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "enabled" } });
       res.json(result);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(400).json({ error: message });
+      sendPluginLifecycleError(res, err);
     }
   });
 
@@ -2044,8 +2062,7 @@ export function pluginRoutes(
       publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "disabled" } });
       res.json(result);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(400).json({ error: message });
+      sendPluginLifecycleError(res, err);
     }
   });
 
@@ -2176,9 +2193,10 @@ export function pluginRoutes(
    *
    * Request body (optional):
    * - version: Target version (defaults to latest)
+   * - localPath: Server-local plugin directory to upgrade from
    *
    * If the upgrade adds new capabilities, the plugin transitions to
-   * 'upgrade_pending' state for board approval. Otherwise, it goes
+   * 'upgrade_pending' state for instance-admin approval. Otherwise, it goes
    * directly to 'ready'.
    *
    * Response: PluginRecord
@@ -2187,8 +2205,42 @@ export function pluginRoutes(
   router.post("/plugins/:pluginId/upgrade", async (req, res) => {
     assertInstanceAdmin(req);
     const { pluginId } = req.params;
-    const body = req.body as { version?: string } | undefined;
-    const version = body?.version;
+    const rawBody: unknown = req.body;
+    if (
+      rawBody !== undefined &&
+      (rawBody === null || typeof rawBody !== "object" || Array.isArray(rawBody))
+    ) {
+      res.status(400).json({ error: "Upgrade request body must be an object" });
+      return;
+    }
+
+    const body = (rawBody ?? {}) as Record<string, unknown>;
+    const unknownKeys = Object.keys(body).filter((key) => key !== "version" && key !== "localPath");
+    if (unknownKeys.length > 0) {
+      res.status(400).json({ error: `Unknown upgrade request field: ${unknownKeys.sort().join(", ")}` });
+      return;
+    }
+
+    const version = body.version;
+    const rawLocalPath = body.localPath;
+
+    if (version !== undefined && typeof version !== "string") {
+      res.status(400).json({ error: "version must be a string" });
+      return;
+    }
+    if (rawLocalPath !== undefined && typeof rawLocalPath !== "string") {
+      res.status(400).json({ error: "localPath must be a string" });
+      return;
+    }
+    const localPath = rawLocalPath?.trim();
+    if (localPath !== undefined && localPath.length === 0) {
+      res.status(400).json({ error: "localPath must not be blank" });
+      return;
+    }
+    if (version !== undefined && localPath !== undefined) {
+      res.status(400).json({ error: "version cannot be combined with localPath" });
+      return;
+    }
 
     const plugin = await resolvePlugin(registry, pluginId);
     if (!plugin) {
@@ -2197,12 +2249,7 @@ export function pluginRoutes(
     }
 
     try {
-      // Upgrade the plugin - this would typically:
-      // 1. Download the new version
-      // 2. Compare capabilities
-      // 3. If new capabilities, mark as upgrade_pending
-      // 4. Otherwise, transition to ready
-      const result = await lifecycle.upgrade(plugin.id, version);
+      const result = await lifecycle.upgrade(plugin.id, version, localPath);
       await logPluginMutationActivity(req, "plugin.upgraded", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
@@ -2213,8 +2260,7 @@ export function pluginRoutes(
       publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "upgraded" } });
       res.json(result);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(400).json({ error: message });
+      sendPluginLifecycleError(res, err);
     }
   });
 

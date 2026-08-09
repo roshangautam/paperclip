@@ -1,6 +1,8 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { badRequest } from "../errors.js";
+import { PluginSourceValidationError } from "../services/plugin-loader.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -51,6 +53,7 @@ async function createApp(
     jobDeps?: unknown;
     toolDeps?: unknown;
     bridgeDeps?: unknown;
+    jsonStrict?: boolean;
     captureJsonContext?: (context: unknown, body: unknown) => void;
   } = {},
 ) {
@@ -65,7 +68,7 @@ async function createApp(
   };
 
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ strict: routeOverrides.jsonStrict ?? true }));
   if (routeOverrides.captureJsonContext) {
     app.use((_req, res, next) => {
       const originalJson = res.json.bind(res);
@@ -232,6 +235,45 @@ describe.sequential("plugin install and upgrade authz", () => {
       version: undefined,
     });
     expect(mockLifecycle.load).toHaveBeenCalledWith(pluginId);
+  }, 20_000);
+
+  it("holds the install mutation lock through plugin activation", async () => {
+    const pluginKey = "paperclip.example";
+    const discovered = { manifest: { id: pluginKey } };
+    mockRegistry.getByKey.mockResolvedValue({
+      id: pluginId,
+      pluginKey,
+      packageName: "paperclip-plugin-example",
+      version: "1.0.0",
+    });
+    mockRegistry.getById.mockResolvedValue({ id: pluginId, pluginKey, status: "ready" });
+    let releaseActivation!: () => void;
+    const holdActivation = new Promise<void>((resolve) => {
+      releaseActivation = resolve;
+    });
+    mockLifecycle.load.mockImplementationOnce(() => holdActivation).mockResolvedValue(undefined);
+
+    const { app, loader } = await createApp(
+      boardActor({ isInstanceAdmin: true }),
+      { installPlugin: vi.fn().mockResolvedValue(discovered) },
+    );
+    const first = request(app)
+      .post("/api/plugins/install")
+      .send({ packageName: "paperclip-plugin-example" })
+      .then((response) => response);
+    await vi.waitFor(() => expect(mockLifecycle.load).toHaveBeenCalledOnce());
+    const second = request(app)
+      .post("/api/plugins/install")
+      .send({ packageName: "paperclip-plugin-example" })
+      .then((response) => response);
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(loader.installPlugin).toHaveBeenCalledOnce();
+
+    releaseActivation();
+    await expect(first).resolves.toMatchObject({ status: 200 });
+    await expect(second).resolves.toMatchObject({ status: 200 });
+    expect(loader.installPlugin).toHaveBeenCalledTimes(2);
   }, 20_000);
 
   it("rejects plugin upgrades for non-admin board users", async () => {
@@ -439,7 +481,182 @@ describe.sequential("plugin install and upgrade authz", () => {
       .send({ version: "1.1.0" });
 
     expect(res.status).toBe(200);
-    expect(mockLifecycle.upgrade).toHaveBeenCalledWith(pluginId, "1.1.0");
+    expect(mockLifecycle.upgrade).toHaveBeenCalledWith(
+      pluginId,
+      "1.1.0",
+      undefined,
+    );
+  }, 20_000);
+
+  it("allows instance admins to upgrade plugins from a server-local path", async () => {
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip.example",
+      version: "1.0.0",
+    });
+    mockLifecycle.upgrade.mockResolvedValue({ id: pluginId, version: "1.1.0" });
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ localPath: "  /plugins/example  " });
+
+    expect(res.status).toBe(200);
+    expect(mockLifecycle.upgrade).toHaveBeenCalledWith(
+      pluginId,
+      undefined,
+      "/plugins/example",
+    );
+  }, 20_000);
+
+  it("reports source validation and lifecycle HTTP errors without masking unexpected upgrade failures", async () => {
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip.example",
+      version: "1.0.0",
+    });
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+
+    mockLifecycle.upgrade.mockRejectedValueOnce(new PluginSourceValidationError("invalid replacement manifest"));
+    const invalidSource = await request(app).post(`/api/plugins/${pluginId}/upgrade`).send({});
+    mockLifecycle.upgrade.mockRejectedValueOnce(badRequest("invalid lifecycle state"));
+    const invalidState = await request(app).post(`/api/plugins/${pluginId}/upgrade`).send({});
+    mockLifecycle.upgrade.mockRejectedValueOnce(new Error("registry unavailable"));
+    const unexpected = await request(app).post(`/api/plugins/${pluginId}/upgrade`).send({});
+
+    expect(invalidSource.status).toBe(400);
+    expect(invalidSource.body.error).toBe("invalid replacement manifest");
+    expect(invalidState.status).toBe(400);
+    expect(invalidState.body.error).toBe("invalid lifecycle state");
+    expect(unexpected.status).toBe(500);
+    expect(unexpected.body.error).toBe("registry unavailable");
+  }, 20_000);
+
+  it("rejects non-string upgrade versions before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ version: { invalid: true } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/version must be a string/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects upgrades that combine a version with a local path", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ version: "1.1.0", localPath: "/plugins/example" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/version cannot be combined with localPath/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects invalid local upgrade paths before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ localPath: { invalid: true } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/localPath must be a string/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects blank local upgrade paths before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ localPath: "   " });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/localPath must not be blank/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects unknown upgrade request fields before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ localpath: "/plugins/example" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/unknown upgrade request field: localpath/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects array upgrade request bodies before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send([{ localPath: "/plugins/example" }]);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/upgrade request body must be an object/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects scalar upgrade request bodies before invoking the lifecycle", async () => {
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    }, {}, { jsonStrict: false });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .set("Content-Type", "application/json")
+      .send(JSON.stringify("latest"));
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/upgrade request body must be an object/i);
+    expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
   }, 20_000);
 });
 

@@ -4360,12 +4360,28 @@ export function issueRoutes(
     executionWorkspaceId?: string | null;
   }) {
     try {
+      if (issue.executionWorkspaceId) {
+        const claimedWorkspace = await executionWorkspacesSvc.claimTerminalIssueCleanup({
+          companyId: issue.companyId,
+          executionWorkspaceId: issue.executionWorkspaceId,
+        });
+        if (!claimedWorkspace) return;
+      }
       await environmentRuntime.destroyReusableSandboxLeases({
         companyId: issue.companyId,
         issueId: issue.id,
         executionWorkspaceId: issue.executionWorkspaceId ?? null,
         failureReason: `issue_terminal_${issue.status}`,
+        terminalWorkspaceReconciliation: issue.executionWorkspaceId
+          ? { executionWorkspaceId: issue.executionWorkspaceId }
+          : undefined,
       });
+      if (issue.executionWorkspaceId) {
+        await executionWorkspacesSvc.markIdleAfterTerminalIssueCleanup({
+          companyId: issue.companyId,
+          executionWorkspaceId: issue.executionWorkspaceId,
+        });
+      }
     } catch (err) {
       logger.warn(
         { err, issueId: issue.id, executionWorkspaceId: issue.executionWorkspaceId ?? null },

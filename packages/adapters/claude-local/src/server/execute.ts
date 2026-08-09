@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
+  ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
   overrideAdapterExecutionTargetRemoteCwd,
@@ -20,7 +21,9 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
   startAdapterExecutionTargetPaperclipBridge,
+  stopPaperclipBridgeThenRestoreWorkspace,
 } from "@paperclipai/adapter-utils/execution-target";
+import { ACP_REMOTE_RUN_CLEANUP_ERROR_CODE } from "@paperclipai/adapter-utils/remote-managed-runtime";
 import {
   asString,
   asNumber,
@@ -81,6 +84,7 @@ import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
+  ACP_WORKSPACE_RESTORE_ERROR_CODE,
   createClaudeAcpExecutor,
   formatClaudeAcpFallbackMessage,
   resolveClaudeExecutionEngineForRun,
@@ -390,7 +394,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       return await executeClaudeAcp(ctx);
     } catch (err) {
-      if (engineSelection.explicit) throw err;
+      if (
+        engineSelection.explicit
+        || (typeof err === "object" && err !== null && "code" in err
+          && (err.code === ACP_WORKSPACE_RESTORE_ERROR_CODE
+            || err.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE
+            || err.code === ACP_REMOTE_RUN_CLEANUP_ERROR_CODE))
+      ) throw err;
       const reason = err instanceof Error ? err.message : String(err);
       await ctx.onLog(
         "stderr",
@@ -1240,15 +1250,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
   } finally {
-    if (paperclipBridge) {
-      await paperclipBridge.stop();
-    }
-    if (restoreRemoteWorkspace) {
-      await onLog(
+    await stopPaperclipBridgeThenRestoreWorkspace({
+      paperclipBridge,
+      restoreRemoteWorkspace,
+      beforeRestore: () => onLog(
         "stdout",
         `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-      );
-      await restoreRemoteWorkspace();
-    }
+      ),
+    });
   }
 }

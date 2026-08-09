@@ -12,7 +12,10 @@ import {
   agents,
   companies,
   createDb,
+  environmentLeases,
+  environments,
   executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -30,6 +33,7 @@ import {
   mergeExecutionWorkspaceConfig,
   readExecutionWorkspaceConfig,
 } from "../services/execution-workspaces.ts";
+import { heartbeatService } from "../services/heartbeat.ts";
 import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
@@ -228,7 +232,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(environmentLeases);
     await db.delete(workspaceRuntimeServices);
+    await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
@@ -238,6 +244,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await db.delete(projects);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(environments);
     await db.delete(companies);
 
     for (const dir of tempDirs) {
@@ -496,6 +503,429 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         branchName: "paperclip/open",
       }),
     ]);
+  });
+
+  it("marks only the company-scoped quarantined workspace idle after terminal cleanup", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const projectId = randomUUID();
+    const otherProjectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const otherExecutionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values([
+      {
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: "PAP",
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: otherCompanyId,
+        name: "Other company",
+        issuePrefix: "OTH",
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+    await db.insert(projects).values([
+      {
+        id: projectId,
+        companyId,
+        name: "Terminal lifecycle",
+        status: "in_progress",
+      },
+      {
+        id: otherProjectId,
+        companyId: otherCompanyId,
+        name: "Other terminal lifecycle",
+        status: "in_progress",
+      },
+    ]);
+    await db.insert(executionWorkspaces).values([
+      {
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Terminal candidate",
+        status: "cleanup_failed",
+        providerType: "git_worktree",
+        cleanupReason: "terminal_issue_workspace_reconciliation",
+      },
+      {
+        id: otherExecutionWorkspaceId,
+        companyId: otherCompanyId,
+        projectId: otherProjectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Other terminal candidate",
+        status: "active",
+        providerType: "git_worktree",
+      },
+    ]);
+
+    await expect(svc.markIdleAfterTerminalIssueCleanup({
+      companyId: otherCompanyId,
+      executionWorkspaceId,
+    })).resolves.toBeNull();
+    await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({ status: "cleanup_failed" });
+
+    await expect(svc.markIdleAfterTerminalIssueCleanup({
+      companyId,
+      executionWorkspaceId,
+    })).resolves.toMatchObject({
+      id: executionWorkspaceId,
+      companyId,
+      status: "idle",
+      cleanupReason: null,
+    });
+    await expect(svc.getById(otherExecutionWorkspaceId)).resolves.toMatchObject({ status: "active" });
+  });
+
+  it("preserves unrelated cleanup failures during terminal issue settlement", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const closedAt = new Date("2026-08-08T22:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Failed explicit archive",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Archive cleanup failed",
+      status: "cleanup_failed",
+      providerType: "git_worktree",
+      cleanupReason: "Failed to remove archived worktree",
+      closedAt,
+    });
+
+    await expect(svc.markIdleAfterTerminalIssueCleanup({
+      companyId,
+      executionWorkspaceId,
+    })).resolves.toBeNull();
+    await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({
+      status: "cleanup_failed",
+      cleanupReason: "Failed to remove archived worktree",
+      closedAt,
+    });
+  });
+
+  it.each(["pending_cleanup", "failed"] as const)(
+    "keeps a workspace active while a reusable sandbox lease is %s",
+    async (leaseStatus) => {
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+      const environmentId = randomUUID();
+      const leaseId = randomUUID();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: "PAP",
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Pending cleanup",
+        status: "in_progress",
+      });
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "cloud_sandbox",
+        name: "Cleanup pending",
+        status: "active",
+        providerType: "cloud_sandbox",
+      });
+      await db.insert(environments).values({
+        id: environmentId,
+        name: `Pending cleanup ${environmentId}`,
+        driver: "sandbox",
+        status: "active",
+        config: {},
+        envVars: {},
+      });
+      await db.insert(environmentLeases).values({
+        id: leaseId,
+        companyId,
+        environmentId,
+        executionWorkspaceId,
+        status: leaseStatus,
+        leasePolicy: "reuse_by_environment",
+        cleanupStatus: "failed",
+        failureReason: "provider_unavailable",
+      });
+
+      await expect(svc.markIdleAfterTerminalIssueCleanup({
+        companyId,
+        executionWorkspaceId,
+      })).resolves.toBeNull();
+      await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({ status: "active" });
+
+      await db
+        .update(environmentLeases)
+        .set({ status: "expired", cleanupStatus: "success", updatedAt: new Date() })
+        .where(eq(environmentLeases.id, leaseId));
+      await expect(svc.markIdleAfterTerminalIssueCleanup({
+        companyId,
+        executionWorkspaceId,
+      })).resolves.toMatchObject({ status: "idle" });
+    },
+  );
+
+  it.each(["queued", "running", "scheduled_retry"])(
+    "keeps a workspace active while a %s heartbeat owns it",
+    async (runStatus) => {
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: "PAP",
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Workspace owner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Heartbeat ownership",
+        status: "in_progress",
+      });
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Heartbeat-owned workspace",
+        status: "active",
+        providerType: "git_worktree",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "manual",
+        status: runStatus,
+        contextSnapshot: { executionWorkspaceId },
+      });
+
+      await expect(svc.markIdleAfterTerminalIssueCleanup({
+        companyId,
+        executionWorkspaceId,
+      })).resolves.toBeNull();
+      await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({ status: "active" });
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+      await expect(svc.markIdleAfterTerminalIssueCleanup({
+        companyId,
+        executionWorkspaceId,
+      })).resolves.toMatchObject({ status: "idle" });
+    },
+  );
+
+  it("keeps a workspace active while another linked issue is non-terminal", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Shared workspace",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Shared workspace",
+      status: "active",
+      providerType: "git_worktree",
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Still using the workspace",
+      status: "in_progress",
+      priority: "medium",
+      executionWorkspaceId,
+    });
+
+    await expect(svc.markIdleAfterTerminalIssueCleanup({
+      companyId,
+      executionWorkspaceId,
+    })).resolves.toBeNull();
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    await expect(svc.markIdleAfterTerminalIssueCleanup({
+      companyId,
+      executionWorkspaceId,
+    })).resolves.toMatchObject({ status: "idle" });
+  });
+
+  it("idles a terminal issue workspace when its owning heartbeat becomes terminal", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const issueId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Workspace owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Terminal heartbeat reconciliation",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Heartbeat-owned terminal workspace",
+      status: "active",
+      providerType: "git_worktree",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Completed while heartbeat was running",
+      status: "done",
+      priority: "medium",
+      executionWorkspaceId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+      contextSnapshot: { issueId, executionWorkspaceId },
+    });
+
+    await expect(svc.markIdleAfterTerminalIssueCleanup({
+      companyId,
+      executionWorkspaceId,
+    })).resolves.toBeNull();
+
+    await heartbeatService(db).cancelRun(runId);
+
+    await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({
+      status: "idle",
+      cleanupReason: null,
+    });
+  });
+
+  it("keeps a terminal heartbeat transition when workspace reconciliation fails", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Workspace owner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+      contextSnapshot: {
+        issueId: randomUUID(),
+        executionWorkspaceId: "malformed-workspace-id",
+      },
+    });
+
+    await expect(heartbeatService(db).cancelRun(runId)).resolves.toMatchObject({
+      id: runId,
+      status: "cancelled",
+    });
+    await expect(
+      db.select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+    ).resolves.toEqual({ status: "cancelled" });
   });
 
   it("reconciles a forward branch record, comments on the source issue, and resolves matching workspace recovery", async () => {
