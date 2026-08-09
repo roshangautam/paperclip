@@ -173,4 +173,23 @@ describe("plugin lifecycle App reconciliation", () => {
     });
     expect(reconcilePluginApplications).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps the current worker running when upgrade validation fails", async () => {
+    const upgradePlugin = vi.fn().mockRejectedValue(new Error("invalid plugin manifest"));
+    const stopWorker = vi.fn();
+    const workerManager = {
+      isRunning: vi.fn().mockReturnValue(true),
+      getWorker: vi.fn().mockReturnValue({}),
+      stopWorker,
+    } as unknown as PluginWorkerManager;
+    const manager = lifecycle({
+      upgradePlugin: upgradePlugin as PluginLoader["upgradePlugin"],
+    }, workerManager);
+
+    await expect(manager.upgrade("plugin-1", undefined, "/plugins/invalid"))
+      .rejects.toThrow("invalid plugin manifest");
+
+    expect(stopWorker).not.toHaveBeenCalled();
+    expect(currentPlugin.status).toBe("ready");
+  });
 });

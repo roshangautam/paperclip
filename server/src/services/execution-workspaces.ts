@@ -1633,7 +1633,7 @@ export function executionWorkspaceService(db: Db) {
             select 1
             from ${heartbeatRuns}
             where ${heartbeatRuns.companyId} = ${input.companyId}
-              and ${heartbeatRuns.status} in ('queued', 'running')
+              and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
               and ${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaces.id}::text
           )`,
         ))

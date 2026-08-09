@@ -730,11 +730,11 @@ export function pluginLifecycleManager(
         "plugin lifecycle: upgrade requested",
       );
 
-      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
-
       // 1. Download and validate new package via loader
       const { oldManifest, newManifest, discovered } =
         await pluginLoaderInstance.upgradePlugin(pluginId, { version, localPath });
+
+      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
 
       log.info(
         {

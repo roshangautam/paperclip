@@ -650,7 +650,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     },
   );
 
-  it.each(["queued", "running"])(
+  it.each(["queued", "running", "scheduled_retry"])(
     "keeps a workspace active while a %s heartbeat owns it",
     async (runStatus) => {
       const companyId = randomUUID();

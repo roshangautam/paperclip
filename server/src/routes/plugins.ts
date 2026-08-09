@@ -2200,6 +2200,10 @@ export function pluginRoutes(
       res.status(400).json({ error: "localPath must be a string" });
       return;
     }
+    if (localPath !== undefined && localPath.trim().length === 0) {
+      res.status(400).json({ error: "localPath must not be blank" });
+      return;
+    }
     if (version !== undefined && localPath !== undefined) {
       res.status(400).json({ error: "version cannot be combined with localPath" });
       return;

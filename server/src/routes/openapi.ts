@@ -4836,7 +4836,7 @@ registry.registerPath({
         "application/json": {
           schema: z.object({
             version: z.string().optional(),
-            localPath: z.string().optional(),
+            localPath: z.string().trim().min(1).optional(),
           }).strict(),
         },
       },
