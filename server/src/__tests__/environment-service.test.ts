@@ -572,6 +572,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
       leasePolicy: "reuse_by_environment",
       provider: "fixture-provider",
       providerLeaseId: "released-reusable-provider-lease",
+      reusableResourceOwner: true,
     });
     const retainedReusableLease = await svc.acquireLease({
       companyId,
@@ -579,6 +580,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
       leasePolicy: "reuse_by_environment",
       provider: "fixture-provider",
       providerLeaseId: "retained-reusable-provider-lease",
+      reusableResourceOwner: true,
     });
     const failedReusableLease = await svc.acquireLease({
       companyId,
@@ -586,6 +588,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
       leasePolicy: "reuse_by_environment",
       provider: "fixture-provider",
       providerLeaseId: "failed-reusable-provider-lease",
+      reusableResourceOwner: true,
     });
     await svc.releaseLease(releasedReusableLease.id, "released");
     await svc.releaseLease(retainedReusableLease.id, "retained");
@@ -653,6 +656,55 @@ describeEmbeddedPostgres("environmentService leases", () => {
     expect(removedEphemeralEnvironment?.id).toBe(ephemeralEnvId);
     expect(ephemeralEnvironmentRows).toHaveLength(0);
     expect(ephemeralLeaseRows).toHaveLength(0);
+  });
+
+  it("ignores non-owner terminal reusable lease history when deleting an environment", async () => {
+    const companyId = randomUUID();
+    const environmentId = randomUUID();
+    const now = new Date();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Reusable Lease History Co",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(environments).values({
+      id: environmentId,
+      name: "Reusable Sandbox History",
+      driver: "sandbox",
+      status: "active",
+      config: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+    for (const status of ["released", "retained", "failed"] as const) {
+      const historicalLease = await svc.acquireLease({
+        companyId,
+        environmentId,
+        leasePolicy: "reuse_by_environment",
+        provider: "fixture-provider",
+        providerLeaseId: `${status}-historical-provider-lease`,
+        reusableResourceOwner: false,
+      });
+      await svc.releaseLease(historicalLease.id, status);
+    }
+
+    await expect(svc.getDeleteBlastRadius(environmentId)).resolves.toMatchObject({
+      environmentId,
+      canDelete: true,
+      deleteBlockedReasons: [],
+      activeRuntimeUse: {
+        activeLeaseCount: 0,
+        reusableLeaseCount: 0,
+        pendingCleanupLeaseCount: 0,
+        hasActiveRuntimeUse: false,
+      },
+    });
+    await expect(svc.removeIfDeletable(environmentId)).resolves.toMatchObject({ id: environmentId });
+    await expect(
+      db.select().from(environmentLeases).where(eq(environmentLeases.environmentId, environmentId)),
+    ).resolves.toEqual([]);
   });
 
   it("creates and then reuses the default local environment for a company", async () => {

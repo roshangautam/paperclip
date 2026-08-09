@@ -129,6 +129,7 @@ export interface EnvironmentLease {
   releasedAt: Date | null;
   failureReason: string | null;
   cleanupStatus: EnvironmentLeaseCleanupStatus | null;
+  reusableResourceOwner: boolean;
   metadata: Record<string, unknown> | null;
   createdAt: Date;
   updatedAt: Date;

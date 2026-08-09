@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { boolean, check, index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { environments } from "./environments.js";
 import { executionWorkspaces } from "./execution_workspaces.js";
@@ -27,6 +27,8 @@ export const environmentLeases = pgTable(
     cleanupStatus: text("cleanup_status"),
     cleanupClaimId: uuid("cleanup_claim_id"),
     cleanupClaimedAt: timestamp("cleanup_claimed_at", { withTimezone: true }),
+    reusableResourceOwner: boolean("reusable_resource_owner").notNull().default(false),
+    reusableAdoptionClaimId: uuid("reusable_adoption_claim_id"),
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -45,6 +47,25 @@ export const environmentLeases = pgTable(
     heartbeatRunIdx: index("environment_leases_heartbeat_run_idx").on(table.heartbeatRunId),
     companyLastUsedIdx: index("environment_leases_company_last_used_idx").on(table.companyId, table.lastUsedAt),
     providerLeaseIdx: index("environment_leases_provider_lease_idx").on(table.providerLeaseId),
+    reusableResourceOwnerIdx: uniqueIndex("environment_leases_reusable_resource_owner_idx")
+      .on(table.companyId, table.environmentId, table.provider, table.providerLeaseId)
+      .where(sql`${table.reusableResourceOwner} = true`),
+    reusableResourceOwnerIdentityCheck: check(
+      "environment_leases_reusable_resource_owner_identity_check",
+      sql`not ${table.reusableResourceOwner} or (
+        ${table.leasePolicy} = 'reuse_by_environment'
+        and ${table.provider} is not null
+        and ${table.providerLeaseId} is not null
+      )`,
+    ),
+    reusableAdoptionClaimOwnerCheck: check(
+      "environment_leases_reusable_adoption_claim_owner_check",
+      sql`${table.reusableAdoptionClaimId} is null or ${table.reusableResourceOwner}`,
+    ),
+    reusableClaimExclusionCheck: check(
+      "environment_leases_reusable_claim_exclusion_check",
+      sql`${table.reusableAdoptionClaimId} is null or ${table.cleanupClaimId} is null`,
+    ),
     pendingCleanupIdx: index("environment_leases_pending_cleanup_idx")
       .on(table.updatedAt, table.cleanupClaimedAt)
       .where(sql`${table.status} = 'pending_cleanup'`),

@@ -93,6 +93,7 @@ function makeLease(overrides: Partial<EnvironmentLease> = {}): EnvironmentLease 
     releasedAt: null,
     failureReason: null,
     cleanupStatus: null,
+    reusableResourceOwner: false,
     metadata: null,
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -417,6 +418,8 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
       workspace: expect.objectContaining({ remotePath: "/home/coder/workspace" }),
     }));
     expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
+      command: "bash",
+      args: ["-lc", "pnpm install"],
       cwd: "/home/coder/workspace",
     }));
   });
