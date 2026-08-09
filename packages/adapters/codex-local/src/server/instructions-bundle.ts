@@ -22,9 +22,7 @@ export function resolveCodexInstructionsBundle(config: Record<string, unknown>):
     return { filePath, rootPath: null, entryRelativePath: null };
   }
 
-  const entryPath = configuredEntryFile
-    ? path.resolve(rootPath, configuredEntryFile)
-    : path.resolve(filePath);
+  const entryPath = path.resolve(filePath);
   const entryRelativePath = path.relative(rootPath, entryPath);
   if (
     !entryRelativePath ||

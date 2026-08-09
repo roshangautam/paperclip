@@ -44,6 +44,20 @@ describe("resolveCodexInstructionsBundle", () => {
     });
   });
 
+  it("uses the configured file as the staged entry when the entry setting differs", () => {
+    const filePath = path.join(rootPath, "AGENTS.md");
+
+    expect(resolveCodexInstructionsBundle({
+      instructionsFilePath: filePath,
+      instructionsRootPath: rootPath,
+      instructionsEntryFile: path.join("nested", "AGENTS.md"),
+    })).toEqual({
+      filePath,
+      rootPath,
+      entryRelativePath: "AGENTS.md",
+    });
+  });
+
   it.each([
     {
       name: "missing root",
@@ -64,19 +78,18 @@ describe("resolveCodexInstructionsBundle", () => {
   });
 
   it.each([
-    ["parent traversal", { instructionsEntryFile: path.join("..", "AGENTS.md") }],
-    ["absolute entry", { instructionsEntryFile: outsidePath }],
-    ["file outside root", { instructionsFilePath: outsidePath }],
-    ["root itself", { instructionsEntryFile: "." }],
-  ])("rejects %s outside the instruction bundle", (_name, override) => {
+    ["parent traversal", { instructionsEntryFile: path.join("..", "AGENTS.md") }, path.resolve(rootPath, "..", "AGENTS.md")],
+    ["absolute entry", { instructionsEntryFile: outsidePath }, outsidePath],
+    ["file outside root", { instructionsFilePath: outsidePath }, outsidePath],
+    ["root itself", { instructionsEntryFile: "." }, rootPath],
+  ])("rejects %s outside the instruction bundle", (_name, override, filePath) => {
     const config = {
       instructionsRootPath: rootPath,
-      instructionsFilePath: path.join(rootPath, "AGENTS.md"),
       ...override,
     };
 
     expect(resolveCodexInstructionsBundle(config)).toEqual({
-      filePath: config.instructionsFilePath,
+      filePath,
       rootPath: null,
       entryRelativePath: null,
     });

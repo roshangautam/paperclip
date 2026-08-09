@@ -218,7 +218,6 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
     const instructionsBundle = resolveCodexInstructionsBundle(config);
     if (
       target?.kind !== "remote" ||
-      target.transport !== "sandbox" ||
       !instructionsBundle.rootPath ||
       !instructionsBundle.entryRelativePath
     ) {
@@ -226,7 +225,9 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
       return withCodexAuthRefreshFailureClassification(result);
     }
 
-    const runtimeTarget = { ...target, syncWorkspace: false as const };
+    const runtimeTarget = target.transport === "sandbox"
+      ? { ...target, syncWorkspace: false as const }
+      : target;
     const workspaceContext = parseObject(ctx.context.paperclipWorkspace);
     const workspaceLocalDir =
       asString(workspaceContext.cwd, "").trim() ||

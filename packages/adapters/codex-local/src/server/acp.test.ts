@@ -628,6 +628,79 @@ describe("codex_local ACP lane", () => {
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 
+  it("stages the complete instruction bundle for SSH ACP", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-ssh-instructions-");
+    const workspaceDir = path.join(root, "workspace");
+    const instructionsDir = path.join(root, "instructions");
+    const instructionsFilePath = path.join(instructionsDir, "AGENTS.md");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    await fs.mkdir(instructionsDir, { recursive: true });
+    await fs.writeFile(instructionsFilePath, "Read SOUL.md.\n", "utf8");
+    await fs.writeFile(path.join(instructionsDir, "SOUL.md"), "Be precise.\n", "utf8");
+
+    const restoreWorkspace = vi.fn(async () => undefined);
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
+      target: input.target,
+      workspaceRemoteDir: "/remote/workspace",
+      runtimeRootDir: "/remote/workspace/.paperclip-runtime/codex",
+      assetDirs: {
+        instructions: "/remote/workspace/.paperclip-runtime/codex/instructions",
+      },
+      restoreWorkspace,
+    }));
+
+    const runtimes: FakeRuntime[] = [];
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => {
+        const runtime = new FakeRuntime(options);
+        runtimes.push(runtime);
+        return runtime as never;
+      },
+    });
+    const sshTarget = {
+      kind: "remote" as const,
+      transport: "ssh" as const,
+      remoteCwd: "/remote/workspace",
+      spec: {
+        host: "127.0.0.1",
+        port: 22,
+        username: "fixture",
+        remoteCwd: "/remote/workspace",
+        remoteWorkspacePath: "/remote/workspace",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+    };
+
+    const result = await execute(buildContext(workspaceDir, {
+      config: {
+        engine: "acp",
+        cwd: workspaceDir,
+        stateDir: path.join(root, "state"),
+        instructionsFilePath,
+        instructionsRootPath: instructionsDir,
+        instructionsEntryFile: "AGENTS.md",
+        promptTemplate: "Do the assigned work.",
+      },
+      executionTarget: sshTarget,
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(prepareAdapterExecutionTargetRuntime).toHaveBeenCalledTimes(1);
+    const preparation = prepareAdapterExecutionTargetRuntime.mock.calls[0]?.[0];
+    expect(preparation?.target).toEqual(sshTarget);
+    expect(preparation?.assets).toEqual([{ key: "instructions", localDir: instructionsDir }]);
+    const prompt = runtimes[0]?.startInputs[0]?.text ?? "";
+    expect(prompt).toContain(
+      "The above agent instructions were loaded from /remote/workspace/.paperclip-runtime/codex/instructions/AGENTS.md.",
+    );
+    expect(prompt).toContain(
+      "Resolve any relative file references from /remote/workspace/.paperclip-runtime/codex/instructions/.",
+    );
+    expect(restoreWorkspace).toHaveBeenCalledTimes(1);
+  });
+
   it("reuses the initialized ACPX executor across repeated calls", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-cached-executor-");
     const runtimes: FakeRuntime[] = [];
