@@ -725,11 +725,12 @@ export async function resolveExecutionRunAdapterConfig(input: {
         ...(requiredScopedEnvBinding.alternativeKeySets ?? []).flat(),
       ])]
     : [];
+  const effectiveRequiredScopedEnv = {
+    ...(requiredScopedEnvBinding?.consumerScopes.includes("agent") ? agentEnv : {}),
+    ...(requiredScopedEnvBinding?.consumerScopes.includes("project") ? projectEnv ?? {} : {}),
+  };
   const isRequiredScopedEnvKeyConfigured = (key: string) => requiredScopedEnvBinding !== null
-    && ((requiredScopedEnvBinding.consumerScopes.includes("agent")
-      && isConfiguredEnvBindingValue(agentEnv[key]))
-      || (requiredScopedEnvBinding.consumerScopes.includes("project")
-        && isConfiguredEnvBindingValue(projectEnv?.[key])));
+    && isConfiguredEnvBindingValue(effectiveRequiredScopedEnv[key]);
   const requiredScopedBindingsConfigured = requiredScopedEnvBinding
     ? requiredScopedEnvBinding.keys.some(isRequiredScopedEnvKeyConfigured)
       || (requiredScopedEnvBinding.alternativeKeySets ?? []).some((keySet) =>
