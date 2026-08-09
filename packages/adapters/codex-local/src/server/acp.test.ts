@@ -713,6 +713,56 @@ describe("codex_local ACP lane", () => {
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 
+  it("closes a prepared remote ACP handle before restoring its run-scoped workspace", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-remote-handle-");
+    const lifecycle: string[] = [];
+    const restoreWorkspace = vi.fn(async () => {
+      lifecycle.push("restore");
+    });
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
+      target: input.target,
+      workspaceRemoteDir: "/remote/prepared-workspace",
+      runtimeRootDir: "/remote/prepared-workspace/.paperclip-runtime/codex",
+      assetDirs: {},
+      restoreWorkspace,
+    }));
+    const runtimes: FakeRuntime[] = [];
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => {
+        const runtime = new FakeRuntime(options);
+        const close = runtime.close.bind(runtime);
+        runtime.close = async (input) => {
+          lifecycle.push("close");
+          await close(input);
+        };
+        runtimes.push(runtime);
+        return runtime as never;
+      },
+    });
+
+    const result = await execute(buildContext(root, {
+      config: {
+        engine: "acp",
+        cwd: root,
+        stateDir: path.join(root, "state"),
+        warmHandleIdleMs: 60_000,
+        promptTemplate: "Do the assigned work.",
+      },
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "test-sandbox",
+        remoteCwd: "/remote/workspace",
+      },
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(runtimes[0]?.closeInputs).toContainEqual(
+      expect.objectContaining({ reason: "paperclip completed turn cleanup" }),
+    );
+    expect(lifecycle).toEqual(["close", "restore"]);
+  });
+
   it("reuses the initialized ACPX executor across repeated calls", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-cached-executor-");
     const runtimes: FakeRuntime[] = [];

@@ -747,16 +747,17 @@ export function pluginLifecycleManager(
      * @param version - Optional target version specifier.
      * @param localPath - Optional server-local path for a local plugin replacement.
      * @returns The updated `PluginRecord`.
-     * @throws {BadRequest} If the plugin is not in a ready or upgrade_pending state.
+     * @throws {BadRequest} If the plugin is not in a ready state.
      */
     async upgrade(pluginId: string, version?: string, localPath?: string): Promise<PluginRecord> {
       const plugin = await requirePlugin(pluginId);
 
-      // Can only upgrade plugins that are ready or already in upgrade_pending
-      if (plugin.status !== "ready" && plugin.status !== "upgrade_pending") {
+      // Retrying an upgrade_pending plugin would compare the pending manifest
+      // against itself and bypass approval for newly added capabilities.
+      if (plugin.status !== "ready") {
         throw badRequest(
           `Cannot upgrade plugin in status '${plugin.status}'. ` +
-            `Plugin must be in 'ready' or 'upgrade_pending' status to be upgraded.`,
+            `Plugin must be in 'ready' status to be upgraded.`,
         );
       }
 

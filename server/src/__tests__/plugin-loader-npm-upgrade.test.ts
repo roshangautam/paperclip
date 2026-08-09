@@ -24,11 +24,24 @@ const mocks = vi.hoisted(() => ({
     updateStatus: vi.fn(),
     uninstall: vi.fn(),
   },
+  renameFailure: vi.fn((_from: string, _to: string): Error | undefined => undefined),
 }));
 
 vi.mock("node:child_process", () => ({
   execFile: mocks.execFile,
 }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rename: async (from: string, to: string) => {
+      const error = mocks.renameFailure(from, to);
+      if (error) throw error;
+      return actual.rename(from, to);
+    },
+  };
+});
 
 vi.mock("../services/plugin-registry.js", () => ({
   pluginRegistryService: () => mocks.registry,
@@ -83,6 +96,7 @@ async function writeInstalledPackage(
 describe("pluginLoader npm upgrades", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.renameFailure.mockReturnValue(undefined);
     mocks.registry.listInstalled.mockResolvedValue([]);
   });
 
@@ -270,6 +284,52 @@ describe("pluginLoader npm upgrades", () => {
       .resolves.toBe(`export default ${JSON.stringify(activeManifest)};\n`);
     await expect(readFile(path.join(packageRoot, "worker.js"), "utf8"))
       .resolves.toBe("export const marker = 'active';\n");
+  });
+
+  it("preserves the previous npm tree when promotion and restoration both fail", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
+    cleanupPaths.add(localPluginDir);
+    const packageName = "paperclip-example";
+    const activeManifest = manifest("1.0.0");
+    const packageRoot = await writeInstalledPackage(localPluginDir, packageName, activeManifest);
+    await writeFile(path.join(packageRoot, "worker.js"), "export const marker = 'active';\n", "utf8");
+    mocks.registry.getById.mockResolvedValue({
+      id: "plugin-1",
+      packageName,
+      packagePath: null,
+      manifestJson: activeManifest,
+    });
+    mocks.execFile.mockImplementationOnce((_file, args, _options, callback) => {
+      void writeInstalledPackage(args[3]!, packageName, manifest("1.1.0")).then(
+        () => callback(null, "", ""),
+        (error: Error) => callback(error, "", ""),
+      );
+      return { kill: vi.fn(), on: vi.fn() };
+    });
+    mocks.renameFailure.mockImplementation((from, to) => {
+      if (to !== localPluginDir) return undefined;
+      if (from.endsWith(`${path.sep}next`)) return new Error("promotion failed");
+      if (from.endsWith(`${path.sep}previous`)) return new Error("restoration failed");
+      return undefined;
+    });
+    const loader = pluginLoader({} as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    await expect(loader.upgradePlugin("plugin-1", { version: "1.1.0" }))
+      .rejects.toThrow("preserved recovery files");
+
+    const restoreCall = mocks.renameFailure.mock.calls.find(([from]) =>
+      from.endsWith(`${path.sep}previous`));
+    expect(restoreCall).toBeDefined();
+    const preservedRoot = path.dirname(restoreCall![0]);
+    cleanupPaths.add(preservedRoot);
+    await expect(readFile(
+      path.join(preservedRoot, "previous", "node_modules", packageName, "worker.js"),
+      "utf8",
+    )).resolves.toBe("export const marker = 'active';\n");
   });
 
   it("keeps npm installs locked through registry persistence before an upgrade", async () => {

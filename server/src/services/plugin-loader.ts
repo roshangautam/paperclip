@@ -1183,6 +1183,7 @@ export function pluginLoader(
   async function stageManagedPluginDirectory(): Promise<{
     root: string;
     directory: string;
+    preserveRoot: boolean;
   }> {
     const parentDir = path.dirname(localPluginDir);
     await mkdir(parentDir, { recursive: true });
@@ -1193,12 +1194,13 @@ export function pluginLoader(
     } else {
       await mkdir(directory, { recursive: true });
     }
-    return { root, directory };
+    return { root, directory, preserveRoot: false };
   }
 
   async function promoteManagedPluginDirectory(staged: {
     root: string;
     directory: string;
+    preserveRoot: boolean;
   }): Promise<{
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -1215,7 +1217,17 @@ export function pluginLoader(
     try {
       await rename(staged.directory, localPluginDir);
     } catch (error) {
-      if (hadPrevious) await rename(previousDir, localPluginDir).catch(() => undefined);
+      if (hadPrevious) {
+        try {
+          await rename(previousDir, localPluginDir);
+        } catch (restoreError) {
+          staged.preserveRoot = true;
+          throw new AggregateError(
+            [error, restoreError],
+            `Failed to promote managed plugins and restore the previous directory; preserved recovery files at ${staged.root}`,
+          );
+        }
+      }
       throw error;
     }
 
@@ -1907,7 +1919,7 @@ export function pluginLoader(
 
           return discovered;
         } finally {
-          if (staged && !promotion.current) {
+          if (staged && !promotion.current && !staged.preserveRoot) {
             await rm(staged.root, { recursive: true, force: true });
           }
         }
@@ -2041,7 +2053,7 @@ export function pluginLoader(
             discovered,
           };
         } finally {
-          if (staged && !promoted) {
+          if (staged && !promoted && !staged.preserveRoot) {
             await rm(staged.root, { recursive: true, force: true });
           }
         }

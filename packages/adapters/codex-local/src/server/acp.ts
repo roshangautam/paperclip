@@ -258,13 +258,11 @@ export function resolveCodexAcpBillingIdentity(
 
 export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): CodexAcpExecutor {
   let executor: CodexAcpExecutor | null = null;
+  const createExecutor = async (executorOptions: CodexAcpExecutorOptions) => {
+    const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
+    return createAcpxEngineExecutor(withCodexAcpDefaults(executorOptions));
+  };
   return async (ctx) => {
-    let currentExecutor = executor;
-    if (!currentExecutor) {
-      const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
-      currentExecutor = createAcpxEngineExecutor(withCodexAcpDefaults(options));
-      executor = currentExecutor;
-    }
     const config = buildCodexAcpConfig(ctx.config);
     const target = readAdapterExecutionTarget({
       executionTarget: ctx.executionTarget,
@@ -272,6 +270,11 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
     });
     const instructionsBundle = resolveCodexInstructionsBundle(config);
     if (target?.kind !== "remote") {
+      let currentExecutor = executor;
+      if (!currentExecutor) {
+        currentExecutor = await createExecutor(options);
+        executor = currentExecutor;
+      }
       const result = await currentExecutor({ ...ctx, config });
       return withCodexAuthRefreshFailureClassification(result);
     }
@@ -307,15 +310,20 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
             instructionsBundle.entryRelativePath,
           )
         : null;
+    // Prepared remote workspaces are run-scoped and may be deleted by
+    // restoreWorkspace below. Keep their ACP process handles run-scoped too,
+    // even when an adapter config enables warm handles for durable workspaces.
+    const remoteExecutor = await createExecutor({ ...options, warmHandles: new Map() });
+    const remoteConfig = { ...config, warmHandleIdleMs: 0 };
 
     let result: AdapterExecutionResult;
     try {
-      result = withCodexAuthRefreshFailureClassification(await currentExecutor({
+      result = withCodexAuthRefreshFailureClassification(await remoteExecutor({
         ...ctx,
         executionTarget,
         executionSessionTarget: target,
         config: {
-          ...config,
+          ...remoteConfig,
           ...(instructionsReferencePath ? { instructionsReferencePath } : {}),
         },
       }));

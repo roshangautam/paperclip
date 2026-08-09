@@ -219,6 +219,19 @@ describe("plugin lifecycle App reconciliation", () => {
     expect(reconcilePluginApplications).toHaveBeenCalledTimes(1);
   });
 
+  it("does not let an upgrade_pending retry bypass capability approval", async () => {
+    currentPlugin = { ...basePlugin, status: "upgrade_pending" };
+    const upgradePlugin = vi.fn();
+    const manager = lifecycle({
+      upgradePlugin: upgradePlugin as PluginLoader["upgradePlugin"],
+    });
+
+    await expect(manager.upgrade("plugin-1", "1.1.0"))
+      .rejects.toThrow("Plugin must be in 'ready' status");
+
+    expect(upgradePlugin).not.toHaveBeenCalled();
+  });
+
   it("keeps the current worker running when upgrade validation fails", async () => {
     const upgradePlugin = vi.fn().mockRejectedValue(new Error("invalid plugin manifest"));
     const stopWorker = vi.fn();

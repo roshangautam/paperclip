@@ -235,13 +235,11 @@ function withClaudeAcpDefaults(options: ClaudeAcpExecutorOptions): AcpxEngineExe
 
 export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}): ClaudeAcpExecutor {
   let executor: ClaudeAcpExecutor | null = null;
+  const createExecutor = async (executorOptions: ClaudeAcpExecutorOptions) => {
+    const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
+    return createAcpxEngineExecutor(withClaudeAcpDefaults(executorOptions));
+  };
   return async (ctx) => {
-    let currentExecutor = executor;
-    if (!currentExecutor) {
-      const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
-      currentExecutor = createAcpxEngineExecutor(withClaudeAcpDefaults(options));
-      executor = currentExecutor;
-    }
     const config = buildClaudeAcpConfig(ctx.config);
     const target = readAdapterExecutionTarget({
       executionTarget: ctx.executionTarget,
@@ -249,6 +247,11 @@ export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}):
     });
     const instructionsBundle = resolveManagedInstructionsBundle(config);
     if (target?.kind !== "remote") {
+      let currentExecutor = executor;
+      if (!currentExecutor) {
+        currentExecutor = await createExecutor(options);
+        executor = currentExecutor;
+      }
       return currentExecutor({ ...ctx, config });
     }
 
@@ -283,15 +286,20 @@ export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}):
             instructionsBundle.entryRelativePath,
           )
         : null;
+    // Prepared remote workspaces are run-scoped and may be deleted by
+    // restoreWorkspace below. Keep their ACP process handles run-scoped too,
+    // even when an adapter config enables warm handles for durable workspaces.
+    const remoteExecutor = await createExecutor({ ...options, warmHandles: new Map() });
+    const remoteConfig = { ...config, warmHandleIdleMs: 0 };
 
     let result: AdapterExecutionResult;
     try {
-      result = await currentExecutor({
+      result = await remoteExecutor({
         ...ctx,
         executionTarget,
         executionSessionTarget: target,
         config: {
-          ...config,
+          ...remoteConfig,
           ...(instructionsReferencePath ? { instructionsReferencePath } : {}),
         },
       });
