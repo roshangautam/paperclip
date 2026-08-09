@@ -4479,6 +4479,107 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
+  it("destroys an active reusable lease when terminal workspace cleanup never started", async () => {
+    const { pluginId, companyId, runId, executionWorkspaceId, reusableLease } =
+      await seedReusablePluginSandboxLease();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal issue whose process exited before lease cleanup",
+      status: "done",
+      priority: "medium",
+      executionWorkspaceId,
+    });
+    await db
+      .update(environmentLeases)
+      .set({ issueId })
+      .where(eq(environmentLeases.id, reusableLease.id));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        expect(method).toBe("environmentDestroyLease");
+      }),
+    } as unknown as PluginWorkerManager;
+
+    await expect(
+      environmentRuntimeService(db, { pluginWorkerManager: workerManager })
+        .retryPendingSandboxCleanups(),
+    ).resolves.toEqual({ attempted: 0, cleaned: 0, pending: 0 });
+
+    expect(workerManager.call).toHaveBeenCalledWith(
+      pluginId,
+      "environmentDestroyLease",
+      expect.objectContaining({ providerLeaseId: "reusable-plugin-lease" }),
+      91234,
+    );
+    await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+    });
+    await expect(executionWorkspaceService(db).getById(executionWorkspaceId)).resolves.toMatchObject({
+      status: "idle",
+      cleanupReason: null,
+    });
+  });
+
+  it("does not destroy a reusable lease when a run starts after terminal reconciliation selection", async () => {
+    const { pluginId, companyId, agentId, runId, executionWorkspaceId, reusableLease } =
+      await seedReusablePluginSandboxLease();
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Terminal issue selected for reconciliation",
+      status: "done",
+      priority: "medium",
+      executionWorkspaceId,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+
+    // Simulate a candidate selected by the reconciliation query before a new
+    // run becomes live. The claim must re-check eligibility atomically.
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+      contextSnapshot: { executionWorkspaceId },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      call: vi.fn(async () => undefined),
+    } as unknown as PluginWorkerManager;
+
+    const destroyed = await environmentRuntimeService(db, { pluginWorkerManager: workerManager })
+      .destroyReusableSandboxLeases({
+        companyId,
+        executionWorkspaceId,
+        failureReason: "terminal_issue_workspace_reconciliation",
+        terminalWorkspaceReconciliation: { executionWorkspaceId },
+      });
+
+    expect(destroyed).toEqual([]);
+    expect(workerManager.call).not.toHaveBeenCalled();
+    const [leaseRow] = await db
+      .select()
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, reusableLease.id));
+    expect(leaseRow).toMatchObject({
+      status: "active",
+      cleanupClaimId: null,
+    });
+  });
+
   it("destroys reusable plugin-backed sandbox leases when a run fails", async () => {
     const { pluginId, runId, reusableLease } = await seedReusablePluginSandboxLease();
     const workerManager = {

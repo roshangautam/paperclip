@@ -552,6 +552,80 @@ describe("claude_local ACP lane", () => {
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 
+  it("returns sandbox restore failure after successful execution", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-restore-failure-");
+    const restoreWorkspace = vi.fn(async () => {
+      throw new Error("sandbox restore failed");
+    });
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
+      target: input.target,
+      workspaceRemoteDir: "/remote/workspace",
+      runtimeRootDir: "/remote/workspace/.paperclip-runtime/claude",
+      assetDirs: {},
+      restoreWorkspace,
+    }));
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+    });
+
+    const result = await execute(buildContext(root, {
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "test-sandbox",
+        remoteCwd: "/remote/workspace",
+      },
+    }));
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorMessage: "ACP workspace restore failed: sandbox restore failed",
+      errorCode: "acp_workspace_restore_failed",
+      resultJson: {
+        workspaceRestoreFailure: {
+          code: "acp_workspace_restore_failed",
+          message: "sandbox restore failed",
+        },
+      },
+    });
+    expect(restoreWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws a coded restore failure when the executor and sandbox restore both throw", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-thrown-executor-and-restore-failure-");
+    const restoreWorkspace = vi.fn(async () => {
+      throw new Error("sandbox restore failed");
+    });
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
+      target: input.target,
+      workspaceRemoteDir: "/remote/workspace",
+      runtimeRootDir: "/remote/workspace/.paperclip-runtime/claude",
+      assetDirs: {},
+      restoreWorkspace,
+    }));
+    const execute = createClaudeAcpExecutor({
+      createRuntime: () => {
+        throw new Error("executor threw after workspace preparation");
+      },
+    });
+
+    const execution = execute(buildContext(root, {
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "test-sandbox",
+        remoteCwd: "/remote/workspace",
+      },
+    }));
+
+    await expect(execution).rejects.toMatchObject({
+      code: "acp_workspace_restore_failed",
+      message:
+        "executor threw after workspace preparation\nACP workspace restore failed: sandbox restore failed",
+    });
+    expect(restoreWorkspace).toHaveBeenCalledOnce();
+  });
+
   it("executes SSH ACP in the prepared workspace while retaining the original session target", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-ssh-runtime-");
     const workspaceDir = path.join(root, "workspace");

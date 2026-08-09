@@ -81,6 +81,7 @@ import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
+  ACP_WORKSPACE_RESTORE_ERROR_CODE,
   createClaudeAcpExecutor,
   formatClaudeAcpFallbackMessage,
   resolveClaudeExecutionEngineForRun,
@@ -390,7 +391,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       return await executeClaudeAcp(ctx);
     } catch (err) {
-      if (engineSelection.explicit) throw err;
+      if (
+        engineSelection.explicit
+        || (typeof err === "object" && err !== null && "code" in err
+          && err.code === ACP_WORKSPACE_RESTORE_ERROR_CODE)
+      ) throw err;
       const reason = err instanceof Error ? err.message : String(err);
       await ctx.onLog(
         "stderr",

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
 
 const {
   ensureAdapterExecutionTargetCommandResolvable,
@@ -12,7 +13,7 @@ const {
 } = vi.hoisted(() => ({
   ensureAdapterExecutionTargetCommandResolvable: vi.fn(async () => undefined),
   ensureAdapterExecutionTargetRuntimeCommandInstalled: vi.fn(async () => undefined),
-  executeCodexAcp: vi.fn(async () => {
+  executeCodexAcp: vi.fn<() => Promise<AdapterExecutionResult>>(async () => {
     throw new Error('Transform failed with 1 error: execute.ts:818:0: ERROR: Unexpected "<<"');
   }),
   prepareCodexRuntimeConfig: vi.fn(async () => ({ cleanup: vi.fn(async () => undefined), notes: [] })),
@@ -41,6 +42,7 @@ const {
 }));
 
 vi.mock("./acp.js", () => ({
+  ACP_WORKSPACE_RESTORE_ERROR_CODE: "acp_workspace_restore_failed",
   createCodexAcpExecutor: () => executeCodexAcp,
   formatCodexAcpFallbackMessage: (reason: string) =>
     `[paperclip] Codex ACP default unavailable; falling back to Codex CLI. ${reason} Set engine=acp to require ACP or engine=cli to silence this fallback.\n`,
@@ -148,6 +150,49 @@ describe("codex_local ACP startup fallback", () => {
     expect(ctx.onLog).toHaveBeenCalledWith(
       "stderr",
       expect.stringContaining('Unexpected "<<"'),
+    );
+  });
+
+  it("does not rerun through the CLI when ACP reports a workspace restore failure", async () => {
+    executeCodexAcp.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "ACP workspace restore failed: sandbox restore failed",
+      errorCode: "acp_workspace_restore_failed",
+      resultJson: {
+        workspaceRestoreFailure: {
+          code: "acp_workspace_restore_failed",
+          message: "sandbox restore failed",
+        },
+      },
+    });
+    const ctx = buildContext();
+
+    const result = await execute(ctx as never);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "acp_workspace_restore_failed",
+    });
+    expect(executeCodexAcp).toHaveBeenCalledTimes(1);
+    expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+  });
+
+  it("does not rerun through the CLI when ACP throws a workspace restore failure", async () => {
+    executeCodexAcp.mockRejectedValueOnce(Object.assign(
+      new Error("executor threw\nACP workspace restore failed: sandbox restore failed"),
+      { code: "acp_workspace_restore_failed" },
+    ));
+    const ctx = buildContext();
+
+    await expect(execute(ctx as never)).rejects.toMatchObject({
+      code: "acp_workspace_restore_failed",
+    });
+    expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+    expect(ctx.onLog).not.toHaveBeenCalledWith(
+      "stderr",
+      expect.stringContaining("falling back to Codex CLI"),
     );
   });
 

@@ -766,7 +766,7 @@ describe("codex_local ACP lane", () => {
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 
-  it("propagates sandbox restore failure after successful execution", async () => {
+  it("returns sandbox restore failure after successful execution", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-restore-failure-");
     const restoreError = new Error("sandbox restore failed");
     const restoreWorkspace = vi.fn(async () => {
@@ -777,8 +777,78 @@ describe("codex_local ACP lane", () => {
       createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
     });
 
-    await expect(execute(context)).rejects.toBe(restoreError);
+    const result = await execute(context);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorMessage: "ACP workspace restore failed: sandbox restore failed",
+      errorCode: "acp_workspace_restore_failed",
+      resultJson: {
+        workspaceRestoreFailure: {
+          code: "acp_workspace_restore_failed",
+          message: "sandbox restore failed",
+        },
+      },
+    });
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves an executor failure when sandbox restore also fails", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-executor-and-restore-failure-");
+    const restoreWorkspace = vi.fn(async () => {
+      throw new Error("sandbox restore failed");
+    });
+    const context = await buildSandboxInstructionsContext(root, restoreWorkspace);
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+        options,
+        [],
+        {
+          status: "failed",
+          error: { message: "executor failed before completion" },
+        } as unknown as FakeRuntimeTurnResult,
+      ) as never,
+    });
+
+    const result = await execute(context);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorMessage:
+        "executor failed before completion\nACP workspace restore failed: sandbox restore failed",
+      errorCode: "acp_workspace_restore_failed",
+      resultJson: {
+        workspaceRestoreFailure: {
+          code: "acp_workspace_restore_failed",
+          message: "sandbox restore failed",
+          executionError: {
+            code: "acpx_turn_failed",
+            message: "executor failed before completion",
+          },
+        },
+      },
+    });
+    expect(restoreWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws a coded restore failure when the executor and sandbox restore both throw", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-thrown-executor-and-restore-failure-");
+    const restoreWorkspace = vi.fn(async () => {
+      throw new Error("sandbox restore failed");
+    });
+    const context = await buildSandboxInstructionsContext(root, restoreWorkspace);
+    const execute = createCodexAcpExecutor({
+      createRuntime: () => {
+        throw new Error("executor threw after workspace preparation");
+      },
+    });
+
+    await expect(execute(context)).rejects.toMatchObject({
+      code: "acp_workspace_restore_failed",
+      message:
+        "executor threw after workspace preparation\nACP workspace restore failed: sandbox restore failed",
+    });
+    expect(restoreWorkspace).toHaveBeenCalledOnce();
   });
 
   it("classifies ACP refresh-token auth failures", async () => {

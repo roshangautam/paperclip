@@ -35,6 +35,7 @@
  * @see PLUGIN_SPEC.md §12 — Process Model
  * @see PLUGIN_SPEC.md §12.5 — Graceful Shutdown Policy
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import type { Db } from "@paperclipai/db";
 import type {
@@ -43,7 +44,7 @@ import type {
   PaperclipPluginManifestV1,
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "./plugin-registry.js";
-import { pluginLoader, type PluginLoader } from "./plugin-loader.js";
+import { pluginLoader, type PluginLoader, withPluginMutationLock } from "./plugin-loader.js";
 import type { PluginWorkerManager, WorkerStartOptions } from "./plugin-worker-manager.js";
 import { toolAccessService } from "./tool-access.js";
 import { badRequest, notFound } from "../errors.js";
@@ -87,6 +88,44 @@ const VALID_TRANSITIONS: Record<string, readonly PluginStatus[]> = {
 };
 
 const APP_RECONCILIATION_RETRY_DELAYS_MS = [250, 1_000, 5_000] as const;
+const pluginLifecycleLocks = new Map<string, Promise<void>>();
+const heldPluginLifecycleLocks = new AsyncLocalStorage<ReadonlyMap<string, symbol>>();
+// Async resources can outlive the operation that created them, so only an
+// actively held token may bypass the queue as a same-chain reentrant call.
+const activePluginLifecycleLockTokens = new Set<symbol>();
+
+async function withPluginLifecycleLock<T>(
+  pluginId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const heldLocks = heldPluginLifecycleLocks.getStore();
+  const heldLockToken = heldLocks?.get(pluginId);
+  if (heldLockToken && activePluginLifecycleLockTokens.has(heldLockToken)) {
+    return operation();
+  }
+
+  const previous = pluginLifecycleLocks.get(pluginId) ?? Promise.resolve();
+  let release!: () => void;
+  const marker = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  pluginLifecycleLocks.set(pluginId, marker);
+  await previous;
+
+  const lockToken = Symbol(pluginId);
+  const nextHeldLocks = new Map(heldLocks);
+  nextHeldLocks.set(pluginId, lockToken);
+  activePluginLifecycleLockTokens.add(lockToken);
+  try {
+    return await heldPluginLifecycleLocks.run(nextHeldLocks, operation);
+  } finally {
+    activePluginLifecycleLockTokens.delete(lockToken);
+    release();
+    if (pluginLifecycleLocks.get(pluginId) === marker) {
+      pluginLifecycleLocks.delete(pluginId);
+    }
+  }
+}
 
 /**
  * Check whether a transition from `from` → `to` is valid.
@@ -523,7 +562,7 @@ export function pluginLifecycleManager(
   // Public API
   // -----------------------------------------------------------------------
 
-  return {
+  const unlockedManager: PluginLifecycleManager = {
     // -- load -------------------------------------------------------------
     /**
      * load — Transitions a plugin to 'ready' status and starts its worker.
@@ -615,8 +654,7 @@ export function pluginLifecycleManager(
       // If already uninstalled and removeData, hard-delete
       if (plugin.status === "uninstalled") {
         if (removeData) {
-          await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
-          const deleted = await registry.uninstall(pluginId, true);
+          const deleted = await pluginLoaderInstance.uninstallPlugin(plugin, true);
           log.info(
             { pluginId, pluginKey: plugin.pluginKey },
             "plugin lifecycle: hard-deleted already-uninstalled plugin",
@@ -636,10 +674,7 @@ export function pluginLifecycleManager(
       }
 
       await deactivatePluginRuntime(pluginId, plugin.pluginKey);
-      await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
-
-      // Perform the uninstall via registry (handles soft/hard delete)
-      const result = await registry.uninstall(pluginId, removeData);
+      const result = await pluginLoaderInstance.uninstallPlugin(plugin, removeData);
 
       log.info(
         { pluginId, pluginKey: plugin.pluginKey, removeData },
@@ -948,5 +983,23 @@ export function pluginLifecycleManager(
     once(event, listener) {
       emitter.once(event, listener);
     },
+  };
+
+  return {
+    ...unlockedManager,
+    load: (pluginId) => withPluginLifecycleLock(pluginId, () => unlockedManager.load(pluginId)),
+    enable: (pluginId) => withPluginLifecycleLock(pluginId, () => unlockedManager.enable(pluginId)),
+    disable: (pluginId, reason) => withPluginLifecycleLock(pluginId, () => unlockedManager.disable(pluginId, reason)),
+    unload: (pluginId, removeData) => withPluginMutationLock(
+      () => withPluginLifecycleLock(pluginId, () => unlockedManager.unload(pluginId, removeData)),
+    ),
+    markError: (pluginId, error) => withPluginLifecycleLock(pluginId, () => unlockedManager.markError(pluginId, error)),
+    markUpgradePending: (pluginId) => withPluginLifecycleLock(pluginId, () => unlockedManager.markUpgradePending(pluginId)),
+    upgrade: (pluginId, version, localPath) => withPluginMutationLock(
+      () => withPluginLifecycleLock(pluginId, () => unlockedManager.upgrade(pluginId, version, localPath)),
+    ),
+    startWorker: (pluginId, workerOptions) => withPluginLifecycleLock(pluginId, () => unlockedManager.startWorker(pluginId, workerOptions)),
+    stopWorker: (pluginId) => withPluginLifecycleLock(pluginId, () => unlockedManager.stopWorker(pluginId)),
+    restartWorker: (pluginId) => withPluginLifecycleLock(pluginId, () => unlockedManager.restartWorker(pluginId)),
   };
 }

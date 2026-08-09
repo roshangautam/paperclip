@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { badRequest } from "../errors.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -235,6 +236,45 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.load).toHaveBeenCalledWith(pluginId);
   }, 20_000);
 
+  it("holds the install mutation lock through plugin activation", async () => {
+    const pluginKey = "paperclip.example";
+    const discovered = { manifest: { id: pluginKey } };
+    mockRegistry.getByKey.mockResolvedValue({
+      id: pluginId,
+      pluginKey,
+      packageName: "paperclip-plugin-example",
+      version: "1.0.0",
+    });
+    mockRegistry.getById.mockResolvedValue({ id: pluginId, pluginKey, status: "ready" });
+    let releaseActivation!: () => void;
+    const holdActivation = new Promise<void>((resolve) => {
+      releaseActivation = resolve;
+    });
+    mockLifecycle.load.mockImplementationOnce(() => holdActivation).mockResolvedValue(undefined);
+
+    const { app, loader } = await createApp(
+      boardActor({ isInstanceAdmin: true }),
+      { installPlugin: vi.fn().mockResolvedValue(discovered) },
+    );
+    const first = request(app)
+      .post("/api/plugins/install")
+      .send({ packageName: "paperclip-plugin-example" })
+      .then((response) => response);
+    await vi.waitFor(() => expect(mockLifecycle.load).toHaveBeenCalledOnce());
+    const second = request(app)
+      .post("/api/plugins/install")
+      .send({ packageName: "paperclip-plugin-example" })
+      .then((response) => response);
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(loader.installPlugin).toHaveBeenCalledOnce();
+
+    releaseActivation();
+    await expect(first).resolves.toMatchObject({ status: 200 });
+    await expect(second).resolves.toMatchObject({ status: 200 });
+    expect(loader.installPlugin).toHaveBeenCalledTimes(2);
+  }, 20_000);
+
   it("rejects plugin upgrades for non-admin board users", async () => {
     const pluginId = "11111111-1111-4111-8111-111111111111";
     const { app } = await createApp({
@@ -445,6 +485,46 @@ describe.sequential("plugin install and upgrade authz", () => {
       "1.1.0",
       undefined,
     );
+  }, 20_000);
+
+  it("allows instance admins to upgrade plugins from a server-local path", async () => {
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip.example",
+      version: "1.0.0",
+    });
+    mockLifecycle.upgrade.mockResolvedValue({ id: pluginId, version: "1.1.0" });
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/upgrade`)
+      .send({ localPath: "/plugins/example" });
+
+    expect(res.status).toBe(200);
+    expect(mockLifecycle.upgrade).toHaveBeenCalledWith(
+      pluginId,
+      undefined,
+      "/plugins/example",
+    );
+  }, 20_000);
+
+  it("preserves lifecycle HTTP errors and reports unexpected upgrade failures as server errors", async () => {
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip.example",
+      version: "1.0.0",
+    });
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+
+    mockLifecycle.upgrade.mockRejectedValueOnce(badRequest("invalid lifecycle state"));
+    const expected = await request(app).post(`/api/plugins/${pluginId}/upgrade`).send({});
+    mockLifecycle.upgrade.mockRejectedValueOnce(new Error("registry unavailable"));
+    const unexpected = await request(app).post(`/api/plugins/${pluginId}/upgrade`).send({});
+
+    expect(expected.status).toBe(400);
+    expect(expected.body.error).toBe("invalid lifecycle state");
+    expect(unexpected.status).toBe(500);
+    expect(unexpected.body.error).toBe("registry unavailable");
   }, 20_000);
 
   it("rejects non-string upgrade versions before invoking the lifecycle", async () => {

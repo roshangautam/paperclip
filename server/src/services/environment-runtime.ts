@@ -3883,6 +3883,157 @@ export function environmentRuntimeService(
     return driver;
   }
 
+  function terminalWorkspaceReconciliationEligibility(input: {
+    companyId: string;
+    executionWorkspaceId: string;
+  }) {
+    return sql`exists (
+      select 1 from ${executionWorkspaces}
+      where ${executionWorkspaces.id} = ${input.executionWorkspaceId}
+        and ${executionWorkspaces.companyId} = ${input.companyId}
+        and ${executionWorkspaces.status} = 'active'
+        and exists (
+          select 1 from ${issues}
+          where ${issues.companyId} = ${executionWorkspaces.companyId}
+            and (${issues.id} = ${executionWorkspaces.sourceIssueId}
+              or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
+            and ${issues.status} in ('done', 'cancelled')
+        )
+        and not exists (
+          select 1 from ${issues}
+          where ${issues.companyId} = ${executionWorkspaces.companyId}
+            and (${issues.id} = ${executionWorkspaces.sourceIssueId}
+              or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
+            and ${issues.status} not in ('done', 'cancelled')
+        )
+        and not exists (
+          select 1 from ${heartbeatRuns}
+          where ${heartbeatRuns.companyId} = ${executionWorkspaces.companyId}
+            and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
+            and ${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaces.id}::text
+        )
+    ) and not exists (
+      select 1 from ${heartbeatRuns}
+      where ${heartbeatRuns.id} = ${environmentLeases.heartbeatRunId}
+        and ${heartbeatRuns.companyId} = ${input.companyId}
+        and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
+    )`;
+  }
+
+  async function destroyReusableSandboxLeases(input: {
+    companyId: string;
+    issueId?: string | null;
+    executionWorkspaceId?: string | null;
+    failureReason?: string;
+    terminalWorkspaceReconciliation?: {
+      executionWorkspaceId: string;
+    };
+  }): Promise<EnvironmentRuntimeLeaseRecord[]> {
+    const scopeConditions = [
+      input.issueId ? eq(environmentLeases.issueId, input.issueId) : undefined,
+      input.executionWorkspaceId ? eq(environmentLeases.executionWorkspaceId, input.executionWorkspaceId) : undefined,
+    ].filter((condition): condition is NonNullable<typeof condition> => Boolean(condition));
+    if (scopeConditions.length === 0) return [];
+
+    const leaseRows = await db
+      .select()
+      .from(environmentLeases)
+      .where(
+        and(
+          eq(environmentLeases.companyId, input.companyId),
+          eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+          inArray(environmentLeases.status, ["active", "released", "retained", "failed", "pending_cleanup"]),
+          ...scopeConditions,
+        ),
+      );
+
+    const destroyed: EnvironmentRuntimeLeaseRecord[] = [];
+    for (const leaseRow of leaseRows) {
+      let claim = await claimSandboxCleanup({
+        leaseId: leaseRow.id,
+        expectedStatus: leaseRow.status as EnvironmentLeaseStatus,
+        targetStatus: "expired",
+        terminalWorkspaceReconciliation: input.terminalWorkspaceReconciliation
+          ? {
+              companyId: input.companyId,
+              executionWorkspaceId: input.terminalWorkspaceReconciliation.executionWorkspaceId,
+            }
+          : undefined,
+      });
+      if (!claim) {
+        const destroyRequest = await requestReusableSandboxDestroy(
+          leaseRow.id,
+          input.failureReason ?? "reusable_lease_destroyed",
+          input.terminalWorkspaceReconciliation
+            ? {
+                companyId: input.companyId,
+                executionWorkspaceId: input.terminalWorkspaceReconciliation.executionWorkspaceId,
+              }
+            : undefined,
+        );
+        if (!destroyRequest) continue;
+        claim = destroyRequest.claimId
+          ? { claimId: destroyRequest.claimId, row: destroyRequest.row }
+          : await claimPendingSandboxCleanup({ leaseId: destroyRequest.row.id });
+        if (!claim) continue;
+      }
+      const claimRenewal = renewPendingSandboxCleanupClaim(claim.row.id, claim.claimId);
+      let environment: Environment | null = null;
+      let leaseSnapshot: EnvironmentLease | null = null;
+      let lease: EnvironmentLease | null = null;
+      try {
+        environment = await environmentsSvc.getById(claim.row.environmentId);
+        leaseSnapshot = toEnvironmentLeaseSnapshot(claim.row);
+        const driver = environment
+          ? getDriver(getLeaseDriverKey(leaseSnapshot, environment))
+          : null;
+        if (!environment || !driver) {
+          await deferSandboxCleanupClaim(
+            claim,
+            environment ? "environment_driver_unavailable" : "environment_unavailable",
+          );
+          continue;
+        }
+        lease = driver.destroyRunLease
+          ? await driver.destroyRunLease({
+              environment,
+              lease: leaseSnapshot,
+              failureReason: input.failureReason ?? "reusable_lease_destroyed",
+              cleanupClaimId: claim.claimId,
+            })
+          : await environmentsSvc.releaseLease(leaseSnapshot.id, "pending_cleanup", {
+              failureReason: input.failureReason ?? "reusable_lease_destroyed",
+              cleanupStatus: "failed",
+              expectedCleanupClaimId: claim.claimId,
+              expectedStatus: "pending_cleanup",
+            });
+      } catch (error) {
+        await deferSandboxCleanupClaim(
+          claim,
+          leaseSnapshot?.failureReason ?? input.failureReason ?? "reusable_lease_destroy_failed",
+        );
+        logger.warn(
+          { err: error, leaseId: claim.row.id, environmentId: claim.row.environmentId },
+          "reusable environment lease destroy failed",
+        );
+        continue;
+      } finally {
+        clearInterval(claimRenewal);
+      }
+      if (!environment || !lease) continue;
+      destroyed.push({
+        environment,
+        lease,
+        leaseContext: {
+          executionWorkspaceId: lease.executionWorkspaceId,
+          executionWorkspaceMode:
+            (lease.metadata?.executionWorkspaceMode as ExecutionWorkspace["mode"] | null | undefined) ?? null,
+        },
+      });
+    }
+    return destroyed;
+  }
+
   async function reconcileTerminalExecutionWorkspaces() {
     const candidates = await db
       .select({
@@ -3906,12 +4057,32 @@ export function environmentRuntimeService(
               or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
             and ${issues.status} not in ('done', 'cancelled')
         )`,
+        sql`not exists (
+          select 1 from ${heartbeatRuns}
+          where ${heartbeatRuns.companyId} = ${executionWorkspaces.companyId}
+            and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
+            and ${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaces.id}::text
+        )`,
+        sql`not exists (
+          select 1 from ${environmentLeases}
+          where ${environmentLeases.companyId} = ${executionWorkspaces.companyId}
+            and ${environmentLeases.executionWorkspaceId} = ${executionWorkspaces.id}
+            and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+            and ${environmentLeases.status} = 'pending_cleanup'
+        )`,
       ))
       .orderBy(asc(executionWorkspaces.updatedAt))
       .limit(SANDBOX_CLEANUP_RETRY_BATCH_SIZE);
 
     for (const candidate of candidates) {
       try {
+        await destroyReusableSandboxLeases({
+          ...candidate,
+          failureReason: "terminal_issue_workspace_reconciliation",
+          terminalWorkspaceReconciliation: {
+            executionWorkspaceId: candidate.executionWorkspaceId,
+          },
+        });
         await executionWorkspacesSvc.markIdleAfterTerminalIssueCleanup(candidate);
       } catch (error) {
         logger.warn(
@@ -3927,6 +4098,10 @@ export function environmentRuntimeService(
     expectedStatus: EnvironmentLeaseStatus;
     targetStatus?: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed">;
     updatedBefore?: Date;
+    terminalWorkspaceReconciliation?: {
+      companyId: string;
+      executionWorkspaceId: string;
+    };
   }) {
     const claimId = randomUUID();
     const claimStaleBefore = new Date(Date.now() - SANDBOX_CLEANUP_CLAIM_STALE_MS);
@@ -3952,6 +4127,9 @@ export function environmentRuntimeService(
           eq(environmentLeases.id, input.leaseId),
           eq(environmentLeases.status, input.expectedStatus),
           input.updatedBefore ? lte(environmentLeases.updatedAt, input.updatedBefore) : undefined,
+          input.terminalWorkspaceReconciliation
+            ? terminalWorkspaceReconciliationEligibility(input.terminalWorkspaceReconciliation)
+            : undefined,
           or(
             isNull(environmentLeases.cleanupClaimedAt),
             lte(environmentLeases.cleanupClaimedAt, claimStaleBefore),
@@ -3975,7 +4153,14 @@ export function environmentRuntimeService(
     });
   }
 
-  async function requestReusableSandboxDestroy(leaseId: string, failureReason: string) {
+  async function requestReusableSandboxDestroy(
+    leaseId: string,
+    failureReason: string,
+    terminalWorkspaceReconciliation?: {
+      companyId: string;
+      executionWorkspaceId: string;
+    },
+  ) {
     const claimId = randomUUID();
     const claimedAt = new Date();
     const row = await db
@@ -4007,6 +4192,9 @@ export function environmentRuntimeService(
         eq(environmentLeases.id, leaseId),
         eq(environmentLeases.leasePolicy, "reuse_by_environment"),
         inArray(environmentLeases.status, ["active", "released", "retained", "failed", "pending_cleanup"]),
+        terminalWorkspaceReconciliation
+          ? terminalWorkspaceReconciliationEligibility(terminalWorkspaceReconciliation)
+          : undefined,
       ))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -4397,104 +4585,7 @@ export function environmentRuntimeService(
       };
     },
 
-    async destroyReusableSandboxLeases(input: {
-      companyId: string;
-      issueId?: string | null;
-      executionWorkspaceId?: string | null;
-      failureReason?: string;
-    }): Promise<EnvironmentRuntimeLeaseRecord[]> {
-      const scopeConditions = [
-        input.issueId ? eq(environmentLeases.issueId, input.issueId) : undefined,
-        input.executionWorkspaceId ? eq(environmentLeases.executionWorkspaceId, input.executionWorkspaceId) : undefined,
-      ].filter((condition): condition is NonNullable<typeof condition> => Boolean(condition));
-      if (scopeConditions.length === 0) return [];
-
-      const leaseRows = await db
-        .select()
-        .from(environmentLeases)
-        .where(
-          and(
-            eq(environmentLeases.companyId, input.companyId),
-            eq(environmentLeases.leasePolicy, "reuse_by_environment"),
-            inArray(environmentLeases.status, ["active", "released", "retained", "failed", "pending_cleanup"]),
-            ...scopeConditions,
-          ),
-        );
-
-      const destroyed: EnvironmentRuntimeLeaseRecord[] = [];
-      for (const leaseRow of leaseRows) {
-        let claim = await claimSandboxCleanup({
-          leaseId: leaseRow.id,
-          expectedStatus: leaseRow.status as EnvironmentLeaseStatus,
-          targetStatus: "expired",
-        });
-        if (!claim) {
-          const destroyRequest = await requestReusableSandboxDestroy(
-            leaseRow.id,
-            input.failureReason ?? "reusable_lease_destroyed",
-          );
-          if (!destroyRequest) continue;
-          claim = destroyRequest.claimId
-            ? { claimId: destroyRequest.claimId, row: destroyRequest.row }
-            : await claimPendingSandboxCleanup({ leaseId: destroyRequest.row.id });
-          if (!claim) continue;
-        }
-        const claimRenewal = renewPendingSandboxCleanupClaim(claim.row.id, claim.claimId);
-        let environment: Environment | null = null;
-        let leaseSnapshot: EnvironmentLease | null = null;
-        let lease: EnvironmentLease | null = null;
-        try {
-          environment = await environmentsSvc.getById(claim.row.environmentId);
-          leaseSnapshot = toEnvironmentLeaseSnapshot(claim.row);
-          const driver = environment
-            ? getDriver(getLeaseDriverKey(leaseSnapshot, environment))
-            : null;
-          if (!environment || !driver) {
-            await deferSandboxCleanupClaim(
-              claim,
-              environment ? "environment_driver_unavailable" : "environment_unavailable",
-            );
-            continue;
-          }
-          lease = driver.destroyRunLease
-            ? await driver.destroyRunLease({
-                environment,
-                lease: leaseSnapshot,
-                failureReason: input.failureReason ?? "reusable_lease_destroyed",
-                cleanupClaimId: claim.claimId,
-              })
-            : await environmentsSvc.releaseLease(leaseSnapshot.id, "pending_cleanup", {
-                failureReason: input.failureReason ?? "reusable_lease_destroyed",
-                cleanupStatus: "failed",
-                expectedCleanupClaimId: claim.claimId,
-                expectedStatus: "pending_cleanup",
-              });
-        } catch (error) {
-          await deferSandboxCleanupClaim(
-            claim,
-            leaseSnapshot?.failureReason ?? input.failureReason ?? "reusable_lease_destroy_failed",
-          );
-          logger.warn(
-            { err: error, leaseId: claim.row.id, environmentId: claim.row.environmentId },
-            "reusable environment lease destroy failed",
-          );
-          continue;
-        } finally {
-          clearInterval(claimRenewal);
-        }
-        if (!environment || !lease) continue;
-        destroyed.push({
-          environment,
-          lease,
-          leaseContext: {
-            executionWorkspaceId: lease.executionWorkspaceId,
-            executionWorkspaceMode:
-              (lease.metadata?.executionWorkspaceMode as ExecutionWorkspace["mode"] | null | undefined) ?? null,
-          },
-        });
-      }
-      return destroyed;
-    },
+    destroyReusableSandboxLeases,
 
     async resumeRunLease(input: EnvironmentDriverLeaseInput): Promise<PluginEnvironmentLease | EnvironmentLease | null> {
       const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));

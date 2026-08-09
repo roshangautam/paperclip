@@ -497,6 +497,14 @@ export interface PluginLoader {
   cleanupInstallArtifacts(plugin: PluginRecord): Promise<void>;
 
   /**
+   * Remove managed install artifacts and unregister the plugin as one mutation.
+   *
+   * Keeping both steps under the managed-directory lock prevents a concurrent
+   * install from recreating the registry row between cleanup and uninstall.
+   */
+  uninstallPlugin(plugin: PluginRecord, removeData?: boolean): Promise<PluginRecord | null>;
+
+  /**
    * Get the local plugin directory this loader is configured to use.
    */
   getLocalPluginDir(): string;
@@ -581,6 +589,22 @@ export interface PluginLoader {
    * Whether runtime services are available for plugin activation.
    */
   hasRuntimeServices(): boolean;
+}
+
+let pluginMutationQueue: Promise<void> = Promise.resolve();
+
+export async function withPluginMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = pluginMutationQueue;
+  let release!: () => void;
+  pluginMutationQueue = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,12 +1237,12 @@ export function pluginLoader(
     };
   }
 
-  let managedUpgradeQueue: Promise<void> = Promise.resolve();
+  let managedPluginDirectoryQueue: Promise<void> = Promise.resolve();
 
-  async function withManagedUpgradeLock<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = managedUpgradeQueue;
+  async function withManagedPluginDirectoryLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = managedPluginDirectoryQueue;
     let release!: () => void;
-    managedUpgradeQueue = new Promise<void>((resolve) => {
+    managedPluginDirectoryQueue = new Promise<void>((resolve) => {
       release = resolve;
     });
     await previous;
@@ -1226,6 +1250,46 @@ export function pluginLoader(
       return await operation();
     } finally {
       release();
+    }
+  }
+
+  async function cleanupInstallArtifactsUnlocked(plugin: PluginRecord): Promise<void> {
+    const managedTargets = new Set<string>();
+    const managedNodeModulesDir = resolveManagedInstallPackageDir(localPluginDir, plugin.packageName);
+    const directManagedDir = path.join(localPluginDir, plugin.packageName);
+
+    managedTargets.add(managedNodeModulesDir);
+    if (isPathInsideDir(directManagedDir, localPluginDir)) {
+      managedTargets.add(directManagedDir);
+    }
+    if (plugin.packagePath && isPathInsideDir(plugin.packagePath, localPluginDir)) {
+      managedTargets.add(path.resolve(plugin.packagePath));
+    }
+
+    const packageJsonPath = path.join(localPluginDir, "package.json");
+    if (existsSync(packageJsonPath)) {
+      try {
+        await execFileAsync(
+          "npm",
+          ["uninstall", plugin.packageName, "--prefix", localPluginDir, "--ignore-scripts"],
+          { timeout: 120_000 },
+        );
+      } catch (err) {
+        log.warn(
+          {
+            pluginId: plugin.id,
+            pluginKey: plugin.pluginKey,
+            packageName: plugin.packageName,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          "plugin-loader: npm uninstall failed during cleanup, falling back to direct removal",
+        );
+      }
+    }
+
+    for (const target of managedTargets) {
+      if (!existsSync(target)) continue;
+      await rm(target, { recursive: true, force: true });
     }
   }
 
@@ -1765,49 +1829,93 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async installPlugin(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
-      const discovered = await fetchAndValidate(installOptions);
-      const manifest = discovered.manifest!;
+      const targetInstallDir = path.resolve(installOptions.installDir ?? localPluginDir);
+      const mutatesManagedDirectory = !installOptions.localPath
+        && targetInstallDir === path.resolve(localPluginDir);
 
-      // Step 6: Persist install record and apply plugin-owned schema migrations
-      // in one database transaction. If migration validation fails, the plugin
-      // row, namespace record, migration ledger, and created schema all roll back.
-      const installDb = manifest.database ? migrationDb : db;
-      await installDb.transaction(async (tx) => {
-        const txDb = tx as unknown as Db;
-        const txRegistry = pluginRegistryService(txDb);
-        const installed = await txRegistry.install(
-          {
-            packageName: discovered.packageName,
-            packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
-          },
-          manifest,
-        );
+      const performInstall = async () => {
+        const staged = mutatesManagedDirectory ? await stageManagedPluginDirectory() : null;
+        const promotion: {
+          current: Awaited<ReturnType<typeof promoteManagedPluginDirectory>> | null;
+        } = { current: null };
+        try {
+          const candidate = await fetchAndValidate({
+            ...installOptions,
+            installDir: staged?.directory ?? installOptions.installDir,
+          });
+          const discovered = staged
+            ? {
+                ...candidate,
+                packagePath: resolveManagedInstallPackageDir(localPluginDir, candidate.packageName),
+              }
+            : candidate;
+          const manifest = discovered.manifest!;
 
-        if (!installed) {
-          throw new Error(`Plugin install did not return a registry row: ${manifest.id}`);
-        }
+          // Persist the plugin and its migrations before exposing staged npm files.
+          // Promotion stays inside the transaction so either side can roll back.
+          const installDb = manifest.database ? migrationDb : db;
+          try {
+            await installDb.transaction(async (tx) => {
+              const txDb = tx as unknown as Db;
+              const txRegistry = pluginRegistryService(txDb);
+              const installed = await txRegistry.install(
+                {
+                  packageName: discovered.packageName,
+                  packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
+                },
+                manifest,
+              );
 
-        if (manifest.database) {
-          await pluginDatabaseService(txDb).applyMigrations(
-            installed.id,
-            manifest,
-            discovered.packagePath,
-            { persistFailure: false },
+              if (!installed) {
+                throw new Error(`Plugin install did not return a registry row: ${manifest.id}`);
+              }
+
+              if (manifest.database) {
+                await pluginDatabaseService(txDb).applyMigrations(
+                  installed.id,
+                  manifest,
+                  candidate.packagePath,
+                  { persistFailure: false },
+                );
+              }
+
+              if (staged) promotion.current = await promoteManagedPluginDirectory(staged);
+            });
+          } catch (error) {
+            await promotion.current?.rollback();
+            promotion.current = null;
+            throw error;
+          }
+
+          await promotion.current?.commit().catch((error: unknown) => {
+            log.warn(
+              { pluginId: manifest.id, err: error instanceof Error ? error.message : String(error) },
+              "plugin-loader: failed to remove npm install rollback directory",
+            );
+          });
+          promotion.current = null;
+
+          log.info(
+            {
+              pluginId: manifest.id,
+              packageName: discovered.packageName,
+              version: discovered.version,
+              capabilities: manifest.capabilities,
+            },
+            "plugin-loader: plugin installed successfully",
           );
+
+          return discovered;
+        } finally {
+          if (staged && !promotion.current) {
+            await rm(staged.root, { recursive: true, force: true });
+          }
         }
-      });
+      };
 
-      log.info(
-        {
-          pluginId: manifest.id,
-          packageName: discovered.packageName,
-          version: discovered.version,
-          capabilities: manifest.capabilities,
-        },
-        "plugin-loader: plugin installed successfully",
-      );
-
-      return discovered;
+      return mutatesManagedDirectory
+        ? withManagedPluginDirectoryLock(performInstall)
+        : performInstall();
     },
 
     // -----------------------------------------------------------------------
@@ -1899,23 +2007,6 @@ export function pluginLoader(
             );
           }
 
-          // 3. Detect capability escalation — new capabilities not in the old manifest
-          const oldCaps = new Set(oldManifest.capabilities ?? []);
-          const newCaps = newManifest.capabilities ?? [];
-          const escalated = newCaps.filter((c) => !oldCaps.has(c));
-
-          if (escalated.length > 0) {
-            log.warn(
-              { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
-              "plugin-loader: upgrade introduces new capabilities — requires admin approval",
-            );
-            throw new Error(
-              `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${escalated.join(", ")}. ` +
-                `The previous version declared [${[...oldCaps].join(", ")}]. ` +
-                `Please review and approve the capability escalation before upgrading.`,
-            );
-          }
-
           await beforePromote?.();
           if (staged) promoted = await promoteManagedPluginDirectory(staged);
 
@@ -1958,7 +2049,7 @@ export function pluginLoader(
 
       return localPath
         ? performUpgrade()
-        : withManagedUpgradeLock(performUpgrade);
+        : withManagedPluginDirectoryLock(performUpgrade);
     },
 
     // -----------------------------------------------------------------------
@@ -1974,43 +2065,14 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async cleanupInstallArtifacts(plugin: PluginRecord): Promise<void> {
-      const managedTargets = new Set<string>();
-      const managedNodeModulesDir = resolveManagedInstallPackageDir(localPluginDir, plugin.packageName);
-      const directManagedDir = path.join(localPluginDir, plugin.packageName);
+      await withManagedPluginDirectoryLock(() => cleanupInstallArtifactsUnlocked(plugin));
+    },
 
-      managedTargets.add(managedNodeModulesDir);
-      if (isPathInsideDir(directManagedDir, localPluginDir)) {
-        managedTargets.add(directManagedDir);
-      }
-      if (plugin.packagePath && isPathInsideDir(plugin.packagePath, localPluginDir)) {
-        managedTargets.add(path.resolve(plugin.packagePath));
-      }
-
-      const packageJsonPath = path.join(localPluginDir, "package.json");
-      if (existsSync(packageJsonPath)) {
-        try {
-          await execFileAsync(
-            "npm",
-            ["uninstall", plugin.packageName, "--prefix", localPluginDir, "--ignore-scripts"],
-            { timeout: 120_000 },
-          );
-        } catch (err) {
-          log.warn(
-            {
-              pluginId: plugin.id,
-              pluginKey: plugin.pluginKey,
-              packageName: plugin.packageName,
-              err: err instanceof Error ? err.message : String(err),
-            },
-            "plugin-loader: npm uninstall failed during cleanup, falling back to direct removal",
-          );
-        }
-      }
-
-      for (const target of managedTargets) {
-        if (!existsSync(target)) continue;
-        await rm(target, { recursive: true, force: true });
-      }
+    async uninstallPlugin(plugin: PluginRecord, removeData = false): Promise<PluginRecord | null> {
+      return withManagedPluginDirectoryLock(async () => {
+        await cleanupInstallArtifactsUnlocked(plugin);
+        return registry.uninstall(plugin.id, removeData) as Promise<PluginRecord | null>;
+      });
     },
 
     // -----------------------------------------------------------------------

@@ -63,7 +63,11 @@ import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
-import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader } from "./services/plugin-loader.js";
+import {
+  DEFAULT_LOCAL_PLUGIN_DIR,
+  pluginLoader,
+  withPluginMutationLock,
+} from "./services/plugin-loader.js";
 import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
@@ -552,41 +556,43 @@ export async function createApp(
       process.env["PAPERCLIP_KUBERNETES_PLUGIN_PATH"] ??
       "/app/packages/plugins/sandbox-providers/kubernetes";
     try {
-      // Idempotent: skip if already installed (any non-uninstalled status).
-      const existing = await pluginRegistry.getByKey(KUBERNETES_PLUGIN_KEY);
-      if (existing) {
-        logger.info(
-          { pluginKey: KUBERNETES_PLUGIN_KEY, status: existing.status },
-          "kubernetes sandbox plugin already installed; skipping auto-install",
-        );
-        return;
-      }
-      // Skip silently when the bundle is absent (e.g. local dev or an image
-      // built without the plugin). Not an error condition.
-      if (!fs.existsSync(path.join(pluginPath, "dist", "manifest.js"))) {
-        logger.info(
-          { pluginPath },
-          "kubernetes sandbox plugin bundle not present; skipping auto-install",
-        );
-        return;
-      }
-      logger.info({ pluginPath }, "auto-installing bundled kubernetes sandbox plugin");
-      const discovered = await loader.installPlugin({ localPath: pluginPath });
-      if (!discovered.manifest) {
-        logger.error("kubernetes sandbox plugin installed but manifest is missing");
-        return;
-      }
-      // Transition installed -> ready and activate the worker.
-      const installed = await pluginRegistry.getByKey(discovered.manifest.id);
-      if (installed) {
-        await lifecycle.load(installed.id);
-        logger.info(
-          { pluginId: installed.id, pluginKey: installed.pluginKey },
-          "kubernetes sandbox plugin auto-installed and loaded",
-        );
-      } else {
-        logger.error("kubernetes sandbox plugin installed but not found in registry");
-      }
+      await withPluginMutationLock(async () => {
+        // Idempotent: skip if already installed (any non-uninstalled status).
+        const existing = await pluginRegistry.getByKey(KUBERNETES_PLUGIN_KEY);
+        if (existing) {
+          logger.info(
+            { pluginKey: KUBERNETES_PLUGIN_KEY, status: existing.status },
+            "kubernetes sandbox plugin already installed; skipping auto-install",
+          );
+          return;
+        }
+        // Skip silently when the bundle is absent (e.g. local dev or an image
+        // built without the plugin). Not an error condition.
+        if (!fs.existsSync(path.join(pluginPath, "dist", "manifest.js"))) {
+          logger.info(
+            { pluginPath },
+            "kubernetes sandbox plugin bundle not present; skipping auto-install",
+          );
+          return;
+        }
+        logger.info({ pluginPath }, "auto-installing bundled kubernetes sandbox plugin");
+        const discovered = await loader.installPlugin({ localPath: pluginPath });
+        if (!discovered.manifest) {
+          logger.error("kubernetes sandbox plugin installed but manifest is missing");
+          return;
+        }
+        // Transition installed -> ready and activate the worker.
+        const installed = await pluginRegistry.getByKey(discovered.manifest.id);
+        if (installed) {
+          await lifecycle.load(installed.id);
+          logger.info(
+            { pluginId: installed.id, pluginKey: installed.pluginKey },
+            "kubernetes sandbox plugin auto-installed and loaded",
+          );
+        } else {
+          logger.error("kubernetes sandbox plugin installed but not found in registry");
+        }
+      });
     } catch (err) {
       logger.error(
         { err },
@@ -594,18 +600,17 @@ export async function createApp(
       );
     }
   };
-  void ensureBundledKubernetesPlugin()
-    .then(() => loader.loadAll())
-    .then((result) => {
-    if (!result) return;
+  await ensureBundledKubernetesPlugin();
+  try {
+    const result = await loader.loadAll();
     for (const loaded of result.results) {
       if (devWatcher && loaded.success && loaded.plugin.packagePath) {
         devWatcher.watch(loaded.plugin.id, loaded.plugin.packagePath);
       }
     }
-  }).catch((err) => {
+  } catch (err) {
     logger.error({ err }, "Failed to load ready plugins on startup");
-  });
+  }
   let appServicesShutdown = false;
   const shutdownAppServices = () => {
     if (appServicesShutdown) return;

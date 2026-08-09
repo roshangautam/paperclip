@@ -4834,10 +4834,27 @@ registry.registerPath({
     body: {
       content: {
         "application/json": {
-          schema: z.object({
-            version: z.string().optional(),
-            localPath: z.string().trim().min(1).optional(),
-          }).strict(),
+          schema: {
+            oneOf: [
+              {
+                type: "object",
+                properties: { version: { type: "string" } },
+                required: ["version"],
+                additionalProperties: false,
+              },
+              {
+                type: "object",
+                properties: { localPath: { type: "string", minLength: 1, pattern: "\\S" } },
+                required: ["localPath"],
+                additionalProperties: false,
+              },
+              {
+                type: "object",
+                properties: {},
+                additionalProperties: false,
+              },
+            ],
+          },
         },
       },
       required: false,

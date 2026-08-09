@@ -215,11 +215,25 @@ describe("openapi routes", () => {
       content: {
         "application/json": {
           schema: {
-            type: "object",
-            properties: {
-              version: { type: "string" },
-              localPath: { type: "string" },
-            },
+            oneOf: [
+              {
+                type: "object",
+                properties: { version: { type: "string" } },
+                required: ["version"],
+                additionalProperties: false,
+              },
+              {
+                type: "object",
+                properties: { localPath: { type: "string", minLength: 1, pattern: "\\S" } },
+                required: ["localPath"],
+                additionalProperties: false,
+              },
+              {
+                type: "object",
+                properties: {},
+                additionalProperties: false,
+              },
+            ],
           },
         },
       },

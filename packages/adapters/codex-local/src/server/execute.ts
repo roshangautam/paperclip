@@ -87,6 +87,7 @@ import {
   resolveCodexInactivityTimeout,
 } from "./output-inactivity-monitor.js";
 import {
+  ACP_WORKSPACE_RESTORE_ERROR_CODE,
   createCodexAcpExecutor,
   formatCodexAcpFallbackMessage,
   resolveCodexExecutionEngineForRun,
@@ -442,7 +443,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       return await executeCodexAcp(ctx);
     } catch (err) {
-      if (engineSelection.explicit) throw err;
+      if (
+        engineSelection.explicit
+        || (typeof err === "object" && err !== null && "code" in err
+          && err.code === ACP_WORKSPACE_RESTORE_ERROR_CODE)
+      ) throw err;
       const reason = err instanceof Error ? err.message : String(err);
       await ctx.onLog(
         "stderr",

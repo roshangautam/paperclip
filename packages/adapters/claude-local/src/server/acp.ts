@@ -57,6 +57,60 @@ type ClaudeAcpExecutorOptions = Omit<
 
 type ClaudeAcpExecutor = (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
 
+export const ACP_WORKSPACE_RESTORE_ERROR_CODE = "acp_workspace_restore_failed";
+
+function errorMessageFromUnknown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function acpWorkspaceRestoreError(executionError: unknown, restoreError: unknown): Error {
+  return Object.assign(
+    new Error(
+      `${errorMessageFromUnknown(executionError)}\nACP workspace restore failed: ${errorMessageFromUnknown(restoreError)}`,
+    ),
+    {
+      code: ACP_WORKSPACE_RESTORE_ERROR_CODE,
+      cause: executionError,
+      executionError,
+      restoreError,
+    },
+  );
+}
+
+function withAcpWorkspaceRestoreFailure(
+  result: AdapterExecutionResult,
+  error: unknown,
+): AdapterExecutionResult {
+  const restoreMessage = errorMessageFromUnknown(error);
+  const teardownMessage = `ACP workspace restore failed: ${restoreMessage}`;
+  const existingErrorMessage =
+    typeof result.errorMessage === "string" && result.errorMessage.trim().length > 0
+      ? result.errorMessage
+      : null;
+  const executionError = existingErrorMessage || result.errorCode
+    ? {
+        code: result.errorCode ?? null,
+        message: existingErrorMessage,
+      }
+    : null;
+  return {
+    ...result,
+    exitCode: result.exitCode === null || result.exitCode === 0 ? 1 : result.exitCode,
+    errorMessage: existingErrorMessage
+      ? `${existingErrorMessage}\n${teardownMessage}`
+      : teardownMessage,
+    errorCode: ACP_WORKSPACE_RESTORE_ERROR_CODE,
+    resultJson: {
+      ...(result.resultJson ?? {}),
+      workspaceRestoreFailure: {
+        code: ACP_WORKSPACE_RESTORE_ERROR_CODE,
+        message: restoreMessage,
+        ...(executionError ? { executionError } : {}),
+      },
+    },
+  };
+}
+
 function normalizeEngine(value: unknown): ClaudeEngineSelection {
   const raw = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (raw === "acp") return { engine: "acp", explicit: true };
@@ -230,8 +284,9 @@ export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}):
           )
         : null;
 
+    let result: AdapterExecutionResult;
     try {
-      return await currentExecutor({
+      result = await currentExecutor({
         ...ctx,
         executionTarget,
         executionSessionTarget: target,
@@ -240,9 +295,29 @@ export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}):
           ...(instructionsReferencePath ? { instructionsReferencePath } : {}),
         },
       });
-    } finally {
-      await preparedRuntime.restoreWorkspace((line) => ctx.onLog("stdout", line));
+    } catch (executionError) {
+      try {
+        await preparedRuntime.restoreWorkspace((line) => ctx.onLog("stdout", line));
+      } catch (restoreError) {
+        try {
+          await ctx.onLog(
+            "stderr",
+            `[paperclip] ACP workspace restore also failed after an execution error: ${errorMessageFromUnknown(restoreError)}\n`,
+          );
+        } catch {
+          // Reporting is best-effort; the coded restoration failure remains authoritative.
+        }
+        throw acpWorkspaceRestoreError(executionError, restoreError);
+      }
+      throw executionError;
     }
+
+    try {
+      await preparedRuntime.restoreWorkspace((line) => ctx.onLog("stdout", line));
+    } catch (restoreError) {
+      return withAcpWorkspaceRestoreFailure(result, restoreError);
+    }
+    return result;
   };
 }
 
