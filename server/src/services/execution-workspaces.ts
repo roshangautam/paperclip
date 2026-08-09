@@ -38,6 +38,7 @@ import {
   listCurrentRuntimeServicesForExecutionWorkspaces,
   listCurrentRuntimeServicesForProjectWorkspaces,
 } from "./workspace-runtime-read-model.js";
+import { isAutomaticReusableEnvironmentLeaseCleanupCandidate } from "./reusable-environment-lease-ownership.js";
 
 type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
@@ -1646,6 +1647,7 @@ export function executionWorkspaceService(db: Db) {
               and ${environmentLeases.executionWorkspaceId} = ${executionWorkspaces.id}
               and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
               and ${environmentLeases.status} = 'pending_cleanup'
+              and ${isAutomaticReusableEnvironmentLeaseCleanupCandidate()}
           )`,
         ))
         .returning()
@@ -1694,6 +1696,7 @@ export function executionWorkspaceService(db: Db) {
               and ${environmentLeases.executionWorkspaceId} = ${executionWorkspaces.id}
               and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
               and ${environmentLeases.status} = 'pending_cleanup'
+              and ${isAutomaticReusableEnvironmentLeaseCleanupCandidate()}
           )`,
         ))
         .returning()
@@ -1724,6 +1727,7 @@ export function executionWorkspaceService(db: Db) {
               and ${environmentLeases.executionWorkspaceId} = ${executionWorkspaces.id}
               and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
               and ${environmentLeases.status} in ('active', 'released', 'retained', 'failed', 'pending_cleanup')
+              and ${isAutomaticReusableEnvironmentLeaseCleanupCandidate()}
           )`,
           sql`not exists (
             select 1

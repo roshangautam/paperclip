@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companySecretBindings,
@@ -71,6 +71,18 @@ import { assertClass3StaticLeaseAllowed, secretService } from "./secrets.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
+import {
+  isAutomaticReusableEnvironmentLeaseCleanupCandidate,
+  PROVIDER_LEASE_IDENTITY_MISSING_MANUAL_CLEANUP_REASON,
+} from "./reusable-environment-lease-ownership.js";
+
+const PROVIDER_LEASE_IDENTITY_MISSING_ERROR_MESSAGE =
+  "Coder lease metadata has no immutable workspace ID; automatic cleanup is unsafe. Delete the legacy workspace manually in Coder.";
+
+function isProviderLeaseIdentityMissingCleanupError(error: unknown): error is JsonRpcCallError {
+  return error instanceof JsonRpcCallError
+    && error.message === PROVIDER_LEASE_IDENTITY_MISSING_ERROR_MESSAGE;
+}
 
 export function buildEnvironmentLeaseContext(input: {
   persistedExecutionWorkspace: Pick<ExecutionWorkspace, "id" | "mode"> | null;
@@ -3198,6 +3210,15 @@ function createSandboxEnvironmentDriver(
       cleanupError = new Error("Sandbox provider plugin worker is unavailable");
     }
 
+    if (isProviderLeaseIdentityMissingCleanupError(cleanupError)) {
+      return await environmentsSvc.releaseLease(input.lease.id, "failed", {
+        failureReason: PROVIDER_LEASE_IDENTITY_MISSING_MANUAL_CLEANUP_REASON,
+        cleanupStatus: "failed",
+        expectedCleanupClaimId: input.cleanupClaimId,
+        expectedStatus: "pending_cleanup",
+      });
+    }
+
     return await finalizeSandboxRelease({
       release: input,
       cleanupError,
@@ -3228,6 +3249,7 @@ function createSandboxEnvironmentDriver(
         eq(environmentLeases.id, lease.id),
         eq(environmentLeases.status, lease.status),
         eq(environmentLeases.providerLeaseId, lease.providerLeaseId),
+        isAutomaticReusableEnvironmentLeaseCleanupCandidate(),
       ))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -3293,6 +3315,15 @@ function createSandboxEnvironmentDriver(
       }
     } catch (error) {
       cleanupError = error;
+    }
+
+    if (isProviderLeaseIdentityMissingCleanupError(cleanupError)) {
+      return await environmentsSvc.releaseLease(lease.id, "failed", {
+        failureReason: PROVIDER_LEASE_IDENTITY_MISSING_MANUAL_CLEANUP_REASON,
+        cleanupStatus: "failed",
+        expectedCleanupClaimId: cleanupClaimId,
+        expectedStatus: "pending_cleanup",
+      });
     }
 
     return await finalizeSandboxRelease({
@@ -3943,6 +3974,7 @@ export function environmentRuntimeService(
           eq(environmentLeases.companyId, input.companyId),
           eq(environmentLeases.leasePolicy, "reuse_by_environment"),
           inArray(environmentLeases.status, ["active", "released", "retained", "failed", "pending_cleanup"]),
+          isAutomaticReusableEnvironmentLeaseCleanupCandidate(),
           ...scopeConditions,
         ),
       );
@@ -3953,6 +3985,7 @@ export function environmentRuntimeService(
         leaseId: leaseRow.id,
         expectedStatus: leaseRow.status as EnvironmentLeaseStatus,
         targetStatus: "expired",
+        requireAuthoritativeReusableLease: true,
         terminalWorkspaceReconciliation: input.terminalWorkspaceReconciliation
           ? {
               companyId: input.companyId,
@@ -4078,6 +4111,7 @@ export function environmentRuntimeService(
             and ${environmentLeases.executionWorkspaceId} = ${executionWorkspaces.id}
             and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
             and ${environmentLeases.status} = 'pending_cleanup'
+            and ${isAutomaticReusableEnvironmentLeaseCleanupCandidate()}
         )`,
       ))
       .orderBy(asc(executionWorkspaces.updatedAt))
@@ -4114,6 +4148,7 @@ export function environmentRuntimeService(
     expectedStatus: EnvironmentLeaseStatus;
     targetStatus?: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed">;
     updatedBefore?: Date;
+    requireAuthoritativeReusableLease?: boolean;
     terminalWorkspaceReconciliation?: {
       companyId: string;
       executionWorkspaceId: string;
@@ -4143,6 +4178,9 @@ export function environmentRuntimeService(
           eq(environmentLeases.id, input.leaseId),
           eq(environmentLeases.status, input.expectedStatus),
           input.updatedBefore ? lte(environmentLeases.updatedAt, input.updatedBefore) : undefined,
+          input.requireAuthoritativeReusableLease
+            ? isAutomaticReusableEnvironmentLeaseCleanupCandidate()
+            : undefined,
           input.terminalWorkspaceReconciliation
             ? terminalWorkspaceReconciliationEligibility(input.terminalWorkspaceReconciliation)
             : undefined,
@@ -4208,6 +4246,7 @@ export function environmentRuntimeService(
         eq(environmentLeases.id, leaseId),
         eq(environmentLeases.leasePolicy, "reuse_by_environment"),
         inArray(environmentLeases.status, ["active", "released", "retained", "failed", "pending_cleanup"]),
+        isAutomaticReusableEnvironmentLeaseCleanupCandidate(),
         terminalWorkspaceReconciliation
           ? terminalWorkspaceReconciliationEligibility(terminalWorkspaceReconciliation)
           : undefined,
@@ -4224,6 +4263,7 @@ export function environmentRuntimeService(
   async function claimPendingSandboxCleanup(input: {
     leaseId: string;
     updatedBefore?: Date;
+    requireAuthoritativeReusableLease?: boolean;
   }) {
     return await claimSandboxCleanup({
       ...input,
@@ -4383,6 +4423,7 @@ export function environmentRuntimeService(
             leaseId: leaseRow.id,
             expectedStatus: "active",
             targetStatus,
+            requireAuthoritativeReusableLease: leaseRow.leasePolicy === "reuse_by_environment",
           });
           if (deferredClaim) {
             await deferSandboxCleanupClaim(
@@ -4404,6 +4445,7 @@ export function environmentRuntimeService(
               leaseId: leaseRow.id,
               expectedStatus: "active",
               targetStatus,
+              requireAuthoritativeReusableLease: leaseRow.leasePolicy === "reuse_by_environment",
             })
           : null;
         if (requiresCleanupClaim && !claim) continue;
@@ -4468,6 +4510,10 @@ export function environmentRuntimeService(
             eq(environmentLeases.status, "pending_cleanup"),
             lte(environmentLeases.updatedAt, updatedBefore),
             claimAvailable,
+            or(
+              ne(environmentLeases.leasePolicy, "reuse_by_environment"),
+              isAutomaticReusableEnvironmentLeaseCleanupCandidate(),
+            ),
           ),
         )
         .orderBy(asc(environmentLeases.updatedAt))
@@ -4475,8 +4521,13 @@ export function environmentRuntimeService(
 
       let attempted = 0;
       let cleaned = 0;
+      let terminalized = 0;
       for (const leaseRow of leaseRows) {
-        const claim = await claimPendingSandboxCleanup({ leaseId: leaseRow.id, updatedBefore });
+        const claim = await claimPendingSandboxCleanup({
+          leaseId: leaseRow.id,
+          updatedBefore,
+          requireAuthoritativeReusableLease: leaseRow.leasePolicy === "reuse_by_environment",
+        });
         if (!claim) continue;
 
         let lease = toEnvironmentLeaseSnapshot(claim.row);
@@ -4549,7 +4600,11 @@ export function environmentRuntimeService(
                 });
           }
           if (retried && retried.status !== "pending_cleanup") {
-            cleaned += 1;
+            const requiresManualCleanup =
+              retried.failureReason === PROVIDER_LEASE_IDENTITY_MISSING_MANUAL_CLEANUP_REASON;
+            if (requiresManualCleanup) terminalized += 1;
+            else cleaned += 1;
+            if (requiresManualCleanup) continue;
             try {
               await logActivity(db, {
                 companyId: retried.companyId,
@@ -4597,7 +4652,7 @@ export function environmentRuntimeService(
       return {
         attempted,
         cleaned,
-        pending: attempted - cleaned,
+        pending: attempted - cleaned - terminalized,
       };
     },
 
