@@ -1390,6 +1390,8 @@ export function pluginLoader(
     } else {
       // npm install
       const spec = version ? `${packageName}@${version}` : packageName!;
+      resolvedPackageName = packageName!;
+      resolvedPackagePath = resolveManagedInstallPackageDir(targetInstallDir, resolvedPackageName);
 
       log.info(
         { spec, installDir: targetInstallDir },
@@ -1407,18 +1409,6 @@ export function pluginLoader(
         );
       } catch (err) {
         throw new Error(`npm install failed for ${spec}: ${String(err)}`);
-      }
-
-      // Resolve the package path after installation
-      const nodeModulesPath = path.join(targetInstallDir, "node_modules");
-      resolvedPackageName = packageName!;
-
-      // Handle scoped packages
-      if (resolvedPackageName.startsWith("@")) {
-        const [scope, name] = resolvedPackageName.split("/");
-        resolvedPackagePath = path.join(nodeModulesPath, scope!, name!);
-      } else {
-        resolvedPackagePath = path.join(nodeModulesPath, resolvedPackageName);
       }
 
       if (!existsSync(resolvedPackagePath)) {
@@ -2731,10 +2721,17 @@ function resolvePluginPackageRoot(
 }
 
 function resolveManagedInstallPackageDir(localPluginDir: string, packageName: string): string {
-  if (packageName.startsWith("@")) {
-    return path.join(localPluginDir, "node_modules", ...packageName.split("/"));
+  const nodeModulesDir = path.resolve(localPluginDir, "node_modules");
+  const packageDir = path.resolve(
+    nodeModulesDir,
+    ...(packageName.startsWith("@") ? packageName.split("/") : [packageName]),
+  );
+  if (packageDir === nodeModulesDir || !isPathInsideDir(packageDir, nodeModulesDir)) {
+    throw new Error(
+      `Plugin package name "${packageName}" escapes the managed node_modules directory`,
+    );
   }
-  return path.join(localPluginDir, "node_modules", packageName);
+  return packageDir;
 }
 
 function isPathInsideDir(candidatePath: string, parentDir: string): boolean {

@@ -134,6 +134,25 @@ describe("pluginLoader npm upgrades", () => {
     cleanupPaths.clear();
   });
 
+  it("rejects npm package paths that escape the managed node_modules directory", async () => {
+    const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-containment-"));
+    cleanupPaths.add(localPluginDir);
+    const db = {
+      transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback(db)),
+    };
+    const loader = pluginLoader(db as never, {
+      localPluginDir,
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    });
+
+    await expect(loader.installPlugin({ packageName: "../../outside-plugin" }))
+      .rejects.toThrow("escapes the managed node_modules directory");
+
+    expect(mocks.execFile).not.toHaveBeenCalled();
+    expect(mocks.registry.install).not.toHaveBeenCalled();
+  });
+
   it("keeps consecutive version upgrades on the npm source", async () => {
     const localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-npm-upgrade-"));
     cleanupPaths.add(localPluginDir);
