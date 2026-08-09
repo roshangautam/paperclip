@@ -698,7 +698,60 @@ describe("claude_local ACP lane", () => {
     expect(lifecycle).toEqual(["close", "restore"]);
   });
 
-  it("throws a coded restore failure when the executor and sandbox restore both throw", async () => {
+  it("closes and classifies a remote ACP handle when metadata fails before the turn", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-metadata-failure-");
+    const lifecycle: string[] = [];
+    const restoreWorkspace = vi.fn(async () => {
+      lifecycle.push("restore");
+    });
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
+      target: input.target,
+      workspaceRemoteDir: "/remote/prepared-workspace",
+      runtimeRootDir: "/remote/prepared-workspace/.paperclip-runtime/claude",
+      assetDirs: {},
+      restoreWorkspace,
+    }));
+    const runtimes: FakeRuntime[] = [];
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => {
+        const runtime = new FakeRuntime(options);
+        const close = runtime.close.bind(runtime);
+        runtime.close = async (input) => {
+          lifecycle.push("close");
+          await close(input);
+        };
+        runtimes.push(runtime);
+        return runtime as never;
+      },
+    });
+
+    const result = await execute(buildContext(root, {
+      onMeta: async () => {
+        lifecycle.push("metadata");
+        throw new Error("metadata callback failed");
+      },
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "test-sandbox",
+        remoteCwd: "/remote/workspace",
+      },
+    }));
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "acpx_runtime_error",
+      errorMessage: "metadata callback failed",
+      resultJson: { phase: "setup" },
+    });
+    expect(runtimes[0]?.startInputs).toHaveLength(0);
+    expect(runtimes[0]?.closeInputs).toContainEqual(
+      expect.objectContaining({ reason: "paperclip setup error cleanup" }),
+    );
+    expect(lifecycle).toEqual(["metadata", "close", "restore"]);
+  });
+
+  it("returns a coded restore failure when classified setup and sandbox restore both fail", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-thrown-executor-and-restore-failure-");
     const restoreWorkspace = vi.fn(async () => {
       throw new Error("sandbox restore failed");
@@ -725,10 +778,20 @@ describe("claude_local ACP lane", () => {
       },
     }));
 
-    await expect(execution).rejects.toMatchObject({
-      code: "acp_workspace_restore_failed",
-      message:
+    await expect(execution).resolves.toMatchObject({
+      exitCode: 1,
+      errorCode: "acp_workspace_restore_failed",
+      errorMessage:
         "executor threw after workspace preparation\nACP workspace restore failed: sandbox restore failed",
+      resultJson: {
+        phase: "setup",
+        workspaceRestoreFailure: {
+          executionError: {
+            code: "acpx_runtime_error",
+            message: "executor threw after workspace preparation",
+          },
+        },
+      },
     });
     expect(restoreWorkspace).toHaveBeenCalledOnce();
   });

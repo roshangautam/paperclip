@@ -221,6 +221,77 @@ async function rejectedWith(
 }
 
 describe("shared ACPX engine runtime behavior", () => {
+  it("stops the callback bridge when its startup log callback fails", async () => {
+    const root = await makeTempRoot();
+    const logError = new Error("callback bridge startup log failed");
+    const paperclipStop = vi.fn(async () => undefined);
+    remoteBridgeMocks.startPaperclipBridge.mockResolvedValueOnce({
+      env: {},
+      stop: paperclipStop,
+    });
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => buildRuntime() as never,
+    });
+
+    const execution = execute({
+      runId: "run-callback-bridge-log-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: remoteSandboxTarget(),
+      onLog: async (stream: string) => {
+        if (stream === "stdout") throw logError;
+      },
+      onMeta: async () => {},
+    } as never);
+
+    await expect(execution).rejects.toBe(logError);
+    expect(paperclipStop).toHaveBeenCalledOnce();
+    expect(remoteBridgeMocks.startProcessSessionBridge).not.toHaveBeenCalled();
+  });
+
+  it("stops both remote bridges when the initial post-build log callback fails", async () => {
+    const root = await makeTempRoot();
+    const logError = new Error("initial executor log failed");
+    const { paperclipStop, processStop } = mockSuccessfulRemoteBridges();
+    const createRuntime = vi.fn(() => buildRuntime() as never);
+    const execute = createAcpxEngineExecutor({ createRuntime });
+
+    const result = await execute({
+      runId: "run-initial-log-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+      },
+      context: {},
+      authToken: "test-token",
+      executionTarget: remoteSandboxTarget(),
+      onLog: async (stream: string) => {
+        if (stream === "stderr") throw logError;
+      },
+      onMeta: async () => {},
+    } as never);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "acpx_runtime_error",
+      errorMessage: "initial executor log failed",
+      resultJson: { phase: "setup" },
+    });
+    expect(createRuntime).not.toHaveBeenCalled();
+    expect(processStop).toHaveBeenCalledOnce();
+    expect(paperclipStop).toHaveBeenCalledOnce();
+  });
+
   it("fails closed when session initialization and remote bridge shutdown both fail", async () => {
     const root = await makeTempRoot();
     const ensureError = new Error("session initialization failed");

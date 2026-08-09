@@ -1294,7 +1294,11 @@ async function buildRuntime(input: {
     });
     if (paperclipBridge) {
       Object.assign(env, paperclipBridge.env);
-      await input.ctx.onLog("stdout", "[paperclip] Sandbox ACP API callback bridge enabled for this run.\n");
+      try {
+        await input.ctx.onLog("stdout", "[paperclip] Sandbox ACP API callback bridge enabled for this run.\n");
+      } catch (err) {
+        await stopPaperclipBridgeAfterSetupFailure(paperclipBridge, err);
+      }
     }
   }
   const runtimeEnv = Object.fromEntries(
@@ -1323,26 +1327,7 @@ async function buildRuntime(input: {
           })
         : null;
   } catch (err) {
-    try {
-      await paperclipBridge?.stop();
-    } catch (cleanupError) {
-      throw Object.assign(
-        new AggregateError(
-          [err, cleanupError],
-          `ACP process-session bridge startup failed and Paperclip callback bridge shutdown also failed: ${err instanceof Error ? err.message : String(err)}`,
-          { cause: err },
-        ),
-        {
-          code: ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
-          operationError: err,
-          cleanupError,
-          remoteExecutionMayStillBeActive:
-            !isRemoteBridgeShutdownFailure(cleanupError) ||
-            remoteBridgeShutdownMayLeaveExecutionActive(cleanupError),
-        },
-      );
-    }
-    throw err;
+    await stopPaperclipBridgeAfterSetupFailure(paperclipBridge, err);
   }
   const overrideCommand = processSessionBridge?.agentCommand ?? wrapperPath;
   const overrides = overrideCommand ? { [acpxAgent]: overrideCommand } : undefined;
@@ -1432,6 +1417,32 @@ async function buildRuntime(input: {
     mcpServers,
     mcpIdentity,
   };
+}
+
+async function stopPaperclipBridgeAfterSetupFailure(
+  paperclipBridge: AdapterExecutionTargetPaperclipBridgeHandle | null,
+  operationError: unknown,
+): Promise<never> {
+  try {
+    await paperclipBridge?.stop();
+  } catch (cleanupError) {
+    throw Object.assign(
+      new AggregateError(
+        [operationError, cleanupError],
+        `ACP process-session setup failed and Paperclip callback bridge shutdown also failed: ${operationError instanceof Error ? operationError.message : String(operationError)}`,
+        { cause: operationError },
+      ),
+      {
+        code: ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
+        operationError,
+        cleanupError,
+        remoteExecutionMayStillBeActive:
+          !isRemoteBridgeShutdownFailure(cleanupError) ||
+          remoteBridgeShutdownMayLeaveExecutionActive(cleanupError),
+      },
+    );
+  }
+  throw operationError;
 }
 
 function sessionConfigOptions(prepared: AcpxPreparedRuntime): Array<{ key: string; value: string }> {
@@ -1853,7 +1864,7 @@ export function summarizeAcpxTurnUsage(input: {
   return { usage, usageDetail, costUsd, cumulativeCostUsd };
 }
 
-type AcpxExecutionPhase = "ensure_session" | "configure_session" | "turn";
+type AcpxExecutionPhase = "setup" | "ensure_session" | "configure_session" | "turn";
 
 function describeErrorDiagnostics(err: unknown): {
   errorName: string;
@@ -2129,6 +2140,40 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       billingType: billingIdentity?.billingType ?? ("unknown" as const),
     };
     const prepared = await buildRuntime({ ctx, engine });
+    let runtimeForCleanup: AcpRuntime | null = null;
+    let handleForCleanup: AcpRuntimeHandle | null = null;
+    let runtimeHandleCloseAttempted = false;
+    let trackedRuntimeCloseFailure: { error: unknown } | undefined;
+    const closeTrackedRuntimeHandle = async (input: {
+      runtime: AcpRuntime;
+      handle: AcpRuntimeHandle;
+      reason: string;
+      discardPersistentState: boolean;
+    }) => {
+      runtimeHandleCloseAttempted = true;
+      const failure = await closeRuntimeHandle(input);
+      if (failure) trackedRuntimeCloseFailure = failure;
+      return failure;
+    };
+    const closeTrackedWarmHandle = async (input: {
+      handles: Map<string, RuntimeCacheEntry>;
+      key: string;
+      entry: RuntimeCacheEntry;
+      reason: string;
+      discardPersistentState?: boolean;
+    }) => {
+      if (
+        runtimeForCleanup === input.entry.runtime &&
+        handleForCleanup === input.entry.handle
+      ) {
+        runtimeHandleCloseAttempted = true;
+      }
+      const failure = await closeWarmHandle(input);
+      if (failure) trackedRuntimeCloseFailure = failure;
+      return failure;
+    };
+
+    try {
     // State the effective wall-clock timeout and its source up front so a
     // later timeout is diagnosable from the run log alone. Goes to stderr:
     // the acpx stdout log stream carries JSON acpx.* event payloads and must
@@ -2170,6 +2215,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       verbose: prepared.acpxAgent === "claude",
     };
     const runtime = cached?.runtime ?? createRuntime(runtimeOptions);
+    runtimeForCleanup = runtime;
     if (cached) clearWarmHandleTimer(cached);
     if (!canResume && asString(previousParams.runtimeSessionName, "")) {
       await ctx.onLog(
@@ -2245,6 +2291,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       };
     }
     const sessionHandle = handle;
+    handleForCleanup = sessionHandle;
     try {
       await applySessionConfigOptions({
         runtime,
@@ -2259,7 +2306,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         err,
         phase: "configure_session",
       });
-      const runtimeCloseFailure = await closeRuntimeHandle({
+      const runtimeCloseFailure = await closeTrackedRuntimeHandle({
         runtime,
         handle: sessionHandle,
         reason: "paperclip config cleanup",
@@ -2389,7 +2436,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       if (terminal.status === "failed" || terminal.status === "cancelled" || timedOut) {
         const existing = warmHandles.get(prepared.sessionKey);
         if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
-          runtimeCloseFailure = await closeWarmHandle({
+          runtimeCloseFailure = await closeTrackedWarmHandle({
             handles: warmHandles,
             key: prepared.sessionKey,
             entry: existing,
@@ -2397,7 +2444,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             discardPersistentState: terminal.status === "cancelled" || timedOut,
           });
         } else {
-          runtimeCloseFailure = await closeRuntimeHandle({
+          runtimeCloseFailure = await closeTrackedRuntimeHandle({
             runtime,
             handle: sessionHandle,
             reason: timedOut ? "paperclip timeout cleanup" : `paperclip turn ${terminal.status}`,
@@ -2407,7 +2454,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       } else if (prepared.mode === "persistent" && warmIdleMs > 0 && !prepared.processSessionBridge) {
         const existing = warmHandles.get(prepared.sessionKey);
         if (existing && !warmHandleMatches(existing, runtime, sessionHandle)) {
-          runtimeCloseFailure = await closeRuntimeHandle({
+          runtimeCloseFailure = await closeTrackedRuntimeHandle({
             runtime,
             handle: sessionHandle,
             reason: "paperclip duplicate warm handle cleanup",
@@ -2432,14 +2479,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       } else {
         const existing = warmHandles.get(prepared.sessionKey);
         if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
-          runtimeCloseFailure = await closeWarmHandle({
+          runtimeCloseFailure = await closeTrackedWarmHandle({
             handles: warmHandles,
             key: prepared.sessionKey,
             entry: existing,
             reason: "paperclip completed turn cleanup",
           });
         } else {
-          runtimeCloseFailure = await closeRuntimeHandle({
+          runtimeCloseFailure = await closeTrackedRuntimeHandle({
             runtime,
             handle: sessionHandle,
             reason: "paperclip completed turn cleanup",
@@ -2501,7 +2548,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       const preEmitMessage =
         messageOverride ?? (err instanceof Error ? err.message : String(err));
       if (cancel) await cancel(preEmitMessage).catch(() => {});
-      const runtimeCloseFailure = await closeRuntimeHandle({
+      const runtimeCloseFailure = await closeTrackedRuntimeHandle({
         runtime,
         handle: sessionHandle,
         reason: timedOut ? "paperclip timeout cleanup" : "paperclip error cleanup",
@@ -2531,6 +2578,52 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         model: prepared.requestedModel || null,
         clearSession: clearSession || timedOut,
         resultJson: { phase: "turn" },
+        summary: message,
+      };
+    }
+    } catch (err) {
+      if (isRemoteBridgeShutdownFailure(err)) throw err;
+
+      let runtimeCloseFailure = trackedRuntimeCloseFailure;
+      if (runtimeForCleanup && handleForCleanup && !runtimeHandleCloseAttempted) {
+        runtimeCloseFailure = await closeTrackedRuntimeHandle({
+          runtime: runtimeForCleanup,
+          handle: handleForCleanup,
+          reason: "paperclip setup error cleanup",
+          discardPersistentState: false,
+        });
+      }
+      if (runtimeForCleanup && handleForCleanup) {
+        const existing = warmHandles.get(prepared.sessionKey);
+        if (warmHandleMatches(existing, runtimeForCleanup, handleForCleanup) && existing) {
+          clearWarmHandleTimer(existing);
+          warmHandles.delete(prepared.sessionKey);
+        }
+      }
+
+      const message = err instanceof Error ? err.message : String(err);
+      const classified = classifyError(err, "setup");
+      await cleanupRemoteBridges(prepared, err, runtimeCloseFailure);
+      try {
+        await emitAcpxFailure({
+          ctx,
+          prepared,
+          err,
+          phase: "setup",
+        });
+      } catch {
+        // The operation error may come from a logging/metadata callback. Its
+        // teardown and stable classification remain authoritative.
+      }
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: message,
+        ...classified,
+        ...billingFields,
+        model: prepared.requestedModel || null,
+        resultJson: { phase: "setup" },
         summary: message,
       };
     }

@@ -793,6 +793,48 @@ describe("codex_local ACP lane", () => {
     expect(lifecycle).toEqual(["close", "restore"]);
   });
 
+  it("closes and classifies a remote ACP handle when metadata fails before the turn", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-metadata-failure-");
+    const lifecycle: string[] = [];
+    const restoreWorkspace = vi.fn(async () => {
+      lifecycle.push("restore");
+    });
+    const context = await buildSandboxInstructionsContext(root, restoreWorkspace);
+    const runtimes: FakeRuntime[] = [];
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => {
+        const runtime = new FakeRuntime(options);
+        const close = runtime.close.bind(runtime);
+        runtime.close = async (input) => {
+          lifecycle.push("close");
+          await close(input);
+        };
+        runtimes.push(runtime);
+        return runtime as never;
+      },
+    });
+
+    const result = await execute({
+      ...context,
+      onMeta: async () => {
+        lifecycle.push("metadata");
+        throw new Error("metadata callback failed");
+      },
+    });
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "acpx_runtime_error",
+      errorMessage: "metadata callback failed",
+      resultJson: { phase: "setup" },
+    });
+    expect(runtimes[0]?.startInputs).toHaveLength(0);
+    expect(runtimes[0]?.closeInputs).toContainEqual(
+      expect.objectContaining({ reason: "paperclip setup error cleanup" }),
+    );
+    expect(lifecycle).toEqual(["metadata", "close", "restore"]);
+  });
+
   it("reuses the initialized ACPX executor across repeated calls", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-cached-executor-");
     const runtimes: FakeRuntime[] = [];
@@ -970,7 +1012,7 @@ describe("codex_local ACP lane", () => {
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
   });
 
-  it("throws a coded restore failure when the executor and sandbox restore both throw", async () => {
+  it("returns a coded restore failure when classified setup and sandbox restore both fail", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-thrown-executor-and-restore-failure-");
     const restoreWorkspace = vi.fn(async () => {
       throw new Error("sandbox restore failed");
@@ -982,10 +1024,20 @@ describe("codex_local ACP lane", () => {
       },
     });
 
-    await expect(execute(context)).rejects.toMatchObject({
-      code: "acp_workspace_restore_failed",
-      message:
+    await expect(execute(context)).resolves.toMatchObject({
+      exitCode: 1,
+      errorCode: "acp_workspace_restore_failed",
+      errorMessage:
         "executor threw after workspace preparation\nACP workspace restore failed: sandbox restore failed",
+      resultJson: {
+        phase: "setup",
+        workspaceRestoreFailure: {
+          executionError: {
+            code: "acpx_runtime_error",
+            message: "executor threw after workspace preparation",
+          },
+        },
+      },
     });
     expect(restoreWorkspace).toHaveBeenCalledOnce();
   });
