@@ -34,6 +34,7 @@ describe("buildWorkspaceRealizationRecordFromDriverInput", () => {
       releasedAt: null,
       failureReason: null,
       cleanupStatus: null,
+      reusableResourceOwner: false,
       metadata: { remoteCwd: "/home/plugin/stale-lease" },
       createdAt: now,
       updatedAt: now,

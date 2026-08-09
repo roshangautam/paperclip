@@ -93,6 +93,7 @@ function makeLease(overrides: Partial<EnvironmentLease> = {}): EnvironmentLease 
     releasedAt: null,
     failureReason: null,
     cleanupStatus: null,
+    reusableResourceOwner: false,
     metadata: null,
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -418,7 +419,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     }));
     expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
       command: "bash",
-      args: ["-lc", "set -euo pipefail\npnpm install"],
+      args: ["-lc", "pnpm install"],
       cwd: "/home/coder/workspace",
     }));
   });
@@ -643,7 +644,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
 
     expect(runtime.execute).toHaveBeenCalledWith(expect.objectContaining({
       command: "bash",
-      args: ["-lc", "set -euo pipefail\nnpm install -g @google/gemini-cli"],
+      args: ["-lc", "npm install -g @google/gemini-cli"],
     }));
     expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
   });
