@@ -4783,6 +4783,14 @@ export function environmentRuntimeService(
               deferredClaim,
               environment ? "environment_driver_unavailable" : "environment_unavailable",
             );
+          } else if (
+            leaseRow.leasePolicy === "reuse_by_environment" &&
+            targetStatus !== "released"
+          ) {
+            await requestReusableSandboxDestroy(
+              leaseRow.id,
+              status === "failed" ? "adapter_or_run_failure" : "lease_expired",
+            );
           }
           continue;
         }
@@ -4801,7 +4809,18 @@ export function environmentRuntimeService(
               requireAuthoritativeReusableLease: leaseRow.leasePolicy === "reuse_by_environment",
             })
           : null;
-        if (requiresCleanupClaim && !claim) continue;
+        if (requiresCleanupClaim && !claim) {
+          if (
+            leaseRow.leasePolicy === "reuse_by_environment" &&
+            targetStatus !== "released"
+          ) {
+            await requestReusableSandboxDestroy(
+              leaseRow.id,
+              status === "failed" ? "adapter_or_run_failure" : "lease_expired",
+            );
+          }
+          continue;
+        }
         const claimedLeaseRow = claim?.row ?? leaseRow;
 
         const leaseSnapshot = toEnvironmentLeaseSnapshot(claimedLeaseRow);
