@@ -147,7 +147,14 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
-  it("suppresses worker output after forwarding realization secrets", async () => {
+  it.each([
+    ["a multiline private key", {
+      GITHUB_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\ntransient-key-material\n-----END PRIVATE KEY-----",
+    }, "transient-key-material"],
+    ["a token-suffixed key", {
+      GITHUB_TOKEN: "github_pat_transient_worker_token",
+    }, "github_pat_transient_worker_token"],
+  ])("suppresses worker output after forwarding %s", async (_label, env, leakedValue) => {
     const childLogger = {
       debug: vi.fn(),
       info: vi.fn(),
@@ -155,7 +162,6 @@ describe("plugin-worker-manager stderr failure context", () => {
       error: vi.fn(),
     };
     const childSpy = vi.spyOn(logger, "child").mockReturnValue(childLogger as any);
-    const privateKey = "-----BEGIN PRIVATE KEY-----\ntransient-key-material\n-----END PRIVATE KEY-----";
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: DELAYED_WORKER_ENTRYPOINT,
       manifest: TEST_MANIFEST,
@@ -177,7 +183,7 @@ describe("plugin-worker-manager stderr failure context", () => {
         environmentId: "environment-1",
         config: { crash: true },
         lease: { providerLeaseId: "lease-1" },
-        env: { GITHUB_APP_PRIVATE_KEY: privateKey },
+        env,
         workspace: {},
       })).rejects.toThrow("Worker process exited");
       await new Promise((resolve) => setImmediate(resolve));
@@ -185,8 +191,7 @@ describe("plugin-worker-manager stderr failure context", () => {
       const logged = JSON.stringify(
         Object.values(childLogger).flatMap((method) => method.mock.calls),
       );
-      expect(logged).not.toContain("transient-key-material");
-      expect(logged).not.toContain(JSON.stringify(privateKey).slice(1, -1));
+      expect(logged).not.toContain(leakedValue);
       expect(logged).not.toContain("provider received");
       expect(logged).not.toContain("[plugin stderr]");
     } finally {

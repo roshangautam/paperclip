@@ -92,7 +92,7 @@ const CRASH_WINDOW_MS = 10 * 60 * 1_000;
 const MAX_STDERR_EXCERPT_CHARS = 8_000;
 
 const SENSITIVE_ENV_KEY_RE =
-  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
+  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|(?:^|[-_])token(?:$|[-_])|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 
 // ---------------------------------------------------------------------------
 // Types

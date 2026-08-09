@@ -734,25 +734,32 @@ export async function resolveExecutionRunAdapterConfig(input: {
   const isRequiredScopedEnvKeyConfigured = (key: string) => requiredScopedEnvBinding !== null
     && !isOverriddenByLaterDisallowedScope(key)
     && isConfiguredEnvBindingValue(effectiveRequiredScopedEnv[key]);
-  const requiredScopedBindingsConfigured = requiredScopedEnvBinding
-    ? requiredScopedEnvBinding.keys.some(isRequiredScopedEnvKeyConfigured)
+  const requiredScopedEnvBindingsSatisfied = (isKeyConfigured: (key: string) => boolean) =>
+    requiredScopedEnvBinding !== null && (
+      requiredScopedEnvBinding.keys.some(isKeyConfigured)
       || (requiredScopedEnvBinding.alternativeKeySets ?? []).some((keySet) =>
-        keySet.length > 0 && keySet.every(isRequiredScopedEnvKeyConfigured))
-    : false;
-  if (requiredScopedEnvBinding && !requiredScopedBindingsConfigured) {
-    throw new ConfigurationIncompleteFailure(`configuration incomplete: ${requiredScopedEnvBinding.remediation}`, {
+        keySet.length > 0 && keySet.every(isKeyConfigured))
+    );
+  const requiredScopedConfigurationFailure = (
+    binding: NonNullable<typeof input.requiredScopedEnvBinding>,
+  ) => new ConfigurationIncompleteFailure(
+    `configuration incomplete: ${binding.remediation}`,
+    {
       configurationIncomplete: {
-        reason: requiredScopedEnvBinding.reason,
+        reason: binding.reason,
         companyId: input.companyId,
         agentId: input.agentId ?? null,
         issueId: input.issueId ?? null,
         projectId: input.projectId ?? null,
         routineId: input.routineId ?? null,
         requiredEnvKeys: requiredScopedEnvKeys,
-        requiredScopes: requiredScopedEnvBinding.consumerScopes,
+        requiredScopes: binding.consumerScopes,
         missingBindings: [],
       },
-    });
+    },
+  );
+  if (requiredScopedEnvBinding && !requiredScopedEnvBindingsSatisfied(isRequiredScopedEnvKeyConfigured)) {
+    throw requiredScopedConfigurationFailure(requiredScopedEnvBinding);
   }
   // Pre-dispatch binding-validation gate: detect declared secret refs that have
   // no binding before resolving any secret value. Missing bindings short-circuit
@@ -964,6 +971,12 @@ export async function resolveExecutionRunAdapterConfig(input: {
     };
     for (const key of routineEnvResolution.secretKeys) {
       secretKeys.add(key);
+    }
+  }
+  if (requiredScopedEnvBinding) {
+    const resolvedEnv = parseObject(resolvedConfig.env);
+    if (!requiredScopedEnvBindingsSatisfied((key) => readNonEmptyString(resolvedEnv[key]) !== null)) {
+      throw requiredScopedConfigurationFailure(requiredScopedEnvBinding);
     }
   }
   // Pre-dispatch credential gate for codex_local: a managed Codex home with no

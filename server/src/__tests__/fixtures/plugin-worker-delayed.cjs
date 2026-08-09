@@ -45,7 +45,10 @@ rl.on("line", (line) => {
   }
 
   if (method === "environmentRealizeWorkspace") {
-    const secret = message.params?.env?.GITHUB_APP_PRIVATE_KEY ?? "";
+    const secret = message.params?.env?.GITHUB_APP_PRIVATE_KEY
+      ?? message.params?.env?.GITHUB_TOKEN
+      ?? message.params?.env?.GH_TOKEN
+      ?? "";
     process.stdout.write(`not-json:${JSON.stringify(secret)}\n`);
     process.stderr.write(`${secret}\n`);
     send({
