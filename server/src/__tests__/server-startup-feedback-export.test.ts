@@ -353,6 +353,7 @@ vi.mock("../auth/better-auth.js", () => ({
 }));
 
 import { startServer } from "../index.ts";
+import { serverVersion } from "../version.js";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -466,6 +467,7 @@ describe("startServer feedback export wiring", () => {
     expect(createAppMock).toHaveBeenCalledTimes(1);
     expect(createAppMock.mock.calls[0]?.[1]).toMatchObject({
       feedbackExportService: feedbackExportServiceMock,
+      hostVersion: serverVersion,
       storageService: { id: "storage-service" },
       serverPort: 3210,
     });

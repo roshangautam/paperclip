@@ -96,6 +96,7 @@ import {
 } from "./shutdown.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
+import { serverVersion } from "./version.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -756,6 +757,7 @@ export async function startServer(): Promise<StartedServer> {
     authPublicBaseUrl: config.authPublicBaseUrl,
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
+    hostVersion: serverVersion,
     pluginMigrationDb: pluginMigrationDb as any,
     betterAuthHandler,
     resolveSession,
