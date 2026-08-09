@@ -672,7 +672,7 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
 
 export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
-  /** Host-generated, non-secret workspace realization context for this lease. */
+  /** Provider-returned workspace realization context, sanitized by the host. */
   workspaceRealization?: Record<string, unknown>;
   command: string;
   args?: string[];
