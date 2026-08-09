@@ -550,6 +550,35 @@ describe("codex_local ACP lane", () => {
     });
   });
 
+  it.each([
+    ["the default", undefined],
+    ["an explicit opt-in", true],
+  ] as const)("preserves %s sandbox workspace synchronization setting", async (_label, syncWorkspace) => {
+    const root = await makeTempRoot("paperclip-codex-acp-workspace-sync-");
+    const executionTarget = {
+      kind: "remote" as const,
+      transport: "sandbox" as const,
+      providerKey: "test-sandbox",
+      remoteCwd: "/remote/workspace",
+      ...(syncWorkspace === undefined ? {} : { syncWorkspace }),
+    };
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
+      target: input.target,
+      workspaceRemoteDir: "/remote/prepared-workspace",
+      runtimeRootDir: "/remote/prepared-workspace/.paperclip-runtime/codex",
+      assetDirs: {},
+      restoreWorkspace: async () => undefined,
+    }));
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+    });
+
+    await execute(buildContext(root, { executionTarget }));
+
+    expect(prepareAdapterExecutionTargetRuntime).toHaveBeenCalledTimes(1);
+    expect(prepareAdapterExecutionTargetRuntime.mock.calls[0]?.[0].target).toEqual(executionTarget);
+  });
+
   it("stages the complete instruction bundle for sandbox ACP without synchronizing the workspace", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-instructions-");
     const workspaceDir = path.join(root, "workspace");
@@ -602,6 +631,7 @@ describe("codex_local ACP lane", () => {
         transport: "sandbox",
         providerKey: "test-sandbox",
         remoteCwd: "/remote/workspace",
+        syncWorkspace: false,
       },
     }));
 

@@ -324,9 +324,6 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
       return withCodexAuthRefreshFailureClassification(result);
     }
 
-    const runtimeTarget = target.transport === "sandbox"
-      ? { ...target, syncWorkspace: false as const }
-      : target;
     const workspaceContext = parseObject(ctx.context.paperclipWorkspace);
     const workspaceLocalDir =
       asString(workspaceContext.cwd, "").trim() ||
@@ -334,7 +331,7 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
       process.cwd();
     const preparedRuntime = await prepareAdapterExecutionTargetRuntime({
       runId: ctx.runId,
-      target: runtimeTarget,
+      target,
       adapterKey: "codex",
       workspaceLocalDir,
       assets:
@@ -344,9 +341,9 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
       onProgress: (line) => ctx.onLog("stdout", line),
       onRuntimeProgress: ctx.onRuntimeProgress,
     });
-    const executionRemoteCwd = preparedRuntime.workspaceRemoteDir ?? runtimeTarget.remoteCwd;
+    const executionRemoteCwd = preparedRuntime.workspaceRemoteDir ?? target.remoteCwd;
     const executionTarget =
-      overrideAdapterExecutionTargetRemoteCwd(runtimeTarget, executionRemoteCwd) ?? runtimeTarget;
+      overrideAdapterExecutionTargetRemoteCwd(target, executionRemoteCwd) ?? target;
     const instructionsReferencePath =
       instructionsBundle.rootPath && instructionsBundle.entryRelativePath
         ? path.posix.join(
