@@ -88,6 +88,7 @@ const mockEnvironmentRuntimeService = vi.hoisted(() => ({
 }));
 const mockExecutionWorkspaceService = vi.hoisted(() => ({
   getById: vi.fn(async () => null),
+  claimTerminalIssueCleanup: vi.fn(async () => ({ id: "claimed-workspace" })),
   markIdleAfterTerminalIssueCleanup: vi.fn(async () => null),
 }));
 
@@ -283,6 +284,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockExternalObjectService.syncIssueSafely.mockReset();
     mockEnvironmentRuntimeService.destroyReusableSandboxLeases.mockReset();
     mockExecutionWorkspaceService.getById.mockReset();
+    mockExecutionWorkspaceService.claimTerminalIssueCleanup.mockReset();
     mockExecutionWorkspaceService.markIdleAfterTerminalIssueCleanup.mockReset();
     mockTxInsertValues.mockReset();
     mockTxInsert.mockReset();
@@ -311,6 +313,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockExternalObjectService.syncIssueSafely.mockResolvedValue(undefined);
     mockEnvironmentRuntimeService.destroyReusableSandboxLeases.mockResolvedValue([]);
     mockExecutionWorkspaceService.getById.mockResolvedValue(null);
+    mockExecutionWorkspaceService.claimTerminalIssueCleanup.mockResolvedValue({ id: "claimed-workspace" });
     mockExecutionWorkspaceService.markIdleAfterTerminalIssueCleanup.mockResolvedValue(null);
     mockLogActivity.mockResolvedValue(undefined);
     mockFeedbackService.listIssueVotesForUser.mockResolvedValue([]);
@@ -1779,11 +1782,39 @@ describe.sequential("issue comment reopen routes", () => {
       issueId: issue.id,
       executionWorkspaceId: issue.executionWorkspaceId,
       failureReason: "issue_terminal_done",
+      terminalWorkspaceReconciliation: {
+        executionWorkspaceId: issue.executionWorkspaceId,
+      },
     });
     expect(mockExecutionWorkspaceService.markIdleAfterTerminalIssueCleanup).toHaveBeenCalledWith({
       companyId: "company-1",
       executionWorkspaceId: issue.executionWorkspaceId,
     });
+  });
+
+  it("does not clean up a terminal workspace that cannot be claimed", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionWorkspaceId: "55555555-5555-4555-8555-555555555555",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
+    mockExecutionWorkspaceService.claimTerminalIssueCleanup.mockResolvedValue(null);
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    expect(mockExecutionWorkspaceService.claimTerminalIssueCleanup).toHaveBeenCalledWith({
+      companyId: "company-1",
+      executionWorkspaceId: issue.executionWorkspaceId,
+    });
+    expect(mockEnvironmentRuntimeService.destroyReusableSandboxLeases).not.toHaveBeenCalled();
+    expect(mockExecutionWorkspaceService.markIdleAfterTerminalIssueCleanup).not.toHaveBeenCalled();
   });
 
   it("writes decision ids into executionState and inserts the decision inside the transaction", async () => {
@@ -1943,6 +1974,9 @@ describe.sequential("issue comment reopen routes", () => {
       issueId: issue.id,
       executionWorkspaceId: issue.executionWorkspaceId,
       failureReason: "issue_terminal_done",
+      terminalWorkspaceReconciliation: {
+        executionWorkspaceId: issue.executionWorkspaceId,
+      },
     });
     expect(mockExecutionWorkspaceService.markIdleAfterTerminalIssueCleanup).toHaveBeenCalledWith({
       companyId: "company-1",

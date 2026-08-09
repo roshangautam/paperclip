@@ -285,7 +285,24 @@ export interface PluginInstallOptions {
 
 export interface PluginUpgradeOptions extends Omit<PluginInstallOptions, "installDir"> {
   /** Called after the replacement package is accepted, immediately before its files are promoted. */
-  beforePromote?: () => Promise<void>;
+  beforePromote?: (manifest: PaperclipPluginManifestV1) => Promise<void>;
+  /** Called after files and registry metadata are updated, while the previous package is still recoverable. */
+  beforeCommit?: () => Promise<void>;
+}
+
+/** An attempted package rollback could not restore a coherent live plugin tree. */
+export class PluginArtifactRollbackError extends AggregateError {}
+
+function includeOperationFailureInRollbackError(
+  operationError: unknown,
+  rollbackError: PluginArtifactRollbackError,
+): PluginArtifactRollbackError {
+  const rollbackErrors = rollbackError.errors as unknown[];
+  if (rollbackErrors.includes(operationError)) return rollbackError;
+  return new PluginArtifactRollbackError(
+    [operationError, ...rollbackErrors],
+    rollbackError.message,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,7 +1239,7 @@ export function pluginLoader(
           await rename(previousDir, localPluginDir);
         } catch (restoreError) {
           staged.preserveRoot = true;
-          throw new AggregateError(
+          throw new PluginArtifactRollbackError(
             [error, restoreError],
             `Failed to promote managed plugins and restore the previous directory; preserved recovery files at ${staged.root}`,
           );
@@ -1237,12 +1254,23 @@ export function pluginLoader(
       },
       async rollback() {
         const rejectedDir = path.join(staged.root, `rejected-${randomUUID()}`);
-        await rename(localPluginDir, rejectedDir);
+        try {
+          await rename(localPluginDir, rejectedDir);
+        } catch (error) {
+          staged.preserveRoot = true;
+          throw new PluginArtifactRollbackError(
+            [error],
+            `Failed to quarantine rejected managed plugins; preserved recovery files at ${staged.root}`,
+          );
+        }
         try {
           if (hadPrevious) await rename(previousDir, localPluginDir);
         } catch (error) {
-          await rename(rejectedDir, localPluginDir).catch(() => undefined);
-          throw error;
+          staged.preserveRoot = true;
+          throw new PluginArtifactRollbackError(
+            [error],
+            `Failed to restore previous managed plugins; preserved recovery files at ${staged.root}`,
+          );
         }
         await rm(staged.root, { recursive: true, force: true });
       },
@@ -1265,25 +1293,29 @@ export function pluginLoader(
     }
   }
 
-  async function cleanupInstallArtifactsUnlocked(plugin: PluginRecord): Promise<void> {
+  async function cleanupInstallArtifactsUnlocked(
+    plugin: PluginRecord,
+    installDir = localPluginDir,
+  ): Promise<void> {
     const managedTargets = new Set<string>();
-    const managedNodeModulesDir = resolveManagedInstallPackageDir(localPluginDir, plugin.packageName);
-    const directManagedDir = path.join(localPluginDir, plugin.packageName);
+    const managedNodeModulesDir = resolveManagedInstallPackageDir(installDir, plugin.packageName);
+    const directManagedDir = path.join(installDir, plugin.packageName);
 
     managedTargets.add(managedNodeModulesDir);
-    if (isPathInsideDir(directManagedDir, localPluginDir)) {
+    if (isPathInsideDir(directManagedDir, installDir)) {
       managedTargets.add(directManagedDir);
     }
     if (plugin.packagePath && isPathInsideDir(plugin.packagePath, localPluginDir)) {
-      managedTargets.add(path.resolve(plugin.packagePath));
+      const relativePackagePath = path.relative(localPluginDir, path.resolve(plugin.packagePath));
+      managedTargets.add(path.resolve(installDir, relativePackagePath));
     }
 
-    const packageJsonPath = path.join(localPluginDir, "package.json");
+    const packageJsonPath = path.join(installDir, "package.json");
     if (existsSync(packageJsonPath)) {
       try {
         await execFileAsync(
           "npm",
-          ["uninstall", plugin.packageName, "--prefix", localPluginDir, "--ignore-scripts"],
+          ["uninstall", plugin.packageName, "--prefix", installDir, "--ignore-scripts"],
           { timeout: 120_000 },
         );
       } catch (err) {
@@ -1971,6 +2003,7 @@ export function pluginLoader(
         localPath = plugin.packagePath ?? undefined,
         version,
         beforePromote,
+        beforeCommit,
       } = upgradeOptions;
 
       if (version !== undefined && localPath !== undefined) {
@@ -2019,10 +2052,11 @@ export function pluginLoader(
             );
           }
 
-          await beforePromote?.();
+          await beforePromote?.(newManifest);
           if (staged) promoted = await promoteManagedPluginDirectory(staged);
 
-          // 4. Update the existing record
+          // 4. Update the existing record, but keep the previous package tree
+          // available until lifecycle activation/reconciliation succeeds.
           try {
             await registry.update(pluginId, {
               packageName: discovered.packageName,
@@ -2033,9 +2067,34 @@ export function pluginLoader(
               version: discovered.version,
               manifest: newManifest,
             });
+            await beforeCommit?.();
           } catch (error) {
-            await promoted?.rollback();
-            promoted = null;
+            if (promoted) {
+              try {
+                await promoted.rollback();
+                promoted = null;
+              } catch (rollbackError) {
+                throw rollbackError instanceof PluginArtifactRollbackError
+                  ? includeOperationFailureInRollbackError(error, rollbackError)
+                  : new PluginArtifactRollbackError(
+                    [error, rollbackError],
+                    `Failed to restore previous managed plugins after upgrade failure at ${staged?.root}`,
+                  );
+              }
+              try {
+                await registry.update(pluginId, {
+                  packageName: activePlugin.packageName,
+                  packagePath: activePlugin.packagePath,
+                  version: oldManifest.version,
+                  manifest: oldManifest,
+                });
+              } catch (registryRollbackError) {
+                throw new PluginArtifactRollbackError(
+                  [error, registryRollbackError],
+                  `Restored previous managed plugins but failed to restore registry metadata for ${pluginId}`,
+                );
+              }
+            }
             throw error;
           }
 
@@ -2082,8 +2141,41 @@ export function pluginLoader(
 
     async uninstallPlugin(plugin: PluginRecord, removeData = false): Promise<PluginRecord | null> {
       return withManagedPluginDirectoryLock(async () => {
-        await cleanupInstallArtifactsUnlocked(plugin);
-        return registry.uninstall(plugin.id, removeData) as Promise<PluginRecord | null>;
+        const staged = await stageManagedPluginDirectory();
+        let promoted: Awaited<ReturnType<typeof promoteManagedPluginDirectory>> | null = null;
+        try {
+          await cleanupInstallArtifactsUnlocked(plugin, staged.directory);
+          promoted = await promoteManagedPluginDirectory(staged);
+          let result: PluginRecord | null;
+          try {
+            result = await registry.uninstall(plugin.id, removeData) as PluginRecord | null;
+          } catch (error) {
+            try {
+              await promoted.rollback();
+              promoted = null;
+            } catch (rollbackError) {
+              throw rollbackError instanceof PluginArtifactRollbackError
+                ? includeOperationFailureInRollbackError(error, rollbackError)
+                : new PluginArtifactRollbackError(
+                  [error, rollbackError],
+                  `Failed to restore managed plugins after uninstall failure at ${staged.root}`,
+                );
+            }
+            throw error;
+          }
+          await promoted.commit().catch((error) => {
+            log.warn(
+              { pluginId: plugin.id, err: error instanceof Error ? error.message : String(error) },
+              "plugin-loader: failed to remove uninstall rollback directory",
+            );
+          });
+          promoted = null;
+          return result;
+        } finally {
+          if (!promoted && !staged.preserveRoot) {
+            await rm(staged.root, { recursive: true, force: true });
+          }
+        }
       });
     },
 
@@ -2617,8 +2709,11 @@ function resolvePluginPackageRoot(
   plugin: PluginRecord & { packagePath?: string | null },
   localPluginDir: string,
 ): string {
-  if (plugin.packagePath && existsSync(plugin.packagePath)) {
-    return path.resolve(plugin.packagePath);
+  if (plugin.packagePath) {
+    if (existsSync(plugin.packagePath)) return path.resolve(plugin.packagePath);
+    throw new Error(
+      `Configured local plugin source not found for plugin "${plugin.pluginKey}": ${plugin.packagePath}`,
+    );
   }
 
   const packageName = plugin.packageName;

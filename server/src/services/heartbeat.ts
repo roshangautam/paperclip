@@ -3273,9 +3273,7 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
     requestedShouldReuseExisting,
     existingExecutionWorkspaceAvailable:
       requestedShouldReuseExisting &&
-      input.existingExecutionWorkspaceStatus !== null &&
-      input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+      ["active", "idle", "in_review"].includes(input.existingExecutionWorkspaceStatus ?? ""),
   };
 }
 
@@ -3646,7 +3644,7 @@ function resolveRootBoundInstructionsFingerprintPath(input: {
   }
 
   const rootPath = path.resolve(input.instructionsRootPath);
-  const candidatePath = input.instructionsEntryFile ?? input.instructionsFilePath;
+  const candidatePath = input.instructionsFilePath ?? input.instructionsEntryFile;
   if (!candidatePath) return { filePath: null, skippedReason: "missing_entry_file" };
 
   const resolvedPath = path.isAbsolute(candidatePath)

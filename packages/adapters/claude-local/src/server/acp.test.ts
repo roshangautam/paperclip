@@ -538,7 +538,7 @@ describe("claude_local ACP lane", () => {
     expect(preparation?.assets).toEqual([{ key: "instructions", localDir: instructionsDir }]);
     const prompt = runtimes[0]?.startInputs[0]?.text ?? "";
     expect(prompt).toContain(
-      "The above agent instructions were loaded from /remote/prepared-workspace/.paperclip-runtime/claude/instructions/AGENTS.md.",
+      "The agent instructions for this session were loaded from /remote/prepared-workspace/.paperclip-runtime/claude/instructions/AGENTS.md.",
     );
     expect(prompt).toContain(
       "Resolve any relative file references from /remote/prepared-workspace/.paperclip-runtime/claude/instructions/.",
@@ -701,6 +701,42 @@ describe("claude_local ACP lane", () => {
         "executor threw after workspace preparation\nACP workspace restore failed: sandbox restore failed",
     });
     expect(restoreWorkspace).toHaveBeenCalledOnce();
+  });
+
+  it("skips workspace restore after a remote bridge shutdown failure", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-bridge-shutdown-failure-");
+    const restoreWorkspace = vi.fn(async () => undefined);
+    prepareAdapterExecutionTargetRuntime.mockImplementation(async (input) => ({
+      target: input.target,
+      workspaceRemoteDir: "/remote/workspace",
+      runtimeRootDir: "/remote/workspace/.paperclip-runtime/claude",
+      assetDirs: {},
+      restoreWorkspace,
+    }));
+    const bridgeShutdownError = Object.assign(
+      new Error("ACP remote bridge shutdown failed"),
+      { code: "acp_remote_bridge_shutdown_failed" },
+    );
+    const execute = createClaudeAcpExecutor({
+      createRuntime: () => {
+        throw bridgeShutdownError;
+      },
+    });
+
+    const execution = execute(buildContext(root, {
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "test-sandbox",
+        remoteCwd: "/remote/workspace",
+      },
+    }));
+
+    await expect(execution).rejects.toMatchObject({
+      code: "acp_workspace_restore_failed",
+      cause: bridgeShutdownError,
+    });
+    expect(restoreWorkspace).not.toHaveBeenCalled();
   });
 
   it("executes SSH ACP in the prepared workspace while retaining the original session target", async () => {

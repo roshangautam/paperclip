@@ -4865,6 +4865,7 @@ registry.registerPath({
     400: r.badRequest,
     403: r.forbidden,
     404: r.notFound,
+    500: r.serverError,
   },
 });
 

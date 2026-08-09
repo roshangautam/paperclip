@@ -15,6 +15,7 @@ import {
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import { inferOpenAiCompatibleBiller } from "@paperclipai/adapter-utils";
 import {
+  ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
   ensureAdapterExecutionTargetCommandResolvable,
   overrideAdapterExecutionTargetRemoteCwd,
   prepareAdapterExecutionTargetRuntime,
@@ -76,6 +77,24 @@ function acpWorkspaceRestoreError(executionError: unknown, restoreError: unknown
       executionError,
       restoreError,
     },
+  );
+}
+
+function isRemoteBridgeShutdownFailure(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    error.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
+  );
+}
+
+function remoteBridgeWorkspaceRestoreError(executionError: unknown): Error {
+  return acpWorkspaceRestoreError(
+    executionError,
+    new Error(
+      "Workspace restore was skipped because ACP remote bridge shutdown failed and remote execution may still be active.",
+    ),
   );
 }
 
@@ -328,6 +347,9 @@ export function createCodexAcpExecutor(options: CodexAcpExecutorOptions = {}): C
         },
       }));
     } catch (executionError) {
+      if (isRemoteBridgeShutdownFailure(executionError)) {
+        throw remoteBridgeWorkspaceRestoreError(executionError);
+      }
       try {
         await preparedRuntime.restoreWorkspace((line) => ctx.onLog("stdout", line));
       } catch (restoreError) {

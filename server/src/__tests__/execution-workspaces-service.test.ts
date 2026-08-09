@@ -505,7 +505,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     ]);
   });
 
-  it("marks only the company-scoped active workspace idle after terminal cleanup", async () => {
+  it("marks only the company-scoped quarantined workspace idle after terminal cleanup", async () => {
     const companyId = randomUUID();
     const otherCompanyId = randomUUID();
     const projectId = randomUUID();
@@ -549,7 +549,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         mode: "isolated_workspace",
         strategyType: "git_worktree",
         name: "Terminal candidate",
-        status: "active",
+        status: "cleanup_failed",
         providerType: "git_worktree",
         cleanupReason: "issue_running",
       },
@@ -569,7 +569,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       companyId: otherCompanyId,
       executionWorkspaceId,
     })).resolves.toBeNull();
-    await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({ status: "active" });
+    await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({ status: "cleanup_failed" });
 
     await expect(svc.markIdleAfterTerminalIssueCleanup({
       companyId,
@@ -717,6 +717,56 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       })).resolves.toMatchObject({ status: "idle" });
     },
   );
+
+  it("keeps a workspace active while another linked issue is non-terminal", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Shared workspace",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Shared workspace",
+      status: "active",
+      providerType: "git_worktree",
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Still using the workspace",
+      status: "in_progress",
+      priority: "medium",
+      executionWorkspaceId,
+    });
+
+    await expect(svc.markIdleAfterTerminalIssueCleanup({
+      companyId,
+      executionWorkspaceId,
+    })).resolves.toBeNull();
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    await expect(svc.markIdleAfterTerminalIssueCleanup({
+      companyId,
+      executionWorkspaceId,
+    })).resolves.toMatchObject({ status: "idle" });
+  });
 
   it("idles a terminal issue workspace when its owning heartbeat becomes terminal", async () => {
     const companyId = randomUUID();

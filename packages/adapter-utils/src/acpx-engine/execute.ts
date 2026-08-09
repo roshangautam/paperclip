@@ -12,6 +12,7 @@ import type {
   UsageSummary,
 } from "@paperclipai/adapter-utils";
 import {
+  ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
   adapterExecutionTargetSessionIdentity,
   formatAdapterExecutionTimeoutErrorMessage,
   formatAdapterExecutionTimeoutStartLogLine,
@@ -1321,7 +1322,22 @@ async function buildRuntime(input: {
           })
         : null;
   } catch (err) {
-    await paperclipBridge?.stop().catch(() => {});
+    try {
+      await paperclipBridge?.stop();
+    } catch (cleanupError) {
+      throw Object.assign(
+        new AggregateError(
+          [err, cleanupError],
+          `ACP process-session bridge startup failed and Paperclip callback bridge shutdown also failed: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        ),
+        {
+          code: ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
+          operationError: err,
+          cleanupError,
+        },
+      );
+    }
     throw err;
   }
   const overrideCommand = processSessionBridge?.agentCommand ?? wrapperPath;
@@ -1468,11 +1484,46 @@ async function applySessionConfigOptions(input: {
   }
 }
 
-async function cleanupRemoteBridges(prepared: AcpxPreparedRuntime): Promise<void> {
-  await Promise.allSettled([
-    prepared.processSessionBridge?.stop(),
-    prepared.paperclipBridge?.stop(),
+async function cleanupRemoteBridges(
+  prepared: AcpxPreparedRuntime,
+  operationError?: unknown,
+): Promise<void> {
+  const processSessionBridge = prepared.processSessionBridge;
+  const paperclipBridge = prepared.paperclipBridge;
+  prepared.processSessionBridge = null;
+  prepared.paperclipBridge = null;
+  const results = await Promise.allSettled([
+    processSessionBridge?.stop(),
+    paperclipBridge?.stop(),
   ]);
+  const failures = results.flatMap((result, index) => {
+    if (result.status === "fulfilled") return [];
+    const label = index === 0 ? "process-session bridge" : "Paperclip callback bridge";
+    return [Object.assign(
+      new Error(`${label}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`),
+      { cause: result.reason },
+    )];
+  });
+  if (failures.length > 0) {
+    throw Object.assign(
+      new AggregateError(failures, "ACP remote bridge shutdown failed"),
+      {
+        code: ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
+        ...(operationError === undefined
+          ? {}
+          : { cause: operationError, operationError }),
+      },
+    );
+  }
+}
+
+function isRemoteBridgeShutdownFailure(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    error.code === ACP_REMOTE_BRIDGE_SHUTDOWN_ERROR_CODE,
+  );
 }
 
 function renderPaperclipEnvNote(env: Record<string, string>): string {
@@ -1523,19 +1574,17 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
       ? path.posix.dirname(instructionsReferencePath)
       : path.dirname(instructionsReferencePath)}/`
     : "";
-  let instructionsPrefix = "";
+  let instructionsContentsPrefix = "";
+  let instructionsReferenceDirective = "";
   const commandNotes: string[] = [];
   if (instructionsFilePath) {
     try {
       const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
-      instructionsPrefix =
-        `${instructionsContents}\n\n` +
-        `The above agent instructions were loaded from ${instructionsReferencePath}. ` +
+      instructionsContentsPrefix = `${instructionsContents}\n\n`;
+      instructionsReferenceDirective =
+        `The agent instructions for this session were loaded from ${instructionsReferencePath}. ` +
         `Resolve any relative file references from ${instructionsDir}.\n\n`;
-      commandNotes.push(
-        `Loaded agent instructions from ${instructionsFilePath}`,
-        `Prepended instructions + path directive to the ACPX prompt (relative references from ${instructionsDir}).`,
-      );
+      commandNotes.push(`Loaded agent instructions from ${instructionsFilePath}`);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       await onLog(
@@ -1562,7 +1611,16 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
       : "";
   const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession });
   const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
-  const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
+  const promptInstructionsPrefix = shouldUseResumeDeltaPrompt
+    ? instructionsReferenceDirective
+    : `${instructionsContentsPrefix}${instructionsReferenceDirective}`;
+  if (instructionsReferenceDirective) {
+    commandNotes.push(
+      shouldUseResumeDeltaPrompt
+        ? `Prepended the current instructions path directive to the ACPX resume prompt (relative references from ${instructionsDir}).`
+        : `Prepended instructions + path directive to the ACPX prompt (relative references from ${instructionsDir}).`,
+    );
+  }
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const taskContextNote = asString(context.paperclipTaskMarkdown, "").trim();
@@ -2109,7 +2167,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         err,
         phase: "ensure_session",
       });
-      await cleanupRemoteBridges(prepared);
+      await cleanupRemoteBridges(prepared, err);
       return {
         exitCode: 1,
         signal: null,
@@ -2163,7 +2221,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         clearWarmHandleTimer(existing);
         warmHandles.delete(prepared.sessionKey);
       }
-      await cleanupRemoteBridges(prepared);
+      await cleanupRemoteBridges(prepared, err);
       return {
         exitCode: 1,
         signal: null,
@@ -2347,7 +2405,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         stopReason: terminalStopReason,
         message: errorMessage,
       });
-      await cleanupRemoteBridges(prepared);
+      const terminalError = terminal.status === "completed" && !timedOut
+        ? undefined
+        : new Error(errorMessage ?? terminalStopReason ?? terminal.status);
+      await cleanupRemoteBridges(prepared, terminalError);
       return {
         exitCode: terminal.status === "completed" ? 0 : 1,
         signal: timedOut ? "SIGTERM" : null,
@@ -2378,6 +2439,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         clearSession,
       };
     } catch (err) {
+      if (isRemoteBridgeShutdownFailure(err)) throw err;
       if (timeout) clearTimeout(timeout);
       const messageOverride = timedOut
         ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
@@ -2403,7 +2465,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         phase: "turn",
         messageOverride,
       });
-      await cleanupRemoteBridges(prepared);
+      await cleanupRemoteBridges(prepared, err);
       return {
         exitCode: 1,
         signal: timedOut ? "SIGTERM" : null,

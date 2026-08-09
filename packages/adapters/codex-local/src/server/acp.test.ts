@@ -619,7 +619,7 @@ describe("codex_local ACP lane", () => {
     expect(preparation?.assets).not.toContainEqual(expect.objectContaining({ key: "workspace" }));
     const prompt = runtimes[0]?.startInputs[0]?.text ?? "";
     expect(prompt).toContain(
-      "The above agent instructions were loaded from /remote/prepared-workspace/.paperclip-runtime/codex/instructions/AGENTS.md.",
+      "The agent instructions for this session were loaded from /remote/prepared-workspace/.paperclip-runtime/codex/instructions/AGENTS.md.",
     );
     expect(prompt).toContain(
       "Resolve any relative file references from /remote/prepared-workspace/.paperclip-runtime/codex/instructions/.",
@@ -698,7 +698,7 @@ describe("codex_local ACP lane", () => {
     expect(preparation?.assets).toEqual([{ key: "instructions", localDir: instructionsDir }]);
     const prompt = runtimes[0]?.startInputs[0]?.text ?? "";
     expect(prompt).toContain(
-      "The above agent instructions were loaded from /remote/workspace/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/codex/instructions/AGENTS.md.",
+      "The agent instructions for this session were loaded from /remote/workspace/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/codex/instructions/AGENTS.md.",
     );
     expect(prompt).toContain(
       "Resolve any relative file references from /remote/workspace/.paperclip-runtime/runs/run-1/workspace/.paperclip-runtime/codex/instructions/.",
@@ -828,6 +828,27 @@ describe("codex_local ACP lane", () => {
 
     await expect(execute(context)).rejects.toThrow("executor construction failed");
     expect(restoreWorkspace).toHaveBeenCalledOnce();
+  });
+
+  it("skips workspace restore after a remote bridge shutdown failure", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-bridge-shutdown-failure-");
+    const restoreWorkspace = vi.fn(async () => undefined);
+    const context = await buildSandboxInstructionsContext(root, restoreWorkspace);
+    const bridgeShutdownError = Object.assign(
+      new Error("ACP remote bridge shutdown failed"),
+      { code: "acp_remote_bridge_shutdown_failed" },
+    );
+    const execute = createCodexAcpExecutor({
+      createRuntime: () => {
+        throw bridgeShutdownError;
+      },
+    });
+
+    await expect(execute(context)).rejects.toMatchObject({
+      code: "acp_workspace_restore_failed",
+      cause: bridgeShutdownError,
+    });
+    expect(restoreWorkspace).not.toHaveBeenCalled();
   });
 
   it("returns sandbox restore failure after successful execution", async () => {

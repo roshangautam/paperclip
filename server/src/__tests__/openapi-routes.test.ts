@@ -244,6 +244,7 @@ describe("openapi routes", () => {
       "400",
       "403",
       "404",
+      "500",
     ]);
     expect(res.body.paths["/api/companies/{companyId}/folders"].post.responses["201"]).toBeDefined();
     expect(res.body.paths["/api/companies/{companyId}/folders/items/move"].post.summary).toBe(

@@ -9,10 +9,19 @@ const sshMocks = vi.hoisted(() => ({
   restoreWorkspaceFromSshExecution: vi.fn(async () => undefined),
   syncDirectoryToSsh: vi.fn(async () => undefined),
 }));
+const snapshotMocks = vi.hoisted(() => ({
+  captureDirectorySnapshot: vi.fn(async () => ({ exclude: [], entries: new Map() })),
+}));
 
 vi.mock("./ssh.js", async () => {
   const actual = await vi.importActual<typeof import("./ssh.js")>("./ssh.js");
   return { ...actual, ...sshMocks };
+});
+vi.mock("./workspace-restore-merge.js", async () => {
+  const actual = await vi.importActual<typeof import("./workspace-restore-merge.js")>(
+    "./workspace-restore-merge.js",
+  );
+  return { ...actual, ...snapshotMocks };
 });
 
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
@@ -21,7 +30,11 @@ const tempDirs: string[] = [];
 
 afterEach(async () => {
   vi.clearAllMocks();
+  sshMocks.prepareWorkspaceForSshExecution.mockResolvedValue({ gitBacked: false });
+  sshMocks.removeDirectoryFromSsh.mockResolvedValue(undefined);
   sshMocks.restoreWorkspaceFromSshExecution.mockResolvedValue(undefined);
+  sshMocks.syncDirectoryToSsh.mockResolvedValue(undefined);
+  snapshotMocks.captureDirectorySnapshot.mockResolvedValue({ exclude: [], entries: new Map() });
   await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -88,5 +101,71 @@ describe("SSH remote managed runtime cleanup", () => {
     await expect(prepared.restoreWorkspace()).rejects.toThrow("restore failed");
 
     expect(sshMocks.removeDirectoryFromSsh).not.toHaveBeenCalled();
+  });
+
+  it("cleans the run root without restoring when workspace preparation fails", async () => {
+    const preparationError = new Error("upload failed");
+    sshMocks.prepareWorkspaceForSshExecution.mockRejectedValueOnce(preparationError);
+
+    await expect(prepareRuntime()).rejects.toBe(preparationError);
+
+    expect(sshMocks.restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
+    expect(sshMocks.removeDirectoryFromSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/remote/workspace/.paperclip-runtime/runs/run-1",
+    }));
+  });
+
+  it("fails closed when preparation and run-root cleanup both fail", async () => {
+    const preparationError = new Error("upload failed");
+    sshMocks.prepareWorkspaceForSshExecution.mockRejectedValueOnce(preparationError);
+    sshMocks.removeDirectoryFromSsh.mockRejectedValueOnce(new Error("cleanup failed"));
+
+    await expect(prepareRuntime()).rejects.toMatchObject({
+      code: "acp_workspace_restore_failed",
+      cause: preparationError,
+      message: expect.stringContaining("cleanup failed"),
+    });
+    expect(sshMocks.restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
+  });
+
+  it("preserves the asset staging error when restore also fails", async () => {
+    const localDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-"));
+    const assetDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-remote-asset-"));
+    tempDirs.push(localDir, assetDir);
+    const stagingError = new Error("asset upload failed");
+    sshMocks.syncDirectoryToSsh.mockRejectedValueOnce(stagingError);
+    sshMocks.restoreWorkspaceFromSshExecution.mockRejectedValueOnce(new Error("restore failed"));
+
+    await expect(prepareRemoteManagedRuntime({
+      spec: {
+        host: "127.0.0.1",
+        port: 22,
+        username: "fixture",
+        remoteCwd: "/remote/workspace",
+        remoteWorkspacePath: "/remote/workspace",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      runId: "run-1",
+      adapterKey: "codex",
+      workspaceLocalDir: localDir,
+      assets: [{ key: "instructions", localDir: assetDir }],
+    })).rejects.toMatchObject({
+      code: "acp_workspace_restore_failed",
+      cause: stagingError,
+      message: expect.stringContaining("restore failed"),
+    });
+  });
+
+  it("treats sync-back as authoritative when only run-root deletion fails", async () => {
+    const prepared = await prepareRuntime();
+    const progress = vi.fn(async () => undefined);
+    sshMocks.removeDirectoryFromSsh.mockRejectedValueOnce(new Error("delete failed"));
+
+    await expect(prepared.restoreWorkspace(progress)).resolves.toBeUndefined();
+
+    expect(sshMocks.restoreWorkspaceFromSshExecution).toHaveBeenCalledOnce();
+    expect(progress).toHaveBeenCalledWith(expect.stringContaining("delete failed"));
   });
 });

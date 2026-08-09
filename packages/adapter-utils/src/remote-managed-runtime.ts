@@ -10,6 +10,30 @@ import {
 import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 import type { RuntimeProgressSink } from "./runtime-progress.js";
 
+const ACP_WORKSPACE_RESTORE_ERROR_CODE = "acp_workspace_restore_failed";
+
+function errorMessageFromUnknown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function remoteWorkspaceCleanupFailure(
+  operationError: unknown,
+  cleanupError: unknown,
+  action: string,
+): Error {
+  return Object.assign(
+    new Error(
+      `${errorMessageFromUnknown(operationError)}\n${action}: ${errorMessageFromUnknown(cleanupError)}`,
+    ),
+    {
+      code: ACP_WORKSPACE_RESTORE_ERROR_CODE,
+      cause: operationError,
+      operationError,
+      restoreError: cleanupError,
+    },
+  );
+}
+
 export interface RemoteManagedRuntimeAsset {
   key: string;
   localDir: string;
@@ -95,16 +119,33 @@ export async function prepareRemoteManagedRuntime(input: {
   const workspaceRemoteDir = path.posix.join(runRootDir, "workspace");
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
 
-  const preparedWorkspace = await prepareWorkspaceForSshExecution({
-    spec: input.spec,
-    localDir: input.workspaceLocalDir,
-    remoteDir: workspaceRemoteDir,
-    onProgress: input.onProgress,
-  });
-  const restoreExclude = preparedWorkspace.gitBacked ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"] : [".paperclip-runtime"];
-  const baselineSnapshot = await captureDirectorySnapshot(input.workspaceLocalDir, {
-    exclude: restoreExclude,
-  });
+  let preparedWorkspace: Awaited<ReturnType<typeof prepareWorkspaceForSshExecution>>;
+  let baselineSnapshot: Awaited<ReturnType<typeof captureDirectorySnapshot>>;
+  try {
+    preparedWorkspace = await prepareWorkspaceForSshExecution({
+      spec: input.spec,
+      localDir: input.workspaceLocalDir,
+      remoteDir: workspaceRemoteDir,
+      onProgress: input.onProgress,
+    });
+    const restoreExclude = preparedWorkspace.gitBacked
+      ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"]
+      : [".paperclip-runtime"];
+    baselineSnapshot = await captureDirectorySnapshot(input.workspaceLocalDir, {
+      exclude: restoreExclude,
+    });
+  } catch (preparationError) {
+    try {
+      await removeDirectoryFromSsh({ spec: input.spec, remoteDir: runRootDir });
+    } catch (cleanupError) {
+      throw remoteWorkspaceCleanupFailure(
+        preparationError,
+        cleanupError,
+        "Remote run workspace cleanup failed after preparation",
+      );
+    }
+    throw preparationError;
+  }
 
   const assetDirs: Record<string, string> = {};
   const restoreWorkspace = async (onProgress?: RuntimeProgressSink) => {
@@ -116,7 +157,17 @@ export async function prepareRemoteManagedRuntime(input: {
       restoreGitHistory: preparedWorkspace.gitBacked,
       onProgress,
     });
-    await removeDirectoryFromSsh({ spec: input.spec, remoteDir: runRootDir });
+    try {
+      await removeDirectoryFromSsh({ spec: input.spec, remoteDir: runRootDir });
+    } catch (cleanupError) {
+      try {
+        await onProgress?.(
+          `[paperclip] Remote run workspace cleanup failed after successful sync-back; local workspace changes were preserved: ${errorMessageFromUnknown(cleanupError)}\n`,
+        );
+      } catch {
+        // Sync-back already succeeded, so warning delivery remains best-effort.
+      }
+    }
   };
   try {
     for (const asset of input.assets ?? []) {
@@ -133,7 +184,15 @@ export async function prepareRemoteManagedRuntime(input: {
       });
     }
   } catch (error) {
-    await restoreWorkspace(input.onProgress);
+    try {
+      await restoreWorkspace(input.onProgress);
+    } catch (restoreError) {
+      throw remoteWorkspaceCleanupFailure(
+        error,
+        restoreError,
+        "Remote workspace restore failed after asset staging",
+      );
+    }
     throw error;
   }
 

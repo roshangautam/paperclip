@@ -3891,7 +3891,7 @@ export function environmentRuntimeService(
       select 1 from ${executionWorkspaces}
       where ${executionWorkspaces.id} = ${input.executionWorkspaceId}
         and ${executionWorkspaces.companyId} = ${input.companyId}
-        and ${executionWorkspaces.status} = 'active'
+        and ${executionWorkspaces.status} = 'cleanup_failed'
         and exists (
           select 1 from ${issues}
           where ${issues.companyId} = ${executionWorkspaces.companyId}
@@ -4039,30 +4039,39 @@ export function environmentRuntimeService(
       .select({
         companyId: executionWorkspaces.companyId,
         executionWorkspaceId: executionWorkspaces.id,
+        status: executionWorkspaces.status,
       })
       .from(executionWorkspaces)
       .where(and(
-        eq(executionWorkspaces.status, "active"),
-        sql`exists (
-          select 1 from ${issues}
-          where ${issues.companyId} = ${executionWorkspaces.companyId}
-            and (${issues.id} = ${executionWorkspaces.sourceIssueId}
-              or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
-            and ${issues.status} in ('done', 'cancelled')
-        )`,
-        sql`not exists (
-          select 1 from ${issues}
-          where ${issues.companyId} = ${executionWorkspaces.companyId}
-            and (${issues.id} = ${executionWorkspaces.sourceIssueId}
-              or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
-            and ${issues.status} not in ('done', 'cancelled')
-        )`,
-        sql`not exists (
-          select 1 from ${heartbeatRuns}
-          where ${heartbeatRuns.companyId} = ${executionWorkspaces.companyId}
-            and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
-            and ${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaces.id}::text
-        )`,
+        or(
+          and(
+            eq(executionWorkspaces.status, "active"),
+            sql`exists (
+              select 1 from ${issues}
+              where ${issues.companyId} = ${executionWorkspaces.companyId}
+                and (${issues.id} = ${executionWorkspaces.sourceIssueId}
+                  or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
+                and ${issues.status} in ('done', 'cancelled')
+            )`,
+            sql`not exists (
+              select 1 from ${issues}
+              where ${issues.companyId} = ${executionWorkspaces.companyId}
+                and (${issues.id} = ${executionWorkspaces.sourceIssueId}
+                  or ${issues.executionWorkspaceId} = ${executionWorkspaces.id})
+                and ${issues.status} not in ('done', 'cancelled')
+            )`,
+            sql`not exists (
+              select 1 from ${heartbeatRuns}
+              where ${heartbeatRuns.companyId} = ${executionWorkspaces.companyId}
+                and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')
+                and ${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId' = ${executionWorkspaces.id}::text
+            )`,
+          ),
+          and(
+            eq(executionWorkspaces.status, "cleanup_failed"),
+            eq(executionWorkspaces.cleanupReason, "terminal_issue_workspace_reconciliation"),
+          ),
+        ),
         sql`not exists (
           select 1 from ${environmentLeases}
           where ${environmentLeases.companyId} = ${executionWorkspaces.companyId}
@@ -4076,6 +4085,13 @@ export function environmentRuntimeService(
 
     for (const candidate of candidates) {
       try {
+        if (candidate.status === "cleanup_failed") {
+          const settledWorkspace = await executionWorkspacesSvc.markIdleAfterTerminalIssueCleanup(candidate);
+          if (settledWorkspace) continue;
+        } else {
+          const claimedWorkspace = await executionWorkspacesSvc.claimTerminalIssueCleanup(candidate);
+          if (!claimedWorkspace) continue;
+        }
         await destroyReusableSandboxLeases({
           ...candidate,
           failureReason: "terminal_issue_workspace_reconciliation",
