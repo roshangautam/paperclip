@@ -169,6 +169,23 @@ describe("claude_local ACP startup fallback", () => {
     );
   });
 
+  it("does not rerun through the CLI when ACP remote run cleanup fails", async () => {
+    executeClaudeAcp.mockRejectedValueOnce(Object.assign(
+      new Error("ACP execution failed and the restored remote run directory could not be removed"),
+      { code: "acp_remote_run_cleanup_failed" },
+    ));
+    const ctx = buildContext();
+
+    await expect(execute(ctx as never)).rejects.toMatchObject({
+      code: "acp_remote_run_cleanup_failed",
+    });
+    expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
+    expect(ctx.onLog).not.toHaveBeenCalledWith(
+      "stderr",
+      expect.stringContaining("falling back to Claude CLI"),
+    );
+  });
+
   it("keeps explicit ACP strict when startup fails", async () => {
     const ctx = buildContext({ engine: "acp" });
 
