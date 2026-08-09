@@ -729,7 +729,10 @@ export async function resolveExecutionRunAdapterConfig(input: {
     ...(requiredScopedEnvBinding?.consumerScopes.includes("agent") ? agentEnv : {}),
     ...(requiredScopedEnvBinding?.consumerScopes.includes("project") ? projectEnv ?? {} : {}),
   };
+  const isOverriddenByLaterDisallowedScope = (key: string) =>
+    routineEnv !== null && Object.prototype.hasOwnProperty.call(routineEnv, key);
   const isRequiredScopedEnvKeyConfigured = (key: string) => requiredScopedEnvBinding !== null
+    && !isOverriddenByLaterDisallowedScope(key)
     && isConfiguredEnvBindingValue(effectiveRequiredScopedEnv[key]);
   const requiredScopedBindingsConfigured = requiredScopedEnvBinding
     ? requiredScopedEnvBinding.keys.some(isRequiredScopedEnvKeyConfigured)

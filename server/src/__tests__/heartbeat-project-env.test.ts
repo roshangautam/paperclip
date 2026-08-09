@@ -610,6 +610,46 @@ describe("resolveExecutionRunAdapterConfig", () => {
     expect(resolveEnvBindings).not.toHaveBeenCalled();
   });
 
+  it("rejects a GitHub App tuple when routine env overrides a required agent binding", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn();
+    const resolveEnvBindings = vi.fn();
+    const collectMissingRuntimeBindings = vi.fn();
+
+    await expect(resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      routineId: "routine-1",
+      executionRunConfig: {
+        env: {
+          GITHUB_APP_ID: "app-1",
+          GITHUB_INSTALLATION_ID: "installation-1",
+          GITHUB_APP_PRIVATE_KEY: "private-key-1",
+        },
+      },
+      projectEnv: null,
+      routineEnv: { GITHUB_APP_PRIVATE_KEY: "" },
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+        collectMissingRuntimeBindings,
+      } as any,
+    })).rejects.toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          reason: "push_write_credential_missing",
+          requiredEnvKeys: GITHUB_PUSH_CREDENTIAL_REQUIRED_KEYS,
+          missingBindings: [],
+        },
+      },
+    });
+    expect(collectMissingRuntimeBindings).not.toHaveBeenCalled();
+    expect(resolveAdapterConfigForRuntime).not.toHaveBeenCalled();
+    expect(resolveEnvBindings).not.toHaveBeenCalled();
+  });
+
   it("retains the push-credential blocker when a required GitHub App secret binding is missing", async () => {
     const resolveAdapterConfigForRuntime = vi.fn();
     const resolveEnvBindings = vi.fn();
