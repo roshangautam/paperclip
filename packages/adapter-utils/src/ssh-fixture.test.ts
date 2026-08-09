@@ -9,6 +9,7 @@ import {
   getSshEnvLabSupport,
   prepareWorkspaceForSshExecution,
   readSshEnvLabFixtureStatus,
+  removeDirectoryFromSsh,
   restoreWorkspaceFromSshExecution,
   runSshCommand,
   syncDirectoryFromSsh,
@@ -90,6 +91,24 @@ describe("ssh env-lab fixture", () => {
       await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
   });
+
+  it.each(["", " ", "/", ".", ".."])(
+    "refuses to recursively remove unsafe remote directory %j",
+    async (remoteDir) => {
+      await expect(removeDirectoryFromSsh({
+        spec: {
+          host: "127.0.0.1",
+          port: 22,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          privateKey: null,
+          knownHosts: null,
+          strictHostKeyChecking: true,
+        },
+        remoteDir,
+      })).rejects.toThrow("Refusing to remove unsafe SSH directory");
+    },
+  );
 
   it("starts an isolated sshd fixture and executes commands through it", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));

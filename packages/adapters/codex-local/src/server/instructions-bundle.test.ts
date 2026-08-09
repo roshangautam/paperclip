@@ -1,12 +1,18 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resolveCodexInstructionsBundle } from "./instructions-bundle.js";
 
 describe("resolveCodexInstructionsBundle", () => {
   const rootPath = mkdtempSync(path.join(os.tmpdir(), "paperclip-codex-instructions-"));
   const outsidePath = path.resolve(rootPath, "..", "outside", "AGENTS.md");
+
+  beforeAll(() => {
+    mkdirSync(path.join(rootPath, "nested"));
+    writeFileSync(path.join(rootPath, "AGENTS.md"), "Use the managed instructions.\n");
+    writeFileSync(path.join(rootPath, "nested", "AGENTS.md"), "Use the nested instructions.\n");
+  });
 
   afterAll(() => rmSync(rootPath, { recursive: true, force: true }));
 

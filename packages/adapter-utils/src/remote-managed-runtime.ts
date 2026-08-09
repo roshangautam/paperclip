@@ -216,6 +216,17 @@ export async function prepareRemoteManagedRuntime(input: {
     try {
       await restoreWorkspace(input.onProgress);
     } catch (restoreError) {
+      if (
+        restoreError &&
+        typeof restoreError === "object" &&
+        "code" in restoreError &&
+        restoreError.code === ACP_REMOTE_RUN_CLEANUP_ERROR_CODE &&
+        "workspaceRestored" in restoreError &&
+        restoreError.workspaceRestored === true
+      ) {
+        Object.assign(restoreError, { operationError: error });
+        throw restoreError;
+      }
       throw remoteWorkspaceCleanupFailure(
         error,
         restoreError,

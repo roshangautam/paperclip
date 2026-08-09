@@ -42,6 +42,14 @@ export function resolveManagedInstructionsBundle(config: Record<string, unknown>
     return { filePath, rootPath: null, entryRelativePath: null };
   }
 
+  try {
+    if (!statSync(entryPath).isFile()) {
+      return { filePath, rootPath: null, entryRelativePath: null };
+    }
+  } catch {
+    return { filePath, rootPath: null, entryRelativePath: null };
+  }
+
   return {
     filePath,
     rootPath,

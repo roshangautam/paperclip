@@ -158,6 +158,40 @@ describe("SSH remote managed runtime cleanup", () => {
     });
   });
 
+  it("preserves cleanup-only classification when asset staging restores before cleanup fails", async () => {
+    const localDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-"));
+    const assetDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-remote-asset-"));
+    tempDirs.push(localDir, assetDir);
+    const stagingError = new Error("asset upload failed");
+    sshMocks.syncDirectoryToSsh.mockRejectedValueOnce(stagingError);
+    sshMocks.removeDirectoryFromSsh.mockRejectedValue(new Error("delete failed"));
+
+    await expect(prepareRemoteManagedRuntime({
+      spec: {
+        host: "127.0.0.1",
+        port: 22,
+        username: "fixture",
+        remoteCwd: "/remote/workspace",
+        remoteWorkspacePath: "/remote/workspace",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      runId: "run-1",
+      adapterKey: "codex",
+      workspaceLocalDir: localDir,
+      assets: [{ key: "instructions", localDir: assetDir }],
+    })).rejects.toMatchObject({
+      code: "acp_remote_run_cleanup_failed",
+      workspaceRestored: true,
+      operationError: stagingError,
+      remoteRunDir: "/remote/workspace/.paperclip-runtime/runs/run-1",
+    });
+
+    expect(sshMocks.restoreWorkspaceFromSshExecution).toHaveBeenCalledOnce();
+    expect(sshMocks.removeDirectoryFromSsh).toHaveBeenCalledTimes(3);
+  });
+
   it("retries run-root deletion after a successful sync-back", async () => {
     const prepared = await prepareRuntime();
     sshMocks.removeDirectoryFromSsh.mockRejectedValueOnce(new Error("delete failed"));
