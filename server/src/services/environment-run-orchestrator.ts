@@ -159,7 +159,8 @@ function transientSensitiveEnvEntries(
 }
 
 function transientEnvValueVariants(value: string): string[] {
-  return Array.from(new Set([value, JSON.stringify(value).slice(1, -1)]));
+  return Array.from(new Set([value, value.trim()].flatMap((candidate) =>
+    [candidate, JSON.stringify(candidate).slice(1, -1)])));
 }
 
 function transientEnvValues(env: Record<string, string> | undefined): string[] {

@@ -488,14 +488,18 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(JSON.stringify((thrown as EnvironmentRunError).cause)).not.toContain(token);
   });
 
-  it("redacts JSON-escaped multiline transient values from provider output", async () => {
-    const privateKey = "-----BEGIN PRIVATE KEY-----\ntransient-key-material\n-----END PRIVATE KEY-----";
-    const serializedSecret = JSON.stringify({ privateKey });
+  it("redacts trimmed and JSON-escaped multiline transient values from provider output", async () => {
+    const privateKey = " \n-----BEGIN PRIVATE KEY-----\ntransient-key-material\n-----END PRIVATE KEY-----\n ";
+    const trimmedPrivateKey = privateKey.trim();
+    const serializedSecret = JSON.stringify({ privateKey: trimmedPrivateKey });
     const runtime = makeMockRuntime({
       realizeWorkspace: vi.fn().mockResolvedValue({
         cwd: "/workspace/project",
         metadata: {
-          workspaceRealization: { providerOutput: serializedSecret },
+          workspaceRealization: {
+            providerOutput: serializedSecret,
+            trimmedPrivateKey,
+          },
         },
       }),
     });
@@ -507,9 +511,10 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
 
     expect(result.workspaceRealization).toEqual({
       providerOutput: '{"privateKey":"***REDACTED***"}',
+      trimmedPrivateKey: "***REDACTED***",
     });
     expect(JSON.stringify(mockUpdateLeaseMetadata.mock.calls)).not.toContain(
-      JSON.stringify(privateKey).slice(1, -1),
+      JSON.stringify(trimmedPrivateKey).slice(1, -1),
     );
   });
 
