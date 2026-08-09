@@ -749,16 +749,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     return toResult(initial);
   } finally {
-    await stopPaperclipBridgeThenRestoreWorkspace({
-      paperclipBridge,
-      restoreRemoteWorkspace,
-      beforeRestore: () => onLog(
-        "stdout",
-        `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-      ),
-    });
-    if (localSkillsDir) {
-      await fs.rm(localSkillsDir, { recursive: true, force: true }).catch(() => undefined);
+    try {
+      await stopPaperclipBridgeThenRestoreWorkspace({
+        paperclipBridge,
+        restoreRemoteWorkspace,
+        beforeRestore: () => onLog(
+          "stdout",
+          `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+        ),
+      });
+    } finally {
+      if (localSkillsDir) {
+        await fs.rm(localSkillsDir, { recursive: true, force: true }).catch(() => undefined);
+      }
     }
   }
 }

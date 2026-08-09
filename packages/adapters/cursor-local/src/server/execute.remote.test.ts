@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -211,6 +211,58 @@ describe("cursor remote execution", () => {
     }));
     expect(restoreWorkspaceFromSshExecution.mock.invocationCallOrder[0])
       .toBeLessThan(removeDirectoryFromSsh.mock.invocationCallOrder[0]!);
+  });
+
+  it("removes the local skills directory when remote workspace restore fails", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-remote-restore-fail-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    restoreWorkspaceFromSshExecution.mockRejectedValueOnce(new Error("restore failed"));
+
+    await expect(execute({
+      runId: "run-restore-fail",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Cursor Builder",
+        adapterType: "cursor",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "agent",
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+    })).rejects.toThrow("restore failed");
+
+    const skillsSyncCalls = syncDirectoryToSsh.mock.calls as unknown as Array<[{ localDir: string }]>;
+    const skillsSyncInput = skillsSyncCalls[0]?.[0];
+    expect(skillsSyncInput?.localDir).toBeTruthy();
+    await expect(access(skillsSyncInput!.localDir!)).rejects.toThrow();
   });
 
   it("resumes saved Cursor sessions for remote SSH execution only when the identity matches", async () => {
