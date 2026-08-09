@@ -826,6 +826,7 @@ export function pluginLifecycleManager(
       // 1. Download and validate before stopping the active worker. The loader
       // invokes this hook only after accepting the replacement manifest.
       let runtimeDeactivated = false;
+      let replacementActivationAttempted = false;
       let addedCaps: PaperclipPluginManifestV1["capabilities"] = [];
       let upgradePendingPersisted = false;
       let upgradedPlugin: PluginRecord | null = null;
@@ -876,6 +877,7 @@ export function pluginLifecycleManager(
             }
 
             const ready = await transition(pluginId, "ready", null, updated);
+            replacementActivationAttempted = true;
             await activateReadyPlugin(pluginId);
             await reconcileAfterTransition(pluginId, ready.pluginKey, "ready");
             emitDomain("plugin.loaded", {
@@ -897,7 +899,10 @@ export function pluginLifecycleManager(
           }
           const current = await requirePlugin(pluginId).catch(() => null);
           let restored = current?.status === "ready";
-          if (upgradePendingPersisted && current?.status === "upgrade_pending") {
+          const shouldRestoreReady =
+            (upgradePendingPersisted && current?.status === "upgrade_pending")
+            || (replacementActivationAttempted && current?.status === "error");
+          if (shouldRestoreReady) {
             restored = await registry.updateStatus(pluginId, {
               status: "ready",
               lastError: null,

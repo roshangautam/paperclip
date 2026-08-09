@@ -1011,7 +1011,11 @@ describe("pluginLoader npm upgrades", () => {
       stopWorker: vi.fn(async () => {
         workerRunning = false;
       }),
-      startWorker: vi.fn().mockRejectedValue(new Error("worker startup failed")),
+      startWorker: vi.fn()
+        .mockRejectedValueOnce(new Error("worker startup failed"))
+        .mockImplementationOnce(async () => {
+          workerRunning = true;
+        }),
     } as unknown as PluginWorkerManager;
     const services = runtimeServices(workerManager, undefined);
     const loader = pluginLoader({} as never, {
@@ -1034,12 +1038,12 @@ describe("pluginLoader npm upgrades", () => {
     await expect(readFile(path.join(packageRoot, "worker.js"), "utf8"))
       .resolves.toBe("export const marker = 'active';\n");
     expect(currentPlugin).toMatchObject({
-      status: "error",
+      status: "ready",
       version: "1.0.0",
       manifestJson: activeManifest,
-      lastError: "Activation failed: worker startup failed",
+      lastError: null,
     });
-    expect(workerManager.startWorker).toHaveBeenCalledTimes(1);
+    expect(workerManager.startWorker).toHaveBeenCalledTimes(2);
   });
 
   it("fails closed and preserves both package trees when activation rollback cannot restore", async () => {
