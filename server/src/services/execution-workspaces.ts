@@ -1710,7 +1710,13 @@ export function executionWorkspaceService(db: Db) {
         .where(and(
           eq(executionWorkspaces.id, input.executionWorkspaceId),
           eq(executionWorkspaces.companyId, input.companyId),
-          inArray(executionWorkspaces.status, ["active", "cleanup_failed"]),
+          or(
+            eq(executionWorkspaces.status, "active"),
+            and(
+              eq(executionWorkspaces.status, "cleanup_failed"),
+              eq(executionWorkspaces.cleanupReason, "terminal_issue_workspace_reconciliation"),
+            ),
+          ),
           sql`not exists (
             select 1
             from ${environmentLeases}

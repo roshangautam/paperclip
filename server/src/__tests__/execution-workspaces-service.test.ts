@@ -551,7 +551,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         name: "Terminal candidate",
         status: "cleanup_failed",
         providerType: "git_worktree",
-        cleanupReason: "issue_running",
+        cleanupReason: "terminal_issue_workspace_reconciliation",
       },
       {
         id: otherExecutionWorkspaceId,
@@ -581,6 +581,48 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       cleanupReason: null,
     });
     await expect(svc.getById(otherExecutionWorkspaceId)).resolves.toMatchObject({ status: "active" });
+  });
+
+  it("preserves unrelated cleanup failures during terminal issue settlement", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const closedAt = new Date("2026-08-08T22:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Failed explicit archive",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Archive cleanup failed",
+      status: "cleanup_failed",
+      providerType: "git_worktree",
+      cleanupReason: "Failed to remove archived worktree",
+      closedAt,
+    });
+
+    await expect(svc.markIdleAfterTerminalIssueCleanup({
+      companyId,
+      executionWorkspaceId,
+    })).resolves.toBeNull();
+    await expect(svc.getById(executionWorkspaceId)).resolves.toMatchObject({
+      status: "cleanup_failed",
+      cleanupReason: "Failed to remove archived worktree",
+      closedAt,
+    });
   });
 
   it.each(["pending_cleanup", "failed"] as const)(
