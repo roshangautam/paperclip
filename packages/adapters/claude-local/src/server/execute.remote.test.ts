@@ -12,6 +12,7 @@ const {
   restoreWorkspaceFromSshExecution,
   syncDirectoryToSsh,
   startAdapterExecutionTargetPaperclipBridge,
+  runAdapterExecutionTargetShellCommand,
 } = vi.hoisted(() => ({
   runChildProcess: vi.fn(async () => ({
     exitCode: 0,
@@ -39,6 +40,15 @@ const {
       PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
     },
     stop: async () => {},
+  })),
+  runAdapterExecutionTargetShellCommand: vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    pid: null,
+    startedAt: new Date().toISOString(),
   })),
 }));
 
@@ -74,6 +84,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   return {
     ...actual,
     startAdapterExecutionTargetPaperclipBridge,
+    runAdapterExecutionTargetShellCommand,
   };
 });
 
@@ -165,6 +176,14 @@ describe("claude remote execution", () => {
         },
       },
       onLog: async () => {},
+      runtimeMcp: {
+        getServers: () => [{
+          name: "Plugin: Agent Identities",
+          url: "https://paperclip.example/api/tool-gateway/gateways/gateway-1/mcp",
+          token: "gateway-token",
+          connectionId: "connection-1",
+        }],
+      },
     });
 
     expect(prepareWorkspaceForSshExecution).toHaveBeenCalledTimes(1);
@@ -187,7 +206,7 @@ describe("claude remote execution", () => {
       | undefined;
     expect(call?.[2]).toContain("--allowedTools");
     expect(call?.[2]).toContain(
-      "Task AskUserQuestion Bash CronCreate CronDelete CronList Edit EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree Glob Grep Monitor NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write",
+      "Task AskUserQuestion Bash CronCreate CronDelete CronList Edit EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree Glob Grep Monitor NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write mcp__Plugin__Agent_Identities__*",
     );
     expect(call?.[2]).not.toContain("--dangerously-skip-permissions");
     expect(call?.[2]).toContain("--append-system-prompt-file");
@@ -218,6 +237,19 @@ describe("claude remote execution", () => {
     expect(call?.[3].env.OTHER_ENV).toBe(workspaceDir);
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
+    expect(runAdapterExecutionTargetShellCommand).toHaveBeenCalledTimes(1);
+    const mcpConfigCall = runAdapterExecutionTargetShellCommand.mock.calls[0] as unknown as
+      | [string, unknown, string, { env: Record<string, string> }]
+      | undefined;
+    const mcpConfig = JSON.parse(mcpConfigCall?.[3]?.env.PAPERCLIP_CLAUDE_MCP_CONFIG ?? "{}");
+    expect(mcpConfig.mcpServers["Plugin: Agent Identities"]).toEqual({
+      type: "http",
+      url: "http://127.0.0.1:4310/api/tool-gateway/gateways/gateway-1/mcp",
+      headers: {
+        Authorization: "Bearer bridge-token",
+        "x-paperclip-tool-gateway-token": "gateway-token",
+      },
+    });
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({
       localDir: workspaceDir,

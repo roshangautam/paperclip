@@ -153,6 +153,15 @@ export async function writePaperclipClaudeMcpConfig(input: {
 }): Promise<string> {
   const configDir = path.join(input.stateDir, "runs", input.runId, "mcp");
   const configPath = path.join(configDir, "mcp-config.json");
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.writeFile(configPath, buildPaperclipClaudeMcpConfig(input), { mode: 0o600 });
+  return configPath;
+}
+
+export function buildPaperclipClaudeMcpConfig(input: {
+  servers: AdapterRuntimeMcpServer[];
+  bridge?: { url: string; token: string };
+}): string {
   const usedNames = new Set<string>();
   const mcpServers: Record<string, unknown> = {};
   for (const server of input.servers) {
@@ -164,15 +173,44 @@ export async function writePaperclipClaudeMcpConfig(input: {
       suffix += 1;
     }
     usedNames.add(name);
+    const endpoint = input.bridge ? new URL(server.url) : null;
     mcpServers[name] = {
       type: "http",
-      url: server.url,
-      headers: { Authorization: `Bearer ${server.token}` },
+      url: endpoint
+        ? new URL(`${endpoint.pathname}${endpoint.search}`, `${input.bridge!.url.replace(/\/+$/, "")}/`).toString()
+        : server.url,
+      headers: input.bridge
+        ? {
+            Authorization: `Bearer ${input.bridge.token}`,
+            "x-paperclip-tool-gateway-token": server.token,
+          }
+        : { Authorization: `Bearer ${server.token}` },
     };
   }
-  await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(configPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
-  return configPath;
+  return JSON.stringify({ mcpServers });
+}
+
+export async function materializeRemoteClaudeMcpConfig(input: {
+  runId: string;
+  target: AdapterExecutionTarget | null | undefined;
+  configPath: string;
+  contents: string;
+  options: AdapterExecutionTargetShellOptions;
+}): Promise<void> {
+  const result = await runAdapterExecutionTargetShellCommand(
+    input.runId,
+    input.target,
+    `mkdir -p ${shellQuote(path.posix.dirname(input.configPath))} && ` +
+      `printf '%s' "$PAPERCLIP_CLAUDE_MCP_CONFIG" > ${shellQuote(input.configPath)} && ` +
+      `chmod 600 ${shellQuote(input.configPath)}`,
+    {
+      ...input.options,
+      env: { ...input.options.env, PAPERCLIP_CLAUDE_MCP_CONFIG: input.contents },
+    },
+  );
+  if (result.timedOut || result.exitCode !== 0) {
+    throw new Error(`Failed to write remote Claude MCP config${result.timedOut ? ": timed out" : `: exit ${result.exitCode ?? "unknown"}`}`);
+  }
 }
 
 export async function prepareClaudeConfigSeed(

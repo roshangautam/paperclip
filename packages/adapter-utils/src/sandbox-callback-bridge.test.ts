@@ -210,6 +210,7 @@ describe("sandbox callback bridge", () => {
         authorization: `Bearer ${bridgeToken}`,
         accept: "application/json",
         "if-none-match": '"client-cache-key"',
+        "x-paperclip-tool-gateway-token": "gateway-session-token",
         "x-paperclip-run-id": "run-bridge-1",
         "x-bridge-debug": "drop-me",
       },
@@ -256,6 +257,7 @@ describe("sandbox callback bridge", () => {
       headers: {
         accept: "application/json",
         "if-none-match": '"client-cache-key"',
+        "x-paperclip-tool-gateway-token": "gateway-session-token",
       },
     });
     expect(seenRequests[0]?.headers.authorization).toBeUndefined();
@@ -916,6 +918,8 @@ describe("sandbox callback bridge", () => {
       { method: "GET", path: "/api/approvals/ap-1/comments" },
       { method: "POST", path: "/api/approvals/ap-1/comments" },
       { method: "POST", path: "/api/companies/co-1/approvals" },
+      { method: "GET", path: "/api/tool-gateway/gateways/gateway-1/mcp" },
+      { method: "POST", path: "/api/tool-gateway/gateways/gateway-1/mcp" },
       { method: "GET", path: "/api/execution-workspaces/ws-1" },
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/start" },
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/stop" },
@@ -954,6 +958,7 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/companies/co-1/logo" },
       { method: "GET", path: "/api/companies/co-1/secrets" },
       { method: "PATCH", path: "/api/secrets/secret-1" },
+      { method: "DELETE", path: "/api/tool-gateway/gateways/gateway-1/mcp" },
     ];
     for (const request of denied) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
