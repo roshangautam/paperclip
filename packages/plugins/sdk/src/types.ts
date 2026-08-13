@@ -48,7 +48,7 @@ import type {
   PrincipalType,
   EnvSecretRefBinding,
 } from "@paperclipai/shared";
-import type { PluginPerformActionContext } from "./protocol.js";
+import type { PluginEnvironmentExecuteResult, PluginPerformActionContext } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Re-exports from @paperclipai/shared (plugin authors import from one place)
@@ -908,6 +908,21 @@ export interface PluginExecutionWorkspacesClient {
    * company access before returning any workspace coordinates.
    */
   get(workspaceId: string, companyId: string): Promise<PluginExecutionWorkspaceMetadata | null>;
+
+  /** Execute a command through the environment lease backing the workspace. */
+  execute(input: PluginExecutionWorkspaceExecuteInput): Promise<PluginEnvironmentExecuteResult>;
+}
+
+export interface PluginExecutionWorkspaceExecuteInput {
+  workspaceId: string;
+  companyId: string;
+  runId: string;
+  command: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  stdin?: string;
+  timeoutMs?: number;
 }
 
 /**
@@ -1909,7 +1924,7 @@ export interface PluginContext {
   /** Read project and workspace metadata. Requires `projects.read` / `project.workspaces.read`. */
   projects: PluginProjectsClient;
 
-  /** Read execution workspace metadata. Requires `execution.workspaces.read`. */
+  /** Read or execute in an execution workspace. Requires the corresponding execution workspace capability. */
   executionWorkspaces: PluginExecutionWorkspacesClient;
 
   /** Resolve and reconcile plugin-managed routines. Requires `routines.managed`. */

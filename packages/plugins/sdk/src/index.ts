@@ -295,6 +295,7 @@ export type {
   PluginEntityQuery,
   PluginWorkspace,
   PluginExecutionWorkspaceMetadata,
+  PluginExecutionWorkspaceExecuteInput,
   Company,
   Project,
   Issue,

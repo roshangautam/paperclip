@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentTaskSessions,
@@ -12,6 +12,8 @@ import {
   companies,
   costEvents,
   createDb,
+  environmentLeases,
+  environments,
   executionWorkspaces,
   heartbeatRuns,
   issueRelations,
@@ -72,7 +74,9 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(issueRelations);
     await db.delete(issues);
+    await db.delete(environmentLeases);
     await db.delete(executionWorkspaces);
+    await db.delete(environments);
     await db.delete(pluginManagedResources);
     await db.delete(projects);
     await db.delete(plugins);
@@ -166,6 +170,150 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       providerMetadata: { sandboxId: "sandbox-1" },
     });
     await expect(services.executionWorkspaces.get({ workspaceId, companyId: otherCompanyId })).resolves.toBeNull();
+  });
+
+  it("executes commands in the active environment lease's remote workspace", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    const environmentId = randomUUID();
+    const providerPluginId = randomUUID();
+    const hostWorkspaceCwd = "/Users/tester/.paperclip/instances/local-coder-audit/workspace-1";
+    await db.insert(projects).values({ id: projectId, companyId, name: "Workspaces", status: "in_progress" });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Feature workspace",
+      status: "active",
+      cwd: hostWorkspaceCwd,
+      providerRef: hostWorkspaceCwd,
+    });
+    await db.insert(environments).values({
+      id: environmentId,
+      name: `Sandbox ${environmentId}`,
+      driver: "sandbox",
+      config: { provider: "fake-provider" },
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+    await db.insert(environmentLeases).values({
+      companyId,
+      environmentId,
+      executionWorkspaceId: workspaceId,
+      heartbeatRunId: runId,
+      status: "active",
+      metadata: {
+        sandboxProviderPlugin: true,
+        pluginId: providerPluginId,
+        provider: "fake-provider",
+        remoteCwd: "/home/coder/workspace",
+      },
+    });
+    const pluginWorkerManager = {
+      call: vi.fn().mockResolvedValue({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "workspace-ok",
+        stderr: "",
+      }),
+    } as any;
+    const services = buildHostServices(
+      db,
+      "plugin-record-id",
+      "paperclip.workspace",
+      createEventBusStub(),
+      undefined,
+      { pluginWorkerManager },
+    );
+
+    await expect(services.executionWorkspaces.execute({
+      workspaceId,
+      companyId,
+      runId,
+      command: "git",
+      args: ["status"],
+      cwd: hostWorkspaceCwd,
+      env: { PAPERCLIP_BRIDGE_TEST: "workspace-ok" },
+    })).resolves.toMatchObject({ exitCode: 0, stdout: "workspace-ok", timedOut: false });
+    expect(pluginWorkerManager.call).toHaveBeenCalledWith(
+      providerPluginId,
+      "environmentExecute",
+      expect.objectContaining({
+        companyId,
+        environmentId,
+        command: "git",
+        args: ["status"],
+        cwd: "/home/coder/workspace",
+        env: { PAPERCLIP_BRIDGE_TEST: "workspace-ok" },
+      }),
+      undefined,
+    );
+  });
+
+  it("rejects execution without exactly one active workspace lease", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    const environmentId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Workspaces", status: "in_progress" });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Feature workspace",
+      status: "active",
+    });
+    await db.insert(environments).values({ id: environmentId, name: `Local ${environmentId}`, driver: "local" });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.workspace", createEventBusStub());
+    const execute = () => services.executionWorkspaces.execute({
+      workspaceId,
+      companyId,
+      runId,
+      command: process.execPath,
+    });
+
+    await expect(execute()).rejects.toThrow("No active environment lease found");
+    const otherRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+    await db.insert(environmentLeases).values({
+      companyId,
+      environmentId,
+      executionWorkspaceId: workspaceId,
+      heartbeatRunId: otherRunId,
+      status: "active",
+    });
+    await expect(execute()).rejects.toThrow("No active environment lease found");
+    await db.insert(environmentLeases).values([
+      { companyId, environmentId, executionWorkspaceId: workspaceId, heartbeatRunId: runId, status: "active" },
+      { companyId, environmentId, executionWorkspaceId: workspaceId, heartbeatRunId: runId, status: "active" },
+    ]);
+    await expect(execute()).rejects.toThrow("Multiple active environment leases found");
   });
 
   it("creates plugin-origin issues with full orchestration fields and audit activity", async () => {

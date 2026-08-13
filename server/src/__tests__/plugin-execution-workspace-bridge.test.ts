@@ -57,4 +57,56 @@ describe("plugin execution workspace bridge", () => {
     });
     expect(get).not.toHaveBeenCalled();
   });
+
+  it("routes command execution only with the execute capability and matching company scope", async () => {
+    const execute = vi.fn().mockResolvedValue({
+      exitCode: 0,
+      timedOut: false,
+      stdout: "ok",
+      stderr: "",
+    });
+    const handlers = createHostClientHandlers({
+      pluginId: "workspace-plugin",
+      capabilities: ["execution.workspaces.execute"],
+      services: { executionWorkspaces: { execute } } as any,
+    });
+    const params = {
+      workspaceId: "workspace-1",
+      companyId: "company-1",
+      runId: "run-1",
+      command: "git",
+      args: ["status"],
+    };
+
+    await expect(
+      handlers["executionWorkspaces.execute"](params, {
+        invocationScope: { companyId: "company-1" },
+      }),
+    ).resolves.toMatchObject({ exitCode: 0, stdout: "ok" });
+    await expect(
+      handlers["executionWorkspaces.execute"](params, {
+        invocationScope: { companyId: "company-2" },
+      }),
+    ).rejects.toMatchObject({
+      code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects command execution without execution workspace execute access", async () => {
+    const execute = vi.fn();
+    const handlers = createHostClientHandlers({
+      pluginId: "workspace-plugin",
+      capabilities: [],
+      services: { executionWorkspaces: { execute } } as any,
+    });
+
+    await expect(
+      handlers["executionWorkspaces.execute"](
+        { workspaceId: "workspace-1", companyId: "company-1", runId: "run-1", command: "git" },
+        { invocationScope: { companyId: "company-1" } },
+      ),
+    ).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED });
+    expect(execute).not.toHaveBeenCalled();
+  });
 });
