@@ -4069,7 +4069,11 @@ rl.on("line", (line) => {
         result: { content: "identity updated", data: { ok: true } },
       };
     });
-    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const releaseRunEnvironmentLeases = vi.fn().mockResolvedValue([]);
+    const gateway = createTestToolGatewayService(db, {
+      pluginToolDispatcher: dispatcher,
+      releaseRunEnvironmentLeases,
+    });
     await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
     await db.insert(toolPolicies).values({
       companyId: company.id,
@@ -4122,6 +4126,261 @@ rl.on("line", (line) => {
         projectId: project.id,
       },
     }]);
+  });
+
+  it("executes an approved agent-origin plugin call for a projectless issue", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    await db.update(issues).set({ projectId: null }).where(eq(issues.id, issue.id));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: issue.id } }).where(eq(heartbeatRuns.id, run.id));
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "update_identity_without_project",
+      toolDisplayName: "Update projectless identity",
+      riskLevel: "write",
+    });
+    const calls: Array<{ tool: string; parameters: unknown; runContext: unknown }> = [];
+    const dispatcher = createPluginDispatcher(pluginTool, async (tool, parameters, runContext) => {
+      calls.push({ tool, parameters, runContext });
+      return {
+        pluginId: pluginTool.plugin.id,
+        toolName: pluginTool.catalogEntry.toolName,
+        result: { content: "identity updated", data: { ok: true } },
+      };
+    });
+    const releaseRunEnvironmentLeases = vi.fn().mockResolvedValue([]);
+    const gateway = createTestToolGatewayService(db, {
+      pluginToolDispatcher: dispatcher,
+      releaseRunEnvironmentLeases,
+    });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review projectless plugin writes",
+      policyType: "require_approval",
+      selectors: { connectionId: pluginTool.connection.id },
+      description: "Plugin writes require review.",
+    });
+
+    await gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "approved" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id },
+    }).then(
+      () => {
+        throw new Error("Expected plugin tool call to request approval");
+      },
+      (error) => expectGatewayError(error, 409, "approval_required"),
+    );
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    await db.update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id));
+    await gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest!.id,
+      actor: { userId: "board-user" },
+    });
+
+    const [invocation] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, actionRequest!.invocationId));
+    expect(invocation).toMatchObject({
+      status: "succeeded",
+      approvalState: "approved",
+      providerType: "paperclip_plugin",
+      runId: run.id,
+      projectId: null,
+    });
+    expect(calls).toEqual([{
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "approved" },
+      runContext: {
+        agentId: agent.id,
+        companyId: company.id,
+        runId: run.id,
+        projectId: "",
+      },
+    }]);
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({
+      runId: run.id,
+      runStatus: "succeeded",
+    });
+  });
+
+  it("releases a terminal run lease after an agent-origin action is rejected", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run, project } = await createIssueAndRun(db, company.id, agent.id);
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "reject_identity_update",
+      toolDisplayName: "Reject identity update",
+      riskLevel: "write",
+    });
+    const releaseRunEnvironmentLeases = vi.fn().mockResolvedValue([]);
+    const gateway = createTestToolGatewayService(db, {
+      pluginToolDispatcher: createPluginDispatcher(pluginTool),
+      releaseRunEnvironmentLeases,
+    });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review rejected plugin writes",
+      policyType: "require_approval",
+      selectors: { connectionId: pluginTool.connection.id },
+      description: "Plugin writes require review.",
+    });
+
+    await gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "rejected" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id },
+    }).then(
+      () => {
+        throw new Error("Expected plugin tool call to request approval");
+      },
+      (error) => expectGatewayError(error, 409, "approval_required"),
+    );
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    await db.update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id));
+    await gateway.declineActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest!.id,
+      actor: { userId: "board-user" },
+    });
+
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({
+      runId: run.id,
+      runStatus: "cancelled",
+    });
+  });
+
+  it("expires an overdue approval without executing it and releases the terminal run lease", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run, project } = await createIssueAndRun(db, company.id, agent.id);
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "expired_identity_update",
+      toolDisplayName: "Expired identity update",
+      riskLevel: "write",
+    });
+    const executeTool = vi.fn(async () => ({
+      pluginId: pluginTool.plugin.id,
+      toolName: pluginTool.catalogEntry.toolName,
+      result: { content: "must not execute", data: { ok: true } },
+    }));
+    const releaseRunEnvironmentLeases = vi.fn().mockResolvedValue([]);
+    const gateway = createTestToolGatewayService(db, {
+      pluginToolDispatcher: createPluginDispatcher(pluginTool, executeTool),
+      releaseRunEnvironmentLeases,
+    });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review expiring plugin writes",
+      policyType: "require_approval",
+      selectors: { connectionId: pluginTool.connection.id },
+      description: "Plugin writes require review.",
+    });
+
+    await gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "expired" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id },
+    }).then(
+      () => {
+        throw new Error("Expected plugin tool call to request approval");
+      },
+      (error) => expectGatewayError(error, 409, "approval_required"),
+    );
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    await db.update(toolActionRequests)
+      .set({ expiresAt: new Date(Date.now() - 1_000), updatedAt: new Date() })
+      .where(eq(toolActionRequests.id, actionRequest!.id));
+    await db.update(heartbeatRuns)
+      .set({ status: "timed_out", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    await expect(gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest!.id,
+      actor: { userId: "board-user" },
+    })).rejects.toMatchObject({ status: 409, reasonCode: "action_expired" });
+
+    const [expired] = await db.select().from(toolActionRequests)
+      .where(eq(toolActionRequests.id, actionRequest!.id));
+    expect(expired?.status).toBe("expired");
+    expect(executeTool).not.toHaveBeenCalled();
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({
+      runId: run.id,
+      runStatus: "timed_out",
+    });
+  });
+
+  it("releases a terminal run lease after approved agent-origin execution fails", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run, project } = await createIssueAndRun(db, company.id, agent.id);
+    const pluginTool = await createConnectedPluginTool(db, company.id, {
+      displayName: "Agent Identities",
+      toolName: "failing_identity_update",
+      toolDisplayName: "Failing identity update",
+      riskLevel: "write",
+    });
+    const executeTool = vi.fn().mockRejectedValue(new Error("plugin execution failed"));
+    const releaseRunEnvironmentLeases = vi.fn().mockResolvedValue([]);
+    const gateway = createTestToolGatewayService(db, {
+      pluginToolDispatcher: createPluginDispatcher(pluginTool, executeTool),
+      releaseRunEnvironmentLeases,
+    });
+    await allowToolsForAgent(db, company.id, agent.id, [pluginTool.namespacedToolName]);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review failing plugin writes",
+      policyType: "require_approval",
+      selectors: { connectionId: pluginTool.connection.id },
+      description: "Plugin writes require review.",
+    });
+
+    await gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: pluginTool.namespacedToolName,
+      parameters: { id: "failure" },
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id },
+    }).then(
+      () => {
+        throw new Error("Expected plugin tool call to request approval");
+      },
+      (error) => expectGatewayError(error, 409, "approval_required"),
+    );
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    await db.update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id));
+    await gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest!.id,
+      actor: { userId: "board-user" },
+    });
+
+    const [failed] = await db.select().from(toolActionRequests)
+      .where(eq(toolActionRequests.id, actionRequest!.id));
+    expect(failed?.status).toBe("failed");
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({
+      runId: run.id,
+      runStatus: "failed",
+    });
   });
 
   it("executes allowed and approved plugin calls from the Test tab", async () => {

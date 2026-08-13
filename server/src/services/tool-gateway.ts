@@ -66,6 +66,7 @@ import {
   type ToolRuntimeSlotView,
 } from "./tool-runtime-supervisor.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
+import { logger } from "../middleware/logger.js";
 import {
   canonicalToolArguments,
   readSignedToolArgumentsPayload,
@@ -463,8 +464,11 @@ function summarizeResult(result: unknown): Record<string, unknown> {
   };
 }
 
-function inferToolRisk(toolName: string): ToolGatewayDescriptor["risk"] {
-  return classifyRisk({ name: toolName });
+function inferToolRisk(
+  toolName: string,
+  annotations?: Record<string, unknown>,
+): ToolGatewayDescriptor["risk"] {
+  return classifyRisk({ name: toolName, annotations });
 }
 
 function riskFromCatalogEntry(entry: Pick<typeof toolCatalogEntries.$inferSelect, "riskLevel" | "isReadOnly" | "isWrite" | "isDestructive">): ToolGatewayDescriptor["risk"] {
@@ -744,6 +748,10 @@ export function createToolGatewayService(
     trustedLocalStdioRuntimeHost?: string | null;
     runtimeSupervisor?: ToolRuntimeSupervisorOptions;
     toolActionSigningSecret?: string;
+    releaseRunEnvironmentLeases?: (input: {
+      runId: string;
+      runStatus: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
+    }) => Promise<unknown>;
     mcpGatewayProtocolLimits?: Partial<{
       authFailures: Partial<McpGatewayRateLimitConfig>;
       gatewayRequests: Partial<McpGatewayRateLimitConfig>;
@@ -765,6 +773,24 @@ export function createToolGatewayService(
   const secrets = secretService(db);
   const protocolLimits = mcpGatewayProtocolLimits(options.mcpGatewayProtocolLimits);
   let nextProtocolRateLimitPruneAt = 0;
+
+  async function releaseRunEnvironmentLeasesIfTerminal(runId: string | null) {
+    if (!runId || !options.releaseRunEnvironmentLeases) return;
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1);
+    if (!run || !["succeeded", "interrupted", "failed", "cancelled", "timed_out"].includes(run.status)) return;
+    try {
+      await options.releaseRunEnvironmentLeases({
+        runId,
+        runStatus: run.status as "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
+      });
+    } catch (error) {
+      logger.warn({ err: error, runId }, "failed to release retained environment leases after tool action resolution");
+    }
+  }
 
   async function pruneExpiredProtocolRateLimitCounters(current: number) {
     if (current < nextProtocolRateLimitPruneAt) return;
@@ -831,7 +857,7 @@ export function createToolGatewayService(
     return (pluginToolDispatcher?.listToolsForAgent() ?? []).map((tool) => ({
       ...tool,
       providerType: "paperclip_plugin" as const,
-      risk: inferToolRisk(tool.name),
+      risk: inferToolRisk(tool.name, tool.annotations),
     }));
   }
 
@@ -842,7 +868,7 @@ export function createToolGatewayService(
       title: tool.displayName,
       description: tool.description,
       inputSchema: tool.parametersSchema,
-      annotations: {},
+      annotations: tool.annotations ?? {},
     });
   }
 
@@ -4175,6 +4201,7 @@ export function createToolGatewayService(
   async function markApprovedActionFailed(input: {
     actionRequestId: string;
     invocationId: string;
+    runId: string | null;
     error: unknown;
   }) {
     const reasonCode = input.error instanceof ToolGatewayHttpError
@@ -4200,6 +4227,7 @@ export function createToolGatewayService(
       errorCode: reasonCode,
       errorMessage: message,
     });
+    await releaseRunEnvironmentLeasesIfTerminal(input.runId);
     return { reasonCode, message };
   }
 
@@ -4246,7 +4274,7 @@ export function createToolGatewayService(
     });
     if (!signedPayload) {
       const error = new ToolGatewayHttpError(409, "Approved tool action arguments signature is invalid", "signed_arguments_invalid");
-      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, error });
+      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, runId: invocation.runId, error });
       throw error;
     }
     if (signedPayload.executionOnApprove !== true) {
@@ -4284,12 +4312,12 @@ export function createToolGatewayService(
       tool = await findToolForSession(session, invocation.toolName);
       liveApprovalSnapshot = await connectedRemoteApprovalSnapshot(session, tool);
     } catch (error) {
-      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, error });
+      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, runId: invocation.runId, error });
       throw error;
     }
     if (!approvalSnapshotsMatch(signedPayload.approvalSnapshot, liveApprovalSnapshot)) {
       const error = new ToolGatewayHttpError(409, "Approved tool action target changed after review", "approved_tool_target_changed");
-      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, error });
+      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, runId: invocation.runId, error });
       throw error;
     }
     const parameters = signedPayload.arguments;
@@ -4307,7 +4335,7 @@ export function createToolGatewayService(
       })
     ) {
       const error = new ToolGatewayHttpError(409, "Approved tool action arguments do not match reviewed hash", "signed_arguments_mismatch");
-      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, error });
+      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, runId: invocation.runId, error });
       throw error;
     }
 
@@ -4332,10 +4360,10 @@ export function createToolGatewayService(
       } else if (tool.providerType === "mcp_local_stdio") {
         result = (await executeLocalStdioTool(session, tool, parameters, executionTimeoutMs)).result;
       } else if (tool.providerType === "paperclip_plugin") {
-        if (!pluginToolDispatcher || !session.runId || !session.projectId) {
+        if (!pluginToolDispatcher || !session.runId) {
           throw new ToolGatewayHttpError(
             409,
-            "Approved plugin action is missing its originating run or project context",
+            "Approved plugin action is missing its originating run context",
             "approved_execution_context_missing",
           );
         }
@@ -4344,7 +4372,7 @@ export function createToolGatewayService(
             agentId: invocation.agentId,
             companyId: invocation.companyId,
             runId: session.runId,
-            projectId: session.projectId,
+            projectId: session.projectId ?? "",
           }),
           executionTimeoutMs,
         ));
@@ -4386,11 +4414,13 @@ export function createToolGatewayService(
         metadata: { durationMs: Date.now() - startedAt, timeoutMs: executionTimeoutMs },
         tool,
       });
+      await releaseRunEnvironmentLeasesIfTerminal(invocation.runId);
       return resultValidation.value;
     } catch (error) {
       const { reasonCode } = await markApprovedActionFailed({
         actionRequestId: claimed.id,
         invocationId: invocation.id,
+        runId: invocation.runId,
         error,
       });
       await writeToolCallEvent({
@@ -4447,6 +4477,7 @@ export function createToolGatewayService(
         updatedAt: now,
       }).where(eq(toolInvocations.id, match.invocation.id));
       await reflectToolActionInteractionLifecycle({ actionRequestId: match.actionRequest.id, status: "expired" });
+      await releaseRunEnvironmentLeasesIfTerminal(match.invocation.runId);
       return null;
     }
     return match;
@@ -5341,6 +5372,22 @@ export function createToolGatewayService(
       if (actionRequest.status !== "pending" && actionRequest.status !== "approved") {
         throw new ToolGatewayHttpError(409, "Tool action request is no longer pending", "action_not_pending");
       }
+      if (actionRequest.expiresAt && actionRequest.expiresAt.getTime() <= Date.now()) {
+        const expiredAt = new Date();
+        const [expired] = await db
+          .update(toolActionRequests)
+          .set({ status: "expired", resolvedAt: expiredAt, updatedAt: expiredAt })
+          .where(and(
+            eq(toolActionRequests.id, actionRequest.id),
+            inArray(toolActionRequests.status, ["pending", "approved"]),
+          ))
+          .returning({ id: toolActionRequests.id });
+        if (expired) {
+          await reflectToolActionInteractionLifecycle({ actionRequestId: expired.id, status: "expired" });
+          await releaseRunEnvironmentLeasesIfTerminal(invocation.runId);
+        }
+        throw new ToolGatewayHttpError(409, "Tool action request approval has expired", "action_expired");
+      }
       let signedPayload: ReturnType<typeof readSignedToolArgumentsPayload> = null;
       try {
         signedPayload = readSignedToolArgumentsPayload({
@@ -5358,6 +5405,7 @@ export function createToolGatewayService(
             .update(toolActionRequests)
             .set({ status: "cancelled", resolvedAt: new Date(), updatedAt: new Date() })
             .where(and(eq(toolActionRequests.id, actionRequest.id), eq(toolActionRequests.status, "pending")));
+          await releaseRunEnvironmentLeasesIfTerminal(invocation.runId);
         }
         throw new ToolGatewayHttpError(
           409,
@@ -5499,6 +5547,7 @@ export function createToolGatewayService(
         .update(toolInvocations)
         .set({ approvalState: "rejected", updatedAt: now })
         .where(eq(toolInvocations.id, invocation.id));
+      await releaseRunEnvironmentLeasesIfTerminal(invocation.runId);
       return updated;
     },
 
@@ -5692,6 +5741,7 @@ export function createToolGatewayService(
             .returning({ id: toolActionRequests.id });
           if (expired) {
             await reflectToolActionInteractionLifecycle({ actionRequestId: expired.id, status: "expired" });
+            await releaseRunEnvironmentLeasesIfTerminal(storedInvocation.runId);
           }
           throw new ToolGatewayHttpError(409, "Tool action request approval has expired", "action_expired");
         }
