@@ -877,6 +877,7 @@ describeEmbeddedPostgres("tool access service", () => {
           name: "get-agent-identity",
           displayName: "Get agent identity",
           description: "Return an agent's configured identity.",
+          annotations: { readOnlyHint: false, openWorldHint: true },
           parametersSchema: {
             type: "object",
             properties: { agentId: { type: "string" } },
@@ -921,6 +922,10 @@ describeEmbeddedPostgres("tool access service", () => {
         title: "Get agent identity",
         description: "Return an agent's configured identity.",
         inputSchema: expect.objectContaining({ required: ["agentId"] }),
+        annotations: { readOnlyHint: false, openWorldHint: true },
+        riskLevel: "write",
+        isReadOnly: false,
+        isWrite: true,
       }),
     ]);
 

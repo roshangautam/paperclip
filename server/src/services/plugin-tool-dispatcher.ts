@@ -60,6 +60,8 @@ export interface AgentToolDescriptor {
   description: string;
   /** JSON Schema describing the tool's input parameters. */
   parametersSchema: Record<string, unknown>;
+  /** Behavioral hints supplied by the plugin manifest. */
+  annotations?: Record<string, unknown>;
   /** The plugin that provides this tool. */
   pluginId: string;
 }
@@ -284,6 +286,7 @@ export function createPluginToolDispatcher(
       displayName: tool.displayName,
       description: tool.description,
       parametersSchema: tool.parametersSchema,
+      annotations: tool.annotations,
       pluginId: tool.pluginDbId,
     };
   }

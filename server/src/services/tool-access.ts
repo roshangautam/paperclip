@@ -2499,7 +2499,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             title: tool.displayName,
             description: tool.description,
             inputSchema: tool.parametersSchema,
-            annotations: {},
+            annotations: tool.annotations ?? {},
           })).filter((tool): tool is McpToolDescriptor => Boolean(tool));
           if (tools.length === 0) return [];
           return [{ plugin, manifest: parsed.data, tools, lifecycle: pluginLifecycleProjection(plugin) }];
@@ -3550,7 +3550,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         title: tool.displayName,
         description: tool.description,
         inputSchema: tool.parametersSchema,
-        annotations: {},
+        annotations: tool.annotations ?? {},
       })),
     };
   }

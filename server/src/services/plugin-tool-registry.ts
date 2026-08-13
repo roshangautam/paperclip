@@ -86,6 +86,8 @@ export interface RegisteredTool {
   description: string;
   /** JSON Schema describing the tool's input parameters. */
   parametersSchema: Record<string, unknown>;
+  /** Behavioral hints supplied by the plugin manifest. */
+  annotations?: Record<string, unknown>;
 }
 
 /**
@@ -276,6 +278,7 @@ export function createPluginToolRegistry(
       displayName: decl.displayName,
       description: decl.description,
       parametersSchema: decl.parametersSchema,
+      annotations: decl.annotations,
     };
 
     byNamespace.set(namespacedName, entry);

@@ -116,6 +116,17 @@ export interface PluginToolDeclaration {
   description: string;
   /** JSON Schema describing the tool's input parameters. */
   parametersSchema: JsonSchema;
+  /** MCP-compatible behavioral hints used by host policy and approval flows. */
+  annotations?: {
+    /** Whether the tool is guaranteed not to modify state. */
+    readOnlyHint?: boolean;
+    /** Whether the tool may perform an irreversible or destructive operation. */
+    destructiveHint?: boolean;
+    /** Whether repeating the same call with the same arguments is safe. */
+    idempotentHint?: boolean;
+    /** Whether the tool can interact with entities outside Paperclip. */
+    openWorldHint?: boolean;
+  };
 }
 
 /**
