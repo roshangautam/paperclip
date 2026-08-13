@@ -623,7 +623,11 @@ export function environmentCustomImageService(
         baseConfig: parsed.config,
         secretRefExcludePaths: parsed.config.provider === "fake"
           ? []
-          : await resolveSandboxProviderSecretRefPaths(db, parsed.config.provider),
+          : await resolveSandboxProviderSecretRefPaths(
+              db,
+              parsed.config.provider,
+              parsed.config as Record<string, unknown>,
+            ),
       });
     } catch {
       return null;
@@ -807,7 +811,11 @@ export function environmentCustomImageService(
           ? fingerprintEnvironmentSandboxProviderConfig(parsed.config, {
               excludePaths: [
                 ...ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
-                ...await resolveSandboxProviderSecretRefPaths(db, parsed.config.provider),
+                ...await resolveSandboxProviderSecretRefPaths(
+                  db,
+                  parsed.config.provider,
+                  parsed.config as Record<string, unknown>,
+                ),
               ],
             })
           : null;
@@ -951,7 +959,11 @@ export function environmentCustomImageService(
       if (!template?.templateRef) return { action: "none" };
       const secretRefExcludePaths = previousParsed.config.provider === "fake"
         ? []
-        : [...await resolveSandboxProviderSecretRefPaths(db, previousParsed.config.provider)];
+        : [...await resolveSandboxProviderSecretRefPaths(
+            db,
+            previousParsed.config.provider,
+            previousParsed.config as Record<string, unknown>,
+          )];
       if (!environmentCustomImageTemplateMatchesBaseConfig({
         template,
         baseConfig: previousParsed.config,
