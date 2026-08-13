@@ -24,6 +24,7 @@ import {
   preflightLowTrustWorkspaceIsolation,
   prioritizeProjectWorkspaceCandidatesForRun,
   parseSessionCompactionPolicy,
+  partitionWorkspaceRealizationAdapterConfig,
   provisionExecutionWorkspaceForFreshnessDecision,
   resolveExecutionWorkspaceConfigFreshness,
   resolveExecutionWorkspaceReuseRequestForIssue,
@@ -41,42 +42,46 @@ import {
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
-  selectWorkspaceRealizationEnv,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
 
 const execFile = promisify(execFileCallback);
 
-describe("selectWorkspaceRealizationEnv", () => {
-  it("selects only non-empty host-side GitHub realization credentials", () => {
-    expect(selectWorkspaceRealizationEnv({
-      GH_TOKEN: "gh-token",
-      GITHUB_TOKEN: "github-token",
-      GITHUB_APP_ID: "12345",
-      GITHUB_INSTALLATION_ID: "67890",
-      GITHUB_APP_INSTALLATION_ID: "67891",
-      GITHUB_APP_PRIVATE_KEY: "private-key",
-      GITHUB_APP_PRIVATE_KEY_FILE: "/host/github-app.pem",
-      OPENAI_API_KEY: "must-not-cross-boundary",
-      EMPTY: "",
-    })).toEqual({
-      GH_TOKEN: "gh-token",
-      GITHUB_TOKEN: "github-token",
-      GITHUB_APP_ID: "12345",
-      GITHUB_INSTALLATION_ID: "67890",
-      GITHUB_APP_INSTALLATION_ID: "67891",
-      GITHUB_APP_PRIVATE_KEY: "private-key",
-      GITHUB_APP_PRIVATE_KEY_FILE: "/host/github-app.pem",
-    });
-  });
+describe("workspace realization credential boundary", () => {
+  it("keeps GitHub App realization credentials out of the adapter runtime", () => {
+    const input = {
+      command: "codex",
+      env: {
+        GITHUB_APP_ID: "app-id",
+        GITHUB_INSTALLATION_ID: "installation-id",
+        GITHUB_APP_INSTALLATION_ID: "alternate-installation-id",
+        GITHUB_APP_PRIVATE_KEY: "private-key",
+        GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app-key",
+        GH_TOKEN: "scoped-gh-token",
+        GITHUB_TOKEN: "scoped-github-token",
+        PLAIN_FLAG: "enabled",
+      },
+    };
 
-  it("omits absent, blank, and non-string credentials", () => {
-    expect(selectWorkspaceRealizationEnv({
-      GH_TOKEN: "   ",
-      GITHUB_TOKEN: 123,
-    })).toBeUndefined();
-    expect(selectWorkspaceRealizationEnv(undefined)).toBeUndefined();
+    const result = partitionWorkspaceRealizationAdapterConfig(input);
+
+    expect(result.workspaceRealizationEnv).toEqual({
+      GITHUB_APP_ID: "app-id",
+      GITHUB_INSTALLATION_ID: "installation-id",
+      GITHUB_APP_INSTALLATION_ID: "alternate-installation-id",
+      GITHUB_APP_PRIVATE_KEY: "private-key",
+      GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app-key",
+    });
+    expect(result.runtimeAdapterConfig).toEqual({
+      command: "codex",
+      env: {
+        GH_TOKEN: "scoped-gh-token",
+        GITHUB_TOKEN: "scoped-github-token",
+        PLAIN_FLAG: "enabled",
+      },
+    });
+    expect(input.env.GITHUB_APP_PRIVATE_KEY).toBe("private-key");
   });
 });
 
@@ -1399,6 +1404,139 @@ describe("effective run execution workspace config freshness", () => {
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
+  it("realizes a fresh workspace when the nested owner metadata agentId belongs to another agent", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-rhea",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      currentAgentId: "agent-voss",
+      existingExecutionWorkspaceMetadata: {
+        workspaceRealization: {
+          rebuild: {
+            metadata: {
+              providerMetadata: {
+                agentId: "agent-rhea",
+                credentialAgentId: "agent-voss",
+              },
+            },
+          },
+        },
+      },
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-rhea",
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
+    });
+  });
+
+  it("rejects reuse when the nested owner metadata credentialAgentId belongs to another agent", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-rhea-credentials",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      currentAgentId: "agent-voss",
+      existingExecutionWorkspaceMetadata: {
+        workspaceRealization: {
+          rebuild: {
+            metadata: {
+              providerMetadata: {
+                agentId: "agent-voss",
+                credentialAgentId: "agent-rhea",
+              },
+            },
+          },
+        },
+      },
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-rhea-credentials",
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
+    });
+  });
+
+  it("rejects reuse when nested ownership metadata is absent but currentAgentId is known", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-legacy",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      currentAgentId: "agent-voss",
+      existingExecutionWorkspaceMetadata: {},
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-legacy",
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
+    });
+  });
+
+  it("permits reuse when nested ownership metadata matches currentAgentId for both owner and credential owner", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-voss",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      currentAgentId: "agent-voss",
+      existingExecutionWorkspaceMetadata: {
+        workspaceRealization: {
+          rebuild: {
+            metadata: {
+              providerMetadata: {
+                agentId: "agent-voss",
+                credentialAgentId: "agent-voss",
+              },
+            },
+          },
+        },
+      },
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-voss",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+    });
+  });
+
+  it("rejects reuse when nested ownership metadata is malformed (missing providerMetadata)", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-malformed",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      currentAgentId: "agent-voss",
+      existingExecutionWorkspaceMetadata: {
+        workspaceRealization: {
+          rebuild: {
+            metadata: {},
+          },
+        },
+      },
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-malformed",
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
+    });
+  });
+
+  it("rejects reuse when nested ownership metadata is malformed (missing agentId)", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-malformed-agent",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      currentAgentId: "agent-voss",
+      existingExecutionWorkspaceMetadata: {
+        workspaceRealization: {
+          rebuild: {
+            metadata: {
+              providerMetadata: {
+                credentialAgentId: "agent-voss",
+              },
+            },
+          },
+        },
+      },
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-malformed-agent",
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
+    });
+  });
+
   it.each([
     { name: "missing", status: null },
     { name: "archived", status: "archived" },
@@ -1831,6 +1969,47 @@ function sessionParamsWithConfigMetadata(
 }
 
 describe("effective run session config freshness", () => {
+  it("excludes workspace-only GitHub App credentials from session metadata", async () => {
+    const buildWithWorkspaceCredentials = (suffix: string, version: number) =>
+      buildSessionConfigMetadata({
+        effectiveAdapterConfig: {
+          command: "codex",
+          model: "gpt-5.4-mini",
+          env: {
+            GITHUB_APP_ID: `app-${suffix}`,
+            GITHUB_APP_PRIVATE_KEY: `private-key-${suffix}`,
+            PLAIN_FLAG: "plain-value",
+          },
+        },
+        environmentEnv: {
+          GITHUB_INSTALLATION_ID: `installation-${suffix}`,
+          ENVIRONMENT_FLAG: "enabled",
+        },
+        projectEnv: {
+          GITHUB_APP_PRIVATE_KEY_FILE: `/run/secrets/key-${suffix}`,
+          PROJECT_FLAG: "enabled",
+        },
+        secretManifest: [
+          {
+            configPath: "env.GITHUB_APP_PRIVATE_KEY",
+            envKey: "GITHUB_APP_PRIVATE_KEY",
+            secretId: "github-app-private-key",
+            bindingId: "github-app-private-key-binding",
+            secretKey: "github-app-private-key",
+            version,
+            provider: "local_encrypted",
+            outcome: "success",
+          },
+        ],
+      });
+
+    const first = await buildWithWorkspaceCredentials("first", 1);
+    const second = await buildWithWorkspaceCredentials("second", 2);
+
+    expect(second.fingerprint).toBe(first.fingerprint);
+    expect(second.categoryFingerprints).toEqual(first.categoryFingerprints);
+  });
+
   it("resets when effective adapter config changes after model/profile/env resolution", async () => {
     const base = await buildSessionConfigMetadata();
     const next = await buildSessionConfigMetadata({

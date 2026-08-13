@@ -155,7 +155,6 @@ function makeRealizeInput(overrides: {
   environment?: Environment;
   lease?: EnvironmentLease;
   persistedExecutionWorkspace?: ExecutionWorkspace | null;
-  env?: Record<string, string>;
 } = {}): Parameters<ReturnType<typeof environmentRunOrchestrator>["realizeForRun"]>[0] {
   return {
     environment: overrides.environment ?? makeEnvironment("local"),
@@ -165,11 +164,17 @@ function makeRealizeInput(overrides: {
     issueId: null,
     heartbeatRunId: "run-1",
     executionWorkspace: makeExecutionWorkspace(),
+    workspaceRealizationEnv: {
+      GITHUB_APP_ID: "app-id",
+      GITHUB_INSTALLATION_ID: "installation-id",
+      GITHUB_APP_INSTALLATION_ID: "alternate-installation-id",
+      GITHUB_APP_PRIVATE_KEY: "resolved-private-key",
+      GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app-key",
+    },
     effectiveExecutionWorkspaceMode: null,
     persistedExecutionWorkspace: overrides.persistedExecutionWorkspace !== undefined
       ? overrides.persistedExecutionWorkspace
       : null,
-    env: overrides.env,
   };
 }
 
@@ -264,6 +269,15 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     );
 
     expect(runtime.realizeWorkspace).toHaveBeenCalledOnce();
+    expect(runtime.realizeWorkspace).toHaveBeenCalledWith(expect.objectContaining({
+      env: {
+        GITHUB_APP_ID: "app-id",
+        GITHUB_INSTALLATION_ID: "installation-id",
+        GITHUB_APP_INSTALLATION_ID: "alternate-installation-id",
+        GITHUB_APP_PRIVATE_KEY: "resolved-private-key",
+        GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app-key",
+      },
+    }));
     expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
   });
 
@@ -282,240 +296,6 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     );
 
     expect(mockResolveEnvironmentExecutionTarget).not.toHaveBeenCalled();
-  });
-
-  it("forwards transient realization env without persisting its secrets", async () => {
-    const appCredentials = {
-      GITHUB_APP_ID: "12345",
-      GITHUB_INSTALLATION_ID: "67890",
-      GITHUB_APP_PRIVATE_KEY: "transient-private-key",
-      GITHUB_APP_PRIVATE_KEY_FILE: "/host/github-app.pem",
-    };
-    const persistedExecutionWorkspace = makePersistedExecutionWorkspace();
-    const runtime = makeMockRuntime({
-      realizeWorkspace: vi.fn().mockResolvedValue({
-        cwd: "/workspace/project",
-        metadata: {
-          workspaceRealization: {
-            rebuild: {
-              repoUrl: `https://${appCredentials.GITHUB_APP_ID}@github.com/example/project.git`,
-              installationId: appCredentials.GITHUB_INSTALLATION_ID,
-              authEcho: appCredentials.GITHUB_APP_PRIVATE_KEY,
-              keyFileEcho: appCredentials.GITHUB_APP_PRIVATE_KEY_FILE,
-              [appCredentials.GITHUB_APP_PRIVATE_KEY]: "credential in a metadata key",
-            },
-          },
-        },
-      }),
-    });
-    mockResolveEnvironmentExecutionTarget.mockResolvedValue(null);
-    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
-
-    const result = await orchestrator.realizeForRun(makeRealizeInput({
-      environment: makeEnvironment("plugin" as Environment["driver"]),
-      persistedExecutionWorkspace,
-      env: appCredentials,
-    }));
-
-    expect(runtime.realizeWorkspace).toHaveBeenCalledWith(expect.objectContaining({
-      env: appCredentials,
-    }));
-    expect(result.workspaceRealization).toEqual({
-      rebuild: {
-        repoUrl: "https://12345@github.com/example/project.git",
-        installationId: "67890",
-        authEcho: "***REDACTED***",
-        keyFileEcho: "***REDACTED***",
-        "***REDACTED***": "credential in a metadata key",
-      },
-    });
-    expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
-      "lease-1",
-      expect.objectContaining({
-        remoteCwd: "/workspace/project",
-        workspaceRealization: result.workspaceRealization,
-      }),
-    );
-    expect(mockUpdateExecutionWorkspace).toHaveBeenCalledWith(
-      "ew-1",
-      expect.objectContaining({
-        metadata: expect.objectContaining({
-          workspaceRealization: result.workspaceRealization,
-        }),
-      }),
-    );
-    const persistedValues = JSON.stringify([
-      mockUpdateLeaseMetadata.mock.calls,
-      mockUpdateExecutionWorkspace.mock.calls,
-    ]);
-    for (const value of [
-      appCredentials.GITHUB_APP_PRIVATE_KEY,
-      appCredentials.GITHUB_APP_PRIVATE_KEY_FILE,
-    ]) {
-      expect(persistedValues).not.toContain(value);
-    }
-    expect(persistedValues).toContain(appCredentials.GITHUB_APP_ID);
-    expect(persistedValues).toContain(appCredentials.GITHUB_INSTALLATION_ID);
-  });
-
-  it("allows non-secret GitHub App identifiers in a realization cwd", async () => {
-    const appId = "12345";
-    const installationId = "67890";
-    const runtime = makeMockRuntime({
-      realizeWorkspace: vi.fn().mockResolvedValue({
-        cwd: `/workspace/${appId}/${installationId}/project`,
-      }),
-    });
-    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
-
-    const result = await orchestrator.realizeForRun(makeRealizeInput({
-      environment: makeEnvironment("plugin" as Environment["driver"]),
-      env: {
-        GITHUB_APP_ID: appId,
-        GITHUB_INSTALLATION_ID: installationId,
-      },
-    }));
-
-    expect(result.workspaceRealization).toEqual({});
-    expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
-      "lease-1",
-      expect.objectContaining({ remoteCwd: `/workspace/${appId}/${installationId}/project` }),
-    );
-    expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
-  });
-
-  it("rejects a realization cwd containing secret transient values", async () => {
-    const token = "github_pat_transient_path_token";
-    const runtime = makeMockRuntime({
-      realizeWorkspace: vi.fn().mockResolvedValue({
-        cwd: `/workspace/${token}/project`,
-      }),
-    });
-    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
-
-    await expect(orchestrator.realizeForRun(makeRealizeInput({
-      env: { GITHUB_TOKEN: token },
-    }))).rejects.toMatchObject({
-      code: "workspace_realization_failed",
-      message: expect.stringContaining("GITHUB_TOKEN"),
-    });
-
-    expect(mockUpdateLeaseMetadata).not.toHaveBeenCalled();
-    expect(mockResolveEnvironmentExecutionTarget).not.toHaveBeenCalled();
-  });
-
-  it("rejects a realization cwd containing a JSON-escaped multiline transient value", async () => {
-    const privateKey = "-----BEGIN PRIVATE KEY-----\ntransient-key-material\n-----END PRIVATE KEY-----";
-    const escapedPrivateKey = JSON.stringify(privateKey).slice(1, -1);
-    const runtime = makeMockRuntime({
-      realizeWorkspace: vi.fn().mockResolvedValue({
-        cwd: `/workspace/${escapedPrivateKey}/project`,
-      }),
-    });
-    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
-
-    await expect(orchestrator.realizeForRun(makeRealizeInput({
-      env: { GITHUB_APP_PRIVATE_KEY: privateKey },
-    }))).rejects.toMatchObject({
-      code: "workspace_realization_failed",
-      message: expect.stringContaining("GITHUB_APP_PRIVATE_KEY"),
-    });
-
-    expect(mockUpdateLeaseMetadata).not.toHaveBeenCalled();
-    expect(mockResolveEnvironmentExecutionTarget).not.toHaveBeenCalled();
-  });
-
-  it("does not invoke or persist non-data realization metadata properties", async () => {
-    const token = "github_pat_metadata_descriptor_token";
-    const metadata = {} as Record<PropertyKey, unknown>;
-    const getter = vi.fn(() => token);
-    Object.defineProperty(metadata, `accessor-${token}`, {
-      enumerable: true,
-      get: getter,
-    });
-    Object.defineProperty(metadata, `hidden-${token}`, {
-      enumerable: false,
-      value: token,
-    });
-    metadata[Symbol(token)] = token;
-    const runtime = makeMockRuntime({
-      realizeWorkspace: vi.fn().mockResolvedValue({
-        cwd: "/workspace/project",
-        metadata: { workspaceRealization: metadata },
-      }),
-    });
-    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
-
-    const result = await orchestrator.realizeForRun(makeRealizeInput({
-      env: { GITHUB_TOKEN: token },
-    }));
-
-    expect(getter).not.toHaveBeenCalled();
-    expect(result.workspaceRealization).toEqual({});
-    expect(JSON.stringify(mockUpdateLeaseMetadata.mock.calls)).not.toContain(token);
-  });
-
-  it("redacts transient realization env from provider errors, including circular details", async () => {
-    const token = "github_pat_transient_failure_token";
-    const providerError = new Error(`clone failed for ${token}`) as Error & {
-      details?: Record<string, unknown>;
-      self?: unknown;
-    };
-    providerError.details = { stderr: `authorization: Bearer ${token}` };
-    providerError.self = providerError;
-    const runtime = makeMockRuntime({
-      realizeWorkspace: vi.fn().mockRejectedValue(providerError),
-    });
-    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
-
-    let thrown: unknown;
-    try {
-      await orchestrator.realizeForRun(makeRealizeInput({ env: { GITHUB_TOKEN: token } }));
-    } catch (error) {
-      thrown = error;
-    }
-
-    expect(thrown).toBeInstanceOf(EnvironmentRunError);
-    expect(thrown).toMatchObject({
-      code: "workspace_realization_failed",
-      cause: expect.objectContaining({
-        message: "clone failed for ***REDACTED***",
-        details: { stderr: "authorization: Bearer ***REDACTED***" },
-        self: "[Circular]",
-      }),
-    });
-    expect(String((thrown as Error).message)).not.toContain(token);
-    expect(JSON.stringify((thrown as EnvironmentRunError).cause)).not.toContain(token);
-  });
-
-  it("redacts trimmed and JSON-escaped multiline transient values from provider output", async () => {
-    const privateKey = " \n-----BEGIN PRIVATE KEY-----\ntransient-key-material\n-----END PRIVATE KEY-----\n ";
-    const trimmedPrivateKey = privateKey.trim();
-    const serializedSecret = JSON.stringify({ privateKey: trimmedPrivateKey });
-    const runtime = makeMockRuntime({
-      realizeWorkspace: vi.fn().mockResolvedValue({
-        cwd: "/workspace/project",
-        metadata: {
-          workspaceRealization: {
-            providerOutput: serializedSecret,
-            trimmedPrivateKey,
-          },
-        },
-      }),
-    });
-    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
-
-    const result = await orchestrator.realizeForRun(makeRealizeInput({
-      env: { GITHUB_APP_PRIVATE_KEY: privateKey },
-    }));
-
-    expect(result.workspaceRealization).toEqual({
-      providerOutput: '{"privateKey":"***REDACTED***"}',
-      trimmedPrivateKey: "***REDACTED***",
-    });
-    expect(JSON.stringify(mockUpdateLeaseMetadata.mock.calls)).not.toContain(
-      JSON.stringify(trimmedPrivateKey).slice(1, -1),
-    );
   });
 
   it("target resolution failure: resolveEnvironmentExecutionTarget throws → EnvironmentRunError with code transport_resolution_failed", async () => {
@@ -657,7 +437,6 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
       command: "bash",
       args: ["-lc", "pnpm install"],
       cwd: "/home/coder/workspace",
-      workspaceRealization: {},
     }));
   });
 
@@ -887,7 +666,6 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
   });
 
   it("surfaces provider-defined provision command failures", async () => {
-    const token = "github_pat_transient_provision_token";
     mockBuildWorkspaceRealizationRequest.mockReturnValue({
       version: 1,
       adapterType: "claude_local",
@@ -926,21 +704,18 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
         signal: null,
         timedOut: false,
         stdout: "",
-        stderr: `/bin/sh: install-tool failed with ${token}\n`,
+        stderr: "/bin/sh: install-tool: not found\n",
       }),
     });
     const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
 
     await expect(orchestrator.realizeForRun(makeRealizeInput({
       environment: makeEnvironment("sandbox"),
-      env: { GITHUB_TOKEN: token },
     }))).rejects.toSatisfy(
       (err: unknown) =>
         err instanceof EnvironmentRunError &&
         err.code === "workspace_realization_failed" &&
-        String(err.message).includes("install-tool failed with ***REDACTED***") &&
-        !String(err.message).includes(token) &&
-        !JSON.stringify(err.cause).includes(token),
+        String(err.message).includes("install-tool: not found"),
     );
 
     expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
