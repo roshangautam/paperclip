@@ -270,15 +270,31 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
 
     expect(runtime.realizeWorkspace).toHaveBeenCalledOnce();
     expect(runtime.realizeWorkspace).toHaveBeenCalledWith(expect.objectContaining({
-      env: {
-        GITHUB_APP_ID: "app-id",
-        GITHUB_INSTALLATION_ID: "installation-id",
-        GITHUB_APP_INSTALLATION_ID: "alternate-installation-id",
-        GITHUB_APP_PRIVATE_KEY: "resolved-private-key",
-        GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app-key",
-      },
+      env: {},
     }));
     expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
+  });
+
+  it("forwards realization credentials only to sandbox/plugin drivers, not local/ssh", async () => {
+    const forwardedEnv = {
+      GITHUB_APP_ID: "app-id",
+      GITHUB_INSTALLATION_ID: "installation-id",
+      GITHUB_APP_INSTALLATION_ID: "alternate-installation-id",
+      GITHUB_APP_PRIVATE_KEY: "resolved-private-key",
+      GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app-key",
+    };
+    for (const driver of ["local", "ssh"] as const) {
+      const runtime = makeMockRuntime();
+      const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+      await orchestrator.realizeForRun(makeRealizeInput({ environment: makeEnvironment(driver) }));
+      expect(runtime.realizeWorkspace).toHaveBeenCalledWith(expect.objectContaining({ env: {} }));
+    }
+    for (const driver of ["sandbox", "plugin"] as const) {
+      const runtime = makeMockRuntime();
+      const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+      await orchestrator.realizeForRun(makeRealizeInput({ environment: makeEnvironment(driver) }));
+      expect(runtime.realizeWorkspace).toHaveBeenCalledWith(expect.objectContaining({ env: forwardedEnv }));
+    }
   });
 
   it("realization failure: runtime.realizeWorkspace throws → EnvironmentRunError with code workspace_realization_failed", async () => {
@@ -306,7 +322,9 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     });
     const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
 
-    await expect(orchestrator.realizeForRun(makeRealizeInput())).rejects.toSatisfy(
+    await expect(
+      orchestrator.realizeForRun(makeRealizeInput({ environment: makeEnvironment("sandbox") })),
+    ).rejects.toSatisfy(
       (err: unknown) => {
         if (!(err instanceof EnvironmentRunError) || err.code !== "workspace_realization_failed") {
           return false;

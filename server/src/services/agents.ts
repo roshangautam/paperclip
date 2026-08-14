@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -15,6 +15,8 @@ import {
   issueExecutionDecisions,
   issues,
   issueComments,
+  environmentLeases,
+  toolInvocations,
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -741,6 +743,44 @@ export function agentService(db: Db) {
       }
 
       return db.transaction(async (tx) => {
+        // Deleting an agent hard-deletes its heartbeat runs, which sets
+        // environment_leases.heartbeat_run_id and tool_invocations.run_id to
+        // NULL (ON DELETE SET NULL). A still-active lease or an un-reconciled
+        // lease-release outbox marker (leaseReleasePendingAt) would then lose
+        // its run identity permanently: the reconciler inner-joins heartbeatRuns
+        // and releaseRunLeases selects by heartbeatRunId, so neither can recover
+        // it, leaking the lease (and any external provider resource). Block the
+        // deletion until those runs' leases are released and markers cleared.
+        const blockingRuns = await tx
+          .select({ runId: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .leftJoin(
+            environmentLeases,
+            and(
+              eq(environmentLeases.heartbeatRunId, heartbeatRuns.id),
+              eq(environmentLeases.status, "active"),
+            ),
+          )
+          .leftJoin(
+            toolInvocations,
+            and(
+              eq(toolInvocations.runId, heartbeatRuns.id),
+              isNotNull(toolInvocations.leaseReleasePendingAt),
+            ),
+          )
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, id),
+              or(isNotNull(environmentLeases.id), isNotNull(toolInvocations.id)),
+            ),
+          )
+          .limit(1);
+        if (blockingRuns.length > 0) {
+          throw conflict(
+            "Agent has runs with active environment leases pending release; cancel the agent and retry after leases are released",
+            { code: "agent_delete_blocked_by_pending_lease_release" },
+          );
+        }
         await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
         await tx
           .update(issues)

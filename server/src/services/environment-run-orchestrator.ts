@@ -441,11 +441,21 @@ export function environmentRunOrchestrator(
       environment.driver === "sandbox" ||
       environment.driver === "plugin"
     ) {
+      // Only sandbox/plugin realization drivers consume the forwarded GitHub
+      // credentials (they perform the private-repo clone during realization).
+      // Local/SSH realization never uses input.env — clone auth is ambient/host
+      // git config resolved at lease acquisition — so forwarding the token would
+      // stamp credentialAgentId ownership markers on an otherwise reusable
+      // local/SSH workspace, wrongly pinning it to one agent.
+      const forwardedRealizationEnv =
+        environment.driver === "sandbox" || environment.driver === "plugin"
+          ? input.workspaceRealizationEnv
+          : {};
       try {
         const workspaceRealizationResult = await environmentRuntime.realizeWorkspace({
           environment,
           lease,
-          env: input.workspaceRealizationEnv,
+          env: forwardedRealizationEnv,
           workspace: {
             localPath: executionWorkspace.cwd,
             remotePath: leaseRemoteCwd ?? pluginRemoteCwd ?? undefined,
@@ -457,18 +467,18 @@ export function environmentRunOrchestrator(
         });
         realizedWorkspaceCwd =
           typeof workspaceRealizationResult.cwd === "string" && workspaceRealizationResult.cwd.trim().length > 0
-            ? redactForwardedRealizationSecretValuesOnly(workspaceRealizationResult.cwd.trim(), input.workspaceRealizationEnv)
+            ? redactForwardedRealizationSecretValuesOnly(workspaceRealizationResult.cwd.trim(), forwardedRealizationEnv)
             : null;
         workspaceRealization = parseObject(workspaceRealizationResult.metadata?.workspaceRealization);
       } catch (err) {
         const rawMessage = err instanceof Error ? err.message : String(err);
         throw new EnvironmentRunError(
           "workspace_realization_failed",
-          `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${redactForwardedRealizationSecrets(rawMessage, input.workspaceRealizationEnv)}`,
+          `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${redactForwardedRealizationSecrets(rawMessage, forwardedRealizationEnv)}`,
           {
             environmentId: environment.id,
             driver: environment.driver,
-            cause: buildSanitizedRealizationCause(err, input.workspaceRealizationEnv),
+            cause: buildSanitizedRealizationCause(err, forwardedRealizationEnv),
           },
         );
       }
