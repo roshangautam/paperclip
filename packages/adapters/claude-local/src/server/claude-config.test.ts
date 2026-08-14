@@ -2,7 +2,12 @@ import * as fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { prepareClaudeConfigSeed } from "./claude-config.js";
+import {
+  buildPaperclipClaudeMcpConfig,
+  prepareClaudeConfigSeed,
+  resolveUniquePaperclipClaudeMcpServerNames,
+} from "./claude-config.js";
+import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
 
 describe("prepareClaudeConfigSeed", () => {
   const cleanupDirs: string[] = [];
@@ -107,5 +112,36 @@ describe("prepareClaudeConfigSeed", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.readFile(path.join(seedDir, "CLAUDE.md"), "utf8"))
       .resolves.toBe("local instructions");
+  });
+});
+
+describe("resolveUniquePaperclipClaudeMcpServerNames", () => {
+  const servers = [
+    { name: "Plugin: Agent Identities", url: "https://a.invalid/mcp", token: "t1", connectionId: "1111aaaa2222" },
+    { name: "Plugin: Agent Identities", url: "https://b.invalid/mcp", token: "t2", connectionId: "3333bbbb4444" },
+    { name: "Plugin: Agent Identities", url: "https://c.invalid/mcp", token: "t3", connectionId: "5555cccc6666" },
+  ];
+
+  it("aligns MCP config keys with remote --allowedTools grants for duplicate server names", () => {
+    const uniqueNames = resolveUniquePaperclipClaudeMcpServerNames(servers);
+    expect(new Set(uniqueNames).size).toBe(servers.length);
+
+    const config = JSON.parse(
+      buildPaperclipClaudeMcpConfig({ servers, bridge: { url: "https://bridge.invalid", token: "bridge-token" } }),
+    );
+    const configKeys = Object.keys(config.mcpServers);
+    expect(configKeys).toEqual(uniqueNames);
+
+    const [, allowedTools] = buildClaudeExecutionPermissionArgs({
+      dangerouslySkipPermissions: true,
+      targetIsRemote: true,
+      runtimeMcpServerNames: uniqueNames,
+    });
+    const grantedPatterns = new Set(allowedTools.split(" "));
+    for (const key of configKeys) {
+      const pattern = `mcp__${key.replace(/[^a-zA-Z0-9_-]/g, "_")}__*`;
+      expect(grantedPatterns.has(pattern)).toBe(true);
+    }
+    expect(allowedTools.match(/mcp__/g)).toHaveLength(servers.length);
   });
 });

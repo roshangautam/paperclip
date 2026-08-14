@@ -77,6 +77,7 @@ import {
   prepareClaudeConfigSeed,
   resolveManagedClaudeRuntimeStateDir,
   resolveSharedClaudeConfigDir,
+  resolveUniquePaperclipClaudeMcpServerNames,
   writePaperclipClaudeMcpConfig,
 } from "./claude-config.js";
 import { claudeCommandSupportsEffortFlag } from "./cli-capabilities.js";
@@ -693,19 +694,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (paperclipBridge) {
       Object.assign(env, paperclipBridge.env);
       if (runtimeMcpServers.length > 0) {
-        await materializeRemoteClaudeMcpConfig({
-          runId,
-          target: runtimeExecutionTarget,
-          configPath: effectiveMcpConfigPath,
-          contents: buildPaperclipClaudeMcpConfig({
-            servers: runtimeMcpServers,
-            bridge: {
-              url: paperclipBridge.env.PAPERCLIP_API_URL,
-              token: paperclipBridge.env.PAPERCLIP_API_KEY,
-            },
-          }),
-          options: { cwd, env, timeoutSec, graceSec, onLog },
-        });
+        try {
+          await materializeRemoteClaudeMcpConfig({
+            runId,
+            target: runtimeExecutionTarget,
+            configPath: effectiveMcpConfigPath,
+            contents: buildPaperclipClaudeMcpConfig({
+              servers: runtimeMcpServers,
+              bridge: {
+                url: paperclipBridge.env.PAPERCLIP_API_URL,
+                token: paperclipBridge.env.PAPERCLIP_API_KEY,
+              },
+            }),
+            options: { cwd, env, timeoutSec, graceSec, onLog },
+          });
+        } catch (error) {
+          await stopPaperclipBridgeThenRestoreWorkspace({
+            paperclipBridge,
+            restoreRemoteWorkspace,
+            beforeRestore: () => onLog(
+              "stdout",
+              `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+            ),
+          }).catch(() => undefined);
+          throw error;
+        }
       }
       const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
       loggedEnv = buildInvocationEnvForLogs(env, {
@@ -853,7 +866,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
       targetIsRemote: executionTargetIsRemote,
-      runtimeMcpServerNames: runtimeMcpServers.map(({ name }) => name),
+      runtimeMcpServerNames: resolveUniquePaperclipClaudeMcpServerNames(runtimeMcpServers),
     }));
     if (chrome) args.push("--chrome");
     // For Bedrock: only pass --model when the ID is a Bedrock-native identifier

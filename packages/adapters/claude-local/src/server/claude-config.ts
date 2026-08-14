@@ -158,13 +158,12 @@ export async function writePaperclipClaudeMcpConfig(input: {
   return configPath;
 }
 
-export function buildPaperclipClaudeMcpConfig(input: {
-  servers: AdapterRuntimeMcpServer[];
-  bridge?: { url: string; token: string };
-}): string {
+export function resolveUniquePaperclipClaudeMcpServerNames(
+  servers: AdapterRuntimeMcpServer[],
+): string[] {
   const usedNames = new Set<string>();
-  const mcpServers: Record<string, unknown> = {};
-  for (const server of input.servers) {
+  const names: string[] = [];
+  for (const server of servers) {
     let name = server.name;
     if (usedNames.has(name)) name = `${name}-${server.connectionId.slice(0, 8)}`;
     let suffix = 2;
@@ -173,6 +172,19 @@ export function buildPaperclipClaudeMcpConfig(input: {
       suffix += 1;
     }
     usedNames.add(name);
+    names.push(name);
+  }
+  return names;
+}
+
+export function buildPaperclipClaudeMcpConfig(input: {
+  servers: AdapterRuntimeMcpServer[];
+  bridge?: { url: string; token: string };
+}): string {
+  const uniqueNames = resolveUniquePaperclipClaudeMcpServerNames(input.servers);
+  const mcpServers: Record<string, unknown> = {};
+  input.servers.forEach((server, index) => {
+    const name = uniqueNames[index]!;
     const endpoint = input.bridge ? new URL(server.url) : null;
     mcpServers[name] = {
       type: "http",
@@ -186,7 +198,7 @@ export function buildPaperclipClaudeMcpConfig(input: {
           }
         : { Authorization: `Bearer ${server.token}` },
     };
-  }
+  });
   return JSON.stringify({ mcpServers });
 }
 
