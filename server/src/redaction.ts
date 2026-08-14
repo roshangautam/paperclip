@@ -174,9 +174,9 @@ export function redactPersistedCredentialValues(
       }
       return result;
     }
+    if (typeof current === "string" && JWT_VALUE_RE.test(current)) return REDACTED_EVENT_VALUE;
     if (key !== null && isIdentifierReferenceKey(key)) return current;
     if (inheritedSensitive) return REDACTED_EVENT_VALUE;
-    if (typeof current === "string" && JWT_VALUE_RE.test(current)) return REDACTED_EVENT_VALUE;
     return current;
   }
 

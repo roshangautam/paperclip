@@ -180,4 +180,19 @@ describe("redactPersistedCredentialValues", () => {
     expect(result.credentials.solid).toBe(REDACTED_EVENT_VALUE);
     expect(result.credentials.agentId).toBe("agent-9");
   });
+
+  it("redacts a JWT stored under an identifier-shaped key while preserving ordinary ids", () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abc-DEF_123";
+    const result = redactPersistedCredentialValues({
+      tokenId: jwt,
+      sessionId: jwt,
+      sandboxId: "sandbox-1",
+      remoteCwd: "/workspace",
+    }) as Record<string, unknown>;
+
+    expect(result.tokenId).toBe(REDACTED_EVENT_VALUE);
+    expect(result.sessionId).toBe(REDACTED_EVENT_VALUE);
+    expect(result.sandboxId).toBe("sandbox-1");
+    expect(result.remoteCwd).toBe("/workspace");
+  });
 });
