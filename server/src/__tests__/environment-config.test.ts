@@ -287,4 +287,37 @@ describe("environment config helpers", () => {
     expect(presented.accessToken).not.toBe("ghs_undeclared_plaintext_secret");
     expect(JSON.stringify(presented)).not.toContain("ghs_undeclared_plaintext_secret");
   });
+
+  it("residually redacts credential-shaped fields for fake/defaulted sandbox providers", async () => {
+    const presented = await presentEnvironmentConfigForRead(
+      {} as never,
+      {
+        driver: "sandbox",
+        config: {
+          provider: "fake",
+          region: "us-east-1",
+          accessToken: "ghs_fake_provider_plaintext_secret",
+        },
+      },
+    );
+
+    expect(presented.provider).toBe("fake");
+    expect(presented.region).toBe("us-east-1");
+    expect(presented.accessToken).not.toBe("ghs_fake_provider_plaintext_secret");
+    expect(JSON.stringify(presented)).not.toContain("ghs_fake_provider_plaintext_secret");
+  });
+
+  it("residually redacts credential-shaped fields for a blank sandbox provider defaulting to fake", async () => {
+    const presented = await presentEnvironmentConfigForRead(
+      {} as never,
+      {
+        driver: "sandbox",
+        config: {
+          accessToken: "ghs_blank_provider_plaintext_secret",
+        },
+      },
+    );
+
+    expect(JSON.stringify(presented)).not.toContain("ghs_blank_provider_plaintext_secret");
+  });
 });

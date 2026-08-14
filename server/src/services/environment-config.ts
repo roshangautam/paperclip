@@ -196,7 +196,15 @@ export async function presentEnvironmentConfigForRead(
   if (environment.driver !== "sandbox") return config;
 
   const provider = getSandboxProvider(config);
-  if (provider === "fake") return config;
+  if (provider === "fake") {
+    // The fake provider has no schema, and getSandboxProvider() defaults a
+    // missing/blank provider to "fake". A historical or malformed config could
+    // therefore carry credential-shaped fields (e.g. { accessToken }); scrub
+    // them residually rather than returning plaintext to admin reads.
+    return compactConfigArrays(
+      redactPersistedCredentialValues(structuredClone(config)) as Record<string, unknown>,
+    );
+  }
 
   let schema: Record<string, unknown> | null = null;
   try {
