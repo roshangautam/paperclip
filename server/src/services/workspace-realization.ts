@@ -6,7 +6,7 @@ import type {
   WorkspaceRealizationRequest,
 } from "@paperclipai/shared";
 import type { RealizedExecutionWorkspace } from "./workspace-runtime.js";
-import { redactPersistedCredentialValues } from "../redaction.js";
+import { redactPersistedCredentialValues, REDACTED_EVENT_VALUE } from "../redaction.js";
 
 function parseObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -16,6 +16,25 @@ function parseObject(value: unknown): Record<string, unknown> {
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+// Provider-returned path strings (result.cwd / remoteCwd / remotePath) are
+// deliberately preserved by redactPersistedCredentialValues (*Path/*Cwd keys),
+// so a provider that smuggles a forwarded token into a path would persist it in
+// realizedCwd / remote.path / summary. Strip the raw and trimmed forms of every
+// forwarded credential value from provider-controlled paths before use.
+function redactForwardedValuesFromPath(
+  value: string | null,
+  forwardedValues: readonly string[],
+): string | null {
+  if (value === null || forwardedValues.length === 0) return value;
+  let out = value;
+  for (const forwarded of forwardedValues) {
+    for (const variant of [forwarded, forwarded.trim()]) {
+      if (variant.length > 0) out = out.split(variant).join(REDACTED_EVENT_VALUE);
+    }
+  }
+  return out;
 }
 
 function readNumber(value: unknown): number | null {
@@ -115,19 +134,21 @@ export function buildWorkspaceRealizationRecord(input: {
   realizedCwd?: string | null;
   providerMetadata?: Record<string, unknown> | null;
   credentialOwnerAgentId?: string | null;
+  forwardedCredentialValues?: readonly string[];
 }): WorkspaceRealizationRecord {
   const leaseMetadata = input.lease.metadata ?? {};
   const providerMetadata = input.providerMetadata ?? {};
+  const forwardedCredentialValues = input.forwardedCredentialValues ?? [];
   const transport =
     input.environment.driver === "ssh" || input.environment.driver === "sandbox" || input.environment.driver === "plugin"
       ? input.environment.driver
       : "local";
   const providerRemotePath =
-    readString(providerMetadata.remoteCwd) ??
+    redactForwardedValuesFromPath(readString(providerMetadata.remoteCwd), forwardedCredentialValues) ??
     readString(leaseMetadata.remoteCwd) ??
-    readString(providerMetadata.remotePath) ??
+    redactForwardedValuesFromPath(readString(providerMetadata.remotePath), forwardedCredentialValues) ??
     null;
-  const realizedCwd = readString(input.realizedCwd);
+  const realizedCwd = redactForwardedValuesFromPath(readString(input.realizedCwd), forwardedCredentialValues);
   const remotePath = transport === "plugin" ? realizedCwd ?? providerRemotePath : providerRemotePath;
   const host = readString(leaseMetadata.host);
   const port = readNumber(leaseMetadata.port);
@@ -154,6 +175,12 @@ export function buildWorkspaceRealizationRecord(input: {
   // metadata (e.g. { accessToken }); the lease-metadata sanitizer does not cover
   // realization results, so redact secret-like values before persisting them.
   const sanitizedProviderMetadata = redactPersistedCredentialValues(providerMetadata) as Record<string, unknown>;
+  for (const pathKey of ["remoteCwd", "remotePath", "cwd"]) {
+    const current = sanitizedProviderMetadata[pathKey];
+    if (typeof current === "string") {
+      sanitizedProviderMetadata[pathKey] = redactForwardedValuesFromPath(current, forwardedCredentialValues);
+    }
+  }
   const persistedProviderMetadata = { ...sanitizedProviderMetadata, ...ownershipMarkers };
 
   const sync = (() => {
@@ -265,6 +292,7 @@ export function buildWorkspaceRealizationRecordFromDriverInput(input: {
   cwd?: string | null;
   providerMetadata?: Record<string, unknown> | null;
   credentialOwnerAgentId?: string | null;
+  forwardedCredentialValues?: readonly string[];
 }): WorkspaceRealizationRecord {
   const request =
     readWorkspaceRealizationRequest(input.workspace.metadata?.workspaceRealizationRequest) ??
@@ -301,5 +329,6 @@ export function buildWorkspaceRealizationRecordFromDriverInput(input: {
     realizedCwd: input.cwd ?? null,
     providerMetadata: input.providerMetadata,
     credentialOwnerAgentId: input.credentialOwnerAgentId ?? null,
+    forwardedCredentialValues: input.forwardedCredentialValues,
   });
 }

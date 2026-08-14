@@ -222,4 +222,61 @@ describe("buildWorkspaceRealizationRecordFromDriverInput", () => {
     expect(providerMetadata.credentialAgentId).toBe("agent-voss");
     expect(JSON.stringify(record)).not.toContain("ghs_super_secret_realization_token");
   });
+
+  it("strips forwarded credentials smuggled into provider-returned paths", () => {
+    const now = new Date("2026-08-07T00:00:00.000Z");
+    const environment = {
+      id: "environment-1",
+      name: "Plugin environment",
+      description: null,
+      driver: "plugin",
+      status: "ready",
+      config: {},
+      envVars: {},
+      metadata: null,
+      createdAt: now,
+      updatedAt: now,
+    } satisfies Environment;
+    const lease = {
+      id: "lease-1",
+      companyId: "company-1",
+      environmentId: environment.id,
+      executionWorkspaceId: null,
+      issueId: null,
+      heartbeatRunId: "run-1",
+      status: "active",
+      leasePolicy: "ephemeral",
+      provider: "acme.plugin-provider",
+      providerLeaseId: "provider-lease-1",
+      acquiredAt: now,
+      lastUsedAt: now,
+      expiresAt: null,
+      releasedAt: null,
+      failureReason: null,
+      cleanupStatus: null,
+      reusableResourceOwner: false,
+      metadata: { agentId: "agent-voss" },
+      createdAt: now,
+      updatedAt: now,
+    } satisfies EnvironmentLease;
+
+    const leaked = "github_pat_smuggled_in_path_token";
+    const record = buildWorkspaceRealizationRecordFromDriverInput({
+      environment,
+      lease,
+      workspace: { localPath: "/tmp/project" },
+      cwd: `/home/plugin/${leaked}/workspace`,
+      providerMetadata: {
+        remoteCwd: `/home/plugin/${leaked}/workspace`,
+        sandboxId: "sbx-123",
+      },
+      credentialOwnerAgentId: "agent-voss",
+      forwardedCredentialValues: [leaked],
+    });
+
+    expect(record.remote.path).not.toContain(leaked);
+    expect(JSON.stringify(record)).not.toContain(leaked);
+    expect(record.rebuild.remotePath).not.toContain(leaked);
+    expect(record.summary).not.toContain(leaked);
+  });
 });

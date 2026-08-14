@@ -210,6 +210,19 @@ function resolveRealizationCredentialOwnerAgentId(input: {
   return readString(input.lease.metadata?.agentId);
 }
 
+// Non-empty forwarded env values long enough to be a credential rather than a
+// short identifier. Passed to the realization record builder so any forwarded
+// token a provider smuggles back into a returned path is stripped before it
+// persists. The length gate avoids over-redacting short path segments.
+function resolveForwardedCredentialValues(input: { env?: Record<string, string> }): string[] {
+  const env = input.env ?? {};
+  const values: string[] = [];
+  for (const value of Object.values(env)) {
+    if (typeof value === "string" && value.trim().length >= 8) values.push(value);
+  }
+  return values;
+}
+
 function resolvePluginSandboxRpcTimeoutMs(config: Record<string, unknown>): number | undefined {
   const timeoutCandidates = [
     typeof config.timeoutMs === "number" ? config.timeoutMs : undefined,
@@ -3604,6 +3617,7 @@ function createSandboxEnvironmentDriver(
             cwd: result.cwd,
             providerMetadata: result.metadata,
             credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
+            forwardedCredentialValues: resolveForwardedCredentialValues(input),
           });
           return {
             cwd: result.cwd,
@@ -4349,6 +4363,7 @@ function createPluginEnvironmentDriver(
         cwd: result.cwd,
         providerMetadata: result.metadata,
         credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
+        forwardedCredentialValues: resolveForwardedCredentialValues(input),
       });
       return {
         ...result,

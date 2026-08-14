@@ -724,7 +724,7 @@ export function createPluginWorkerHandle(
   function handleWorkerNotification(notification: JsonRpcNotification): void {
     if (notification.method === "log") {
       const context = contextForWorkerMessage(notification);
-      if (context.invalidInvocationScope || context.suppressWorkerOutput) return;
+      if (suppressUnscopedWorkerOutput || context.invalidInvocationScope || context.suppressWorkerOutput) return;
       const params = notification.params as {
         level?: string;
         message?: string;
