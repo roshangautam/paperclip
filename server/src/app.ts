@@ -515,6 +515,7 @@ export async function createApp(
 
   jobCoordinator.start();
   scheduler.start();
+  const reconcileExpiredToolActions = () => toolGateway.reconcileExpiredExecuteOnApproveActions();
   let feedbackExportShuttingDown = false;
   let feedbackExportTimer: ReturnType<typeof setInterval> | null = null;
   const disableFeedbackExportFlushes = () => {
@@ -642,5 +643,5 @@ export async function createApp(
     void flushPluginLogBuffer();
   });
 
-  return app;
+  return Object.assign(app, { reconcileExpiredToolActions });
 }
