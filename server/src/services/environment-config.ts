@@ -307,7 +307,7 @@ async function persistConfigSecretRefs(input: {
     });
     nextConfig = writeConfigValueAtPath(nextConfig, path, created.secretId);
   }
-  return nextConfig;
+  return compactConfigArrays(nextConfig);
 }
 
 async function resolveConfigSecretRefsForRuntime(input: {

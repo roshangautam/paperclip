@@ -683,6 +683,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
   let remoteMcpConfigMaterialized = false;
+  try {
   if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
     paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
       runId,
@@ -696,38 +697,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (paperclipBridge) {
       Object.assign(env, paperclipBridge.env);
       if (runtimeMcpServers.length > 0) {
-        try {
-          await materializeRemoteClaudeMcpConfig({
-            runId,
-            target: runtimeExecutionTarget,
-            configPath: effectiveMcpConfigPath,
-            contents: buildPaperclipClaudeMcpConfig({
-              servers: runtimeMcpServers,
-              bridge: {
-                url: paperclipBridge.env.PAPERCLIP_API_URL,
-                token: paperclipBridge.env.PAPERCLIP_API_KEY,
-              },
-            }),
-            options: { cwd, env, timeoutSec, graceSec, onLog },
-          });
-          remoteMcpConfigMaterialized = true;
-        } catch (error) {
-          await removeRemoteClaudeMcpConfig({
-            runId,
-            target: runtimeExecutionTarget,
-            configPath: effectiveMcpConfigPath,
-            options: { cwd, env, timeoutSec, graceSec, onLog },
-          });
-          await stopPaperclipBridgeThenRestoreWorkspace({
-            paperclipBridge,
-            restoreRemoteWorkspace,
-            beforeRestore: () => onLog(
-              "stdout",
-              `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-            ),
-          }).catch(() => undefined);
-          throw error;
-        }
+        remoteMcpConfigMaterialized = true;
+        await materializeRemoteClaudeMcpConfig({
+          runId,
+          target: runtimeExecutionTarget,
+          configPath: effectiveMcpConfigPath,
+          contents: buildPaperclipClaudeMcpConfig({
+            servers: runtimeMcpServers,
+            bridge: {
+              url: paperclipBridge.env.PAPERCLIP_API_URL,
+              token: paperclipBridge.env.PAPERCLIP_API_KEY,
+            },
+          }),
+          options: { cwd, env, timeoutSec, graceSec, onLog },
+        });
       }
       const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
       loggedEnv = buildInvocationEnvForLogs(env, {
@@ -1236,10 +1219,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // this issue so the next continuation starts from a clean slate.
         poisonedPreviousMessageId ||
         Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
-    };
+     };
   };
 
-  try {
     const initial = await runAttempt(sessionId ?? null);
     const sessionErrorKind =
       sessionId &&

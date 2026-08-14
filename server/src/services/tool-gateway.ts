@@ -753,6 +753,35 @@ function isRunLeaseReleaseTerminal(status: string): status is RunLeaseReleaseSta
   return (RUN_LEASE_RELEASE_TERMINAL_STATUSES as readonly string[]).includes(status);
 }
 
+// finalizeMarkedLeaseRelease holds a pooled transaction (with a per-invocation
+// advisory lock) while awaiting the injected provider release, which re-enters
+// the SAME pool on the top-level db handle for its own checkouts. Without a gate,
+// pool-max concurrent finalizers each pin a connection and then wait forever for
+// an inner checkout that can never be satisfied — a total pool-exhaustion deadlock.
+// This FIFO gate (capacity 1, shared per physical pool via the db handle) is
+// acquired BEFORE db.transaction so a waiter never holds a connection, bounding
+// concurrent finalizer transactions to one per pool.
+const leaseReleaseFinalizeGates = new WeakMap<Db, Promise<void>>();
+
+function runExclusiveLeaseReleaseFinalize<T>(db: Db, task: () => Promise<T>): Promise<T> {
+  const priorSlotFree = leaseReleaseFinalizeGates.get(db) ?? Promise.resolve();
+  let releaseSlot!: () => void;
+  const thisSlotFree = new Promise<void>((resolve) => {
+    releaseSlot = resolve;
+  });
+  leaseReleaseFinalizeGates.set(db, thisSlotFree);
+  return priorSlotFree.then(task).then(
+    (value) => {
+      releaseSlot();
+      return value;
+    },
+    (error) => {
+      releaseSlot();
+      throw error;
+    },
+  );
+}
+
 export function createToolGatewayService(
   db: Db,
   options: {
@@ -833,7 +862,7 @@ export function createToolGatewayService(
   ): Promise<"released" | "skipped" | "retryable"> {
     const releaseRunEnvironmentLeases = options.releaseRunEnvironmentLeases;
     if (!releaseRunEnvironmentLeases) return "skipped";
-    return db.transaction(async (tx) => {
+    return runExclusiveLeaseReleaseFinalize(db, () => db.transaction(async (tx) => {
       await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${invocationId}))`);
       const [row] = await tx
         .select({ runId: toolInvocations.runId, pendingAt: toolInvocations.leaseReleasePendingAt })
@@ -872,7 +901,7 @@ export function createToolGatewayService(
         .set({ leaseReleasePendingAt: null, updatedAt: now })
         .where(eq(toolInvocations.id, invocationId));
       return "released";
-    });
+    }));
   }
 
   async function pruneExpiredProtocolRateLimitCounters(current: number) {

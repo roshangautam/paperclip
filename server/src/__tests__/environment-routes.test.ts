@@ -1315,6 +1315,74 @@ describe("environment routes", () => {
     );
   });
 
+  it("compacts sparse secret-ref arrays after deleting blank items during persistence", async () => {
+    const tokenSecretIds = [
+      "44444444-4444-4444-4444-444444444444",
+      "55555555-5555-5555-5555-555555555555",
+    ];
+    const environment = {
+      ...createEnvironment(),
+      id: "env-sandbox-sparse-plugin",
+      name: "Sparse Sandbox",
+      driver: "sandbox" as const,
+      config: {
+        provider: "secure-plugin",
+        template: "base",
+        tokens: tokenSecretIds,
+      },
+    };
+    mockEnvironmentService.create.mockResolvedValue(environment);
+    mockValidatePluginSandboxProviderConfig.mockResolvedValue({
+      normalizedConfig: {
+        template: "base",
+        tokens: ["token-1", "  ", "token-2"],
+      },
+      driver: {
+        driverKey: "secure-plugin",
+        kind: "sandbox_provider",
+        displayName: "Secure Sandbox",
+        configSchema: {
+          type: "object",
+          properties: {
+            template: { type: "string" },
+            tokens: {
+              type: "array",
+              items: { type: "string", format: "secret-ref" },
+            },
+          },
+        },
+      },
+    });
+    const pluginWorkerManager = {};
+    mockSecretService.create
+      .mockResolvedValueOnce({ id: tokenSecretIds[0] })
+      .mockResolvedValueOnce({ id: tokenSecretIds[1] });
+    const app = createApp({
+      type: "board",
+      userId: "user-1",
+      source: "local_implicit",
+    }, { pluginWorkerManager });
+
+    const res = await request(app)
+      .post("/api/companies/company-1/environments")
+      .send({
+        name: "Sparse Sandbox",
+        driver: "sandbox",
+        config: {
+          provider: "secure-plugin",
+          template: "base",
+          tokens: ["token-1", "  ", "token-2"],
+        },
+      });
+
+    expect(res.status).toBe(201);
+    const persistedConfig = mockEnvironmentService.create.mock.calls[0][0].config as {
+      tokens: unknown[];
+    };
+    expect(persistedConfig.tokens).toEqual([tokenSecretIds[0], tokenSecretIds[1]]);
+    expect(JSON.stringify(mockEnvironmentService.create.mock.calls[0][0])).not.toContain("null");
+  });
+
   it("uses the configured provider for schema-driven sandbox secret fields", async () => {
     process.env.PAPERCLIP_SECRETS_PROVIDER = "aws_secrets_manager";
     const environment = {

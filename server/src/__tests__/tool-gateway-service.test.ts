@@ -1056,6 +1056,61 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
   });
 
+  it("serializes concurrent lease-release finalizers so provider release never re-enters the pool in parallel", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const releaseRunEnvironmentLeases = vi.fn(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      inFlight -= 1;
+    });
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+
+    async function markTerminalDecline() {
+      const { company, agent, run } = await createRunFixture(db);
+      await db.insert(toolPolicies).values({
+        companyId: company.id,
+        name: "Review note writes",
+        policyType: "require_approval",
+        selectors: { toolName: "mcp-remote-fixture:update_note" },
+      });
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: "mcp-remote-fixture:update_note",
+        parameters: { noteId: "n1", body: "short" },
+      })).rejects.toMatchObject({ reasonCode: "approval_required" });
+      const [actionRequest] = await db.select().from(toolActionRequests)
+        .where(eq(toolActionRequests.companyId, company.id));
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, run.id));
+      return { company, actionRequest };
+    }
+
+    const first = await markTerminalDecline();
+    const second = await markTerminalDecline();
+
+    await Promise.all([
+      gateway.declineActionRequest({
+        companyId: first.company.id,
+        actionRequestId: first.actionRequest.id,
+        actor: { userId: "board-user" },
+      }),
+      gateway.declineActionRequest({
+        companyId: second.company.id,
+        actionRequestId: second.actionRequest.id,
+        actor: { userId: "board-user" },
+      }),
+    ]);
+
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+    expect(maxInFlight).toBe(1);
+    const cleared = await db.select().from(toolInvocations)
+      .where(inArray(toolInvocations.id, [first.actionRequest.invocationId, second.actionRequest.invocationId]));
+    expect(cleared.every((row) => row.leaseReleasePendingAt === null)).toBe(true);
+  });
+
   it("marks the lease-release on decline of a still-running run and defers release until the run is terminal", async () => {
     const releaseRunEnvironmentLeases = vi.fn(async () => undefined);
     const { company, agent, run } = await createRunFixture(db);
