@@ -134,7 +134,17 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
   return sanitizeRecord(payload);
 }
 
-const IDENTIFIER_REFERENCE_KEY_RE = /(?:id|name|ref|path|url|uri|host)$/i;
+// An identifier-reference key is a whole identifier word (`id`, `name`, ...), a
+// delimiter-suffixed form (`user_id`, `TOKEN_ID`), or a genuine camelCase suffix
+// (`agentId`, `sandboxId`). Plain words that merely end in those letters — e.g.
+// `valid`, `hybrid`, `solid` — are NOT identifiers, so a credential-shaped parent
+// no longer preserves a nested `{ valid: "secret" }` value.
+const IDENTIFIER_WORD_OR_DELIMITED_KEY_RE = /(?:^|[-_])(?:id|name|ref|path|url|uri|host)$/i;
+const IDENTIFIER_CAMEL_SUFFIX_KEY_RE = /[a-z](?:Id|Name|Ref|Path|Url|Uri|Host)$/;
+
+function isIdentifierReferenceKey(key: string): boolean {
+  return IDENTIFIER_WORD_OR_DELIMITED_KEY_RE.test(key) || IDENTIFIER_CAMEL_SUFFIX_KEY_RE.test(key);
+}
 
 export function redactPersistedCredentialValues(
   value: unknown,
@@ -154,7 +164,7 @@ export function redactPersistedCredentialValues(
       for (const [childKey, childValue] of Object.entries(current)) {
         const childPath = path ? `${path}.${encodeConfigPathSegment(childKey)}` : encodeConfigPathSegment(childKey);
         const sensitiveKey = SECRET_PAYLOAD_KEY_RE.test(childKey)
-          && !IDENTIFIER_REFERENCE_KEY_RE.test(childKey);
+          && !isIdentifierReferenceKey(childKey);
         result[childKey] = visit(
           childValue,
           childPath,
@@ -164,7 +174,7 @@ export function redactPersistedCredentialValues(
       }
       return result;
     }
-    if (key !== null && IDENTIFIER_REFERENCE_KEY_RE.test(key)) return current;
+    if (key !== null && isIdentifierReferenceKey(key)) return current;
     if (inheritedSensitive) return REDACTED_EVENT_VALUE;
     if (typeof current === "string" && JWT_VALUE_RE.test(current)) return REDACTED_EVENT_VALUE;
     return current;

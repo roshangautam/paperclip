@@ -76,6 +76,25 @@ rl.on("line", (line) => {
       });
       return;
     }
+    if (message.params?.config?.errorEchoNestedToken) {
+      let nestedToken = "";
+      try {
+        const envelope = JSON.parse(message.params?.env?.PAPERCLIP_CLAUDE_MCP_CONFIG ?? "{}");
+        nestedToken = envelope?.mcpServers?.gw?.headers?.Authorization ?? "";
+      } catch {
+        nestedToken = "";
+      }
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        error: {
+          code: -32000,
+          message: `provider rejected ${nestedToken}`,
+          data: { extracted: nestedToken },
+        },
+      });
+      return;
+    }
     send({
       jsonrpc: "2.0",
       id: message.id,

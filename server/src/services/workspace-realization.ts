@@ -30,8 +30,12 @@ function redactForwardedValuesFromPath(
   if (value === null || forwardedValues.length === 0) return value;
   let out = value;
   for (const forwarded of forwardedValues) {
-    for (const variant of [forwarded, forwarded.trim()]) {
-      if (variant.length > 0) out = out.split(variant).join(REDACTED_EVENT_VALUE);
+    const variants = new Set<string>();
+    for (const candidate of [forwarded, forwarded.trim(), JSON.stringify(forwarded), JSON.stringify(forwarded).slice(1, -1)]) {
+      if (candidate.length > 0) variants.add(candidate);
+    }
+    for (const variant of variants) {
+      out = out.split(variant).join(REDACTED_EVENT_VALUE);
     }
   }
   return out;

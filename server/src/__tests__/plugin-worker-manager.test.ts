@@ -203,6 +203,46 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("redacts a bearer token extracted from the PAPERCLIP_CLAUDE_MCP_CONFIG envelope in a worker error", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      const bearer = "sk-transient-gateway-bearer-token-abc123";
+      const envelope = JSON.stringify({
+        mcpServers: { gw: { headers: { Authorization: bearer } } },
+      });
+      await expect(
+        handle.call("environmentRealizeWorkspace", {
+          driverKey: "coder",
+          companyId: "company-1",
+          environmentId: "environment-1",
+          config: { errorEchoNestedToken: true },
+          lease: { providerLeaseId: "lease-1" },
+          env: { PAPERCLIP_CLAUDE_MCP_CONFIG: envelope },
+          workspace: {},
+        }),
+      ).rejects.toSatisfy((err) => {
+        if (!(err instanceof JsonRpcCallError)) return false;
+        const serialized = `${err.message}${JSON.stringify(err.data ?? null)}`;
+        return !serialized.includes(bearer);
+      });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("redacts forwarded credentials echoed in a worker JSON-RPC error response", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: DELAYED_WORKER_ENTRYPOINT,

@@ -539,11 +539,37 @@ export function createPluginWorkerHandle(
     return false;
   }
 
+  function collectJsonStringLeaves(raw: string, out: string[]): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const visit = (node: unknown): void => {
+      if (typeof node === "string") {
+        if (node.length > 0) out.push(node);
+      } else if (Array.isArray(node)) {
+        for (const entry of node) visit(entry);
+      } else if (node && typeof node === "object") {
+        for (const entry of Object.values(node as Record<string, unknown>)) visit(entry);
+      }
+    };
+    visit(parsed);
+  }
+
   function collectForwardedEnvValues(params: unknown): string[] {
     if (!isRecord(params) || !isRecord(params.env)) return [];
     const values: string[] = [];
-    for (const value of Object.values(params.env)) {
-      if (typeof value === "string" && value.length > 0) values.push(value);
+    for (const [key, value] of Object.entries(params.env)) {
+      if (typeof value !== "string" || value.length === 0) continue;
+      values.push(value);
+      // A provider can parse a known JSON envelope (e.g. PAPERCLIP_CLAUDE_MCP_CONFIG)
+      // and echo only an extracted nested token, which no longer matches the whole
+      // envelope string. Collect its nested string leaves so they are redacted too.
+      if (SENSITIVE_ENV_KEY_ALLOWLIST.has(key)) {
+        collectJsonStringLeaves(value, values);
+      }
     }
     return values;
   }

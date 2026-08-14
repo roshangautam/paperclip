@@ -164,4 +164,20 @@ describe("redactPersistedCredentialValues", () => {
 
     expect(result).toEqual({ agentCredentials: [{ agentId: "agent-2", apiToken: undefined }] });
   });
+
+  it("does not treat words merely ending in identifier letters as identifiers", () => {
+    const result = redactPersistedCredentialValues({
+      credentials: {
+        valid: "plaintext-secret-1",
+        hybrid: "plaintext-secret-2",
+        solid: "plaintext-secret-3",
+        agentId: "agent-9",
+      },
+    }) as { credentials: Record<string, unknown> };
+
+    expect(result.credentials.valid).toBe(REDACTED_EVENT_VALUE);
+    expect(result.credentials.hybrid).toBe(REDACTED_EVENT_VALUE);
+    expect(result.credentials.solid).toBe(REDACTED_EVENT_VALUE);
+    expect(result.credentials.agentId).toBe("agent-9");
+  });
 });
