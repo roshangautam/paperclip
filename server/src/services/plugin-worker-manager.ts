@@ -699,7 +699,14 @@ export function createPluginWorkerHandle(
       });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      log.error({ method, err: errorMessage }, "host handler error");
+      // A credential-bearing invocation can surface a forwarded secret inside a
+      // host-handler error (e.g. a mismatched company id in a scope error), so
+      // suppress the verbatim error text whenever process-wide worker output
+      // suppression is active — the worker still receives the full error below.
+      log.error(
+        { method, err: suppressUnscopedWorkerOutput ? REDACTED_EVENT_VALUE : errorMessage },
+        "host handler error",
+      );
       try {
         sendMessage(
           createErrorResponse(

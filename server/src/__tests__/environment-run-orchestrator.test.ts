@@ -424,6 +424,25 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(result.workspaceRealization).toEqual({});
   });
 
+  it("redacts a forwarded credential smuggled into the provider cwd before persisting remoteCwd", async () => {
+    const environment = makeEnvironment("plugin" as Environment["driver"]);
+    mockUpdateLeaseMetadata.mockImplementation((_id, metadata) => makeLease({ metadata }));
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue(null);
+
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({
+        cwd: "/home/coder/resolved-private-key/workspace",
+      }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await orchestrator.realizeForRun(makeRealizeInput({ environment }));
+
+    const persisted = mockUpdateLeaseMetadata.mock.calls[0]?.[1] as { remoteCwd?: string };
+    expect(persisted.remoteCwd).toBeDefined();
+    expect(persisted.remoteCwd).not.toContain("resolved-private-key");
+  });
+
   it("uses the provider cwd when the optional realization hook is absent", async () => {
     const environment = makeEnvironment("plugin" as Environment["driver"]);
     mockBuildWorkspaceRealizationRequest.mockReturnValue({

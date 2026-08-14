@@ -422,7 +422,7 @@ export function environmentRunOrchestrator(
         });
         realizedWorkspaceCwd =
           typeof workspaceRealizationResult.cwd === "string" && workspaceRealizationResult.cwd.trim().length > 0
-            ? workspaceRealizationResult.cwd.trim()
+            ? redactForwardedRealizationSecrets(workspaceRealizationResult.cwd.trim(), input.workspaceRealizationEnv)
             : null;
         workspaceRealization = parseObject(workspaceRealizationResult.metadata?.workspaceRealization);
       } catch (err) {
