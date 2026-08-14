@@ -203,6 +203,43 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("redacts forwarded credentials echoed in a worker JSON-RPC error response", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      const leaked = "github_pat_transient_error_token";
+      await expect(
+        handle.call("environmentRealizeWorkspace", {
+          driverKey: "coder",
+          companyId: "company-1",
+          environmentId: "environment-1",
+          config: { errorEcho: true },
+          lease: { providerLeaseId: "lease-1" },
+          env: { GITHUB_TOKEN: leaked },
+          workspace: {},
+        }),
+      ).rejects.toSatisfy((err) => {
+        if (!(err instanceof JsonRpcCallError)) return false;
+        const serialized = `${err.message}${JSON.stringify(err.data ?? null)}`;
+        return !serialized.includes(leaked);
+      });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("rejects execution when the worker does not advertise environmentExecute", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,

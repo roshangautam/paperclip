@@ -40,6 +40,7 @@ import {
 } from "@paperclipai/plugin-sdk";
 import type {
   JsonRpcId,
+  JsonRpcError,
   PluginInvocationContext,
   PluginInvocationScope,
   JsonRpcResponse,
@@ -53,6 +54,7 @@ import type {
   InitializeParams,
 } from "@paperclipai/plugin-sdk";
 import { logger } from "../middleware/logger.js";
+import { redactSensitiveText, REDACTED_EVENT_VALUE } from "../redaction.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -535,6 +537,43 @@ export function createPluginWorkerHandle(
       if (SENSITIVE_ENV_KEY_RE.test(key) || SENSITIVE_ENV_KEY_ALLOWLIST.has(key)) return true;
     }
     return false;
+  }
+
+  function collectForwardedEnvValues(params: unknown): string[] {
+    if (!isRecord(params) || !isRecord(params.env)) return [];
+    const values: string[] = [];
+    for (const value of Object.values(params.env)) {
+      if (typeof value === "string" && value.length > 0) values.push(value);
+    }
+    return values;
+  }
+
+  // A worker's JSON-RPC error response for a secret-bearing invocation can echo
+  // forwarded credentials in error.message/error.data. Side-channel suppression
+  // only silences stdout/stderr, so redact the forwarded values (raw, trimmed,
+  // JSON forms) plus a pattern backstop before the error propagates to the host.
+  function redactWorkerError(error: JsonRpcError, forwardedValues: string[]): JsonRpcError {
+    const redactValue = (input: string): string => {
+      let out = input;
+      for (const rawValue of forwardedValues) {
+        const variants = new Set<string>();
+        for (const candidate of [rawValue, rawValue.trim(), JSON.stringify(rawValue), JSON.stringify(rawValue).slice(1, -1)]) {
+          if (candidate.length > 0) variants.add(candidate);
+        }
+        for (const variant of variants) out = out.split(variant).join(REDACTED_EVENT_VALUE);
+      }
+      return redactSensitiveText(out);
+    };
+    const message = redactValue(error.message);
+    let data = error.data;
+    if (data !== undefined) {
+      try {
+        data = JSON.parse(redactValue(JSON.stringify(data))) as unknown;
+      } catch {
+        data = undefined;
+      }
+    }
+    return { code: error.code, message, ...(data !== undefined ? { data } : {}) };
   }
 
   function deriveInvocationScope(
@@ -1198,6 +1237,7 @@ export function createPluginWorkerHandle(
       const timeout = timeoutMs ?? Math.min(rpcTimeoutMs, MAX_RPC_TIMEOUT_MS);
       const suppressWorkerOutput = containsSensitiveEnv(params);
       if (suppressWorkerOutput) suppressUnscopedWorkerOutput = true;
+      const forwardedEnvValues = suppressWorkerOutput ? collectForwardedEnvValues(params) : [];
       const invocationScope = deriveInvocationScope(method, params, invocationMetadata);
       const invocation = invocationScope
         ? registerInvocation(invocationScope, suppressWorkerOutput)
@@ -1235,7 +1275,14 @@ export function createPluginWorkerHandle(
           if (isJsonRpcSuccessResponse(response)) {
             settle(resolve, response.result as HostToWorkerMethods[M][1]);
           } else if ("error" in response && response.error) {
-            settle(reject, new JsonRpcCallError(response.error));
+            settle(
+              reject,
+              new JsonRpcCallError(
+                forwardedEnvValues.length > 0
+                  ? redactWorkerError(response.error, forwardedEnvValues)
+                  : response.error,
+              ),
+            );
           } else {
             settle(reject, new Error(`Unexpected response format for "${method}"`));
           }

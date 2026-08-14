@@ -64,6 +64,18 @@ rl.on("line", (line) => {
     if (message.params?.config?.crash) {
       process.exit(1);
     }
+    if (message.params?.config?.errorEcho) {
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        error: {
+          code: -32000,
+          message: `provider rejected token ${secret}`,
+          data: { forwarded: secret },
+        },
+      });
+      return;
+    }
     send({
       jsonrpc: "2.0",
       id: message.id,
