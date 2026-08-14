@@ -28,7 +28,7 @@ import type {
   PluginRecord,
 } from "@paperclipai/shared";
 import type { ToolRunContext, ToolResult } from "@paperclipai/plugin-sdk";
-import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import type { HostInvocationMetadata, PluginWorkerManager } from "./plugin-worker-manager.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import {
   createPluginToolRegistry,
@@ -144,6 +144,7 @@ export interface PluginToolDispatcher {
     namespacedName: string,
     parameters: unknown,
     runContext: ToolRunContext,
+    invocationMetadata?: HostInvocationMetadata,
   ): Promise<ToolExecutionResult>;
 
   /**
@@ -406,6 +407,7 @@ export function createPluginToolDispatcher(
       namespacedName: string,
       parameters: unknown,
       runContext: ToolRunContext,
+      invocationMetadata?: HostInvocationMetadata,
     ): Promise<ToolExecutionResult> {
       log.debug(
         {
@@ -420,6 +422,7 @@ export function createPluginToolDispatcher(
         namespacedName,
         parameters,
         runContext,
+        invocationMetadata,
       );
 
       log.debug(

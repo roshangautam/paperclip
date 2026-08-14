@@ -4060,9 +4060,19 @@ rl.on("line", (line) => {
       toolDisplayName: "Update identity",
       riskLevel: "write",
     });
-    const calls: Array<{ tool: string; parameters: unknown; runContext: unknown }> = [];
-    const dispatcher = createPluginDispatcher(pluginTool, async (tool, parameters, runContext) => {
-      calls.push({ tool, parameters, runContext });
+    const calls: Array<{
+      tool: string;
+      parameters: unknown;
+      runContext: unknown;
+      invocationMetadata: unknown;
+    }> = [];
+    const dispatcher = createPluginDispatcher(pluginTool, async (
+      tool,
+      parameters,
+      runContext,
+      invocationMetadata,
+    ) => {
+      calls.push({ tool, parameters, runContext, invocationMetadata });
       return {
         pluginId: pluginTool.plugin.id,
         toolName: pluginTool.catalogEntry.toolName,
@@ -4125,6 +4135,7 @@ rl.on("line", (line) => {
         runId: run.id,
         projectId: project.id,
       },
+      invocationMetadata: { allowTerminalRunWorkspaceExecution: true },
     }]);
   });
 

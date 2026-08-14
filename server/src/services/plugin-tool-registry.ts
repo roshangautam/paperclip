@@ -24,7 +24,7 @@ import type {
   PluginToolDeclaration,
 } from "@paperclipai/shared";
 import type { ToolRunContext, ToolResult, ExecuteToolParams } from "@paperclipai/plugin-sdk";
-import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import type { HostInvocationMetadata, PluginWorkerManager } from "./plugin-worker-manager.js";
 import { logger } from "../middleware/logger.js";
 
 // ---------------------------------------------------------------------------
@@ -205,6 +205,7 @@ export interface PluginToolRegistry {
     namespacedName: string,
     parameters: unknown,
     runContext: ToolRunContext,
+    invocationMetadata?: HostInvocationMetadata,
   ): Promise<ToolExecutionResult>;
 
   /**
@@ -396,6 +397,7 @@ export function createPluginToolRegistry(
       namespacedName: string,
       parameters: unknown,
       runContext: ToolRunContext,
+      invocationMetadata?: HostInvocationMetadata,
     ): Promise<ToolExecutionResult> {
       // 1. Resolve the namespaced name
       const parsed = parsePluginToolName(namespacedName);
@@ -445,7 +447,7 @@ export function createPluginToolRegistry(
         runContext,
       };
 
-      const result = await workerManager.call(dbId, "executeTool", rpcParams);
+      const result = await workerManager.call(dbId, "executeTool", rpcParams, undefined, invocationMetadata);
 
       log.debug(
         {
