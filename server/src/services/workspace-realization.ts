@@ -37,6 +37,29 @@ function redactForwardedValuesFromPath(
   return out;
 }
 
+// redactPersistedCredentialValues deliberately preserves identifier-shaped keys
+// (ending in id/name/ref/path/cwd/url), so a provider could smuggle a forwarded
+// credential into e.g. { sandboxId: <GITHUB_TOKEN> } and have it survive into
+// remote.sandboxId, summary, and persisted metadata. Deep-scrub every forwarded
+// value variant from the whole metadata object before any field is read.
+function deepRedactForwardedValues(value: unknown, forwardedValues: readonly string[]): unknown {
+  if (forwardedValues.length === 0) return value;
+  if (typeof value === "string") {
+    return redactForwardedValuesFromPath(value, forwardedValues);
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => deepRedactForwardedValues(entry, forwardedValues));
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = deepRedactForwardedValues(entry, forwardedValues);
+    }
+    return out;
+  }
+  return value;
+}
+
 function readNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -137,16 +160,19 @@ export function buildWorkspaceRealizationRecord(input: {
   forwardedCredentialValues?: readonly string[];
 }): WorkspaceRealizationRecord {
   const leaseMetadata = input.lease.metadata ?? {};
-  const providerMetadata = input.providerMetadata ?? {};
   const forwardedCredentialValues = input.forwardedCredentialValues ?? [];
+  const providerMetadata = deepRedactForwardedValues(
+    input.providerMetadata ?? {},
+    forwardedCredentialValues,
+  ) as Record<string, unknown>;
   const transport =
     input.environment.driver === "ssh" || input.environment.driver === "sandbox" || input.environment.driver === "plugin"
       ? input.environment.driver
       : "local";
   const providerRemotePath =
-    redactForwardedValuesFromPath(readString(providerMetadata.remoteCwd), forwardedCredentialValues) ??
+    readString(providerMetadata.remoteCwd) ??
     readString(leaseMetadata.remoteCwd) ??
-    redactForwardedValuesFromPath(readString(providerMetadata.remotePath), forwardedCredentialValues) ??
+    readString(providerMetadata.remotePath) ??
     null;
   const realizedCwd = redactForwardedValuesFromPath(readString(input.realizedCwd), forwardedCredentialValues);
   const remotePath = transport === "plugin" ? realizedCwd ?? providerRemotePath : providerRemotePath;
@@ -174,13 +200,8 @@ export function buildWorkspaceRealizationRecord(input: {
   // Provider realization results can echo forwarded credentials back in their
   // metadata (e.g. { accessToken }); the lease-metadata sanitizer does not cover
   // realization results, so redact secret-like values before persisting them.
+  // providerMetadata is already deep-scrubbed of forwarded credential values.
   const sanitizedProviderMetadata = redactPersistedCredentialValues(providerMetadata) as Record<string, unknown>;
-  for (const pathKey of ["remoteCwd", "remotePath", "cwd"]) {
-    const current = sanitizedProviderMetadata[pathKey];
-    if (typeof current === "string") {
-      sanitizedProviderMetadata[pathKey] = redactForwardedValuesFromPath(current, forwardedCredentialValues);
-    }
-  }
   const persistedProviderMetadata = { ...sanitizedProviderMetadata, ...ownershipMarkers };
 
   const sync = (() => {
