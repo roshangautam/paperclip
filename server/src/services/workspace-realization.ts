@@ -113,6 +113,7 @@ export function buildWorkspaceRealizationRecord(input: {
   request: WorkspaceRealizationRequest;
   realizedCwd?: string | null;
   providerMetadata?: Record<string, unknown> | null;
+  credentialOwnerAgentId?: string | null;
 }): WorkspaceRealizationRecord {
   const leaseMetadata = input.lease.metadata ?? {};
   const providerMetadata = input.providerMetadata ?? {};
@@ -133,6 +134,22 @@ export function buildWorkspaceRealizationRecord(input: {
   const sandboxId = readString(leaseMetadata.sandboxId) ?? readString(providerMetadata.sandboxId);
   const providerOwnsWorkspaceSync =
     parseObject(parseObject(providerMetadata.workspaceRealization).sync).strategy === "provider_defined";
+
+  // Host-authoritative ownership markers, stamped only when the host forwarded
+  // agent-scoped realization credentials. The credential owner is taken from the
+  // lease metadata (set at acquire time), never from provider-returned data, so
+  // a plugin cannot spoof ownership. A realization with no forwarded credentials
+  // carries no markers and stays freely reusable — it holds nothing to protect —
+  // while a credential-bearing one records both markers so heartbeat reuse
+  // enforces same-agent ownership.
+  const invokingAgentId = readString(leaseMetadata.agentId);
+  const credentialOwnerAgentId = readString(input.credentialOwnerAgentId);
+  const ownershipMarkers: Record<string, unknown> = {};
+  if (credentialOwnerAgentId) {
+    ownershipMarkers.agentId = invokingAgentId ?? credentialOwnerAgentId;
+    ownershipMarkers.credentialAgentId = credentialOwnerAgentId;
+  }
+  const persistedProviderMetadata = { ...providerMetadata, ...ownershipMarkers };
 
   const sync = (() => {
     if (transport === "local") {
@@ -224,7 +241,7 @@ export function buildWorkspaceRealizationRecord(input: {
         runtimeOverlay: input.request.runtimeOverlay,
         environmentDriver: input.environment.driver,
         provider,
-        providerMetadata,
+        providerMetadata: persistedProviderMetadata,
       },
     },
     summary,
@@ -242,6 +259,7 @@ export function buildWorkspaceRealizationRecordFromDriverInput(input: {
   };
   cwd?: string | null;
   providerMetadata?: Record<string, unknown> | null;
+  credentialOwnerAgentId?: string | null;
 }): WorkspaceRealizationRecord {
   const request =
     readWorkspaceRealizationRequest(input.workspace.metadata?.workspaceRealizationRequest) ??
@@ -277,5 +295,6 @@ export function buildWorkspaceRealizationRecordFromDriverInput(input: {
     request,
     realizedCwd: input.cwd ?? null,
     providerMetadata: input.providerMetadata,
+    credentialOwnerAgentId: input.credentialOwnerAgentId ?? null,
   });
 }

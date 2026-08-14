@@ -186,6 +186,30 @@ export interface EnvironmentDriverReleaseInput {
   cleanupClaimId?: string;
 }
 
+const REALIZATION_CREDENTIAL_ENV_KEYS = new Set([
+  "GITHUB_APP_ID",
+  "GITHUB_INSTALLATION_ID",
+  "GITHUB_APP_INSTALLATION_ID",
+  "GITHUB_APP_PRIVATE_KEY",
+  "GITHUB_APP_PRIVATE_KEY_FILE",
+]);
+
+// The agent that owns a realization's forwarded credentials, or null when no
+// agent-scoped realization credentials were supplied. Used to stamp the
+// heartbeat reuse ownership marker so a workspace realized with one agent's
+// credentials is not reused by another agent.
+function resolveRealizationCredentialOwnerAgentId(input: {
+  lease: Pick<EnvironmentLease, "metadata">;
+  env?: Record<string, string>;
+}): string | null {
+  const env = input.env ?? {};
+  const suppliesCredentials = Object.entries(env).some(
+    ([key, value]) => REALIZATION_CREDENTIAL_ENV_KEYS.has(key) && typeof value === "string" && value.length > 0,
+  );
+  if (!suppliesCredentials) return null;
+  return readString(input.lease.metadata?.agentId);
+}
+
 function resolvePluginSandboxRpcTimeoutMs(config: Record<string, unknown>): number | undefined {
   const timeoutCandidates = [
     typeof config.timeoutMs === "number" ? config.timeoutMs : undefined,
@@ -254,6 +278,13 @@ export interface EnvironmentRuntimeLeaseRecord {
 
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_TIMEOUT_MS = 5_000;
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS = 100;
+// Bounded lifetime for the in-memory sandbox runtime-config cache. Entries hold
+// resolved lease credentials, so they must not outlive the lease. Because a
+// lease can be released by a different runtime-service instance (whose eviction
+// path never runs here), a TTL and size cap guarantee released-lease secrets
+// cannot be retained for the lifetime of this process.
+const SANDBOX_RUNTIME_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000;
+const SANDBOX_RUNTIME_CONFIG_CACHE_MAX_ENTRIES = 256;
 const SANDBOX_CLEANUP_RETRY_DELAY_MS = 5 * 60 * 1000;
 const SANDBOX_CLEANUP_CLAIM_STALE_MS = 5 * 60 * 1000;
 const SANDBOX_CLEANUP_CLAIM_RENEW_MS = 60 * 1000;
@@ -741,6 +772,7 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         lease: input.lease,
         workspace: input.workspace,
         cwd: input.workspace.localPath ?? input.workspace.remotePath ?? null,
+        credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
       });
       return {
         cwd: input.workspace.localPath ?? input.workspace.remotePath ?? "/",
@@ -804,6 +836,7 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
           typeof input.lease.metadata?.remoteCwd === "string" && input.lease.metadata.remoteCwd.trim().length > 0
             ? input.lease.metadata.remoteCwd.trim()
             : input.workspace.remotePath ?? input.workspace.localPath ?? null,
+        credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
       });
       return {
         cwd: record.remote.path ?? record.local.path,
@@ -872,10 +905,22 @@ function createSandboxEnvironmentDriver(
   const runtimeConfigByLeaseId = new Map<string, {
     provider: string;
     promise: Promise<Record<string, unknown>>;
+    expiresAt: number;
   }>();
 
   function clearSandboxRuntimeConfig(leaseId: string) {
     runtimeConfigByLeaseId.delete(leaseId);
+  }
+
+  function pruneExpiredSandboxRuntimeConfig(now: number) {
+    for (const [leaseId, entry] of runtimeConfigByLeaseId) {
+      if (entry.expiresAt <= now) runtimeConfigByLeaseId.delete(leaseId);
+    }
+    while (runtimeConfigByLeaseId.size > SANDBOX_RUNTIME_CONFIG_CACHE_MAX_ENTRIES) {
+      const oldest = runtimeConfigByLeaseId.keys().next().value;
+      if (oldest === undefined) break;
+      runtimeConfigByLeaseId.delete(oldest);
+    }
   }
 
   function secretBindingTargetForLease(lease: EnvironmentLease) {
@@ -2052,8 +2097,10 @@ function createSandboxEnvironmentDriver(
     provider: string;
     acquisitionContext?: SandboxAcquisitionContext;
   }): Promise<Record<string, unknown>> {
+    const now = Date.now();
+    pruneExpiredSandboxRuntimeConfig(now);
     const cached = runtimeConfigByLeaseId.get(input.lease.id);
-    if (cached) {
+    if (cached && cached.expiresAt > now) {
       if (cached.provider !== input.provider) {
         throw new Error(
           `Sandbox lease "${input.lease.id}" cannot change providers from "${cached.provider}" to "${input.provider}".`,
@@ -2063,7 +2110,11 @@ function createSandboxEnvironmentDriver(
     }
 
     const promise = resolveSandboxRuntimeConfigUncached(input);
-    runtimeConfigByLeaseId.set(input.lease.id, { provider: input.provider, promise });
+    runtimeConfigByLeaseId.set(input.lease.id, {
+      provider: input.provider,
+      promise,
+      expiresAt: now + SANDBOX_RUNTIME_CONFIG_CACHE_TTL_MS,
+    });
     try {
       return await promise;
     } catch (error) {
@@ -3557,6 +3608,7 @@ function createSandboxEnvironmentDriver(
           typeof input.lease.metadata?.remoteCwd === "string" && input.lease.metadata.remoteCwd.trim().length > 0
             ? input.lease.metadata.remoteCwd.trim()
             : input.workspace.remotePath ?? input.workspace.localPath ?? null,
+        credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
       });
       return {
         cwd: record.remote.path ?? record.local.path,
@@ -4282,6 +4334,7 @@ function createPluginEnvironmentDriver(
         workspace: input.workspace,
         cwd: result.cwd,
         providerMetadata: result.metadata,
+        credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
       });
       return {
         ...result,
