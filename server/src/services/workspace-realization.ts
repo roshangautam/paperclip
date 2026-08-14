@@ -43,9 +43,10 @@ function redactForwardedValuesFromPath(
 
 // redactPersistedCredentialValues deliberately preserves identifier-shaped keys
 // (ending in id/name/ref/path/cwd/url), so a provider could smuggle a forwarded
-// credential into e.g. { sandboxId: <GITHUB_TOKEN> } and have it survive into
-// remote.sandboxId, summary, and persisted metadata. Deep-scrub every forwarded
-// value variant from the whole metadata object before any field is read.
+// credential into e.g. { sandboxId: <GITHUB_TOKEN> } — or as a property NAME,
+// { [GITHUB_TOKEN]: "x" } — and have it survive into remote.sandboxId, summary,
+// and persisted metadata. Deep-scrub every forwarded value variant from both the
+// keys and the values of the whole metadata object before any field is read.
 function deepRedactForwardedValues(value: unknown, forwardedValues: readonly string[]): unknown {
   if (forwardedValues.length === 0) return value;
   if (typeof value === "string") {
@@ -57,7 +58,8 @@ function deepRedactForwardedValues(value: unknown, forwardedValues: readonly str
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = deepRedactForwardedValues(entry, forwardedValues);
+      const scrubbedKey = redactForwardedValuesFromPath(key, forwardedValues) ?? key;
+      out[scrubbedKey] = deepRedactForwardedValues(entry, forwardedValues);
     }
     return out;
   }

@@ -897,6 +897,119 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
   });
 
+  it("persists a lease-release marker when approved-success release fails transiently and the reconciler retries it", async () => {
+    const releaseRunEnvironmentLeases = vi.fn()
+      .mockRejectedValueOnce(new Error("lease provider unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review note writes",
+      policyType: "require_approval",
+      selectors: { toolName: "mcp-remote-fixture:update_note" },
+    });
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters: { noteId: "n1", body: "reviewed body" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    const approved = await gateway.approveActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest.id,
+      actor: { userId: "board-user" },
+    });
+    expect(approved.status).toBe("executed");
+    const [marked] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, actionRequest.invocationId));
+    expect(marked.status).toBe("succeeded");
+    expect(marked.leaseReleasePendingAt).toBeInstanceOf(Date);
+
+    const retry = await gateway.reconcileExpiredExecuteOnApproveActions();
+    expect(retry).toMatchObject({ markedReleased: 1 });
+    const [released] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, actionRequest.invocationId));
+    expect(released.leaseReleasePendingAt).toBeNull();
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+  });
+
+  it("persists a lease-release marker when decline release fails transiently and the reconciler retries it", async () => {
+    const releaseRunEnvironmentLeases = vi.fn()
+      .mockRejectedValueOnce(new Error("lease provider unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review note writes",
+      policyType: "require_approval",
+      selectors: { toolName: "mcp-remote-fixture:update_note" },
+    });
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters: { noteId: "n1", body: "short" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    const declined = await gateway.declineActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest.id,
+      actor: { userId: "board-user" },
+    });
+    expect(declined.status).toBe("rejected");
+    const [marked] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, actionRequest.invocationId));
+    expect(marked.approvalState).toBe("rejected");
+    expect(marked.leaseReleasePendingAt).toBeInstanceOf(Date);
+
+    const retry = await gateway.reconcileExpiredExecuteOnApproveActions();
+    expect(retry).toMatchObject({ markedReleased: 1 });
+    const [released] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, actionRequest.invocationId));
+    expect(released.leaseReleasePendingAt).toBeNull();
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not mark a lease-release when the run is not yet terminal on decline", async () => {
+    const releaseRunEnvironmentLeases = vi.fn(async () => undefined);
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review note writes",
+      policyType: "require_approval",
+      selectors: { toolName: "mcp-remote-fixture:update_note" },
+    });
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters: { noteId: "n1", body: "short" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+    const [actionRequest] = await db.select().from(toolActionRequests);
+
+    await gateway.declineActionRequest({
+      companyId: company.id,
+      actionRequestId: actionRequest.id,
+      actor: { userId: "board-user" },
+    });
+    const [invocation] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, actionRequest.invocationId));
+    expect(invocation.leaseReleasePendingAt).toBeNull();
+    expect(releaseRunEnvironmentLeases).not.toHaveBeenCalled();
+    const retry = await gateway.reconcileExpiredExecuteOnApproveActions();
+    expect(retry).toMatchObject({ markedReleased: 0 });
+  });
+
   it("reconciles only expired signed execute-on-approve requests and releases terminal run leases once", async () => {
     const pendingFixture = await createRunFixture(db);
     const approvedFixture = await createRunFixture(db);

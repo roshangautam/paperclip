@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -739,6 +739,20 @@ const VIRTUAL_RUN_TOOL: ToolGatewayDescriptor = {
 
 const VIRTUAL_TOOLS = [VIRTUAL_SEARCH_TOOLS, VIRTUAL_RUN_TOOL];
 
+type RunLeaseReleaseStatus = "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
+
+const RUN_LEASE_RELEASE_TERMINAL_STATUSES: readonly RunLeaseReleaseStatus[] = [
+  "succeeded",
+  "interrupted",
+  "failed",
+  "cancelled",
+  "timed_out",
+];
+
+function isRunLeaseReleaseTerminal(status: string): status is RunLeaseReleaseStatus {
+  return (RUN_LEASE_RELEASE_TERMINAL_STATUSES as readonly string[]).includes(status);
+}
+
 export function createToolGatewayService(
   db: Db,
   options: {
@@ -781,17 +795,82 @@ export function createToolGatewayService(
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .limit(1);
-    if (!run || !["succeeded", "interrupted", "failed", "cancelled", "timed_out"].includes(run.status)) return false;
+    if (!run || !isRunLeaseReleaseTerminal(run.status)) return false;
     try {
       await options.releaseRunEnvironmentLeases({
         runId,
-        runStatus: run.status as "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
+        runStatus: run.status as RunLeaseReleaseStatus,
       });
       return true;
     } catch (error) {
       logger.warn({ err: error, runId }, "failed to release retained environment leases after tool action resolution");
       return false;
     }
+  }
+
+  async function runLeaseReleaseIsSchedulable(runId: string | null): Promise<boolean> {
+    if (!runId || !options.releaseRunEnvironmentLeases) return false;
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1);
+    return Boolean(run && isRunLeaseReleaseTerminal(run.status));
+  }
+
+  // Durable outbox for lease release on non-expiry action resolution. The four
+  // terminal-resolution paths (approved-success, approved-failure, invalid
+  // decline, explicit decline) commit lease_release_pending_at in the SAME write
+  // as the terminal invocation status, then attempt release after commit. If the
+  // provider call throws, the marker survives so this reconcile-safe finalizer
+  // retries it under a per-invocation advisory lock. Provider release must stay
+  // idempotent (a crash between a successful release and the marker clear can
+  // re-issue one release), matching the expiry-path contract.
+  async function finalizeMarkedLeaseRelease(
+    invocationId: string,
+  ): Promise<"released" | "skipped" | "retryable"> {
+    const releaseRunEnvironmentLeases = options.releaseRunEnvironmentLeases;
+    if (!releaseRunEnvironmentLeases) return "skipped";
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${invocationId}))`);
+      const [row] = await tx
+        .select({ runId: toolInvocations.runId, pendingAt: toolInvocations.leaseReleasePendingAt })
+        .from(toolInvocations)
+        .where(eq(toolInvocations.id, invocationId))
+        .limit(1);
+      if (!row || row.pendingAt === null) return "skipped";
+      const now = new Date();
+      if (!row.runId) {
+        await tx
+          .update(toolInvocations)
+          .set({ leaseReleasePendingAt: null, updatedAt: now })
+          .where(eq(toolInvocations.id, invocationId));
+        return "skipped";
+      }
+      const [run] = await tx
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, row.runId))
+        .limit(1);
+      if (!run || !isRunLeaseReleaseTerminal(run.status)) return "retryable";
+      try {
+        await releaseRunEnvironmentLeases({
+          runId: row.runId,
+          runStatus: run.status as RunLeaseReleaseStatus,
+        });
+      } catch (error) {
+        logger.warn(
+          { err: error, runId: row.runId, invocationId },
+          "failed to release retained environment leases for marked tool invocation",
+        );
+        return "retryable";
+      }
+      await tx
+        .update(toolInvocations)
+        .set({ leaseReleasePendingAt: null, updatedAt: now })
+        .where(eq(toolInvocations.id, invocationId));
+      return "released";
+    });
   }
 
   async function pruneExpiredProtocolRateLimitCounters(current: number) {
@@ -4418,12 +4497,14 @@ export function createToolGatewayService(
       : "tool_execution_failed";
     const message = input.error instanceof Error ? input.error.message : String(input.error);
     const now = new Date();
+    const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(input.runId);
     await db.update(toolInvocations).set({
       status: "failed",
       errorCode: reasonCode,
       errorMessage: message,
       completedAt: now,
       updatedAt: now,
+      leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
     }).where(eq(toolInvocations.id, input.invocationId));
     await db.update(toolActionRequests).set({
       status: "failed",
@@ -4436,7 +4517,7 @@ export function createToolGatewayService(
       errorCode: reasonCode,
       errorMessage: message,
     });
-    await releaseRunEnvironmentLeasesIfTerminal(input.runId);
+    if (scheduleLeaseRelease) await finalizeMarkedLeaseRelease(input.invocationId);
     return { reasonCode, message };
   }
 
@@ -4595,6 +4676,7 @@ export function createToolGatewayService(
         promptInjectionMode: "block",
       });
       const now = new Date();
+      const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(invocation.runId);
       await db.update(toolInvocations).set({
         status: "succeeded",
         resultHash: resultValidation.summary.sha256 ?? null,
@@ -4602,6 +4684,7 @@ export function createToolGatewayService(
         resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
         completedAt: now,
         updatedAt: now,
+        leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
       }).where(eq(toolInvocations.id, invocation.id));
       await db.update(toolActionRequests).set({ status: "executed", resolvedAt: now, updatedAt: now }).where(eq(toolActionRequests.id, claimed.id));
       await reflectToolActionInteractionLifecycle({
@@ -4623,7 +4706,7 @@ export function createToolGatewayService(
         metadata: { durationMs: Date.now() - startedAt, timeoutMs: executionTimeoutMs },
         tool,
       });
-      await releaseRunEnvironmentLeasesIfTerminal(invocation.runId);
+      if (scheduleLeaseRelease) await finalizeMarkedLeaseRelease(invocation.id);
       return resultValidation.value;
     } catch (error) {
       const { reasonCode } = await markApprovedActionFailed({
@@ -5596,11 +5679,21 @@ export function createToolGatewayService(
       }
       if (!signedPayload) {
         if (actionRequest.status === "pending") {
-          await db
-            .update(toolActionRequests)
-            .set({ status: "cancelled", resolvedAt: new Date(), updatedAt: new Date() })
-            .where(and(eq(toolActionRequests.id, actionRequest.id), eq(toolActionRequests.status, "pending")));
-          await releaseRunEnvironmentLeasesIfTerminal(invocation.runId);
+          const now = new Date();
+          const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(invocation.runId);
+          await db.transaction(async (tx) => {
+            await tx
+              .update(toolActionRequests)
+              .set({ status: "cancelled", resolvedAt: now, updatedAt: now })
+              .where(and(eq(toolActionRequests.id, actionRequest.id), eq(toolActionRequests.status, "pending")));
+            if (scheduleLeaseRelease) {
+              await tx
+                .update(toolInvocations)
+                .set({ leaseReleasePendingAt: now, updatedAt: now })
+                .where(eq(toolInvocations.id, invocation.id));
+            }
+          });
+          if (scheduleLeaseRelease) await finalizeMarkedLeaseRelease(invocation.id);
         }
         throw new ToolGatewayHttpError(
           409,
@@ -5738,11 +5831,16 @@ export function createToolGatewayService(
       if (!updated) {
         throw new ToolGatewayHttpError(409, "Tool action request has already been resolved", "action_already_resolved");
       }
+      const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(invocation.runId);
       await db
         .update(toolInvocations)
-        .set({ approvalState: "rejected", updatedAt: now })
+        .set({
+          approvalState: "rejected",
+          updatedAt: now,
+          leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
+        })
         .where(eq(toolInvocations.id, invocation.id));
-      await releaseRunEnvironmentLeasesIfTerminal(invocation.runId);
+      if (scheduleLeaseRelease) await finalizeMarkedLeaseRelease(invocation.id);
       return updated;
     },
 
@@ -6784,7 +6882,44 @@ export function createToolGatewayService(
         }
         if (candidates.length < pageSize) break;
       }
-      return { scanned, reconciled, released, invalidated, legacyExpired };
+
+      let markedReleased = 0;
+      if (options.releaseRunEnvironmentLeases) {
+        let markedCursor: { pendingAt: Date; id: string } | null = null;
+        while (scanned < scanCeiling && reconciled + released + invalidated + legacyExpired + markedReleased < limit) {
+          const pageSize = Math.min(limit, scanCeiling - scanned);
+          const marked = await db
+            .select({ id: toolInvocations.id, pendingAt: toolInvocations.leaseReleasePendingAt })
+            .from(toolInvocations)
+            .where(and(
+              isNotNull(toolInvocations.leaseReleasePendingAt),
+              markedCursor
+                ? or(
+                    gt(toolInvocations.leaseReleasePendingAt, markedCursor.pendingAt),
+                    and(
+                      eq(toolInvocations.leaseReleasePendingAt, markedCursor.pendingAt),
+                      gt(toolInvocations.id, markedCursor.id),
+                    ),
+                  )
+                : undefined,
+            ))
+            .orderBy(asc(toolInvocations.leaseReleasePendingAt), asc(toolInvocations.id))
+            .limit(pageSize);
+          if (marked.length === 0) break;
+          scanned += marked.length;
+          const lastMarked = marked.at(-1);
+          if (!lastMarked?.pendingAt) break;
+          markedCursor = { pendingAt: lastMarked.pendingAt, id: lastMarked.id };
+          for (const row of marked) {
+            const outcome = await finalizeMarkedLeaseRelease(row.id);
+            if (outcome === "released") markedReleased += 1;
+            if (reconciled + released + invalidated + legacyExpired + markedReleased >= limit) break;
+          }
+          if (marked.length < pageSize) break;
+        }
+      }
+
+      return { scanned, reconciled, released, invalidated, legacyExpired, markedReleased };
     },
 
     async listRuntimeSlots(companyId?: string) {
