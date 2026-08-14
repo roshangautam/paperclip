@@ -574,32 +574,46 @@ export function createPluginWorkerHandle(
     return values;
   }
 
-  // A worker's JSON-RPC error response for a secret-bearing invocation can echo
-  // forwarded credentials in error.message/error.data. Side-channel suppression
-  // only silences stdout/stderr, so redact the forwarded values (raw, trimmed,
-  // JSON forms) plus a pattern backstop before the error propagates to the host.
-  function redactWorkerError(error: JsonRpcError, forwardedValues: string[]): JsonRpcError {
-    const redactValue = (input: string): string => {
-      let out = input;
-      for (const rawValue of forwardedValues) {
-        const variants = new Set<string>();
-        for (const candidate of [rawValue, rawValue.trim(), JSON.stringify(rawValue), JSON.stringify(rawValue).slice(1, -1)]) {
-          if (candidate.length > 0) variants.add(candidate);
-        }
-        for (const variant of variants) out = out.split(variant).join(REDACTED_EVENT_VALUE);
+  // A worker's JSON-RPC response for a secret-bearing invocation can echo
+  // forwarded credentials in error.message/error.data OR in a successful
+  // result payload's strings. Side-channel suppression only silences
+  // stdout/stderr, so redact the forwarded values (raw, trimmed, JSON forms)
+  // plus a pattern backstop before either propagates to the host.
+  function redactForwardedString(input: string, forwardedValues: string[]): string {
+    let out = input;
+    for (const rawValue of forwardedValues) {
+      const variants = new Set<string>();
+      for (const candidate of [rawValue, rawValue.trim(), JSON.stringify(rawValue), JSON.stringify(rawValue).slice(1, -1)]) {
+        if (candidate.length > 0) variants.add(candidate);
       }
-      return redactSensitiveText(out);
-    };
-    const message = redactValue(error.message);
+      for (const variant of variants) out = out.split(variant).join(REDACTED_EVENT_VALUE);
+    }
+    return redactSensitiveText(out);
+  }
+
+  function redactWorkerError(error: JsonRpcError, forwardedValues: string[]): JsonRpcError {
+    const message = redactForwardedString(error.message, forwardedValues);
     let data = error.data;
     if (data !== undefined) {
       try {
-        data = JSON.parse(redactValue(JSON.stringify(data))) as unknown;
+        data = JSON.parse(redactForwardedString(JSON.stringify(data), forwardedValues)) as unknown;
       } catch {
         data = undefined;
       }
     }
     return { code: error.code, message, ...(data !== undefined ? { data } : {}) };
+  }
+
+  // Redact forwarded credential variants echoed into a successful result
+  // payload's strings. Falls back to dropping the payload if it cannot be
+  // re-parsed, since returning an unredacted result would leak the credential.
+  function redactWorkerResult(result: unknown, forwardedValues: string[]): unknown {
+    if (result === undefined) return result;
+    try {
+      return JSON.parse(redactForwardedString(JSON.stringify(result), forwardedValues)) as unknown;
+    } catch {
+      return null;
+    }
   }
 
   function deriveInvocationScope(
@@ -1306,7 +1320,12 @@ export function createPluginWorkerHandle(
         method,
         resolve: (response: JsonRpcResponse) => {
           if (isJsonRpcSuccessResponse(response)) {
-            settle(resolve, response.result as HostToWorkerMethods[M][1]);
+            settle(
+              resolve,
+              (forwardedEnvValues.length > 0
+                ? redactWorkerResult(response.result, forwardedEnvValues)
+                : response.result) as HostToWorkerMethods[M][1],
+            );
           } else if ("error" in response && response.error) {
             settle(
               reject,

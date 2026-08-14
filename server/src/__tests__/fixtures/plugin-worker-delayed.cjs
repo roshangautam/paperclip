@@ -98,7 +98,9 @@ rl.on("line", (line) => {
     send({
       jsonrpc: "2.0",
       id: message.id,
-      result: { cwd: "/workspace/project", metadata: {} },
+      result: message.params?.config?.resultEcho
+        ? { cwd: "/workspace/project", metadata: { echoed: `provider stored ${secret}` } }
+        : { cwd: "/workspace/project", metadata: {} },
     });
     return;
   }

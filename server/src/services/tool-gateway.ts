@@ -5831,32 +5831,41 @@ export function createToolGatewayService(
         throw new ToolGatewayHttpError(409, "Tool action request is no longer pending", "action_not_pending");
       }
       const now = new Date();
-      const [updated] = await db
-        .update(toolActionRequests)
-        .set({
-          status: "rejected",
-          resolvedByAgentId: input.actor.agentId ?? null,
-          resolvedByUserId: input.actor.userId ?? null,
-          decidedByAgentId: input.actor.agentId ?? null,
-          decidedByUserId: input.actor.userId ?? null,
-          decidedAt: now,
-          resolvedAt: now,
-          updatedAt: now,
-        })
-        .where(and(eq(toolActionRequests.id, actionRequest.id), eq(toolActionRequests.status, "pending")))
-        .returning();
-      if (!updated) {
-        throw new ToolGatewayHttpError(409, "Tool action request has already been resolved", "action_already_resolved");
-      }
       const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(invocation.runId);
-      await db
-        .update(toolInvocations)
-        .set({
-          approvalState: "rejected",
-          updatedAt: now,
-          leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
-        })
-        .where(eq(toolInvocations.id, invocation.id));
+      // The rejected action-request transition, the invocation approval state,
+      // and the lease-release marker must commit atomically, matching the
+      // approved success/failure paths. Splitting them lets a crash leave the
+      // request "rejected" with no leaseReleasePendingAt: retries return early
+      // above, and the reconciler has nothing to select, so a terminal run's
+      // lease stays active indefinitely.
+      const updated = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(toolActionRequests)
+          .set({
+            status: "rejected",
+            resolvedByAgentId: input.actor.agentId ?? null,
+            resolvedByUserId: input.actor.userId ?? null,
+            decidedByAgentId: input.actor.agentId ?? null,
+            decidedByUserId: input.actor.userId ?? null,
+            decidedAt: now,
+            resolvedAt: now,
+            updatedAt: now,
+          })
+          .where(and(eq(toolActionRequests.id, actionRequest.id), eq(toolActionRequests.status, "pending")))
+          .returning();
+        if (!row) {
+          throw new ToolGatewayHttpError(409, "Tool action request has already been resolved", "action_already_resolved");
+        }
+        await tx
+          .update(toolInvocations)
+          .set({
+            approvalState: "rejected",
+            updatedAt: now,
+            leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
+          })
+          .where(eq(toolInvocations.id, invocation.id));
+        return row;
+      });
       if (scheduleLeaseRelease) await finalizeMarkedLeaseRelease(invocation.id);
       return updated;
     },

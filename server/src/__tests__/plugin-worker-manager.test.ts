@@ -280,6 +280,38 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("redacts forwarded credentials echoed in a successful worker result payload", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      const leaked = "github_pat_transient_result_token";
+      const result = await handle.call("environmentRealizeWorkspace", {
+        driverKey: "coder",
+        companyId: "company-1",
+        environmentId: "environment-1",
+        config: { resultEcho: true },
+        lease: { providerLeaseId: "lease-1" },
+        env: { GITHUB_TOKEN: leaked },
+        workspace: {},
+      });
+      expect(JSON.stringify(result)).not.toContain(leaked);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("rejects execution when the worker does not advertise environmentExecute", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,

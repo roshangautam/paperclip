@@ -212,15 +212,32 @@ function resolveRealizationCredentialOwnerAgentId(input: {
   return readString(input.lease.metadata?.agentId);
 }
 
-// Non-empty forwarded env values long enough to be a credential rather than a
-// short identifier. Passed to the realization record builder so any forwarded
-// token a provider smuggles back into a returned path is stripped before it
-// persists. The length gate avoids over-redacting short path segments.
-function resolveForwardedCredentialValues(input: { env?: Record<string, string> }): string[] {
+// Env keys whose forwarded VALUE is secret credential material rather than a
+// non-secret identifier. Only these are stripped from a returned realization
+// path: GITHUB_APP_ID, installation IDs, and the GITHUB_APP_PRIVATE_KEY_FILE
+// path are identifiers the orchestrator intentionally preserves, and scrubbing
+// them would corrupt cwd/remotePath and diverge from the separately persisted
+// lease.metadata.remoteCwd.
+const REALIZATION_SECRET_VALUE_ENV_KEYS = new Set([
+  "GITHUB_APP_PRIVATE_KEY",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+]);
+
+// Forwarded secret-bearing env values that a provider could smuggle back into a
+// returned path. Passed to the realization record builder so any such token is
+// stripped before it persists, while non-secret identifiers are retained.
+export function resolveForwardedCredentialValues(input: { env?: Record<string, string> }): string[] {
   const env = input.env ?? {};
   const values: string[] = [];
-  for (const value of Object.values(env)) {
-    if (typeof value === "string" && value.trim().length >= 8) values.push(value);
+  for (const [key, value] of Object.entries(env)) {
+    if (
+      REALIZATION_SECRET_VALUE_ENV_KEYS.has(key)
+      && typeof value === "string"
+      && value.trim().length > 0
+    ) {
+      values.push(value);
+    }
   }
   return values;
 }

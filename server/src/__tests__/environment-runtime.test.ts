@@ -39,7 +39,7 @@ import {
   PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
-import { environmentRuntimeService, findReusableSandboxLeaseId } from "../services/environment-runtime.ts";
+import { environmentRuntimeService, findReusableSandboxLeaseId, resolveForwardedCredentialValues } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import { executionWorkspaceService } from "../services/execution-workspaces.ts";
 import { realizePluginEnvironmentWorkspace } from "../services/plugin-environment-driver.ts";
@@ -86,6 +86,32 @@ describe("realizePluginEnvironmentWorkspace", () => {
       expect.any(Object),
       91_234,
     );
+  });
+});
+
+describe("resolveForwardedCredentialValues", () => {
+  it("collects only secret-bearing values and preserves non-secret App identifiers", () => {
+    const values = resolveForwardedCredentialValues({
+      env: {
+        GITHUB_APP_ID: "123456",
+        GITHUB_INSTALLATION_ID: "987654",
+        GITHUB_APP_INSTALLATION_ID: "987654",
+        GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/app-987654-key",
+        GITHUB_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----abc",
+        GITHUB_TOKEN: "github_pat_token_value",
+        GH_TOKEN: "gh_token_value",
+      },
+    });
+    expect(values).toContain("-----BEGIN PRIVATE KEY-----abc");
+    expect(values).toContain("github_pat_token_value");
+    expect(values).toContain("gh_token_value");
+    expect(values).not.toContain("123456");
+    expect(values).not.toContain("987654");
+    expect(values).not.toContain("/run/secrets/app-987654-key");
+  });
+
+  it("returns an empty list when no env is forwarded", () => {
+    expect(resolveForwardedCredentialValues({})).toEqual([]);
   });
 });
 
