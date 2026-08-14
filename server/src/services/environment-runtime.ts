@@ -194,6 +194,7 @@ export interface EnvironmentDriverExecuteInput extends EnvironmentDriverLeaseInp
   env?: Record<string, string>;
   stdin?: string;
   timeoutMs?: number;
+  workspaceRealization?: Record<string, unknown>;
 }
 
 export interface EnvironmentRuntimeDriver {
@@ -3560,6 +3561,9 @@ function createSandboxEnvironmentDriver(
             env: input.env,
             stdin: input.stdin,
             timeoutMs: input.timeoutMs,
+            ...(input.workspaceRealization
+              ? { workspaceRealization: input.workspaceRealization }
+              : {}),
           }, resolvePluginExecuteRpcTimeoutMs({
             requestedTimeoutMs: input.timeoutMs,
             config: sanitizedConfig,
@@ -4286,6 +4290,9 @@ function createPluginEnvironmentDriver(
           env: input.env,
           stdin: input.stdin,
           timeoutMs: input.timeoutMs,
+          ...(input.workspaceRealization
+            ? { workspaceRealization: input.workspaceRealization }
+            : {}),
         },
       });
     },

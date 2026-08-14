@@ -274,6 +274,9 @@ export type PluginRpcErrorCode =
  */
 export interface PluginInvocationScope {
   companyId: string;
+  runId?: string;
+  agentId?: string;
+  allowTerminalRunWorkspaceExecution?: boolean;
 }
 
 /**
@@ -675,6 +678,7 @@ export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverB
   env?: Record<string, string>;
   stdin?: string;
   timeoutMs?: number;
+  workspaceRealization?: Record<string, unknown>;
 }
 
 export interface PluginEnvironmentExecuteResult {

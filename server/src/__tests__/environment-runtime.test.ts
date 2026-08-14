@@ -1937,6 +1937,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             shellCommand: "bash",
             pluginKey: "provider-config-key",
           }));
+          expect(params.workspaceRealization).toEqual({
+            remote: { path: "/configured/workspace" },
+          });
           return {
             exitCode: 0,
             signal: null,
@@ -1985,6 +1988,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       cwd: "/workspace",
       env: {},
       timeoutMs: 1000,
+      workspaceRealization: {
+        remote: { path: "/configured/workspace" },
+      },
     });
 
     expect(acquired.lease.provider).toBe("fake-plugin");
@@ -7266,6 +7272,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       env: { FOO: "bar" },
       stdin: "",
       timeoutMs: 1000,
+      workspaceRealization: {
+        sync: { strategy: "sandbox_archive_upload_download" },
+      },
     });
     const destroyed = await runtimeWithPlugin.destroyRunLease({
       environment,
@@ -7323,6 +7332,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       args: ["ok"],
       cwd: "/workspace/project",
       env: { FOO: "bar" },
+      workspaceRealization: {
+        sync: { strategy: "sandbox_archive_upload_download" },
+      },
     }), 91000);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", {
       driverKey: "fake-plugin",
