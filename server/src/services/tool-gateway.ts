@@ -1594,41 +1594,62 @@ export function createToolGatewayService(
       return { expired: true, runId: cancelled.runId };
     });
     if (!transition) return { expired: false, released: false };
-    const released = await db.transaction(async (tx) => {
+    const released = await finalizePendingLeaseRelease({
+      invocationId: input.invocationId,
+      pendingErrorCode: "action_expired_pending_lease_release",
+      finalErrorCode: "action_expired",
+      now: input.now,
+    });
+    return { expired: transition.expired, released };
+  }
+
+  async function finalizePendingLeaseRelease(input: {
+    invocationId: string;
+    pendingErrorCode:
+      | "action_expired_pending_lease_release"
+      | "action_request_invalidated_pending_lease_release";
+    finalErrorCode: "action_expired" | "action_request_invalidated";
+    now: Date;
+  }): Promise<boolean> {
+    return db.transaction(async (tx) => {
       await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${input.invocationId}))`);
       const [pendingRelease] = await tx
         .select({ runId: toolInvocations.runId })
         .from(toolInvocations)
         .where(and(
           eq(toolInvocations.id, input.invocationId),
-          eq(toolInvocations.errorCode, "action_expired_pending_lease_release"),
+          eq(toolInvocations.status, "cancelled"),
+          eq(toolInvocations.errorCode, input.pendingErrorCode),
         ))
         .limit(1);
       if (!pendingRelease) return false;
       const didRelease = await releaseRunEnvironmentLeasesIfTerminal(pendingRelease.runId);
       if (!didRelease) return false;
-      await tx.update(toolInvocations).set({ errorCode: "action_expired", updatedAt: input.now }).where(and(
-        eq(toolInvocations.id, input.invocationId),
-        eq(toolInvocations.errorCode, "action_expired_pending_lease_release"),
-      ));
-      return true;
+      const [finalized] = await tx
+        .update(toolInvocations)
+        .set({ errorCode: input.finalErrorCode, updatedAt: input.now })
+        .where(and(
+          eq(toolInvocations.id, input.invocationId),
+          eq(toolInvocations.errorCode, input.pendingErrorCode),
+        ))
+        .returning({ id: toolInvocations.id });
+      return Boolean(finalized);
     });
-    return { expired: transition.expired, released };
   }
 
   async function invalidateExpiredActionCandidate(input: {
     actionRequestId: string;
     invocationId: string;
     now: Date;
-  }): Promise<boolean> {
-    return db.transaction(async (tx) => {
+  }): Promise<{ invalidated: boolean; released: boolean }> {
+    const transition = await db.transaction(async (tx) => {
       const [cancelledInvocation] = await tx
         .update(toolInvocations)
         .set({
           status: "cancelled",
           approvalState: "expired",
           idempotencyKey: null,
-          errorCode: "action_request_invalidated",
+          errorCode: "action_request_invalidated_pending_lease_release",
           errorMessage: "Tool action request signature is invalid",
           completedAt: input.now,
           updatedAt: input.now,
@@ -1638,7 +1659,21 @@ export function createToolGatewayService(
           eq(toolInvocations.status, "awaiting_approval"),
         ))
         .returning({ id: toolInvocations.id });
-      if (!cancelledInvocation) return false;
+      if (!cancelledInvocation) {
+        const [pendingRelease] = await tx
+          .select({ id: toolInvocations.id })
+          .from(toolInvocations)
+          .innerJoin(toolActionRequests, eq(toolActionRequests.invocationId, toolInvocations.id))
+          .where(and(
+            eq(toolInvocations.id, input.invocationId),
+            eq(toolInvocations.status, "cancelled"),
+            eq(toolInvocations.errorCode, "action_request_invalidated_pending_lease_release"),
+            eq(toolActionRequests.id, input.actionRequestId),
+            eq(toolActionRequests.status, "cancelled"),
+          ))
+          .limit(1);
+        return pendingRelease ? { invalidated: false } : null;
+      }
       const [cancelledRequest] = await tx
         .update(toolActionRequests)
         .set({ status: "cancelled", resolvedAt: input.now, updatedAt: input.now })
@@ -1654,6 +1689,55 @@ export function createToolGatewayService(
         status: "expired",
         errorCode: "action_request_invalidated",
         errorMessage: "Tool action request signature is invalid",
+      }, tx);
+      return { invalidated: true };
+    });
+    if (!transition) return { invalidated: false, released: false };
+    const released = await finalizePendingLeaseRelease({
+      invocationId: input.invocationId,
+      pendingErrorCode: "action_request_invalidated_pending_lease_release",
+      finalErrorCode: "action_request_invalidated",
+      now: input.now,
+    });
+    return { invalidated: transition.invalidated, released };
+  }
+
+  async function expireLegacyActionCandidate(input: {
+    actionRequestId: string;
+    invocationId: string;
+    now: Date;
+  }): Promise<boolean> {
+    return db.transaction(async (tx) => {
+      const [cancelledInvocation] = await tx
+        .update(toolInvocations)
+        .set({
+          status: "cancelled",
+          approvalState: "expired",
+          idempotencyKey: null,
+          errorCode: "action_expired",
+          errorMessage: "Tool action request approval expired before execution",
+          completedAt: input.now,
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(toolInvocations.id, input.invocationId),
+          eq(toolInvocations.status, "awaiting_approval"),
+        ))
+        .returning({ id: toolInvocations.id });
+      if (!cancelledInvocation) return false;
+      const [expiredRequest] = await tx
+        .update(toolActionRequests)
+        .set({ status: "expired", resolvedAt: input.now, updatedAt: input.now })
+        .where(and(
+          eq(toolActionRequests.id, input.actionRequestId),
+          inArray(toolActionRequests.status, ["pending", "approved"]),
+          lte(toolActionRequests.expiresAt, input.now),
+        ))
+        .returning({ id: toolActionRequests.id });
+      if (!expiredRequest) tx.rollback();
+      await reflectToolActionInteractionLifecycle({
+        actionRequestId: expiredRequest.id,
+        status: "expired",
       }, tx);
       return true;
     });
@@ -6594,7 +6678,8 @@ export function createToolGatewayService(
       let reconciled = 0;
       let released = 0;
       let invalidated = 0;
-      while (scanned < scanCeiling && reconciled + released + invalidated < limit) {
+      let legacyExpired = 0;
+      while (scanned < scanCeiling && reconciled + released + invalidated + legacyExpired < limit) {
         const pageSize = Math.min(limit, scanCeiling - scanned);
         const candidates = await db
           .select({ actionRequest: toolActionRequests, invocation: toolInvocations })
@@ -6610,6 +6695,11 @@ export function createToolGatewayService(
                 eq(toolActionRequests.status, "expired"),
                 eq(toolInvocations.status, "cancelled"),
                 eq(toolInvocations.errorCode, "action_expired_pending_lease_release"),
+              ),
+              and(
+                eq(toolActionRequests.status, "cancelled"),
+                eq(toolInvocations.status, "cancelled"),
+                eq(toolInvocations.errorCode, "action_request_invalidated_pending_lease_release"),
               ),
             ),
             cursor
@@ -6630,6 +6720,28 @@ export function createToolGatewayService(
         if (!lastCandidate?.actionRequest.expiresAt) break;
         cursor = { expiresAt: lastCandidate.actionRequest.expiresAt, id: lastCandidate.actionRequest.id };
         for (const { actionRequest, invocation } of candidates) {
+          if (invocation.errorCode === "action_expired_pending_lease_release") {
+            const result = await expireExecuteOnApproveAction({
+              actionRequestId: actionRequest.id,
+              invocationId: invocation.id,
+              now,
+            });
+            if (result.expired) reconciled += 1;
+            if (result.released) released += 1;
+            if (reconciled + released + invalidated + legacyExpired >= limit) break;
+            continue;
+          }
+          if (invocation.errorCode === "action_request_invalidated_pending_lease_release") {
+            const result = await invalidateExpiredActionCandidate({
+              actionRequestId: actionRequest.id,
+              invocationId: invocation.id,
+              now,
+            });
+            if (result.invalidated) invalidated += 1;
+            if (result.released) released += 1;
+            if (reconciled + released + invalidated + legacyExpired >= limit) break;
+            continue;
+          }
           let signedPayload: ReturnType<typeof readSignedToolArgumentsPayload> = null;
           try {
             signedPayload = readSignedToolArgumentsPayload({
@@ -6642,14 +6754,25 @@ export function createToolGatewayService(
             signedPayload = null;
           }
           if (!signedPayload) {
-            if (await invalidateExpiredActionCandidate({
+            const result = await invalidateExpiredActionCandidate({
               actionRequestId: actionRequest.id,
               invocationId: invocation.id,
               now,
-            })) invalidated += 1;
+            });
+            if (result.invalidated) invalidated += 1;
+            if (result.released) released += 1;
+            if (reconciled + released + invalidated + legacyExpired >= limit) break;
             continue;
           }
-          if (signedPayload.executionOnApprove !== true) continue;
+          if (signedPayload.executionOnApprove !== true) {
+            if (await expireLegacyActionCandidate({
+              actionRequestId: actionRequest.id,
+              invocationId: invocation.id,
+              now,
+            })) legacyExpired += 1;
+            if (reconciled + released + invalidated + legacyExpired >= limit) break;
+            continue;
+          }
           const result = await expireExecuteOnApproveAction({
             actionRequestId: actionRequest.id,
             invocationId: invocation.id,
@@ -6657,11 +6780,11 @@ export function createToolGatewayService(
           });
           if (result.expired) reconciled += 1;
           if (result.released) released += 1;
-          if (reconciled + released + invalidated >= limit) break;
+          if (reconciled + released + invalidated + legacyExpired >= limit) break;
         }
         if (candidates.length < pageSize) break;
       }
-      return { scanned, reconciled, released, invalidated };
+      return { scanned, reconciled, released, invalidated, legacyExpired };
     },
 
     async listRuntimeSlots(companyId?: string) {

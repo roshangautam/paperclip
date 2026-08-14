@@ -972,9 +972,10 @@ describeEmbeddedPostgres("tool gateway service", () => {
       "pending",
       "expired",
     ]);
-    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(3);
     expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({ runId: pendingFixture.run.id, runStatus: "succeeded" });
     expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({ runId: approvedFixture.run.id, runStatus: "succeeded" });
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({ runId: invalidFixture.run.id, runStatus: "succeeded" });
   });
 
   it("keeps an expired action pending when its invocation is no longer awaiting approval", async () => {
@@ -1058,11 +1059,11 @@ describeEmbeddedPostgres("tool gateway service", () => {
     await db.update(toolActionRequests).set({ expiresAt: new Date(oldestExpiry.getTime() + limit) })
       .where(eq(toolActionRequests.id, validFixture.actionRequest.id));
 
-    const result = await gateway.reconcileExpiredExecuteOnApproveActions({ limit, scanCeiling: limit });
-    const next = await gateway.reconcileExpiredExecuteOnApproveActions({ limit, scanCeiling: limit });
+    const result = await gateway.reconcileExpiredExecuteOnApproveActions({ limit: 10, scanCeiling: limit });
+    const next = await gateway.reconcileExpiredExecuteOnApproveActions({ limit: 10, scanCeiling: limit });
 
-    expect(result).toMatchObject({ scanned: limit, reconciled: 0, released: 0, invalidated: limit });
-    expect(next).toMatchObject({ scanned: 1, reconciled: 1, released: 1, invalidated: 0 });
+    expect(result).toMatchObject({ scanned: limit, reconciled: 0, released: limit, invalidated: limit, legacyExpired: 0 });
+    expect(next).toMatchObject({ scanned: 1, reconciled: 1, released: 1, invalidated: 0, legacyExpired: 0 });
     const [validRequest] = await db.select().from(toolActionRequests)
       .where(eq(toolActionRequests.id, validFixture.actionRequest.id));
     expect(validRequest.status).toBe("expired");
@@ -1081,7 +1082,119 @@ describeEmbeddedPostgres("tool gateway service", () => {
       interaction.status === "expired"
       && interaction.result?.toolAction?.status === "expired"
       && interaction.result.toolAction.errorCode === "action_request_invalidated")).toBe(true);
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(limit + 1);
+  });
+
+  it("retries lease release for an invalidated action after a transient failure", async () => {
+    const releaseRunEnvironmentLeases = vi.fn()
+      .mockRejectedValueOnce(new Error("lease provider unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const fixture = await createExpiredExecuteOnApproveFixture(db, gateway, "invalidated retry");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, fixture.run.id));
+    await db.update(toolActionRequests).set({ signedArguments: "unverifiable-after-rotation" })
+      .where(eq(toolActionRequests.id, fixture.actionRequest.id));
+
+    const first = await gateway.reconcileExpiredExecuteOnApproveActions();
+    const second = await gateway.reconcileExpiredExecuteOnApproveActions();
+
+    expect(first).toMatchObject({ scanned: 1, invalidated: 1, released: 0 });
+    expect(second).toMatchObject({ scanned: 1, invalidated: 0, released: 1 });
+    const [request] = await db.select().from(toolActionRequests)
+      .where(eq(toolActionRequests.id, fixture.actionRequest.id));
+    expect(request.status).toBe("cancelled");
+    const [invocation] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, fixture.actionRequest.invocationId));
+    expect(invocation.status).toBe("cancelled");
+    expect(invocation.approvalState).toBe("expired");
+    expect(invocation.idempotencyKey).toBeNull();
+    expect(invocation.errorCode).toBe("action_request_invalidated");
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+  });
+
+  it("follows the durable invalidation marker on retry regardless of later signature verifiability", async () => {
+    const releaseRunEnvironmentLeases = vi.fn()
+      .mockRejectedValueOnce(new Error("lease provider unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const fixture = await createExpiredExecuteOnApproveFixture(db, gateway, "marker before signature");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, fixture.run.id));
+    const [invocation] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, fixture.actionRequest.invocationId));
+    const validExecuteOnApproveSignature = signToolArguments({
+      invocationId: invocation.id,
+      toolName: invocation.toolName,
+      canonicalArguments: canonicalToolArguments(fixture.parameters),
+      executionOnApprove: true,
+      signingSecret: testToolActionSigningSecret,
+    });
+    await db.update(toolActionRequests).set({ signedArguments: "unverifiable-during-first-pass" })
+      .where(eq(toolActionRequests.id, fixture.actionRequest.id));
+
+    const first = await gateway.reconcileExpiredExecuteOnApproveActions();
+    expect(first).toMatchObject({ scanned: 1, invalidated: 1, released: 0, reconciled: 0 });
+
+    await db.update(toolActionRequests).set({ signedArguments: validExecuteOnApproveSignature })
+      .where(eq(toolActionRequests.id, fixture.actionRequest.id));
+
+    const second = await gateway.reconcileExpiredExecuteOnApproveActions();
+    expect(second).toMatchObject({ scanned: 1, invalidated: 0, released: 1, reconciled: 0 });
+    const [invocationAfter] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, fixture.actionRequest.invocationId));
+    expect(invocationAfter.errorCode).toBe("action_request_invalidated");
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+  });
+
+  it("expires legacy non-execute-on-approve rows so they cannot starve newer expirations", async () => {
+    const scanCeiling = 3;
+    const releaseRunEnvironmentLeases = vi.fn(async () => undefined);
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const legacyFixtures = await Promise.all(Array.from({ length: scanCeiling }, (_, index) =>
+      createExpiredExecuteOnApproveFixture(db, gateway, `legacy ${index}`)));
+    const validFixture = await createExpiredExecuteOnApproveFixture(db, gateway, "valid after legacy page");
+    for (const fixture of [...legacyFixtures, validFixture]) {
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.run.id));
+    }
+    const oldestExpiry = new Date(Date.now() - 10_000);
+    for (const [index, fixture] of legacyFixtures.entries()) {
+      const [invocation] = await db.select().from(toolInvocations)
+        .where(eq(toolInvocations.id, fixture.actionRequest.invocationId));
+      const legacySignature = signToolArguments({
+        invocationId: invocation.id,
+        toolName: invocation.toolName,
+        canonicalArguments: canonicalToolArguments(fixture.parameters),
+        signingSecret: testToolActionSigningSecret,
+      });
+      await db.update(toolActionRequests).set({
+        expiresAt: new Date(oldestExpiry.getTime() + index),
+        signedArguments: legacySignature,
+      }).where(eq(toolActionRequests.id, fixture.actionRequest.id));
+    }
+    await db.update(toolActionRequests).set({ expiresAt: new Date(oldestExpiry.getTime() + scanCeiling) })
+      .where(eq(toolActionRequests.id, validFixture.actionRequest.id));
+
+    const first = await gateway.reconcileExpiredExecuteOnApproveActions({ limit: 10, scanCeiling });
+    const next = await gateway.reconcileExpiredExecuteOnApproveActions({ limit: 10, scanCeiling });
+
+    expect(first).toMatchObject({ scanned: scanCeiling, legacyExpired: scanCeiling, reconciled: 0, released: 0, invalidated: 0 });
+    expect(next).toMatchObject({ scanned: 1, reconciled: 1, released: 1, legacyExpired: 0, invalidated: 0 });
+    const legacyRequests = await db.select().from(toolActionRequests)
+      .where(inArray(toolActionRequests.id, legacyFixtures.map((fixture) => fixture.actionRequest.id)));
+    expect(legacyRequests.every((request) => request.status === "expired")).toBe(true);
+    const legacyInvocations = await db.select().from(toolInvocations)
+      .where(inArray(toolInvocations.id, legacyFixtures.map((fixture) => fixture.actionRequest.invocationId)));
+    expect(legacyInvocations.every((invocation) =>
+      invocation.status === "cancelled"
+      && invocation.approvalState === "expired"
+      && invocation.errorCode === "action_expired")).toBe(true);
+    const [validRequest] = await db.select().from(toolActionRequests)
+      .where(eq(toolActionRequests.id, validFixture.actionRequest.id));
+    expect(validRequest.status).toBe("expired");
     expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(1);
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({ runId: validFixture.run.id, runStatus: "succeeded" });
   });
 
   it("adds formal board approval for destructive tool actions and fails closed until approved", async () => {
