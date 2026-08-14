@@ -1056,7 +1056,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
   });
 
-  it("does not mark a lease-release when the run is not yet terminal on decline", async () => {
+  it("marks the lease-release on decline of a still-running run and defers release until the run is terminal", async () => {
     const releaseRunEnvironmentLeases = vi.fn(async () => undefined);
     const { company, agent, run } = await createRunFixture(db);
     await db.insert(toolPolicies).values({
@@ -1079,12 +1079,27 @@ describeEmbeddedPostgres("tool gateway service", () => {
       actionRequestId: actionRequest.id,
       actor: { userId: "board-user" },
     });
-    const [invocation] = await db.select().from(toolInvocations)
+    const [marked] = await db.select().from(toolInvocations)
       .where(eq(toolInvocations.id, actionRequest.invocationId));
-    expect(invocation.leaseReleasePendingAt).toBeNull();
+    expect(marked.leaseReleasePendingAt).toBeInstanceOf(Date);
     expect(releaseRunEnvironmentLeases).not.toHaveBeenCalled();
-    const retry = await gateway.reconcileExpiredExecuteOnApproveActions();
-    expect(retry).toMatchObject({ markedReleased: 0 });
+
+    const beforeTerminal = await gateway.reconcileExpiredExecuteOnApproveActions();
+    expect(beforeTerminal).toMatchObject({ markedReleased: 0 });
+    expect(releaseRunEnvironmentLeases).not.toHaveBeenCalled();
+    const [stillMarked] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, actionRequest.invocationId));
+    expect(stillMarked.leaseReleasePendingAt).toBeInstanceOf(Date);
+
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id));
+
+    const afterTerminal = await gateway.reconcileExpiredExecuteOnApproveActions();
+    expect(afterTerminal).toMatchObject({ markedReleased: 1 });
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(1);
+    const [released] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, actionRequest.invocationId));
+    expect(released.leaseReleasePendingAt).toBeNull();
   });
 
   it("reconciles only expired signed execute-on-approve requests and releases terminal run leases once", async () => {

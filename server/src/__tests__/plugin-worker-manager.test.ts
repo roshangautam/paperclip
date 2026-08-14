@@ -303,10 +303,13 @@ describe("plugin-worker-manager stderr failure context", () => {
         environmentId: "environment-1",
         config: { resultEcho: true },
         lease: { providerLeaseId: "lease-1" },
-        env: { GITHUB_TOKEN: leaked },
+        env: { GITHUB_TOKEN: leaked, GITHUB_APP_ID: "app-42" },
         workspace: {},
       });
-      expect(JSON.stringify(result)).not.toContain(leaked);
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain(leaked);
+      expect(serialized).toContain("app-42");
+      expect(result.cwd).toBe("/workspace/app-42/project");
     } finally {
       await handle.stop().catch(() => undefined);
     }

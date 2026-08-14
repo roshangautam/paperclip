@@ -792,22 +792,12 @@ describe("requiresPushCapabilityPreflight", () => {
 });
 
 describe("buildPushCapabilityScopedEnvBinding", () => {
-  it("offers the GitHub App tuple only for realization drivers that mint an installation token", () => {
-    for (const driver of ["sandbox", "plugin"]) {
-      const binding = buildPushCapabilityScopedEnvBinding(driver);
-      expect(binding.alternativeKeySets).toBeDefined();
-      expect(binding.alternativeKeySets?.length ?? 0).toBeGreaterThan(0);
-      expect(binding.remediation).toContain("GitHub App identity");
-    }
-  });
-
-  it("requires a real push token for local/SSH runs that never exchange the App tuple", () => {
-    for (const driver of ["local", "ssh", undefined, null]) {
-      const binding = buildPushCapabilityScopedEnvBinding(driver);
-      expect(binding.alternativeKeySets).toBeUndefined();
-      expect(binding.remediation).not.toContain("GitHub App identity");
-      expect(binding.keys).toEqual(["GH_TOKEN", "GITHUB_TOKEN"]);
-    }
+  it("requires a real push token and never accepts a GitHub App tuple alone", () => {
+    const binding = buildPushCapabilityScopedEnvBinding();
+    expect(binding.keys).toEqual(["GH_TOKEN", "GITHUB_TOKEN"]);
+    expect(binding.alternativeKeySets).toBeUndefined();
+    expect(binding.remediation).not.toContain("GitHub App identity");
+    expect(binding.consumerScopes).toEqual(["agent", "project"]);
   });
 });
 

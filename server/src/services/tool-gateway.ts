@@ -808,14 +808,16 @@ export function createToolGatewayService(
     }
   }
 
-  async function runLeaseReleaseIsSchedulable(runId: string | null): Promise<boolean> {
-    if (!runId || !options.releaseRunEnvironmentLeases) return false;
-    const [run] = await db
-      .select({ status: heartbeatRuns.status })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .limit(1);
-    return Boolean(run && isRunLeaseReleaseTerminal(run.status));
+  // Whether a terminal action resolution should stamp the lease-release marker.
+  // Gated only on durable ownership (run-bound + release configured), NOT on the
+  // run being terminal yet. Marking whenever the run-bound action resolves closes
+  // a TOCTOU leak: run completion defers releasing a lease while an action is
+  // still pending, so if we only marked on an already-terminal run we could miss
+  // the release entirely when the run turns terminal between our status read and
+  // commit. finalizeMarkedLeaseRelease and the reconciler defer the actual
+  // release until the run itself is terminal.
+  function runBoundLeaseReleaseIsMarkable(runId: string | null): boolean {
+    return Boolean(runId && options.releaseRunEnvironmentLeases);
   }
 
   // Durable outbox for lease release on non-expiry action resolution. The four
@@ -4497,7 +4499,7 @@ export function createToolGatewayService(
       : "tool_execution_failed";
     const message = input.error instanceof Error ? input.error.message : String(input.error);
     const now = new Date();
-    const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(input.runId);
+    const scheduleLeaseRelease = runBoundLeaseReleaseIsMarkable(input.runId);
     // Same atomicity invariant as the approved-success path: the terminal
     // invocation write (with its lease-release marker) and the action-request
     // "failed" demotion must commit together. A crash between them strands the
@@ -4684,7 +4686,7 @@ export function createToolGatewayService(
         promptInjectionMode: "block",
       });
       const now = new Date();
-      const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(invocation.runId);
+      const scheduleLeaseRelease = runBoundLeaseReleaseIsMarkable(invocation.runId);
       // The terminal invocation write (with its lease-release marker) and the
       // action-request "executed" transition must commit atomically. Splitting
       // them lets a crash strand the request in "executing": reconcile then sees
@@ -5697,7 +5699,7 @@ export function createToolGatewayService(
       if (!signedPayload) {
         if (actionRequest.status === "pending") {
           const now = new Date();
-          const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(invocation.runId);
+          const scheduleLeaseRelease = runBoundLeaseReleaseIsMarkable(invocation.runId);
           await db.transaction(async (tx) => {
             await tx
               .update(toolActionRequests)
@@ -5831,7 +5833,7 @@ export function createToolGatewayService(
         throw new ToolGatewayHttpError(409, "Tool action request is no longer pending", "action_not_pending");
       }
       const now = new Date();
-      const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(invocation.runId);
+      const scheduleLeaseRelease = runBoundLeaseReleaseIsMarkable(invocation.runId);
       // The rejected action-request transition, the invocation approval state,
       // and the lease-release marker must commit atomically, matching the
       // approved success/failure paths. Splitting them lets a crash leave the
@@ -6922,8 +6924,10 @@ export function createToolGatewayService(
           const marked = await db
             .select({ id: toolInvocations.id, pendingAt: toolInvocations.leaseReleasePendingAt })
             .from(toolInvocations)
+            .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, toolInvocations.runId))
             .where(and(
               isNotNull(toolInvocations.leaseReleasePendingAt),
+              inArray(heartbeatRuns.status, RUN_LEASE_RELEASE_TERMINAL_STATUSES),
               markedCursor
                 ? or(
                     gt(toolInvocations.leaseReleasePendingAt, markedCursor.pendingAt),

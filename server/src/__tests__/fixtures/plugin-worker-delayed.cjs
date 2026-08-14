@@ -99,7 +99,10 @@ rl.on("line", (line) => {
       jsonrpc: "2.0",
       id: message.id,
       result: message.params?.config?.resultEcho
-        ? { cwd: "/workspace/project", metadata: { echoed: `provider stored ${secret}` } }
+        ? {
+            cwd: `/workspace/${message.params?.env?.GITHUB_APP_ID ?? "app"}/project`,
+            metadata: { echoed: `provider stored ${secret}`, appId: message.params?.env?.GITHUB_APP_ID ?? null },
+          }
         : { cwd: "/workspace/project", metadata: {} },
     });
     return;

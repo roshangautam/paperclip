@@ -356,12 +356,6 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participan
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
 const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
-const PUSH_CAPABILITY_ALTERNATIVE_ENV_KEY_SETS = [
-  ["GITHUB_APP_ID", "GITHUB_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
-  ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
-  ["GITHUB_APP_ID", "GITHUB_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY_FILE"],
-  ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY_FILE"],
-] as const;
 // Keep this in sync with local adapters that require a git workspace before launch.
 const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "claude_local",
@@ -619,34 +613,25 @@ export function requiresPushCapabilityPreflight(input: {
     && hasGithubPrWorkflowSkill(input.explicitRunScopedSkillKeys);
 }
 
-// A GitHub App tuple only yields push credentials when the realizing driver
-// exchanges it for an installation token. sandbox/plugin realization does that,
-// but local/SSH realizeWorkspace never consumes env and
-// partitionWorkspaceRealizationAdapterConfig strips GITHUB_APP_* from the
-// runtime, so an App tuple would pass preflight and then launch git/gh with no
-// usable push auth. Restrict the App alternative to token-minting drivers.
-const PUSH_CAPABILITY_INSTALLATION_TOKEN_DRIVERS = new Set(["sandbox", "plugin"]);
-
-function pushCapabilityRealizationMintsInstallationToken(driver: string | null | undefined): boolean {
-  return typeof driver === "string" && PUSH_CAPABILITY_INSTALLATION_TOKEN_DRIVERS.has(driver);
-}
-
-export function buildPushCapabilityScopedEnvBinding(driver: string | null | undefined): {
+// A GitHub App tuple authenticates the initial private clone DURING workspace
+// realization, but the runtime git/gh push happens after
+// partitionWorkspaceRealizationAdapterConfig strips every GITHUB_APP_* value,
+// and no realization path is guaranteed to exchange the tuple for a usable
+// runtime push token (the built-in sandbox fallback ignores env, and plugin
+// realize hooks are optional). Push preflight therefore requires a real token;
+// an App tuple alone is not accepted as push capability.
+export function buildPushCapabilityScopedEnvBinding(): {
   keys: string[];
   alternativeKeySets?: readonly (readonly string[])[];
   consumerScopes: readonly ("agent" | "project")[];
   reason: string;
   remediation: string;
 } {
-  const appTupleUsable = pushCapabilityRealizationMintsInstallationToken(driver);
   return {
     keys: [...PUSH_CAPABILITY_ENV_KEYS],
-    alternativeKeySets: appTupleUsable ? PUSH_CAPABILITY_ALTERNATIVE_ENV_KEY_SETS : undefined,
     consumerScopes: ["agent", "project"],
     reason: "push_write_credential_missing",
-    remediation: appTupleUsable
-      ? "GitHub PR workflow requires GH_TOKEN, GITHUB_TOKEN, or a complete GitHub App identity bound at project or agent scope."
-      : "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
+    remediation: "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
   };
 }
 
@@ -12689,7 +12674,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       secretsSvc,
       trustPreset,
       requiredScopedEnvBinding: pushCapabilityPreflightRequired
-        ? buildPushCapabilityScopedEnvBinding(selectedEnvironmentForConfig?.driver)
+        ? buildPushCapabilityScopedEnvBinding()
         : undefined,
     });
     const { runtimeAdapterConfig: resolvedRuntimeConfig, workspaceRealizationEnv } =

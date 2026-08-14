@@ -558,16 +558,24 @@ export function createPluginWorkerHandle(
     visit(parsed);
   }
 
+  // Collect only the forwarded values that are themselves credential material,
+  // keyed by a secret-bearing env name (or a known secret envelope). Collecting
+  // every value once any sensitive key is present would over-redact legitimate
+  // provider output: a non-secret value such as GITHUB_APP_ID=app-1 or CI=1
+  // would be rewritten in a returned cwd, and redacting ordinary result JSON can
+  // make it unparseable and collapse the payload to null.
   function collectForwardedEnvValues(params: unknown): string[] {
     if (!isRecord(params) || !isRecord(params.env)) return [];
     const values: string[] = [];
     for (const [key, value] of Object.entries(params.env)) {
       if (typeof value !== "string" || value.length === 0) continue;
+      const isSecretEnvelope = SENSITIVE_ENV_KEY_ALLOWLIST.has(key);
+      if (!SENSITIVE_ENV_KEY_RE.test(key) && !isSecretEnvelope) continue;
       values.push(value);
       // A provider can parse a known JSON envelope (e.g. PAPERCLIP_CLAUDE_MCP_CONFIG)
       // and echo only an extracted nested token, which no longer matches the whole
       // envelope string. Collect its nested string leaves so they are redacted too.
-      if (SENSITIVE_ENV_KEY_ALLOWLIST.has(key)) {
+      if (isSecretEnvelope) {
         collectJsonStringLeaves(value, values);
       }
     }
