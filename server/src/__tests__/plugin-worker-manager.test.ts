@@ -154,6 +154,9 @@ describe("plugin-worker-manager stderr failure context", () => {
     ["a token-suffixed key", {
       GITHUB_TOKEN: "github_pat_transient_worker_token",
     }, "github_pat_transient_worker_token"],
+    ["a known secret-bearing envelope with an opaque key name", {
+      PAPERCLIP_CLAUDE_MCP_CONFIG: '{"mcpServers":{"gw":{"headers":{"Authorization":"Bearer transient-bridge-token"}}}}',
+    }, "transient-bridge-token"],
   ])("suppresses worker output after forwarding %s", async (_label, env, leakedValue) => {
     const childLogger = {
       debug: vi.fn(),

@@ -94,6 +94,11 @@ const MAX_STDERR_EXCERPT_CHARS = 8_000;
 const SENSITIVE_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|(?:^|[-_])token(?:$|[-_])|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 
+// Known secret-bearing env values whose name does not match the pattern above.
+// PAPERCLIP_CLAUDE_MCP_CONFIG carries bridge/gateway bearer tokens inside a JSON
+// envelope, so it must suppress worker output even though the key is opaque.
+const SENSITIVE_ENV_KEY_ALLOWLIST = new Set(["PAPERCLIP_CLAUDE_MCP_CONFIG"]);
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -526,7 +531,8 @@ export function createPluginWorkerHandle(
   function containsSensitiveEnv(params: unknown): boolean {
     if (!isRecord(params) || !isRecord(params.env)) return false;
     for (const [key, value] of Object.entries(params.env)) {
-      if (SENSITIVE_ENV_KEY_RE.test(key) && typeof value === "string" && value.length > 0) return true;
+      if (typeof value !== "string" || value.length === 0) continue;
+      if (SENSITIVE_ENV_KEY_RE.test(key) || SENSITIVE_ENV_KEY_ALLOWLIST.has(key)) return true;
     }
     return false;
   }
