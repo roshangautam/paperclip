@@ -140,6 +140,62 @@ describe("collectSecretRefPaths", () => {
     });
   });
 
+  it("scopes resource-keyed arrays nested under patternProperties and additionalProperties", () => {
+    const scopedArraySchema = {
+      type: "array",
+      "x-paperclip-runtime-scope": {
+        resource: "agent",
+        field: "agentId",
+        fallback: "first",
+      },
+      items: {
+        type: "object",
+        properties: {
+          agentId: { type: "string", "x-paperclip-resource": "agent" },
+          apiToken: { type: "string", format: "secret-ref" },
+        },
+      },
+    };
+    const makeConfig = () => ({
+      byRegion: {
+        useast: [
+          { agentId: "agent-1", apiToken: "token-1" },
+          { agentId: "agent-2", apiToken: "token-2" },
+        ],
+      },
+      dynamic: {
+        extra: [
+          { agentId: "agent-1", apiToken: "token-3" },
+          { agentId: "agent-2", apiToken: "token-4" },
+        ],
+      },
+    });
+    const schema = {
+      type: "object",
+      properties: {
+        byRegion: {
+          type: "object",
+          patternProperties: {
+            "^us": scopedArraySchema,
+          },
+        },
+        dynamic: {
+          type: "object",
+          additionalProperties: scopedArraySchema,
+        },
+      },
+    };
+
+    expect(compactConfigArrays(scopeConfigResourceArrays(schema, makeConfig(), { agent: "agent-2" }))).toEqual({
+      byRegion: { useast: [{ agentId: "agent-2", apiToken: "token-2" }] },
+      dynamic: { extra: [{ agentId: "agent-2", apiToken: "token-4" }] },
+    });
+    expect(compactConfigArrays(scopeConfigResourceArrays(schema, makeConfig(), { agent: "agent-1" }))).toEqual({
+      byRegion: { useast: [{ agentId: "agent-1", apiToken: "token-1" }] },
+      dynamic: { extra: [{ agentId: "agent-1", apiToken: "token-3" }] },
+    });
+  });
+
   it("collects composed primitive refs in nested arrays", () => {
     const config = {
       token: "top-level",

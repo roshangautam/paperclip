@@ -340,6 +340,7 @@ export function scopeConfigResourceArrays(
     path: string,
     seenRefs: ReadonlySet<string>,
   ): void {
+    const visitedKeys = new Set<string>();
     const ref = node.$ref;
     if (typeof ref === "string") {
       const refAtPath = `${ref}\u0000${path}`;
@@ -379,7 +380,32 @@ export function scopeConfigResourceArrays(
         if (!isPlainRecord(propertySchema) || !Object.prototype.hasOwnProperty.call(value, key)) {
           continue;
         }
+        visitedKeys.add(key);
         walk(propertySchema, value[key], joinConfigPath(path, key), seenRefs);
+      }
+    }
+
+    if (isPlainRecord(node.patternProperties) && isPlainRecord(value)) {
+      for (const [pattern, propertySchema] of Object.entries(node.patternProperties)) {
+        if (!isPlainRecord(propertySchema)) continue;
+        let matcher: RegExp;
+        try {
+          matcher = new RegExp(pattern);
+        } catch {
+          continue;
+        }
+        for (const key of Object.keys(value)) {
+          if (!matcher.test(key)) continue;
+          visitedKeys.add(key);
+          walk(propertySchema, value[key], joinConfigPath(path, key), seenRefs);
+        }
+      }
+    }
+
+    if (isPlainRecord(node.additionalProperties) && isPlainRecord(value)) {
+      for (const key of Object.keys(value)) {
+        if (visitedKeys.has(key)) continue;
+        walk(node.additionalProperties, value[key], joinConfigPath(path, key), seenRefs);
       }
     }
 
