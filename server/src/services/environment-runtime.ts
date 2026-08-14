@@ -77,7 +77,7 @@ import { assertClass3StaticLeaseAllowed, secretService } from "./secrets.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
-import { redactEventPayload } from "../redaction.js";
+import { redactPersistedCredentialValues } from "../redaction.js";
 import { readSignedToolArgumentsPayload } from "./tool-content-guards.js";
 import {
   isAutomaticReusableEnvironmentLeaseCleanupCandidate,
@@ -102,17 +102,51 @@ export function buildEnvironmentLeaseContext(input: {
   };
 }
 
-function stripSecretRefValuesFromPluginLeaseMetadata(input: {
+function secretRefContainerPaths(paths: Iterable<string>): Set<string> {
+  const containers = new Set<string>();
+  for (const path of paths) {
+    const segments = path.split(".");
+    for (let length = 1; length < segments.length; length += 1) {
+      containers.add(segments.slice(0, length).join("."));
+    }
+  }
+  return containers;
+}
+
+function stripSecretRefsFromPluginConfigSnapshot(input: {
+  config: Record<string, unknown> | null | undefined;
+  schema: Record<string, unknown> | null | undefined;
+}): Record<string, unknown> {
+  let sanitized = structuredClone(input.config ?? {}) as Record<string, unknown>;
+  // A schema-governed config snapshot is reconstructed on reuse by re-inserting
+  // secret-refs at DB-bound config paths, so structure must be preserved and only
+  // schema-declared secret values removed. Without a schema there is no safe
+  // reconstruction contract, so fall back to value-level credential redaction.
+  if (!input.schema) {
+    return redactPersistedCredentialValues(sanitized) as Record<string, unknown>;
+  }
+  for (const path of collectSecretRefPaths(input.schema, sanitized)) {
+    sanitized = writeConfigValueAtPath(sanitized, path, undefined);
+  }
+  return sanitized;
+}
+
+function sanitizePluginProviderLeaseMetadata(input: {
   metadata: Record<string, unknown> | null | undefined;
   schema: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
   let sanitized = structuredClone(input.metadata ?? {}) as Record<string, unknown>;
-  if (!input.schema) return redactEventPayload(sanitized) ?? {};
-  for (const path of collectSecretRefPaths(input.schema, sanitized)) {
+  // Provider-returned lease metadata is an untrusted persistence boundary: the
+  // config schema identifies restorable secret-ref paths but does not constrain
+  // arbitrary fields a provider returns, so remove declared refs and then redact
+  // residual credential-shaped values without collapsing reuse-critical structure.
+  const secretRefPaths = collectSecretRefPaths(input.schema, sanitized);
+  for (const path of secretRefPaths) {
     sanitized = writeConfigValueAtPath(sanitized, path, undefined);
   }
-
-  return sanitized;
+  return redactPersistedCredentialValues(sanitized, {
+    preserveContainerPaths: secretRefContainerPaths(secretRefPaths),
+  }) as Record<string, unknown>;
 }
 
 export interface EnvironmentDriverAcquireInput {
@@ -306,12 +340,12 @@ function buildSandboxCustomImageReplay(input: {
   runtimeConfig: SandboxEnvironmentConfig;
   schema?: Record<string, unknown> | null;
 }): SandboxCustomImageReplay | null {
-  const storedConfig = stripSecretRefValuesFromPluginLeaseMetadata({
-    metadata: input.storedConfig as unknown as Record<string, unknown>,
+  const storedConfig = stripSecretRefsFromPluginConfigSnapshot({
+    config: input.storedConfig as unknown as Record<string, unknown>,
     schema: input.schema,
   });
-  const runtimeConfig = stripSecretRefValuesFromPluginLeaseMetadata({
-    metadata: input.runtimeConfig as unknown as Record<string, unknown>,
+  const runtimeConfig = stripSecretRefsFromPluginConfigSnapshot({
+    config: input.runtimeConfig as unknown as Record<string, unknown>,
     schema: input.schema,
   });
   const setEntries: Array<[string, unknown]> = [];
@@ -2377,7 +2411,7 @@ function createSandboxEnvironmentDriver(
         throw new Error(`Plugin-backed sandbox acquisition "${acquisitionId}" returned no provider lease id.`);
       }
       providerMetadata = sanitizePluginSandboxConfigFromLeaseMetadata(
-        stripSecretRefValuesFromPluginLeaseMetadata({
+        sanitizePluginProviderLeaseMetadata({
           metadata: providerLease.metadata,
           schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
         }),
@@ -2658,8 +2692,8 @@ function createSandboxEnvironmentDriver(
           storedConfig as unknown as Record<string, unknown>,
           { agent: input.agentId },
         ) as SandboxEnvironmentConfig;
-        const providerConfigForLease = stripSecretRefValuesFromPluginLeaseMetadata({
-          metadata: sandboxConfigForLeaseMetadata(scopedStoredConfig),
+        const providerConfigForLease = stripSecretRefsFromPluginConfigSnapshot({
+          config: sandboxConfigForLeaseMetadata(scopedStoredConfig),
           schema: providerConfigSchema,
         });
         const supportsReusableLeases = pluginProvider.resolved.driver.supportsReusableLeases === true;
@@ -2847,7 +2881,7 @@ function createSandboxEnvironmentDriver(
                 const replacementMetadata = {
                   ...fallbackLeaseMetadata,
                   ...sanitizePluginSandboxConfigFromLeaseMetadata(
-                    stripSecretRefValuesFromPluginLeaseMetadata({
+                    sanitizePluginProviderLeaseMetadata({
                       metadata: providerLease.metadata,
                       schema: providerConfigSchema,
                     }),
@@ -3036,7 +3070,7 @@ function createSandboxEnvironmentDriver(
           // as `reuse_by_environment` would let a concurrent heartbeat resume
           // the test's provider lease and lose its sandbox when the test ends.
           const sanitizedProviderMetadata = sanitizePluginSandboxConfigFromLeaseMetadata(
-            stripSecretRefValuesFromPluginLeaseMetadata({
+            sanitizePluginProviderLeaseMetadata({
               metadata: acquiredLease.metadata,
               schema: providerConfigSchema,
             }),

@@ -1,4 +1,5 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
+import { encodeConfigPathSegment } from "./services/json-schema-secret-refs.js";
 
 const SECRET_FIELD_NAME_PATTERN =
   String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)[A-Za-z0-9_-]*`;
@@ -131,6 +132,45 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
   if (!payload) return null;
   if (!isPlainObject(payload)) return payload;
   return sanitizeRecord(payload);
+}
+
+const IDENTIFIER_REFERENCE_KEY_RE = /(?:id|name|ref|path|url|uri|host)$/i;
+
+export function redactPersistedCredentialValues(
+  value: unknown,
+  options: { preserveContainerPaths?: ReadonlySet<string> } = {},
+): unknown {
+  const preserveContainerPaths = options.preserveContainerPaths ?? new Set<string>();
+
+  function visit(current: unknown, path: string, inheritedSensitive: boolean, key: string | null): unknown {
+    if (current === null || current === undefined) return current;
+    if (Array.isArray(current)) {
+      return current.map((entry, index) =>
+        visit(entry, path ? `${path}.${index}` : String(index), inheritedSensitive, null),
+      );
+    }
+    if (isPlainObject(current)) {
+      const result: Record<string, unknown> = {};
+      for (const [childKey, childValue] of Object.entries(current)) {
+        const childPath = path ? `${path}.${encodeConfigPathSegment(childKey)}` : encodeConfigPathSegment(childKey);
+        const sensitiveKey = SECRET_PAYLOAD_KEY_RE.test(childKey)
+          && !IDENTIFIER_REFERENCE_KEY_RE.test(childKey);
+        result[childKey] = visit(
+          childValue,
+          childPath,
+          preserveContainerPaths.has(childPath) ? false : inheritedSensitive || sensitiveKey,
+          childKey,
+        );
+      }
+      return result;
+    }
+    if (key !== null && IDENTIFIER_REFERENCE_KEY_RE.test(key)) return current;
+    if (inheritedSensitive) return REDACTED_EVENT_VALUE;
+    if (typeof current === "string" && JWT_VALUE_RE.test(current)) return REDACTED_EVENT_VALUE;
+    return current;
+  }
+
+  return visit(value, "", false, null);
 }
 
 export function redactSensitiveText(input: string): string {

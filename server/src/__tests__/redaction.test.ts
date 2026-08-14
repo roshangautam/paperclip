@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { REDACTED_EVENT_VALUE, redactEventPayload, redactSensitiveText, sanitizeRecord } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, redactEventPayload, redactPersistedCredentialValues, redactSensitiveText, sanitizeRecord } from "../redaction.js";
 
 describe("redaction", () => {
   it("redacts sensitive keys and nested secret values", () => {
@@ -134,5 +134,34 @@ describe("redaction", () => {
 
     expect(result?.args).toEqual(["--api-key", "not-a-command-secret"]);
     expect(result?.argv).toEqual(["--api-key", REDACTED_EVENT_VALUE]);
+  });
+});
+
+describe("redactPersistedCredentialValues", () => {
+  it("redacts credential-shaped values while preserving reuse-critical structure", () => {
+    const result = redactPersistedCredentialValues({
+      accessToken: "provider-plaintext",
+      agentCredentials: [{ agentId: "agent-2" }],
+      secretName: "provider-runtime-secret-name",
+      sandboxId: "sandbox-1",
+      remoteCwd: "/workspace",
+    });
+
+    expect(result).toEqual({
+      accessToken: REDACTED_EVENT_VALUE,
+      agentCredentials: [{ agentId: "agent-2" }],
+      secretName: "provider-runtime-secret-name",
+      sandboxId: "sandbox-1",
+      remoteCwd: "/workspace",
+    });
+  });
+
+  it("keeps values under preserved secret-ref container paths intact", () => {
+    const result = redactPersistedCredentialValues(
+      { agentCredentials: [{ agentId: "agent-2", apiToken: undefined }] },
+      { preserveContainerPaths: new Set(["agentCredentials", "agentCredentials.0"]) },
+    );
+
+    expect(result).toEqual({ agentCredentials: [{ agentId: "agent-2", apiToken: undefined }] });
   });
 });
