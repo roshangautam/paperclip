@@ -217,6 +217,10 @@ interface ActiveInvocation {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+export interface HostInvocationMetadata {
+  allowTerminalRunWorkspaceExecution?: boolean;
+}
+
 interface WorkerMessageContext extends WorkerHostCallContext {
   suppressWorkerOutput?: boolean;
 }
@@ -269,6 +273,7 @@ export interface PluginWorkerHandle {
     method: M,
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
+    invocationMetadata?: HostInvocationMetadata,
   ): Promise<HostToWorkerMethods[M][1]>;
 
   /**
@@ -364,6 +369,7 @@ export interface PluginWorkerManager {
     method: M,
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
+    invocationMetadata?: HostInvocationMetadata,
   ): Promise<HostToWorkerMethods[M][1]>;
 }
 
@@ -528,6 +534,7 @@ export function createPluginWorkerHandle(
   function deriveInvocationScope(
     method: HostToWorkerMethodName | string,
     params: unknown,
+    invocationMetadata?: HostInvocationMetadata,
   ): PluginInvocationScope | null {
     if (!isRecord(params)) return null;
 
@@ -541,7 +548,17 @@ export function createPluginWorkerHandle(
 
     if (method === "executeTool" && isRecord(params.runContext)) {
       const companyId = readNonEmptyString(params.runContext.companyId);
-      return companyId ? { companyId } : null;
+      if (!companyId) return null;
+      const runId = readNonEmptyString(params.runContext.runId);
+      const agentId = readNonEmptyString(params.runContext.agentId);
+      return {
+        companyId,
+        ...(runId ? { runId } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(invocationMetadata?.allowTerminalRunWorkspaceExecution === true
+          ? { allowTerminalRunWorkspaceExecution: true }
+          : {}),
+      };
     }
 
     if (method === "onEvent" && isRecord(params.event)) {
@@ -1158,6 +1175,7 @@ export function createPluginWorkerHandle(
     method: M,
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
+    invocationMetadata?: HostInvocationMetadata,
   ): Promise<HostToWorkerMethods[M][1]> {
     const rpcPromise = new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
       if (!childProcess?.stdin?.writable) {
@@ -1173,7 +1191,7 @@ export function createPluginWorkerHandle(
       const timeout = timeoutMs ?? Math.min(rpcTimeoutMs, MAX_RPC_TIMEOUT_MS);
       const suppressWorkerOutput = containsSensitiveEnv(params);
       if (suppressWorkerOutput) suppressUnscopedWorkerOutput = true;
-      const invocationScope = deriveInvocationScope(method, params);
+      const invocationScope = deriveInvocationScope(method, params, invocationMetadata);
       const invocation = invocationScope
         ? registerInvocation(invocationScope, suppressWorkerOutput)
         : null;
@@ -1285,6 +1303,7 @@ export function createPluginWorkerHandle(
       method: M,
       params: HostToWorkerMethods[M][0],
       timeoutMs?: number,
+      invocationMetadata?: HostInvocationMetadata,
     ): Promise<HostToWorkerMethods[M][1]> {
       if (status !== "running" && status !== "starting") {
         return Promise.reject(
@@ -1302,7 +1321,7 @@ export function createPluginWorkerHandle(
           new Error(`Plugin worker "${pluginId}" does not support required method "${method}".`),
         );
       }
-      return callInternal(method, params, timeoutMs);
+      return callInternal(method, params, timeoutMs, invocationMetadata);
     },
 
     notify(method: string, params: unknown) {
@@ -1522,6 +1541,7 @@ export function createPluginWorkerManager(
       method: M,
       params: HostToWorkerMethods[M][0],
       timeoutMs?: number,
+      invocationMetadata?: HostInvocationMetadata,
     ): Promise<HostToWorkerMethods[M][1]> {
       const handle = workers.get(pluginId);
       if (!handle) {
@@ -1529,7 +1549,7 @@ export function createPluginWorkerManager(
           new Error(`No worker registered for plugin "${pluginId}"`),
         );
       }
-      return handle.call(method, params, timeoutMs);
+      return handle.call(method, params, timeoutMs, invocationMetadata);
     },
   };
 }

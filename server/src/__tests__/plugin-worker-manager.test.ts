@@ -327,6 +327,102 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("passes executeTool run and agent scope to nested worker host calls", async () => {
+    const companiesGet = vi.fn(async (
+      params: { companyId: string },
+      context?: { invocationScope?: { companyId?: string | null; runId?: string; agentId?: string } | null },
+    ) => ({
+      id: params.companyId,
+      scope: context?.invocationScope ?? null,
+    }));
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {
+        "companies.get": companiesGet as never,
+      },
+    });
+
+    try {
+      await handle.start();
+
+      await expect(handle.call("executeTool", {
+        toolName: "probe",
+        parameters: {
+          mode: "echo",
+          requestedCompanyId: "company-a",
+        },
+        runContext: {
+          companyId: "company-a",
+          projectId: "project-1",
+          runId: "run-1",
+          agentId: "agent-1",
+        },
+      })).resolves.toEqual({
+        id: "company-a",
+        scope: { companyId: "company-a", runId: "run-1", agentId: "agent-1" },
+      });
+      expect(companiesGet).toHaveBeenCalledWith(
+        { companyId: "company-a" },
+        { invocationScope: { companyId: "company-a", runId: "run-1", agentId: "agent-1" } },
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("adds terminal workspace execution scope only from host invocation metadata", async () => {
+    const companiesGet = vi.fn(async (
+      params: { companyId: string },
+      context?: { invocationScope?: { allowTerminalRunWorkspaceExecution?: boolean } | null },
+    ) => ({
+      id: params.companyId,
+      allowTerminalRunWorkspaceExecution:
+        context?.invocationScope?.allowTerminalRunWorkspaceExecution === true,
+    }));
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: { "companies.get": companiesGet as never },
+    });
+    const params = {
+      toolName: "probe",
+      parameters: { mode: "echo", requestedCompanyId: "company-a" },
+      runContext: {
+        companyId: "company-a",
+        projectId: "project-1",
+        runId: "run-1",
+        agentId: "agent-1",
+        allowTerminalRunWorkspaceExecution: true,
+      },
+    } as HostToWorkerMethods["executeTool"][0];
+
+    try {
+      await handle.start();
+
+      await expect(handle.call("executeTool", params)).resolves.toMatchObject({
+        allowTerminalRunWorkspaceExecution: false,
+      });
+      await expect(handle.call(
+        "executeTool",
+        params,
+        undefined,
+        { allowTerminalRunWorkspaceExecution: true },
+      )).resolves.toMatchObject({ allowTerminalRunWorkspaceExecution: true });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("passes echoed invocation scope to worker-to-host handlers", async () => {
     const companiesGet = vi.fn(async () => ({ id: "company-1" }));
     const handle = createPluginWorkerHandle("test.plugin", {
