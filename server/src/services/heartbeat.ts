@@ -630,8 +630,21 @@ const WORKSPACE_REALIZATION_ONLY_ENV_KEYS = new Set([
   "GITHUB_APP_PRIVATE_KEY_FILE",
 ]);
 
+// Tokens the workspace realization needs for the initial private-repo clone but
+// that the adapter runtime also uses for its git push preflight. Unlike the App
+// identity keys above, these are copied into the realization env AND retained in
+// the adapter runtime rather than moved out.
+const WORKSPACE_REALIZATION_SHARED_ENV_KEYS = new Set([
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+]);
+
 function isWorkspaceRealizationOnlyEnvKey(key: string) {
   return WORKSPACE_REALIZATION_ONLY_ENV_KEYS.has(key);
+}
+
+function isWorkspaceRealizationSharedEnvKey(key: string) {
+  return WORKSPACE_REALIZATION_SHARED_ENV_KEYS.has(key);
 }
 
 function stripWorkspaceRealizationOnlyEnvBindings(envValue: unknown): unknown {
@@ -664,7 +677,8 @@ export function partitionWorkspaceRealizationAdapterConfig(
   const workspaceRealizationEnv = Object.fromEntries(
     Object.entries(env).filter(
       (entry): entry is [string, string] =>
-        isWorkspaceRealizationOnlyEnvKey(entry[0]) && typeof entry[1] === "string",
+        (isWorkspaceRealizationOnlyEnvKey(entry[0]) || isWorkspaceRealizationSharedEnvKey(entry[0]))
+        && typeof entry[1] === "string",
     ),
   );
   if (!Object.prototype.hasOwnProperty.call(config, "env")) {

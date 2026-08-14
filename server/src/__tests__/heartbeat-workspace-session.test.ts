@@ -72,6 +72,8 @@ describe("workspace realization credential boundary", () => {
       GITHUB_APP_INSTALLATION_ID: "alternate-installation-id",
       GITHUB_APP_PRIVATE_KEY: "private-key",
       GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app-key",
+      GH_TOKEN: "scoped-gh-token",
+      GITHUB_TOKEN: "scoped-github-token",
     });
     expect(result.runtimeAdapterConfig).toEqual({
       command: "codex",
@@ -82,6 +84,32 @@ describe("workspace realization credential boundary", () => {
       },
     });
     expect(input.env.GITHUB_APP_PRIVATE_KEY).toBe("private-key");
+  });
+
+  it("forwards push tokens to realization while retaining them in the adapter runtime", () => {
+    const input = {
+      command: "codex",
+      env: {
+        GH_TOKEN: "scoped-gh-token",
+        GITHUB_TOKEN: "scoped-github-token",
+        PLAIN_FLAG: "enabled",
+      },
+    };
+
+    const result = partitionWorkspaceRealizationAdapterConfig(input);
+
+    expect(result.workspaceRealizationEnv).toEqual({
+      GH_TOKEN: "scoped-gh-token",
+      GITHUB_TOKEN: "scoped-github-token",
+    });
+    expect(result.runtimeAdapterConfig).toEqual({
+      command: "codex",
+      env: {
+        GH_TOKEN: "scoped-gh-token",
+        GITHUB_TOKEN: "scoped-github-token",
+        PLAIN_FLAG: "enabled",
+      },
+    });
   });
 });
 

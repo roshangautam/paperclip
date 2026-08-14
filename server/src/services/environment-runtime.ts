@@ -192,6 +192,8 @@ const REALIZATION_CREDENTIAL_ENV_KEYS = new Set([
   "GITHUB_APP_INSTALLATION_ID",
   "GITHUB_APP_PRIVATE_KEY",
   "GITHUB_APP_PRIVATE_KEY_FILE",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
 ]);
 
 // The agent that owns a realization's forwarded credentials, or null when no
