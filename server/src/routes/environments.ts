@@ -42,6 +42,7 @@ import {
   presentEnvironmentConfigForRead,
   readSshEnvironmentPrivateKeySecretId,
   type ParsedEnvironmentConfig,
+  type SandboxProviderSchemaCache,
 } from "../services/environment-config.js";
 import { probeEnvironment } from "../services/environment-probe.js";
 import { secretService } from "../services/secrets.js";
@@ -136,13 +137,13 @@ export function environmentRoutes(
     config: Record<string, unknown> | null;
     envVars?: Record<string, unknown> | null;
     metadata: Record<string, unknown> | null;
-  }>(req: Request, environment: T): Promise<T> {
+  }>(req: Request, environment: T, schemaCache?: SandboxProviderSchemaCache): Promise<T> {
     if (!canReadFullInstanceEnvironment(req)) {
       return redactEnvironmentForRestrictedView(environment);
     }
     return {
       ...environment,
-      config: await presentEnvironmentConfigForRead(db, environment),
+      config: await presentEnvironmentConfigForRead(db, environment, schemaCache),
     };
   }
 
@@ -389,7 +390,8 @@ export function environmentRoutes(
       status: req.query.status as string | undefined,
       driver: req.query.driver as string | undefined,
     });
-    res.json(await Promise.all(rows.map((row) => presentEnvironmentForRead(req, row))));
+    const schemaCache: SandboxProviderSchemaCache = new Map();
+    res.json(await Promise.all(rows.map((row) => presentEnvironmentForRead(req, row, schemaCache))));
   });
 
   router.get("/environments/:id/delete-blast-radius", async (req, res) => {

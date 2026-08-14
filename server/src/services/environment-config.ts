@@ -156,18 +156,26 @@ function parseSandboxEnvironmentConfig(
     : ({ success: false as const, error: parsed.error });
 }
 
+export type SandboxProviderSchemaCache = Map<string, Record<string, unknown> | null>;
+
 async function getSandboxProviderConfigSchema(
   db: Db,
   provider: string,
+  schemaCache?: SandboxProviderSchemaCache,
 ): Promise<Record<string, unknown> | null> {
+  if (schemaCache?.has(provider)) {
+    return schemaCache.get(provider) ?? null;
+  }
   const resolved = await resolvePluginSandboxProviderDriverByKey({
     db,
     driverKey: provider,
   });
   const schema = resolved?.driver.configSchema;
-  return schema && typeof schema === "object" && !Array.isArray(schema)
+  const normalized = schema && typeof schema === "object" && !Array.isArray(schema)
     ? schema as Record<string, unknown>
     : null;
+  schemaCache?.set(provider, normalized);
+  return normalized;
 }
 
 export async function resolveSandboxProviderSecretRefPaths(
@@ -181,6 +189,7 @@ export async function resolveSandboxProviderSecretRefPaths(
 export async function presentEnvironmentConfigForRead(
   db: Db,
   environment: { driver: string; config: Record<string, unknown> | null },
+  schemaCache?: SandboxProviderSchemaCache,
 ): Promise<Record<string, unknown>> {
   const config = parseObject(environment.config);
   if (environment.driver !== "sandbox") return config;
@@ -190,7 +199,7 @@ export async function presentEnvironmentConfigForRead(
 
   let schema: Record<string, unknown> | null = null;
   try {
-    schema = await getSandboxProviderConfigSchema(db, provider);
+    schema = await getSandboxProviderConfigSchema(db, provider, schemaCache);
   } catch {
     // A missing provider must not expose historical plaintext config.
   }
