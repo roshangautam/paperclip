@@ -603,9 +603,10 @@ export function createPluginWorkerHandle(
     if (!invocationId) {
       const hasActiveInvocation = activeInvocations.size > 0 ||
         Array.from(pendingRequests.values()).some((pending) => pending.invocationId);
-      return hasActiveInvocation || suppressUnscopedWorkerOutput
-        ? { invalidInvocationScope: true }
-        : {};
+      return {
+        ...(hasActiveInvocation ? { invalidInvocationScope: true } : {}),
+        ...(suppressUnscopedWorkerOutput ? { suppressWorkerOutput: true } : {}),
+      };
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
