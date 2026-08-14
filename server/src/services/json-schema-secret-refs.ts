@@ -11,6 +11,32 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// Security: config paths are dot-joined strings shared by builders, readers,
+// writers, and persisted secret-ref bindings. A literal key may contain a dot
+// (e.g. `tokens."github.com"`), so segments are escaped JSON-Pointer style
+// (`~` -> `~0`, `.` -> `~1`) to keep the join reversible; otherwise such a key
+// is unreachable and its plaintext is neither converted nor redacted.
+function encodePathSegment(segment: string): string {
+  return segment.replaceAll("~", "~0").replaceAll(".", "~1");
+}
+
+function decodePathSegment(segment: string): string {
+  return segment.replaceAll("~1", ".").replaceAll("~0", "~");
+}
+
+function joinConfigPath(prefix: string, segment: string | number): string {
+  const encoded = typeof segment === "number" ? String(segment) : encodePathSegment(segment);
+  return prefix ? `${prefix}.${encoded}` : encoded;
+}
+
+function splitConfigPath(dotPath: string): string[] {
+  return dotPath.split(".").map(decodePathSegment);
+}
+
+export function encodeConfigPathSegment(segment: string | number): string {
+  return typeof segment === "number" ? String(segment) : encodePathSegment(segment);
+}
+
 function resolveLocalSchemaRef(
   rootSchema: Record<string, unknown>,
   ref: string,
@@ -119,7 +145,7 @@ export function inspectSecretRefPaths(
           continue;
         }
         visitedKeys.add(key);
-        const path = prefix ? `${prefix}.${key}` : key;
+        const path = joinConfigPath(prefix, key);
         const propertyValue = isPlainRecord(value)
           ? value[key]
           : undefined;
@@ -149,7 +175,7 @@ export function inspectSecretRefPaths(
         for (const [key, propertyValue] of Object.entries(value)) {
           if (!matcher.test(key)) continue;
           visitedKeys.add(key);
-          const path = prefix ? `${prefix}.${key}` : key;
+          const path = joinConfigPath(prefix, key);
           walk(propertySchema, path, propertyValue, seenRefs);
         }
       }
@@ -161,7 +187,7 @@ export function inspectSecretRefPaths(
       if (isPlainRecord(value)) {
         for (const [key, propertyValue] of Object.entries(value)) {
           if (visitedKeys.has(key)) continue;
-          const path = prefix ? `${prefix}.${key}` : key;
+          const path = joinConfigPath(prefix, key);
           walk(additionalProperties, path, propertyValue, seenRefs);
         }
       }
@@ -184,7 +210,7 @@ export function inspectSecretRefPaths(
         }
         if (!Array.isArray(value) || index >= value.length) return;
         visitedIndexes.add(index);
-        const path = prefix ? `${prefix}.${index}` : String(index);
+        const path = joinConfigPath(prefix, index);
         walk(itemSchema, path, value[index], seenRefs);
       });
       const additionalItems = node.additionalItems;
@@ -193,7 +219,7 @@ export function inspectSecretRefPaths(
         if (Array.isArray(value)) {
           value.forEach((entry, index) => {
             if (visitedIndexes.has(index)) return;
-            const path = prefix ? `${prefix}.${index}` : String(index);
+            const path = joinConfigPath(prefix, index);
             walk(additionalItems, path, entry, seenRefs);
           });
         }
@@ -204,7 +230,7 @@ export function inspectSecretRefPaths(
       sawInspectableStructure = true;
       if (Array.isArray(value)) {
         value.forEach((entry, index) => {
-          const path = prefix ? `${prefix}.${index}` : String(index);
+          const path = joinConfigPath(prefix, index);
           walk(items, path, entry, seenRefs);
         });
       }
@@ -353,7 +379,7 @@ export function scopeConfigResourceArrays(
         if (!isPlainRecord(propertySchema) || !Object.prototype.hasOwnProperty.call(value, key)) {
           continue;
         }
-        walk(propertySchema, value[key], path ? `${path}.${key}` : key, seenRefs);
+        walk(propertySchema, value[key], joinConfigPath(path, key), seenRefs);
       }
     }
 
@@ -361,12 +387,12 @@ export function scopeConfigResourceArrays(
     if (isPlainRecord(items) && Array.isArray(value)) {
       value.forEach((entry, index) => {
         if (entry === undefined) return;
-        walk(items, entry, path ? `${path}.${index}` : String(index), seenRefs);
+        walk(items, entry, joinConfigPath(path, index), seenRefs);
       });
     } else if (Array.isArray(items) && Array.isArray(value)) {
       items.forEach((itemSchema, index) => {
         if (isPlainRecord(itemSchema) && index < value.length) {
-          walk(itemSchema, value[index], path ? `${path}.${index}` : String(index), seenRefs);
+          walk(itemSchema, value[index], joinConfigPath(path, index), seenRefs);
         }
       });
       if (isPlainRecord(node.additionalItems)) {
@@ -374,7 +400,7 @@ export function scopeConfigResourceArrays(
           walk(
             node.additionalItems,
             value[index],
-            path ? `${path}.${index}` : String(index),
+            joinConfigPath(path, index),
             seenRefs,
           );
         }
@@ -418,7 +444,7 @@ export function readConfigValueAtPath(
   dotPath: string,
 ): unknown {
   let current: unknown = config;
-  for (const key of dotPath.split(".")) {
+  for (const key of splitConfigPath(dotPath)) {
     current = readPathSegment(current, key);
     if (current === undefined) return undefined;
   }
@@ -431,7 +457,7 @@ export function writeConfigValueAtPath(
   value: unknown,
 ): Record<string, unknown> {
   const result = structuredClone(config) as Record<string, unknown>;
-  const keys = dotPath.split(".");
+  const keys = splitConfigPath(dotPath);
   let cursor: unknown = result;
 
   for (let index = 0; index < keys.length - 1; index += 1) {

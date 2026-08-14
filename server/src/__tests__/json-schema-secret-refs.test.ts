@@ -207,6 +207,30 @@ describe("collectSecretRefPaths", () => {
     }))).toEqual(["tokens.github", "tokens.slack"]);
   });
 
+  it("round-trips dynamic keys that contain a dot", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        tokens: {
+          type: "object",
+          additionalProperties: { type: "string", format: "secret-ref" },
+        },
+      },
+    };
+    const config = { tokens: { "github.com": "plaintext-token" } };
+
+    const [path] = Array.from(collectSecretRefPaths(schema, config));
+    expect(path).toBe("tokens.github~1com");
+    expect(readConfigValueAtPath(config, path!)).toBe("plaintext-token");
+
+    const cleared = writeConfigValueAtPath(config, path!, undefined);
+    expect(cleared).toEqual({ tokens: {} });
+    expect(config).toEqual({ tokens: { "github.com": "plaintext-token" } });
+
+    const rewritten = writeConfigValueAtPath(config, path!, "secret-uuid");
+    expect(rewritten).toEqual({ tokens: { "github.com": "secret-uuid" } });
+  });
+
   it("collects tuple and additional item secret refs", () => {
     const schema = {
       type: "object",
