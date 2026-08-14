@@ -34,6 +34,7 @@ import {
   writeConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { resolveActiveEnvironmentCustomImageTemplateForRuntime } from "./environment-custom-image-runtime.js";
+import { redactPersistedCredentialValues } from "../redaction.js";
 
 const secretRefSchema = z.object({
   type: z.literal("secret_ref"),
@@ -214,6 +215,12 @@ export async function presentEnvironmentConfigForRead(
       presented = writeConfigValueAtPath(presented, path, undefined);
     }
   }
+  // Schema redaction only covers declared secret-ref paths; a plugin config can
+  // still carry undeclared credential-shaped fields. Scrub those residually while
+  // preserving the schema-declared secret-ref paths handled above.
+  presented = redactPersistedCredentialValues(presented, {
+    preserveContainerPaths: inspection.paths,
+  }) as Record<string, unknown>;
   return compactConfigArrays(presented);
 }
 

@@ -164,4 +164,62 @@ describe("buildWorkspaceRealizationRecordFromDriverInput", () => {
     expect(providerMetadata.agentId).toBe("agent-voss");
     expect(providerMetadata.credentialAgentId).toBe("agent-voss");
   });
+
+  it("redacts credential-shaped values echoed back in provider realization metadata", () => {
+    const now = new Date("2026-08-07T00:00:00.000Z");
+    const environment = {
+      id: "environment-1",
+      name: "Plugin environment",
+      description: null,
+      driver: "plugin",
+      status: "ready",
+      config: {},
+      envVars: {},
+      metadata: null,
+      createdAt: now,
+      updatedAt: now,
+    } satisfies Environment;
+    const lease = {
+      id: "lease-1",
+      companyId: "company-1",
+      environmentId: environment.id,
+      executionWorkspaceId: null,
+      issueId: null,
+      heartbeatRunId: "run-1",
+      status: "active",
+      leasePolicy: "ephemeral",
+      provider: "acme.plugin-provider",
+      providerLeaseId: "provider-lease-1",
+      acquiredAt: now,
+      lastUsedAt: now,
+      expiresAt: null,
+      releasedAt: null,
+      failureReason: null,
+      cleanupStatus: null,
+      reusableResourceOwner: false,
+      metadata: { agentId: "agent-voss" },
+      createdAt: now,
+      updatedAt: now,
+    } satisfies EnvironmentLease;
+
+    const record = buildWorkspaceRealizationRecordFromDriverInput({
+      environment,
+      lease,
+      workspace: { localPath: "/tmp/project" },
+      cwd: "/home/plugin/workspace",
+      providerMetadata: {
+        remoteCwd: "/home/plugin/workspace",
+        accessToken: "ghs_super_secret_realization_token",
+        sandboxId: "sbx-123",
+      },
+      credentialOwnerAgentId: "agent-voss",
+    });
+
+    const providerMetadata = record.rebuild.metadata.providerMetadata as Record<string, unknown>;
+    expect(providerMetadata.accessToken).not.toBe("ghs_super_secret_realization_token");
+    expect(providerMetadata.remoteCwd).toBe("/home/plugin/workspace");
+    expect(providerMetadata.sandboxId).toBe("sbx-123");
+    expect(providerMetadata.credentialAgentId).toBe("agent-voss");
+    expect(JSON.stringify(record)).not.toContain("ghs_super_secret_realization_token");
+  });
 });

@@ -298,6 +298,22 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(mockResolveEnvironmentExecutionTarget).not.toHaveBeenCalled();
   });
 
+  it("realization failure: forwarded credentials echoed in the provider error are redacted", async () => {
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockRejectedValue(
+        new Error('provider rejected token "resolved-private-key" for installation'),
+      ),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await expect(orchestrator.realizeForRun(makeRealizeInput())).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof EnvironmentRunError &&
+        err.code === "workspace_realization_failed" &&
+        !err.message.includes("resolved-private-key"),
+    );
+  });
+
   it("target resolution failure: resolveEnvironmentExecutionTarget throws → EnvironmentRunError with code transport_resolution_failed", async () => {
     mockResolveEnvironmentExecutionTarget.mockRejectedValue(new Error("network error"));
 

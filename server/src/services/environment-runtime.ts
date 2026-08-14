@@ -3583,7 +3583,7 @@ function createSandboxEnvironmentDriver(
             lease: input.lease,
             provider: providerKey,
           });
-          return await pluginWorkerManager.call(pluginId, "environmentRealizeWorkspace", {
+          const result = await pluginWorkerManager.call(pluginId, "environmentRealizeWorkspace", {
             driverKey: providerKey,
             companyId: input.lease.companyId,
             environmentId: input.environment.id,
@@ -3597,6 +3597,20 @@ function createSandboxEnvironmentDriver(
             env: input.env,
             workspace: input.workspace,
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)));
+          const record = buildWorkspaceRealizationRecordFromDriverInput({
+            environment: input.environment,
+            lease: input.lease,
+            workspace: input.workspace,
+            cwd: result.cwd,
+            providerMetadata: result.metadata,
+            credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
+          });
+          return {
+            cwd: result.cwd,
+            metadata: {
+              workspaceRealization: record,
+            },
+          };
         }
       }
 

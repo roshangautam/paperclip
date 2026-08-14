@@ -6,6 +6,7 @@ import type {
   WorkspaceRealizationRequest,
 } from "@paperclipai/shared";
 import type { RealizedExecutionWorkspace } from "./workspace-runtime.js";
+import { redactPersistedCredentialValues } from "../redaction.js";
 
 function parseObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -149,7 +150,11 @@ export function buildWorkspaceRealizationRecord(input: {
     ownershipMarkers.agentId = invokingAgentId ?? credentialOwnerAgentId;
     ownershipMarkers.credentialAgentId = credentialOwnerAgentId;
   }
-  const persistedProviderMetadata = { ...providerMetadata, ...ownershipMarkers };
+  // Provider realization results can echo forwarded credentials back in their
+  // metadata (e.g. { accessToken }); the lease-metadata sanitizer does not cover
+  // realization results, so redact secret-like values before persisting them.
+  const sanitizedProviderMetadata = redactPersistedCredentialValues(providerMetadata) as Record<string, unknown>;
+  const persistedProviderMetadata = { ...sanitizedProviderMetadata, ...ownershipMarkers };
 
   const sync = (() => {
     if (transport === "local") {

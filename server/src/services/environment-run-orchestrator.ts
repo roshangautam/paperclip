@@ -41,6 +41,7 @@ import {
   type AdapterRemoteExecutionSpec,
 } from "@paperclipai/adapter-utils/execution-target";
 import { buildWorkspaceRealizationRequest } from "./workspace-realization.js";
+import { redactSensitiveText, REDACTED_EVENT_VALUE } from "../redaction.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
 import { parseObject } from "../adapters/utils.js";
@@ -112,6 +113,28 @@ export interface EnvironmentRealizationResult {
 export interface EnvironmentReleaseResult {
   released: EnvironmentRuntimeLeaseRecord[];
   errors: Array<{ leaseId: string; error: unknown }>;
+}
+
+// A provider's realization error message can echo back forwarded credentials
+// (e.g. a GitHub App private key). Redact each forwarded value in its raw,
+// trimmed, and JSON-serialized forms before it reaches the run error, then apply
+// pattern-based redaction as a defense-in-depth backstop for derived encodings.
+function redactForwardedRealizationSecrets(
+  message: string,
+  forwardedEnv: Record<string, string>,
+): string {
+  let redacted = message;
+  for (const rawValue of Object.values(forwardedEnv)) {
+    if (typeof rawValue !== "string") continue;
+    const variants = new Set<string>();
+    for (const candidate of [rawValue, rawValue.trim(), JSON.stringify(rawValue), JSON.stringify(rawValue).slice(1, -1)]) {
+      if (candidate.length > 0) variants.add(candidate);
+    }
+    for (const variant of variants) {
+      redacted = redacted.split(variant).join(REDACTED_EVENT_VALUE);
+    }
+  }
+  return redactSensitiveText(redacted);
 }
 
 function firstNonEmptyLine(text: string | null | undefined): string | null {
@@ -403,9 +426,10 @@ export function environmentRunOrchestrator(
             : null;
         workspaceRealization = parseObject(workspaceRealizationResult.metadata?.workspaceRealization);
       } catch (err) {
+        const rawMessage = err instanceof Error ? err.message : String(err);
         throw new EnvironmentRunError(
           "workspace_realization_failed",
-          `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${redactForwardedRealizationSecrets(rawMessage, input.workspaceRealizationEnv)}`,
           {
             environmentId: environment.id,
             driver: environment.driver,
