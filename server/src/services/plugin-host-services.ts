@@ -26,6 +26,7 @@ import type {
   PluginIssueAssigneeSummary,
   PluginIssueOrchestrationSummary,
   PluginExecutionWorkspaceMetadata,
+  PluginExecutionWorkspaceExecuteInput,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
@@ -1520,7 +1521,15 @@ export function buildHostServices(
         }
         return null;
       },
-      async execute(params) {
+      async execute(
+        params: PluginExecutionWorkspaceExecuteInput,
+        context?: {
+          invocationScope?: {
+            agentId?: string;
+            allowTerminalRunWorkspaceExecution?: boolean;
+          } | null;
+        },
+      ) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const workspace = requireInCompany(
@@ -1529,8 +1538,27 @@ export function buildHostServices(
           companyId,
         );
 
+        const runRows = await db
+          .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.id, params.runId),
+            eq(heartbeatRuns.companyId, companyId),
+          ))
+          .limit(1);
+        const run = runRows[0];
+        const runIsExecutable = run?.status === "queued"
+          || run?.status === "running"
+          || context?.invocationScope?.allowTerminalRunWorkspaceExecution === true;
+        if (!run || !runIsExecutable) {
+          throw new Error("Heartbeat run is not executable");
+        }
+        if (run.agentId !== context?.invocationScope?.agentId) {
+          throw new Error("Heartbeat run is not owned by the invoking agent");
+        }
+
         const leaseRows = await db
-          .select({ id: environmentLeases.id })
+          .select({ id: environmentLeases.id, expiresAt: environmentLeases.expiresAt })
           .from(environmentLeases)
           .where(and(
             eq(environmentLeases.companyId, companyId),
@@ -1544,6 +1572,9 @@ export function buildHostServices(
         }
         if (leaseRows.length > 1) {
           throw new Error("Multiple active environment leases found for execution workspace");
+        }
+        if (leaseRows[0]?.expiresAt && leaseRows[0].expiresAt <= new Date()) {
+          throw new Error("No active environment lease found for execution workspace");
         }
 
         const lease = await environments.getLeaseById(leaseRows[0]!.id);
@@ -1572,6 +1603,13 @@ export function buildHostServices(
           env: params.env,
           stdin: params.stdin,
           timeoutMs: params.timeoutMs,
+          ...(lease.metadata?.workspaceRealization
+            ? {
+                workspaceRealization: Object.fromEntries(
+                  Object.entries(lease.metadata.workspaceRealization),
+                ),
+              }
+            : {}),
         });
       },
     },
