@@ -74,6 +74,7 @@ import {
   buildPaperclipClaudeMcpConfig,
   materializeRemoteClaudeConfig,
   materializeRemoteClaudeMcpConfig,
+  removeRemoteClaudeMcpConfig,
   prepareClaudeConfigSeed,
   resolveManagedClaudeRuntimeStateDir,
   resolveSharedClaudeConfigDir,
@@ -681,6 +682,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
   }
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+  let remoteMcpConfigMaterialized = false;
   if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
     paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
       runId,
@@ -708,7 +710,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             }),
             options: { cwd, env, timeoutSec, graceSec, onLog },
           });
+          remoteMcpConfigMaterialized = true;
         } catch (error) {
+          await removeRemoteClaudeMcpConfig({
+            runId,
+            target: runtimeExecutionTarget,
+            configPath: effectiveMcpConfigPath,
+            options: { cwd, env, timeoutSec, graceSec, onLog },
+          });
           await stopPaperclipBridgeThenRestoreWorkspace({
             paperclipBridge,
             restoreRemoteWorkspace,
@@ -1283,6 +1292,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
   } finally {
+    if (remoteMcpConfigMaterialized) {
+      await removeRemoteClaudeMcpConfig({
+        runId,
+        target: runtimeExecutionTarget,
+        configPath: effectiveMcpConfigPath,
+        options: { cwd, env, timeoutSec, graceSec, onLog },
+      });
+    }
     await stopPaperclipBridgeThenRestoreWorkspace({
       paperclipBridge,
       restoreRemoteWorkspace,

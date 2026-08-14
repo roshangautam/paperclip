@@ -225,6 +225,25 @@ export async function materializeRemoteClaudeMcpConfig(input: {
   }
 }
 
+// The materialized remote MCP config embeds the callback-bridge bearer token and
+// managed tool-gateway tokens. The managed workspace restore excludes
+// .paperclip-runtime, so this file would otherwise persist readable on the
+// remote resource after the run; remove it (best-effort) on both success and
+// failure so transient credentials do not accumulate.
+export async function removeRemoteClaudeMcpConfig(input: {
+  runId: string;
+  target: AdapterExecutionTarget | null | undefined;
+  configPath: string;
+  options: AdapterExecutionTargetShellOptions;
+}): Promise<void> {
+  await runAdapterExecutionTargetShellCommand(
+    input.runId,
+    input.target,
+    `rm -f ${shellQuote(input.configPath)}`,
+    input.options,
+  ).catch(() => undefined);
+}
+
 export async function prepareClaudeConfigSeed(
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],

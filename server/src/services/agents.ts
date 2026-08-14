@@ -751,6 +751,18 @@ export function agentService(db: Db) {
         // and releaseRunLeases selects by heartbeatRunId, so neither can recover
         // it, leaking the lease (and any external provider resource). Block the
         // deletion until those runs' leases are released and markers cleared.
+        //
+        // Lock the agent's run rows FOR UPDATE before the check so this is
+        // serialized with lease acquisition: a concurrent lease insert takes a
+        // FOR KEY SHARE lock on the referenced heartbeat_run row, which conflicts
+        // with our FOR UPDATE and blocks until this transaction commits. Without
+        // the lock a lease could be inserted after the check returns empty but
+        // before the run deletion nulls heartbeat_run_id, re-orphaning the lease.
+        await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, id))
+          .for("update");
         const blockingRuns = await tx
           .select({ runId: heartbeatRuns.id })
           .from(heartbeatRuns)

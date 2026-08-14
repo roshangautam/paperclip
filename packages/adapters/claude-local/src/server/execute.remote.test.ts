@@ -237,7 +237,7 @@ describe("claude remote execution", () => {
     expect(call?.[3].env.OTHER_ENV).toBe(workspaceDir);
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
-    expect(runAdapterExecutionTargetShellCommand).toHaveBeenCalledTimes(1);
+    expect(runAdapterExecutionTargetShellCommand).toHaveBeenCalledTimes(2);
     const mcpConfigCall = runAdapterExecutionTargetShellCommand.mock.calls[0] as unknown as
       | [string, unknown, string, { env: Record<string, string> }]
       | undefined;
@@ -250,6 +250,14 @@ describe("claude remote execution", () => {
         "x-paperclip-tool-gateway-token": "gateway-token",
       },
     });
+    const cleanupCall = runAdapterExecutionTargetShellCommand.mock.calls[1] as unknown as
+      | [string, unknown, string, { env: Record<string, string> }]
+      | undefined;
+    expect(cleanupCall?.[2]).toMatch(/^rm -f /);
+    expect(cleanupCall?.[2]).toContain(".paperclip-runtime/claude/mcp-config");
+    expect(cleanupCall?.[3]?.env.PAPERCLIP_CLAUDE_MCP_CONFIG).toBeUndefined();
+    expect(runAdapterExecutionTargetShellCommand.mock.invocationCallOrder[0])
+      .toBeLessThan(runAdapterExecutionTargetShellCommand.mock.invocationCallOrder[1]!);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({
       localDir: workspaceDir,
