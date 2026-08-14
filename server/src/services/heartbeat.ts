@@ -619,6 +619,37 @@ export function requiresPushCapabilityPreflight(input: {
     && hasGithubPrWorkflowSkill(input.explicitRunScopedSkillKeys);
 }
 
+// A GitHub App tuple only yields push credentials when the realizing driver
+// exchanges it for an installation token. sandbox/plugin realization does that,
+// but local/SSH realizeWorkspace never consumes env and
+// partitionWorkspaceRealizationAdapterConfig strips GITHUB_APP_* from the
+// runtime, so an App tuple would pass preflight and then launch git/gh with no
+// usable push auth. Restrict the App alternative to token-minting drivers.
+const PUSH_CAPABILITY_INSTALLATION_TOKEN_DRIVERS = new Set(["sandbox", "plugin"]);
+
+function pushCapabilityRealizationMintsInstallationToken(driver: string | null | undefined): boolean {
+  return typeof driver === "string" && PUSH_CAPABILITY_INSTALLATION_TOKEN_DRIVERS.has(driver);
+}
+
+export function buildPushCapabilityScopedEnvBinding(driver: string | null | undefined): {
+  keys: string[];
+  alternativeKeySets?: readonly (readonly string[])[];
+  consumerScopes: readonly ("agent" | "project")[];
+  reason: string;
+  remediation: string;
+} {
+  const appTupleUsable = pushCapabilityRealizationMintsInstallationToken(driver);
+  return {
+    keys: [...PUSH_CAPABILITY_ENV_KEYS],
+    alternativeKeySets: appTupleUsable ? PUSH_CAPABILITY_ALTERNATIVE_ENV_KEY_SETS : undefined,
+    consumerScopes: ["agent", "project"],
+    reason: "push_write_credential_missing",
+    remediation: appTupleUsable
+      ? "GitHub PR workflow requires GH_TOKEN, GITHUB_TOKEN, or a complete GitHub App identity bound at project or agent scope."
+      : "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
+  };
+}
+
 const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|(?:^|[-_])token(?:$|[-_])|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 
@@ -12658,14 +12689,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       secretsSvc,
       trustPreset,
       requiredScopedEnvBinding: pushCapabilityPreflightRequired
-        ? {
-            keys: [...PUSH_CAPABILITY_ENV_KEYS],
-            alternativeKeySets: PUSH_CAPABILITY_ALTERNATIVE_ENV_KEY_SETS,
-            consumerScopes: ["agent", "project"],
-            reason: "push_write_credential_missing",
-            remediation:
-              "GitHub PR workflow requires GH_TOKEN, GITHUB_TOKEN, or a complete GitHub App identity bound at project or agent scope.",
-          }
+        ? buildPushCapabilityScopedEnvBinding(selectedEnvironmentForConfig?.driver)
         : undefined,
     });
     const { runtimeAdapterConfig: resolvedRuntimeConfig, workspaceRealizationEnv } =

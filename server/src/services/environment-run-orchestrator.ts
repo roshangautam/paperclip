@@ -137,6 +137,24 @@ function redactForwardedRealizationSecrets(
   return redactSensitiveText(redacted);
 }
 
+// Matches env keys whose VALUE is secret credential material (tokens, private
+// key bodies). Anchored at the end so identifier/path keys like GITHUB_APP_ID or
+// GITHUB_APP_PRIVATE_KEY_FILE are excluded: the realized cwd path legitimately
+// contains such identifiers, and scrubbing them would corrupt the persisted
+// remoteCwd and break execution.
+const REALIZATION_SECRET_VALUE_KEY_RE =
+  /(?:token|secret|password|passwd|credential|bearer|(?:^|[-_])private[-_]?key)$/i;
+
+function redactForwardedRealizationSecretValuesOnly(
+  path: string,
+  forwardedEnv: Record<string, string>,
+): string {
+  const secretOnlyEnv = Object.fromEntries(
+    Object.entries(forwardedEnv).filter(([key]) => REALIZATION_SECRET_VALUE_KEY_RE.test(key)),
+  );
+  return redactForwardedRealizationSecrets(path, secretOnlyEnv);
+}
+
 function firstNonEmptyLine(text: string | null | undefined): string | null {
   if (!text) return null;
   for (const rawLine of text.split(/\r?\n/)) {
@@ -422,7 +440,7 @@ export function environmentRunOrchestrator(
         });
         realizedWorkspaceCwd =
           typeof workspaceRealizationResult.cwd === "string" && workspaceRealizationResult.cwd.trim().length > 0
-            ? redactForwardedRealizationSecrets(workspaceRealizationResult.cwd.trim(), input.workspaceRealizationEnv)
+            ? redactForwardedRealizationSecretValuesOnly(workspaceRealizationResult.cwd.trim(), input.workspaceRealizationEnv)
             : null;
         workspaceRealization = parseObject(workspaceRealizationResult.metadata?.workspaceRealization);
       } catch (err) {
