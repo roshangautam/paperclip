@@ -6902,9 +6902,14 @@ export function createToolGatewayService(
 
       let markedReleased = 0;
       if (options.releaseRunEnvironmentLeases) {
+        // Independent budget: the marked lease-release outbox must not share the
+        // expired-action phase's `scanned`/`limit`, or a sustained approval-expiry
+        // backlog (which alone can exhaust that budget) would indefinitely starve
+        // release of terminal-run leases that already hold durable markers.
+        let markedScanned = 0;
         let markedCursor: { pendingAt: Date; id: string } | null = null;
-        while (scanned < scanCeiling && reconciled + released + invalidated + legacyExpired + markedReleased < limit) {
-          const pageSize = Math.min(limit, scanCeiling - scanned);
+        while (markedScanned < scanCeiling && markedReleased < limit) {
+          const pageSize = Math.min(limit, scanCeiling - markedScanned);
           const marked = await db
             .select({ id: toolInvocations.id, pendingAt: toolInvocations.leaseReleasePendingAt })
             .from(toolInvocations)
@@ -6923,6 +6928,7 @@ export function createToolGatewayService(
             .orderBy(asc(toolInvocations.leaseReleasePendingAt), asc(toolInvocations.id))
             .limit(pageSize);
           if (marked.length === 0) break;
+          markedScanned += marked.length;
           scanned += marked.length;
           const lastMarked = marked.at(-1);
           if (!lastMarked?.pendingAt) break;
@@ -6930,7 +6936,7 @@ export function createToolGatewayService(
           for (const row of marked) {
             const outcome = await finalizeMarkedLeaseRelease(row.id);
             if (outcome === "released") markedReleased += 1;
-            if (reconciled + released + invalidated + legacyExpired + markedReleased >= limit) break;
+            if (markedReleased >= limit) break;
           }
           if (marked.length < pageSize) break;
         }
