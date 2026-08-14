@@ -23,11 +23,16 @@ const {
   heartbeatServiceMock,
   loadConfigMock,
   reconcileBuiltInAgentsOnStartupMock,
+  reconcileExpiredToolActionsMock,
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
   routineServiceMock,
 } = vi.hoisted(() => {
-  const createAppMock = vi.fn(async () => ((_: unknown, __: unknown) => {}) as never);
+  const reconcileExpiredToolActionsMock = vi.fn(async () => ({ scanned: 0, reconciled: 0, released: 0 }));
+  const createAppMock = vi.fn(async () => Object.assign(
+    (_request: unknown, _response: unknown) => undefined,
+    { reconcileExpiredToolActions: reconcileExpiredToolActionsMock },
+  ));
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
   const createDbMock = vi.fn(() => ({}) as never);
   const detectPortMock = vi.fn(async (port: number) => port);
@@ -114,6 +119,7 @@ const {
     heartbeatServiceMock,
     loadConfigMock,
     reconcileBuiltInAgentsOnStartupMock,
+    reconcileExpiredToolActionsMock,
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
     routineServiceMock,
@@ -298,6 +304,7 @@ import { serverVersion } from "../version.js";
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    reconcileExpiredToolActionsMock.mockResolvedValue({ scanned: 0, reconciled: 0, released: 0 });
     loadConfigMock.mockReturnValue(buildTestConfig());
     resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
       suppressed: false,
@@ -347,7 +354,7 @@ describe("startServer feedback export wiring", () => {
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);
       expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).not.toHaveBeenCalled();
 
-      expect(intervalCallbacks).toHaveLength(2);
+      expect(intervalCallbacks).toHaveLength(3);
       intervalCallbacks.forEach((callback) => callback());
       await Promise.resolve();
       await Promise.resolve();
@@ -427,7 +434,7 @@ describe("startServer feedback export wiring", () => {
 
       expect(heartbeatServiceMock.promoteDueScheduledRetries).toHaveBeenCalledTimes(1);
       expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).not.toHaveBeenCalled();
-      expect(intervalCallbacks).toHaveLength(2);
+      expect(intervalCallbacks).toHaveLength(3);
 
       intervalCallbacks.forEach((callback) => callback());
       expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(1);
@@ -458,7 +465,7 @@ describe("startServer feedback export wiring", () => {
     try {
       await startServer();
 
-      expect(intervalCallbacks).toHaveLength(1);
+      expect(intervalCallbacks).toHaveLength(2);
       intervalCallbacks[0]!();
       expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(1);
 
@@ -467,6 +474,26 @@ describe("startServer feedback export wiring", () => {
       await new Promise((resolve) => setImmediate(resolve));
       intervalCallbacks[0]!();
       expect(environmentRuntimeServiceMock.retryPendingSandboxCleanups).toHaveBeenCalledTimes(2);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("reconciles expired tool actions on startup and the periodic scheduler", async () => {
+    const intervalCallbacks: Array<() => void> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallbacks.push(callback);
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      await vi.waitFor(() => expect(reconcileExpiredToolActionsMock).toHaveBeenCalledTimes(1));
+
+      intervalCallbacks.forEach((callback) => callback());
+      await vi.waitFor(() => expect(reconcileExpiredToolActionsMock).toHaveBeenCalledTimes(2));
     } finally {
       setIntervalSpy.mockRestore();
     }

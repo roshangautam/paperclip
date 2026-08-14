@@ -141,128 +141,6 @@ function formatProvisionFailureDetail(result: {
   return detail ? `${status}: ${detail}` : status;
 }
 
-const TRANSIENT_ENV_REDACTED_VALUE = "***REDACTED***";
-const TRANSIENT_ENV_SENSITIVE_KEYS = new Set([
-  "GH_TOKEN",
-  "GITHUB_TOKEN",
-  "GITHUB_APP_PRIVATE_KEY",
-  "GITHUB_APP_PRIVATE_KEY_FILE",
-]);
-
-function transientSensitiveEnvEntries(
-  env: Record<string, string> | undefined,
-): Array<[string, string]> {
-  return Object.entries(env ?? {})
-    .filter(([key, value]) =>
-      TRANSIENT_ENV_SENSITIVE_KEYS.has(key) && value.trim().length > 0)
-    .sort(([, a], [, b]) => b.length - a.length);
-}
-
-function transientEnvValueVariants(value: string): string[] {
-  return Array.from(new Set([value, value.trim()].flatMap((candidate) =>
-    [candidate, JSON.stringify(candidate).slice(1, -1)])));
-}
-
-function transientEnvValues(env: Record<string, string> | undefined): string[] {
-  return Array.from(new Set(
-    transientSensitiveEnvEntries(env).flatMap(([, value]) => transientEnvValueVariants(value)),
-  )).sort((a, b) => b.length - a.length);
-}
-
-function transientEnvKeyInText(
-  text: string,
-  env: Record<string, string> | undefined,
-): string | null {
-  return transientSensitiveEnvEntries(env)
-    .find(([, value]) => transientEnvValueVariants(value)
-      .some((candidate) => text.includes(candidate)))?.[0] ?? null;
-}
-
-function redactTransientEnvText(text: string, env: Record<string, string> | undefined): string {
-  let redacted = text;
-  for (const value of transientEnvValues(env)) {
-    redacted = redacted.split(value).join(TRANSIENT_ENV_REDACTED_VALUE);
-  }
-  return redacted;
-}
-
-function readDataStringProperty(
-  value: object,
-  key: string,
-  fallback: string,
-): string {
-  let current: object | null = value;
-  while (current) {
-    const descriptor = Object.getOwnPropertyDescriptor(current, key);
-    if (descriptor) {
-      return "value" in descriptor && typeof descriptor.value === "string"
-        ? descriptor.value
-        : fallback;
-    }
-    current = Object.getPrototypeOf(current);
-  }
-  return fallback;
-}
-
-function redactTransientEnvValue(
-  value: unknown,
-  env: Record<string, string> | undefined,
-  active = new WeakSet<object>(),
-): unknown {
-  if (typeof value === "string") return redactTransientEnvText(value, env);
-  if (Array.isArray(value)) {
-    if (active.has(value)) return "[Circular]";
-    active.add(value);
-    const redacted = value.map((entry) => redactTransientEnvValue(entry, env, active));
-    active.delete(value);
-    return redacted;
-  }
-  if (value instanceof Error) {
-    if (active.has(value)) return "[Circular]";
-    active.add(value);
-    const message = readDataStringProperty(value, "message", "Unknown error");
-    const name = readDataStringProperty(value, "name", "Error");
-    const stack = readDataStringProperty(value, "stack", "");
-    const redacted = new Error(redactTransientEnvText(message, env));
-    redacted.name = redactTransientEnvText(name, env);
-    if (stack) redacted.stack = redactTransientEnvText(stack, env);
-    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
-      if (!descriptor.enumerable || !("value" in descriptor)) continue;
-      const redactedKey = redactTransientEnvText(key, env);
-      (redacted as unknown as Record<string, unknown>)[redactedKey] = redactTransientEnvValue(
-        descriptor.value,
-        env,
-        active,
-      );
-    }
-    active.delete(value);
-    return redacted;
-  }
-  if (value && typeof value === "object") {
-    if (active.has(value)) return "[Circular]";
-    active.add(value);
-    const redacted = Object.fromEntries(
-      Object.entries(Object.getOwnPropertyDescriptors(value)).flatMap(([key, descriptor]) => {
-        if (!descriptor.enumerable || !("value" in descriptor)) return [];
-        return [[
-          redactTransientEnvText(key, env),
-          redactTransientEnvValue(descriptor.value, env, active),
-        ]];
-      }),
-    );
-    active.delete(value);
-    return redacted;
-  }
-  return value;
-}
-
-function redactTransientEnvRecord(
-  value: Record<string, unknown>,
-  env: Record<string, string> | undefined,
-): Record<string, unknown> {
-  return redactTransientEnvValue(value, env) as Record<string, unknown>;
-}
-
 // ---------------------------------------------------------------------------
 // Service factory
 // ---------------------------------------------------------------------------
@@ -460,9 +338,9 @@ export function environmentRunOrchestrator(
     issueId: string | null;
     heartbeatRunId: string;
     executionWorkspace: RealizedExecutionWorkspace;
+    workspaceRealizationEnv: Record<string, string>;
     effectiveExecutionWorkspaceMode: string | null;
     persistedExecutionWorkspace: ExecutionWorkspace | null;
-    env?: Record<string, string>;
   }): Promise<EnvironmentRealizationResult> {
     const {
       environment,
@@ -509,7 +387,7 @@ export function environmentRunOrchestrator(
         const workspaceRealizationResult = await environmentRuntime.realizeWorkspace({
           environment,
           lease,
-          env: input.env,
+          env: input.workspaceRealizationEnv,
           workspace: {
             localPath: executionWorkspace.cwd,
             remotePath: leaseRemoteCwd ?? pluginRemoteCwd ?? undefined,
@@ -519,32 +397,19 @@ export function environmentRunOrchestrator(
             },
           },
         });
-        const candidateRealizedWorkspaceCwd =
+        realizedWorkspaceCwd =
           typeof workspaceRealizationResult.cwd === "string" && workspaceRealizationResult.cwd.trim().length > 0
             ? workspaceRealizationResult.cwd.trim()
             : null;
-        const cwdTransientEnvKey = candidateRealizedWorkspaceCwd
-          ? transientEnvKeyInText(candidateRealizedWorkspaceCwd, input.env)
-          : null;
-        if (cwdTransientEnvKey) {
-          throw new Error(
-            `Workspace realization cwd contains transient environment value from ${cwdTransientEnvKey}; providers must return credential-free paths.`,
-          );
-        }
-        realizedWorkspaceCwd = candidateRealizedWorkspaceCwd;
-        workspaceRealization = redactTransientEnvRecord(
-          parseObject(workspaceRealizationResult.metadata?.workspaceRealization),
-          input.env,
-        );
+        workspaceRealization = parseObject(workspaceRealizationResult.metadata?.workspaceRealization);
       } catch (err) {
-        const redactedError = redactTransientEnvValue(err, input.env);
         throw new EnvironmentRunError(
           "workspace_realization_failed",
-          `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${redactTransientEnvText(err instanceof Error ? err.message : String(err), input.env)}`,
+          `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${err instanceof Error ? err.message : String(err)}`,
           {
             environmentId: environment.id,
             driver: environment.driver,
-            cause: redactedError,
+            cause: err,
           },
         );
       }
@@ -632,7 +497,6 @@ export function environmentRunOrchestrator(
             command: "bash",
             args: ["-lc", provisionCommand],
             cwd: realizedCwd,
-            workspaceRealization,
             env: {
               SHELL: "/bin/bash",
             },
@@ -642,14 +506,13 @@ export function environmentRunOrchestrator(
             throw new Error(formatProvisionFailureDetail(provisionResult));
           }
         } catch (err) {
-          const redactedError = redactTransientEnvValue(err, input.env);
           throw new EnvironmentRunError(
             "workspace_realization_failed",
-            `Failed to provision workspace for environment "${environment.name}" (${environment.driver}): ${redactTransientEnvText(err instanceof Error ? err.message : String(err), input.env)}`,
+            `Failed to provision workspace for environment "${environment.name}" (${environment.driver}): ${err instanceof Error ? err.message : String(err)}`,
             {
               environmentId: environment.id,
               driver: environment.driver,
-              cause: redactedError,
+              cause: err,
             },
           );
         }

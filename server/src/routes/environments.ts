@@ -7,6 +7,7 @@ import {
   createEnvironmentSchema,
   finishEnvironmentCustomImageSetupSessionSchema,
   getEnvironmentCapabilities,
+  envBindingSchema,
   probeEnvironmentConfigSchema,
   redactEnvironmentCustomImageSetupSession,
   redactEnvironmentCustomImageTemplate,
@@ -38,8 +39,10 @@ import {
   collectEnvironmentSecretRefs,
   normalizeEnvironmentConfigForPersistence,
   normalizeEnvironmentConfigForProbe,
+  presentEnvironmentConfigForRead,
   readSshEnvironmentPrivateKeySecretId,
   type ParsedEnvironmentConfig,
+  type SandboxProviderSchemaCache,
 } from "../services/environment-config.js";
 import { probeEnvironment } from "../services/environment-probe.js";
 import { secretService } from "../services/secrets.js";
@@ -70,6 +73,22 @@ export function environmentRoutes(
     return value && typeof value === "object" && !Array.isArray(value)
       ? (value as Record<string, unknown>)
       : {};
+  }
+
+  function collectEnvironmentEnvSecretRefs(envVars: unknown) {
+    return Object.entries(parseObject(envVars)).flatMap(([key, rawBinding]) => {
+      const parsed = envBindingSchema.safeParse(rawBinding);
+      if (!parsed.success || typeof parsed.data !== "object" || parsed.data.type !== "secret_ref") {
+        return [];
+      }
+      return [{
+        secretId: parsed.data.secretId,
+        configPath: `env.${key}`,
+        versionSelector: parsed.data.version ?? "latest",
+        projectionClass: parsed.data.projectionClass,
+        projectionAllowlistKey: parsed.data.projectionAllowlistKey ?? null,
+      }];
+    });
   }
 
   function assertCanAccessInstanceEnvironments(req: Request) {
@@ -113,14 +132,19 @@ export function environmentRoutes(
     };
   }
 
-  function presentEnvironmentForRead<T extends {
+  async function presentEnvironmentForRead<T extends {
+    driver: string;
     config: Record<string, unknown> | null;
     envVars?: Record<string, unknown> | null;
     metadata: Record<string, unknown> | null;
-  }>(req: Request, environment: T): T {
-    return canReadFullInstanceEnvironment(req)
-      ? environment
-      : redactEnvironmentForRestrictedView(environment);
+  }>(req: Request, environment: T, schemaCache?: SandboxProviderSchemaCache): Promise<T> {
+    if (!canReadFullInstanceEnvironment(req)) {
+      return redactEnvironmentForRestrictedView(environment);
+    }
+    return {
+      ...environment,
+      config: await presentEnvironmentConfigForRead(db, environment, schemaCache),
+    };
   }
 
   async function assertCanReadSecretsForDraftProbe(req: Request, companyId: string) {
@@ -366,7 +390,8 @@ export function environmentRoutes(
       status: req.query.status as string | undefined,
       driver: req.query.driver as string | undefined,
     });
-    res.json(rows.map((row) => presentEnvironmentForRead(req, row)));
+    const schemaCache: SandboxProviderSchemaCache = new Map();
+    res.json(await Promise.all(rows.map((row) => presentEnvironmentForRead(req, row, schemaCache))));
   });
 
   router.get("/environments/:id/delete-blast-radius", async (req, res) => {
@@ -682,7 +707,7 @@ export function environmentRoutes(
         status: environment.status,
       },
     });
-    res.status(201).json(environment);
+    res.status(201).json(await presentEnvironmentForRead(req, environment));
   });
 
   router.get("/environments/:id", async (req, res) => {
@@ -692,7 +717,7 @@ export function environmentRoutes(
       res.status(404).json({ error: "Environment not found" });
       return;
     }
-    res.json(presentEnvironmentForRead(req, environment));
+    res.json(await presentEnvironmentForRead(req, environment));
   });
 
   router.get("/environments/:id/leases", async (req, res) => {
@@ -781,10 +806,15 @@ export function environmentRoutes(
       ReturnType<typeof customImages.reconcileActiveTemplateForConfigChange>
     > = { action: "none" };
     if (patch.config !== undefined || patch.driver !== undefined) {
+      const configSecretRefs = await collectEnvironmentSecretRefs({ db, environment });
       await secrets.syncSecretRefsForTarget(
         companyIdForSecrets!,
         { targetType: "environment", targetId: environment.id },
-        await collectEnvironmentSecretRefs({ db, environment }),
+        [
+          ...configSecretRefs,
+          ...collectEnvironmentEnvSecretRefs(environment.envVars),
+        ],
+        { replaceAll: true },
       );
       try {
         customImageReconciliation = await customImages.reconcileActiveTemplateForConfigChange({
@@ -809,9 +839,10 @@ export function environmentRoutes(
       entityId: environment.id,
       details: summarizeEnvironmentUpdate(patch as Record<string, unknown>, environment),
     });
+    const presented = await presentEnvironmentForRead(req, environment);
     res.json(customImageReconciliation.action === "none"
-      ? environment
-      : { ...environment, customImageReconciliation });
+      ? presented
+      : { ...presented, customImageReconciliation });
   });
 
   router.delete("/environments/:id", async (req, res) => {

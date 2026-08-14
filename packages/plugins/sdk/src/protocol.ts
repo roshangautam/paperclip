@@ -59,6 +59,7 @@ import type {
   PluginIssueWakeupResult,
   PluginJobContext,
   PluginExecutionWorkspaceMetadata,
+  PluginExecutionWorkspaceExecuteInput,
   PluginWorkspace,
   ToolRunContext,
   ToolResult,
@@ -273,6 +274,9 @@ export type PluginRpcErrorCode =
  */
 export interface PluginInvocationScope {
   companyId: string;
+  runId?: string;
+  agentId?: string;
+  allowTerminalRunWorkspaceExecution?: boolean;
 }
 
 /**
@@ -652,10 +656,6 @@ export interface PluginEnvironmentDestroyLeaseParams extends PluginEnvironmentRe
 
 export interface PluginEnvironmentRealizeWorkspaceParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
-  /**
-   * Run-scoped environment values needed only while realizing the workspace.
-   * Providers must not persist these values in lease or realization metadata.
-   */
   env?: Record<string, string>;
   workspace: {
     localPath?: string;
@@ -672,14 +672,13 @@ export interface PluginEnvironmentRealizeWorkspaceResult {
 
 export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
-  /** Provider-returned workspace realization context, sanitized by the host. */
-  workspaceRealization?: Record<string, unknown>;
   command: string;
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
   stdin?: string;
   timeoutMs?: number;
+  workspaceRealization?: Record<string, unknown>;
 }
 
 export interface PluginEnvironmentExecuteResult {
@@ -1202,6 +1201,10 @@ export interface WorkerToHostMethods {
       companyId: string;
     },
     result: PluginExecutionWorkspaceMetadata | null,
+  ];
+  "executionWorkspaces.execute": [
+    params: PluginExecutionWorkspaceExecuteInput,
+    result: PluginEnvironmentExecuteResult,
   ];
   "projects.managed.get": [
     params: { projectKey: string; companyId: string },

@@ -87,6 +87,11 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/approvals\/[^/]+\/comments$/ },
   { method: "POST", path: /^\/api\/companies\/[^/]+\/approvals$/ },
 
+  // Managed MCP gateways. The bridge authenticates the sandbox request with
+  // its own bearer token and carries the run-scoped gateway token separately.
+  { method: "GET", path: /^\/api\/tool-gateway\/gateways\/[^/]+\/mcp$/ },
+  { method: "POST", path: /^\/api\/tool-gateway\/gateways\/[^/]+\/mcp$/ },
+
   // Execution workspaces and runtime services (start/stop/restart dev servers)
   { method: "GET", path: /^\/api\/execution-workspaces\/[^/]+$/ },
   { method: "POST", path: /^\/api\/execution-workspaces\/[^/]+\/runtime-services\/(?:start|stop|restart)$/ },
@@ -107,6 +112,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST = [
   "content-type",
   "if-match",
   "if-none-match",
+  "x-paperclip-tool-gateway-token",
 ] as const;
 
 export interface SandboxCallbackBridgeRequest {

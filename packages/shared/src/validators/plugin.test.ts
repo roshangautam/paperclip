@@ -9,6 +9,39 @@ describe("plugin capability constants", () => {
 });
 
 describe("plugin manifest validators", () => {
+  it("preserves tool annotations used by host risk policy", () => {
+    const parsed = pluginManifestV1Schema.parse({
+      id: "paperclip.annotated-tools",
+      apiVersion: 1,
+      version: "0.1.0",
+      displayName: "Annotated tools",
+      description: "A plugin with policy-aware tool declarations.",
+      author: "Paperclip",
+      categories: ["automation"],
+      capabilities: ["agent.tools.register"],
+      entrypoints: { worker: "./dist/worker.js" },
+      tools: [{
+        name: "update_record",
+        displayName: "Update record",
+        description: "Updates a record.",
+        parametersSchema: { type: "object" },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      }],
+    });
+
+    expect(parsed.tools?.[0]?.annotations).toEqual({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    });
+  });
+
   it("accepts existing-style plugins that do not request access or authorization capabilities", () => {
     const parsed = pluginManifestV1Schema.parse({
       id: "paperclip.compat-dashboard",

@@ -25,8 +25,12 @@ import {
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import {
   collectSecretRefPaths,
+  compactConfigArrays,
+  type ConfigResourceScopes,
+  inspectSecretRefPaths,
   isUuidSecretRef,
   readConfigValueAtPath,
+  scopeConfigResourceArrays,
   writeConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { resolveActiveEnvironmentCustomImageTemplateForRuntime } from "./environment-custom-image-runtime.js";
@@ -152,25 +156,65 @@ function parseSandboxEnvironmentConfig(
     : ({ success: false as const, error: parsed.error });
 }
 
+export type SandboxProviderSchemaCache = Map<string, Record<string, unknown> | null>;
+
 async function getSandboxProviderConfigSchema(
   db: Db,
   provider: string,
+  schemaCache?: SandboxProviderSchemaCache,
 ): Promise<Record<string, unknown> | null> {
+  if (schemaCache?.has(provider)) {
+    return schemaCache.get(provider) ?? null;
+  }
   const resolved = await resolvePluginSandboxProviderDriverByKey({
     db,
     driverKey: provider,
   });
   const schema = resolved?.driver.configSchema;
-  return schema && typeof schema === "object" && !Array.isArray(schema)
+  const normalized = schema && typeof schema === "object" && !Array.isArray(schema)
     ? schema as Record<string, unknown>
     : null;
+  schemaCache?.set(provider, normalized);
+  return normalized;
 }
 
 export async function resolveSandboxProviderSecretRefPaths(
   db: Db,
   provider: string,
+  config?: Record<string, unknown>,
 ): Promise<Set<string>> {
-  return collectSecretRefPaths(await getSandboxProviderConfigSchema(db, provider));
+  return collectSecretRefPaths(await getSandboxProviderConfigSchema(db, provider), config);
+}
+
+export async function presentEnvironmentConfigForRead(
+  db: Db,
+  environment: { driver: string; config: Record<string, unknown> | null },
+  schemaCache?: SandboxProviderSchemaCache,
+): Promise<Record<string, unknown>> {
+  const config = parseObject(environment.config);
+  if (environment.driver !== "sandbox") return config;
+
+  const provider = getSandboxProvider(config);
+  if (provider === "fake") return config;
+
+  let schema: Record<string, unknown> | null = null;
+  try {
+    schema = await getSandboxProviderConfigSchema(db, provider, schemaCache);
+  } catch {
+    // A missing provider must not expose historical plaintext config.
+  }
+  if (!schema) return { provider };
+
+  let presented = structuredClone(config) as Record<string, unknown>;
+  const inspection = inspectSecretRefPaths(schema, presented);
+  if (!inspection.inspectable) return { provider };
+  for (const path of inspection.paths) {
+    const value = readConfigValueAtPath(presented, path);
+    if (typeof value !== "string" || !isUuidSecretRef(value.trim())) {
+      presented = writeConfigValueAtPath(presented, path, undefined);
+    }
+  }
+  return compactConfigArrays(presented);
 }
 
 function secretName(input: {
@@ -224,7 +268,7 @@ async function persistConfigSecretRefs(input: {
   actor?: { userId?: string | null; agentId?: string | null };
 }): Promise<Record<string, unknown>> {
   let nextConfig = { ...input.config };
-  for (const path of collectSecretRefPaths(input.schema)) {
+  for (const path of collectSecretRefPaths(input.schema, nextConfig)) {
     const rawValue = readConfigValueAtPath(nextConfig, path);
     if (typeof rawValue !== "string") continue;
     const trimmed = rawValue.trim();
@@ -269,7 +313,7 @@ async function resolveConfigSecretRefsForRuntime(input: {
   const secrets = secretService(input.db);
   let nextConfig = { ...input.config };
   const resolvedSecretVersions: ResolvedEnvironmentSecretVersion[] = [];
-  for (const path of collectSecretRefPaths(input.schema)) {
+  for (const path of collectSecretRefPaths(input.schema, nextConfig)) {
     const current = readConfigValueAtPath(nextConfig, path);
     if (typeof current !== "string") continue;
     const trimmed = current.trim();
@@ -312,7 +356,7 @@ async function resolveConfigSecretRefsForProbe(input: {
 }): Promise<Record<string, unknown>> {
   const secrets = secretService(input.db);
   let nextConfig = { ...input.config };
-  for (const path of collectSecretRefPaths(input.schema)) {
+  for (const path of collectSecretRefPaths(input.schema, nextConfig)) {
     const current = readConfigValueAtPath(nextConfig, path);
     if (typeof current !== "string") continue;
     const trimmed = current.trim();
@@ -352,7 +396,7 @@ export async function collectEnvironmentSecretRefs(input: {
   if (parsed.driver === "sandbox" && parsed.config.provider !== "fake") {
     const schema = await getSandboxProviderConfigSchema(input.db, parsed.config.provider);
     const refs: Array<{ secretId: string; configPath: string; versionSelector?: SecretVersionSelector }> = [];
-    for (const path of collectSecretRefPaths(schema)) {
+    for (const path of collectSecretRefPaths(schema, parsed.config as Record<string, unknown>)) {
       const current = readConfigValueAtPath(parsed.config as Record<string, unknown>, path);
       if (typeof current === "string" && isUuidSecretRef(current.trim())) {
         refs.push({ secretId: current.trim(), configPath: path, versionSelector: "latest" });
@@ -596,6 +640,7 @@ export async function resolveEnvironmentDriverConfigForRuntime(
       targetType: SecretBindingTargetType;
       targetId: string;
     };
+    resourceScopes?: ConfigResourceScopes;
   },
 ): Promise<ParsedEnvironmentConfig> {
   const parsed = parseEnvironmentDriverConfig(environment);
@@ -638,13 +683,18 @@ export async function resolveEnvironmentDriverConfigForRuntime(
 
   if (parsed.driver === "sandbox" && parsed.config.provider !== "fake") {
     const schema = await getSandboxProviderConfigSchema(db, parsed.config.provider);
-    let runtimeConfig = parsed.config;
+    const scopedConfig = scopeConfigResourceArrays(
+      schema,
+      parsed.config as Record<string, unknown>,
+      context?.resourceScopes,
+    );
+    let runtimeConfig = compactConfigArrays(scopedConfig) as SandboxEnvironmentConfig;
     let resolvedSecretVersions: ResolvedEnvironmentSecretVersion[] = [];
     if (companyId) {
       const resolved = await resolveConfigSecretRefsForRuntime({
         db,
         companyId,
-        config: parsed.config as Record<string, unknown>,
+        config: scopedConfig,
         schema,
         context: {
           consumerType: secretBindingTarget?.targetType ?? "environment",
@@ -653,11 +703,11 @@ export async function resolveEnvironmentDriverConfigForRuntime(
           heartbeatRunId: context?.heartbeatRunId ?? null,
         },
       });
-      runtimeConfig = resolved.config as SandboxEnvironmentConfig;
+      runtimeConfig = compactConfigArrays(resolved.config) as SandboxEnvironmentConfig;
       resolvedSecretVersions = resolved.resolvedSecretVersions;
     } else {
-      for (const path of collectSecretRefPaths(schema)) {
-        const current = readConfigValueAtPath(parsed.config as Record<string, unknown>, path);
+      for (const path of collectSecretRefPaths(schema, scopedConfig)) {
+        const current = readConfigValueAtPath(scopedConfig, path);
         if (typeof current === "string" && isUuidSecretRef(current.trim())) {
           throw unprocessable("Runtime secret resolution requires a companyId context");
         }
@@ -673,7 +723,10 @@ export async function resolveEnvironmentDriverConfigForRuntime(
             // Match the capture-time fingerprint exclusions: secret-ref paths
             // are excluded when the template's source fingerprint is computed,
             // so they must be excluded when re-checking it here.
-            secretRefExcludePaths: collectSecretRefPaths(schema),
+            secretRefExcludePaths: collectSecretRefPaths(
+              schema,
+              parsed.config as Record<string, unknown>,
+            ),
           })
         : runtimeConfig,
       resolvedSecretVersions,

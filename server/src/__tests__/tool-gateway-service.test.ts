@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -44,6 +44,36 @@ function createTestToolGatewayService(db: ReturnType<typeof createDb>, options: 
     ...options,
     toolActionSigningSecret: options.toolActionSigningSecret ?? testToolActionSigningSecret,
   });
+}
+
+async function createExpiredExecuteOnApproveFixture(
+  db: ReturnType<typeof createDb>,
+  gateway: ReturnType<typeof createTestToolGatewayService>,
+  body: string,
+) {
+  const fixture = await createRunFixture(db);
+  await db.insert(toolPolicies).values({
+    companyId: fixture.company.id,
+    name: "Review note writes",
+    policyType: "require_approval",
+    selectors: { toolName: "mcp-remote-fixture:update_note" },
+  });
+  const session = await gateway.createSession({
+    companyId: fixture.company.id,
+    agentId: fixture.agent.id,
+    runId: fixture.run.id,
+  });
+  const parameters = { noteId: fixture.run.id, body };
+  await expect(gateway.executeTool({
+    sessionToken: session.token,
+    tool: "mcp-remote-fixture:update_note",
+    parameters,
+  })).rejects.toMatchObject({ reasonCode: "approval_required" });
+  const [actionRequest] = await db.select().from(toolActionRequests)
+    .where(eq(toolActionRequests.companyId, fixture.company.id));
+  await db.update(toolActionRequests).set({ expiresAt: new Date(Date.now() - 1_000) })
+    .where(eq(toolActionRequests.id, actionRequest.id));
+  return { ...fixture, actionRequest, parameters, session };
 }
 
 async function createRunFixture(db: ReturnType<typeof createDb>) {
@@ -514,6 +544,54 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(executionEvents).toHaveLength(1);
   });
 
+  it("expires approved execute-on-approve matches on replay without approvedActionRequestId", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review note writes",
+      policyType: "require_approval",
+      selectors: { toolName: "mcp-remote-fixture:update_note" },
+    });
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const parameters = { noteId: "n1", body: "expired approved" };
+
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters,
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    const now = new Date();
+    // Approve the action
+    await db.update(toolActionRequests).set({ status: "approved", decidedAt: now, resolvedAt: now })
+      .where(eq(toolActionRequests.id, actionRequest.id));
+
+    // Expire the approved action
+    const expiredAt = new Date(Date.now() - 1_000);
+    await db.update(toolActionRequests).set({ expiresAt: expiredAt })
+      .where(eq(toolActionRequests.id, actionRequest.id));
+
+    // Replay the identical call — should expire the approved match and require fresh approval
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters,
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+
+    // Verify the expired action is marked as expired
+    const [expiredAction] = await db.select().from(toolActionRequests)
+      .where(eq(toolActionRequests.id, actionRequest.id));
+    expect(expiredAction.status).toBe("expired");
+
+    // Verify a fresh action request was created
+    const allRequests = await db.select().from(toolActionRequests)
+      .orderBy(toolActionRequests.createdAt);
+    expect(allRequests).toHaveLength(2);
+    expect(allRequests[1]?.status).toBe("pending");
+  });
+
   it("keeps pre-execute-on-approve approved requests inert", async () => {
     const { company, agent, run } = await createRunFixture(db);
     await db.insert(toolPolicies).values({
@@ -736,6 +814,274 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(requests).toHaveLength(2);
     expect(requests[0]?.status).toBe("expired");
     expect(requests[1]?.status).toBe("pending");
+  });
+
+  it("persists a retry marker when matching-request expiry lease release fails transiently", async () => {
+    const releaseRunEnvironmentLeases = vi.fn()
+      .mockRejectedValueOnce(new Error("lease provider unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const fixture = await createExpiredExecuteOnApproveFixture(db, gateway, "matching retry");
+
+    await expect(gateway.executeTool({
+      sessionToken: fixture.session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters: fixture.parameters,
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+
+    const [marked] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, fixture.actionRequest.invocationId));
+    expect(marked).toMatchObject({
+      status: "cancelled",
+      approvalState: "expired",
+      errorCode: "action_expired_pending_lease_release",
+    });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, fixture.run.id));
+    const failedRetry = await gateway.reconcileExpiredExecuteOnApproveActions();
+    const retry = await gateway.reconcileExpiredExecuteOnApproveActions();
+    expect(failedRetry).toMatchObject({ reconciled: 0, released: 0 });
+    expect(retry).toMatchObject({ reconciled: 0, released: 1 });
+    const [released] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, fixture.actionRequest.invocationId));
+    expect(released.errorCode).toBe("action_expired");
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+  });
+
+  it("persists a retry marker when approval-entrypoint expiry lease release fails transiently", async () => {
+    const releaseRunEnvironmentLeases = vi.fn()
+      .mockRejectedValueOnce(new Error("lease provider unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const fixture = await createExpiredExecuteOnApproveFixture(db, gateway, "approval retry");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, fixture.run.id));
+
+    await expect(gateway.approveActionRequest({
+      companyId: fixture.company.id,
+      actionRequestId: fixture.actionRequest.id,
+      actor: { userId: "board-user" },
+    })).rejects.toMatchObject({ reasonCode: "action_expired" });
+
+    const [marked] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, fixture.actionRequest.invocationId));
+    expect(marked.errorCode).toBe("action_expired_pending_lease_release");
+    const retry = await gateway.reconcileExpiredExecuteOnApproveActions();
+    expect(retry).toMatchObject({ reconciled: 0, released: 1 });
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+  });
+
+  it("persists a retry marker when approved-id expiry lease release fails transiently", async () => {
+    const releaseRunEnvironmentLeases = vi.fn()
+      .mockRejectedValueOnce(new Error("lease provider unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const fixture = await createExpiredExecuteOnApproveFixture(db, gateway, "approved id retry");
+
+    await expect(gateway.executeTool({
+      sessionToken: fixture.session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters: fixture.parameters,
+      approvedActionRequestId: fixture.actionRequest.id,
+    })).rejects.toMatchObject({ reasonCode: "action_expired" });
+
+    const [marked] = await db.select().from(toolInvocations)
+      .where(eq(toolInvocations.id, fixture.actionRequest.invocationId));
+    expect(marked.errorCode).toBe("action_expired_pending_lease_release");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, fixture.run.id));
+    const failedRetry = await gateway.reconcileExpiredExecuteOnApproveActions();
+    const retry = await gateway.reconcileExpiredExecuteOnApproveActions();
+    expect(failedRetry).toMatchObject({ reconciled: 0, released: 0 });
+    expect(retry).toMatchObject({ reconciled: 0, released: 1 });
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+  });
+
+  it("reconciles only expired signed execute-on-approve requests and releases terminal run leases once", async () => {
+    const pendingFixture = await createRunFixture(db);
+    const approvedFixture = await createRunFixture(db);
+    const executingFixture = await createRunFixture(db);
+    const invalidFixture = await createRunFixture(db);
+    const releaseRunEnvironmentLeases = vi.fn(async () => undefined);
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const fixtures = [pendingFixture, approvedFixture, executingFixture, invalidFixture];
+
+    for (const fixture of fixtures) {
+      await db.insert(toolPolicies).values({
+        companyId: fixture.company.id,
+        name: "Review note writes",
+        policyType: "require_approval",
+        selectors: { toolName: "mcp-remote-fixture:update_note" },
+      });
+      const session = await gateway.createSession({
+        companyId: fixture.company.id,
+        agentId: fixture.agent.id,
+        runId: fixture.run.id,
+      });
+      await expect(gateway.executeTool({
+        sessionToken: session.token,
+        tool: "mcp-remote-fixture:update_note",
+        parameters: { noteId: fixture.run.id, body: "expires without revisit" },
+      })).rejects.toMatchObject({ reasonCode: "approval_required" });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.run.id));
+    }
+
+    const requests = await db.select().from(toolActionRequests).orderBy(toolActionRequests.createdAt);
+    const pendingRequest = requests[0];
+    const approvedRequest = requests[1];
+    const executingRequest = requests[2];
+    const invalidRequest = requests[3];
+    expect(pendingRequest && approvedRequest && executingRequest && invalidRequest).toBeTruthy();
+    if (!pendingRequest || !approvedRequest || !executingRequest || !invalidRequest) return;
+    const expiredAt = new Date(Date.now() - 1_000);
+    await db.update(toolActionRequests).set({ expiresAt: expiredAt }).where(eq(toolActionRequests.id, pendingRequest.id));
+    await db.update(toolActionRequests).set({ status: "approved", expiresAt: expiredAt })
+      .where(eq(toolActionRequests.id, approvedRequest.id));
+    await db.update(toolActionRequests).set({ status: "executing", expiresAt: expiredAt })
+      .where(eq(toolActionRequests.id, executingRequest.id));
+    await db.update(toolActionRequests).set({ expiresAt: expiredAt, signedArguments: "unrelated-approval" })
+      .where(eq(toolActionRequests.id, invalidRequest.id));
+
+    const [first, second] = await Promise.all([
+      gateway.reconcileExpiredExecuteOnApproveActions({ limit: 10 }),
+      gateway.reconcileExpiredExecuteOnApproveActions({ limit: 10 }),
+    ]);
+    const third = await gateway.reconcileExpiredExecuteOnApproveActions({ limit: 10 });
+
+    expect(first.reconciled + second.reconciled).toBe(2);
+    expect(third.reconciled).toBe(0);
+    const reconciledRequests = await db.select().from(toolActionRequests).orderBy(toolActionRequests.createdAt);
+    expect(reconciledRequests.map((request) => request.status)).toEqual([
+      "expired",
+      "expired",
+      "executing",
+      "cancelled",
+    ]);
+    const invocations = await db.select().from(toolInvocations).orderBy(toolInvocations.createdAt);
+    expect(invocations.map((invocation) => [invocation.status, invocation.approvalState])).toEqual([
+      ["cancelled", "expired"],
+      ["cancelled", "expired"],
+      ["awaiting_approval", "pending"],
+      ["cancelled", "expired"],
+    ]);
+    const interactions = await db.select().from(issueThreadInteractions).orderBy(issueThreadInteractions.createdAt);
+    expect(interactions.map((interaction) => interaction.status)).toEqual([
+      "expired",
+      "expired",
+      "pending",
+      "expired",
+    ]);
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({ runId: pendingFixture.run.id, runStatus: "succeeded" });
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({ runId: approvedFixture.run.id, runStatus: "succeeded" });
+  });
+
+  it("keeps an expired action pending when its invocation is no longer awaiting approval", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review note writes",
+      policyType: "require_approval",
+      selectors: { toolName: "mcp-remote-fixture:update_note" },
+    });
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters: { noteId: "n1", body: "raced invocation" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    await db.update(toolActionRequests).set({ expiresAt: new Date(Date.now() - 1_000) })
+      .where(eq(toolActionRequests.id, actionRequest.id));
+    await db.update(toolInvocations).set({ status: "executing" })
+      .where(eq(toolInvocations.id, actionRequest.invocationId));
+
+    const result = await gateway.reconcileExpiredExecuteOnApproveActions();
+
+    expect(result.reconciled).toBe(0);
+    const [unchanged] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.id, actionRequest.id));
+    expect(unchanged.status).toBe("pending");
+  });
+
+  it("retries lease release for an atomically expired action after a transient failure", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review note writes",
+      policyType: "require_approval",
+      selectors: { toolName: "mcp-remote-fixture:update_note" },
+    });
+    const releaseRunEnvironmentLeases = vi.fn()
+      .mockRejectedValueOnce(new Error("lease provider unavailable"))
+      .mockResolvedValueOnce(undefined);
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "mcp-remote-fixture:update_note",
+      parameters: { noteId: "n1", body: "retry cleanup" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run.id));
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    await db.update(toolActionRequests).set({ expiresAt: new Date(Date.now() - 1_000) })
+      .where(eq(toolActionRequests.id, actionRequest.id));
+
+    const first = await gateway.reconcileExpiredExecuteOnApproveActions();
+    const second = await gateway.reconcileExpiredExecuteOnApproveActions();
+
+    expect(first).toMatchObject({ reconciled: 1, released: 0 });
+    expect(second).toMatchObject({ reconciled: 0, released: 1 });
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
+  });
+
+  it("terminalizes invalid signatures so later valid expired actions cannot starve", async () => {
+    const limit = 3;
+    const releaseRunEnvironmentLeases = vi.fn(async () => undefined);
+    const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+    const invalidFixtures = await Promise.all(Array.from({ length: limit }, (_, index) =>
+      createExpiredExecuteOnApproveFixture(db, gateway, `invalid ${index}`)));
+    const validFixture = await createExpiredExecuteOnApproveFixture(db, gateway, "valid after invalid page");
+    for (const fixture of [...invalidFixtures, validFixture]) {
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.run.id));
+    }
+    const oldestExpiry = new Date(Date.now() - 10_000);
+    for (const [index, fixture] of invalidFixtures.entries()) {
+      await db.update(toolActionRequests).set({
+        expiresAt: new Date(oldestExpiry.getTime() + index),
+        signedArguments: `invalid-signature-${index}`,
+      }).where(eq(toolActionRequests.id, fixture.actionRequest.id));
+    }
+    await db.update(toolActionRequests).set({ expiresAt: new Date(oldestExpiry.getTime() + limit) })
+      .where(eq(toolActionRequests.id, validFixture.actionRequest.id));
+
+    const result = await gateway.reconcileExpiredExecuteOnApproveActions({ limit, scanCeiling: limit });
+    const next = await gateway.reconcileExpiredExecuteOnApproveActions({ limit, scanCeiling: limit });
+
+    expect(result).toMatchObject({ scanned: limit, reconciled: 0, released: 0, invalidated: limit });
+    expect(next).toMatchObject({ scanned: 1, reconciled: 1, released: 1, invalidated: 0 });
+    const [validRequest] = await db.select().from(toolActionRequests)
+      .where(eq(toolActionRequests.id, validFixture.actionRequest.id));
+    expect(validRequest.status).toBe("expired");
+    const invalidRequests = await db.select().from(toolActionRequests)
+      .where(inArray(toolActionRequests.id, invalidFixtures.map((fixture) => fixture.actionRequest.id)));
+    expect(invalidRequests.every((request) => request.status === "cancelled")).toBe(true);
+    const invalidInvocations = await db.select().from(toolInvocations)
+      .where(inArray(toolInvocations.id, invalidFixtures.map((fixture) => fixture.actionRequest.invocationId)));
+    expect(invalidInvocations.every((invocation) =>
+      invocation.status === "cancelled"
+      && invocation.errorCode === "action_request_invalidated"
+      && invocation.idempotencyKey === null)).toBe(true);
+    const invalidInteractions = await db.select().from(issueThreadInteractions)
+      .where(inArray(issueThreadInteractions.companyId, invalidFixtures.map((fixture) => fixture.company.id)));
+    expect(invalidInteractions.every((interaction) =>
+      interaction.status === "expired"
+      && interaction.result?.toolAction?.status === "expired"
+      && interaction.result.toolAction.errorCode === "action_request_invalidated")).toBe(true);
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(1);
   });
 
   it("adds formal board approval for destructive tool actions and fails closed until approved", async () => {

@@ -761,6 +761,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         async get(workspaceId: string, companyId: string) {
           return callHost("executionWorkspaces.get", { workspaceId, companyId });
         },
+        async execute(input) {
+          return callHost("executionWorkspaces.execute", input);
+        },
       },
 
       routines: {

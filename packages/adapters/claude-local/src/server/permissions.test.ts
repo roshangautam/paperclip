@@ -15,6 +15,18 @@ describe("claude-local remote permission args", () => {
     ]);
   });
 
+  it("allows only the runtime MCP servers attached to remote execution", () => {
+    const [, allowedTools] = buildClaudeExecutionPermissionArgs({
+      dangerouslySkipPermissions: true,
+      targetIsRemote: true,
+      runtimeMcpServerNames: ["Plugin: Agent Identities", "Plugin: Agent Identities"],
+    });
+
+    expect(allowedTools.split(" ")).toContain("mcp__Plugin__Agent_Identities__*");
+    expect(allowedTools.match(/mcp__/g)).toHaveLength(1);
+    expect(allowedTools).not.toContain("mcp__*");
+  });
+
   it("uses the canonical Bash tool grant for remote probes", () => {
     expect(buildClaudeProbePermissionArgs({ dangerouslySkipPermissions: true, targetIsRemote: true })).toEqual([
       "--allowedTools",

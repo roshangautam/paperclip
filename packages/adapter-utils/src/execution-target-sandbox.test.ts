@@ -915,12 +915,21 @@ describe("sandbox adapter execution targets", () => {
     const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
     await mkdir(runtimeRootDir, { recursive: true });
 
-    const requests: Array<{ method: string; url: string; auth: string | null; runId: string | null }> = [];
+    const requests: Array<{
+      method: string;
+      url: string;
+      auth: string | null;
+      gatewayToken: string | null;
+      runId: string | null;
+    }> = [];
     const apiServer = createServer((req, res) => {
       requests.push({
         method: req.method ?? "GET",
         url: req.url ?? "/",
         auth: req.headers.authorization ?? null,
+        gatewayToken: typeof req.headers["x-paperclip-tool-gateway-token"] === "string"
+          ? req.headers["x-paperclip-tool-gateway-token"]
+          : null,
         runId: typeof req.headers["x-paperclip-run-id"] === "string" ? req.headers["x-paperclip-run-id"] : null,
       });
       res.writeHead(200, { "content-type": "application/json" });
@@ -964,19 +973,128 @@ describe("sandbox adapter execution targets", () => {
         headers: {
           authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
           accept: "application/json",
+          "x-paperclip-tool-gateway-token": "must-not-escape-on-ordinary-routes",
         },
       });
 
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({ ok: true });
-      expect(requests).toEqual([{
-        method: "GET",
-        url: "/api/agents/me",
-        auth: "Bearer real-run-jwt",
-        runId: "run-bridge",
-      }]);
+
+      const missingGatewayTokenResponse = await fetch(
+        `${bridge!.env.PAPERCLIP_API_URL}/api/tool-gateway/gateways/gateway-1/mcp`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }),
+        },
+      );
+      expect(missingGatewayTokenResponse.status).toBe(401);
+      expect(await missingGatewayTokenResponse.json()).toEqual({
+        error: "Managed MCP gateway bearer token is required.",
+      });
+
+      const gatewayResponse = await fetch(
+        `${bridge!.env.PAPERCLIP_API_URL}/api/tool-gateway/gateways/gateway-1/mcp`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+            "content-type": "application/json",
+            "x-paperclip-tool-gateway-token": "gateway-session-token",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }),
+        },
+      );
+      expect(gatewayResponse.status).toBe(200);
+      expect(await gatewayResponse.json()).toEqual({ ok: true });
+      expect(requests).toEqual([
+        {
+          method: "GET",
+          url: "/api/agents/me",
+          auth: "Bearer real-run-jwt",
+          gatewayToken: null,
+          runId: "run-bridge",
+        },
+        {
+          method: "POST",
+          url: "/api/tool-gateway/gateways/gateway-1/mcp",
+          auth: "Bearer gateway-session-token",
+          gatewayToken: null,
+          runId: "run-bridge",
+        },
+      ]);
     } finally {
       await bridge?.stop();
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
+  it("isolates Paperclip bridges for concurrent runs sharing a runtime root", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-concurrent-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "claude");
+    await mkdir(runtimeRootDir, { recursive: true });
+
+    const apiServer = createServer((req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ runId: req.headers["x-paperclip-run-id"] ?? null }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the concurrent bridge test API server to listen on a TCP port.");
+    }
+
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "coder",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+      timeoutMs: 30_000,
+    };
+    const startBridge = (runId: string) => startAdapterExecutionTargetPaperclipBridge({
+      runId,
+      target,
+      runtimeRootDir,
+      adapterKey: "claude",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: `http://127.0.0.1:${address.port}`,
+    });
+
+    const firstBridge = await startBridge("run-one");
+    const secondBridge = await startBridge("run-two");
+    let firstStopped = false;
+    try {
+      const initialRunIds = await Promise.all([firstBridge, secondBridge].map(async (bridge) => {
+        const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/agents/me`, {
+          headers: { authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}` },
+        });
+        expect(response.status).toBe(200);
+        return (await response.json() as { runId: string }).runId;
+      }));
+      expect(initialRunIds).toEqual(["run-one", "run-two"]);
+
+      await firstBridge?.stop();
+      firstStopped = true;
+
+      const response = await fetch(`${secondBridge!.env.PAPERCLIP_API_URL}/api/agents/me`, {
+        headers: { authorization: `Bearer ${secondBridge!.env.PAPERCLIP_API_KEY}` },
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ runId: "run-two" });
+    } finally {
+      if (!firstStopped) await firstBridge?.stop();
+      await secondBridge?.stop();
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));
     }
   });

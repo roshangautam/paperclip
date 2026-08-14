@@ -362,26 +362,6 @@ const PUSH_CAPABILITY_ALTERNATIVE_ENV_KEY_SETS = [
   ["GITHUB_APP_ID", "GITHUB_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY_FILE"],
   ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY_FILE"],
 ] as const;
-const WORKSPACE_REALIZATION_ENV_KEYS = [
-  ...PUSH_CAPABILITY_ENV_KEYS,
-  "GITHUB_APP_ID",
-  "GITHUB_INSTALLATION_ID",
-  "GITHUB_APP_INSTALLATION_ID",
-  "GITHUB_APP_PRIVATE_KEY",
-  "GITHUB_APP_PRIVATE_KEY_FILE",
-] as const;
-
-export function selectWorkspaceRealizationEnv(
-  env: Record<string, unknown> | null | undefined,
-): Record<string, string> | undefined {
-  const selected = Object.fromEntries(
-    WORKSPACE_REALIZATION_ENV_KEYS.flatMap((key) => {
-      const value = env?.[key];
-      return typeof value === "string" && value.trim().length > 0 ? [[key, value]] : [];
-    }),
-  );
-  return Object.keys(selected).length > 0 ? selected : undefined;
-}
 // Keep this in sync with local adapters that require a git workspace before launch.
 const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "claude_local",
@@ -641,6 +621,63 @@ export function requiresPushCapabilityPreflight(input: {
 
 const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|(?:^|[-_])token(?:$|[-_])|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
+
+const WORKSPACE_REALIZATION_ONLY_ENV_KEYS = new Set([
+  "GITHUB_APP_ID",
+  "GITHUB_INSTALLATION_ID",
+  "GITHUB_APP_INSTALLATION_ID",
+  "GITHUB_APP_PRIVATE_KEY",
+  "GITHUB_APP_PRIVATE_KEY_FILE",
+]);
+
+function isWorkspaceRealizationOnlyEnvKey(key: string) {
+  return WORKSPACE_REALIZATION_ONLY_ENV_KEYS.has(key);
+}
+
+function stripWorkspaceRealizationOnlyEnvBindings(envValue: unknown): unknown {
+  if (envValue == null) return envValue;
+  return Object.fromEntries(
+    Object.entries(parseObject(envValue)).filter(([key]) => !isWorkspaceRealizationOnlyEnvKey(key)),
+  );
+}
+
+function isWorkspaceRealizationOnlySecret(
+  entry: EffectiveRunConfigSecretManifestEntry,
+) {
+  const record = entry as Record<string, unknown>;
+  const envKey = readNonEmptyString(record.envKey);
+  if (envKey && isWorkspaceRealizationOnlyEnvKey(envKey)) return true;
+  const configPath = readNonEmptyString(record.configPath);
+  return Boolean(
+    configPath?.startsWith("env.")
+    && isWorkspaceRealizationOnlyEnvKey(configPath.slice("env.".length)),
+  );
+}
+
+export function partitionWorkspaceRealizationAdapterConfig(
+  config: Record<string, unknown>,
+): {
+  runtimeAdapterConfig: Record<string, unknown>;
+  workspaceRealizationEnv: Record<string, string>;
+} {
+  const env = parseObject(config.env);
+  const workspaceRealizationEnv = Object.fromEntries(
+    Object.entries(env).filter(
+      (entry): entry is [string, string] =>
+        isWorkspaceRealizationOnlyEnvKey(entry[0]) && typeof entry[1] === "string",
+    ),
+  );
+  if (!Object.prototype.hasOwnProperty.call(config, "env")) {
+    return { runtimeAdapterConfig: config, workspaceRealizationEnv };
+  }
+  return {
+    runtimeAdapterConfig: {
+      ...config,
+      env: stripWorkspaceRealizationOnlyEnvBindings(env),
+    },
+    workspaceRealizationEnv,
+  };
+}
 
 function isPaperclipRuntimeEnvKey(key: string) {
   return key.startsWith("PAPERCLIP_");
@@ -3322,14 +3359,42 @@ export type ExecutionWorkspaceReuseRequestForIssue = {
   existingExecutionWorkspaceAvailable: boolean;
 };
 
+function executionWorkspaceRealizationBelongsToAgent(input: {
+  currentAgentId?: string | null;
+  existingExecutionWorkspaceMetadata?: unknown;
+}) {
+  const currentAgentId = readNonEmptyString(input.currentAgentId);
+  if (!currentAgentId) return true;
+
+  const metadata = parseObject(input.existingExecutionWorkspaceMetadata);
+  const workspaceRealization = parseObject(metadata.workspaceRealization);
+  const rebuild = parseObject(workspaceRealization.rebuild);
+  const rebuildMetadata = parseObject(rebuild.metadata);
+  const providerMetadata = parseObject(rebuildMetadata.providerMetadata);
+
+  const agentId = readNonEmptyString(providerMetadata.agentId);
+  const credentialAgentId = readNonEmptyString(providerMetadata.credentialAgentId);
+
+  return (
+    agentId !== null &&
+    credentialAgentId !== null &&
+    agentId === currentAgentId &&
+    credentialAgentId === currentAgentId
+  );
+}
+
 export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
   existingExecutionWorkspaceStatus?: string | null;
+  currentAgentId?: string | null;
+  existingExecutionWorkspaceMetadata?: unknown;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
   const requestedShouldReuseExisting =
-    input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
+    input.issueExecutionWorkspacePreference === "reuse_existing" &&
+    requestedExecutionWorkspaceId !== null &&
+    executionWorkspaceRealizationBelongsToAgent(input);
 
   return {
     requestedExecutionWorkspaceId,
@@ -3810,20 +3875,25 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   runtimeSkills: unknown;
   agentConfigRevision?: unknown;
 }): Promise<EffectiveRunSessionConfigMetadata> {
-  const secretManifest = input.secretManifest ?? [];
-  const instructions = await resolveInstructionsConfigFingerprintMetadata(input.effectiveAdapterConfig);
+  const secretManifest = (input.secretManifest ?? []).filter(
+    (entry) => !isWorkspaceRealizationOnlySecret(entry),
+  );
+  const { runtimeAdapterConfig } = partitionWorkspaceRealizationAdapterConfig(
+    input.effectiveAdapterConfig,
+  );
+  const instructions = await resolveInstructionsConfigFingerprintMetadata(runtimeAdapterConfig);
   const categoryValues = buildSessionConfigCategoryValues({
     adapterType: input.adapterType,
-    effectiveAdapterConfig: input.effectiveAdapterConfig,
+    effectiveAdapterConfig: runtimeAdapterConfig,
     agentRuntimeConfig: input.agentRuntimeConfig,
     modelProfile: input.modelProfile,
     instructions,
     issueOverrides: input.issueOverrides,
     workspaceConfig: input.workspaceConfig,
     environment: input.environment,
-    environmentEnv: input.environmentEnv,
-    projectEnv: input.projectEnv,
-    routineEnv: input.routineEnv,
+    environmentEnv: stripWorkspaceRealizationOnlyEnvBindings(input.environmentEnv),
+    projectEnv: stripWorkspaceRealizationOnlyEnvBindings(input.projectEnv),
+    routineEnv: stripWorkspaceRealizationOnlyEnvBindings(input.routineEnv),
     secretManifest,
     runtimeSkills: input.runtimeSkills,
     agentConfigRevision: input.agentConfigRevision ?? null,
@@ -12404,6 +12474,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
+      currentAgentId: agent.id,
+      existingExecutionWorkspaceMetadata: existingExecutionWorkspace?.metadata ?? null,
     });
     const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
     const reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable
@@ -12572,6 +12644,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : undefined,
     });
+    const { runtimeAdapterConfig: resolvedRuntimeConfig, workspaceRealizationEnv } =
+      partitionWorkspaceRealizationAdapterConfig(resolvedConfig);
+    const runtimeAdapterEnv = Object.fromEntries(
+      Object.entries(parseObject(resolvedRuntimeConfig.env)).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
     if (secretManifest.length > 0) {
       context.paperclipSecrets = {
         manifest: secretManifest,
@@ -12580,7 +12659,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delete context.paperclipSecrets;
     }
     const effectiveResolvedConfig = applyRunScopedMentionedSkillKeys(
-      resolvedConfig,
+      resolvedRuntimeConfig,
       runScopedMentionedSkillKeys,
     );
     const runtimeSkillPreference = readPaperclipSkillSyncPreference(effectiveResolvedConfig);
@@ -13082,9 +13161,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueId: issueId ?? null,
       heartbeatRunId: run.id,
       executionWorkspace,
+      workspaceRealizationEnv,
       effectiveExecutionWorkspaceMode,
       persistedExecutionWorkspace,
-      env: selectWorkspaceRealizationEnv(parseObject(resolvedConfig.env)),
     });
     activeEnvironmentLease = {
       ...activeEnvironmentLease,
@@ -13556,11 +13635,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : null,
         cwd: executionWorkspace.cwd,
       });
-      const adapterEnv = Object.fromEntries(
-        Object.entries(parseObject(resolvedConfig.env)).filter(
-          (entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string",
-        ),
-      );
       const runtimeServices = await ensureRuntimeServicesForRun({
         db,
         runId: run.id,
@@ -13573,7 +13647,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         workspace: executionWorkspace,
         executionWorkspaceId: persistedExecutionWorkspace?.id ?? issueRef?.executionWorkspaceId ?? null,
         config: hostExecutionWorkspaceConfig,
-        adapterEnv,
+        adapterEnv: runtimeAdapterEnv,
         onLog,
       });
       if (runtimeServices.length > 0) {
@@ -16036,20 +16110,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             legacyUseProjectWorkspace: null,
           });
           const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, workspaceManagedConfig);
-          const existingExecutionWorkspaceStatus = issue.executionWorkspaceId
+          const existingExecutionWorkspace = issue.executionWorkspaceId
             ? await tx
-              .select({ status: executionWorkspaces.status })
+              .select({
+                status: executionWorkspaces.status,
+                metadata: executionWorkspaces.metadata,
+              })
               .from(executionWorkspaces)
               .where(and(
                 eq(executionWorkspaces.id, issue.executionWorkspaceId),
                 eq(executionWorkspaces.companyId, issue.companyId),
               ))
-              .then((rows) => rows[0]?.status ?? null)
+              .then((rows) => rows[0] ?? null)
             : null;
           const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
             issueExecutionWorkspaceId: issue.executionWorkspaceId,
             issueExecutionWorkspacePreference: issue.executionWorkspacePreference,
-            existingExecutionWorkspaceStatus,
+            existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
+            currentAgentId: agent.id,
+            existingExecutionWorkspaceMetadata: existingExecutionWorkspace?.metadata ?? null,
           });
           const hasResolvablePriorSessionWorkspace = await resolveHasResolvablePriorSessionWorkspace();
 

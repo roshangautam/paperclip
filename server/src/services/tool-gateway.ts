@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, isNull, lte, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -66,6 +66,7 @@ import {
   type ToolRuntimeSlotView,
 } from "./tool-runtime-supervisor.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
+import { logger } from "../middleware/logger.js";
 import {
   canonicalToolArguments,
   readSignedToolArgumentsPayload,
@@ -463,8 +464,11 @@ function summarizeResult(result: unknown): Record<string, unknown> {
   };
 }
 
-function inferToolRisk(toolName: string): ToolGatewayDescriptor["risk"] {
-  return classifyRisk({ name: toolName });
+function inferToolRisk(
+  toolName: string,
+  annotations?: Record<string, unknown>,
+): ToolGatewayDescriptor["risk"] {
+  return classifyRisk({ name: toolName, annotations });
 }
 
 function riskFromCatalogEntry(entry: Pick<typeof toolCatalogEntries.$inferSelect, "riskLevel" | "isReadOnly" | "isWrite" | "isDestructive">): ToolGatewayDescriptor["risk"] {
@@ -744,6 +748,10 @@ export function createToolGatewayService(
     trustedLocalStdioRuntimeHost?: string | null;
     runtimeSupervisor?: ToolRuntimeSupervisorOptions;
     toolActionSigningSecret?: string;
+    releaseRunEnvironmentLeases?: (input: {
+      runId: string;
+      runStatus: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
+    }) => Promise<unknown>;
     mcpGatewayProtocolLimits?: Partial<{
       authFailures: Partial<McpGatewayRateLimitConfig>;
       gatewayRequests: Partial<McpGatewayRateLimitConfig>;
@@ -765,6 +773,26 @@ export function createToolGatewayService(
   const secrets = secretService(db);
   const protocolLimits = mcpGatewayProtocolLimits(options.mcpGatewayProtocolLimits);
   let nextProtocolRateLimitPruneAt = 0;
+
+  async function releaseRunEnvironmentLeasesIfTerminal(runId: string | null) {
+    if (!runId || !options.releaseRunEnvironmentLeases) return false;
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1);
+    if (!run || !["succeeded", "interrupted", "failed", "cancelled", "timed_out"].includes(run.status)) return false;
+    try {
+      await options.releaseRunEnvironmentLeases({
+        runId,
+        runStatus: run.status as "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
+      });
+      return true;
+    } catch (error) {
+      logger.warn({ err: error, runId }, "failed to release retained environment leases after tool action resolution");
+      return false;
+    }
+  }
 
   async function pruneExpiredProtocolRateLimitCounters(current: number) {
     if (current < nextProtocolRateLimitPruneAt) return;
@@ -831,7 +859,7 @@ export function createToolGatewayService(
     return (pluginToolDispatcher?.listToolsForAgent() ?? []).map((tool) => ({
       ...tool,
       providerType: "paperclip_plugin" as const,
-      risk: inferToolRisk(tool.name),
+      risk: inferToolRisk(tool.name, tool.annotations),
     }));
   }
 
@@ -842,7 +870,7 @@ export function createToolGatewayService(
       title: tool.displayName,
       description: tool.description,
       inputSchema: tool.parametersSchema,
-      annotations: {},
+      annotations: tool.annotations ?? {},
     });
   }
 
@@ -1447,8 +1475,8 @@ export function createToolGatewayService(
     errorCode?: string | null;
     errorMessage?: string | null;
     resultSummary?: string | null;
-  }): Promise<void> {
-    const [linked] = await db
+  }, dbOrTx: Db | Parameters<Parameters<Db["transaction"]>[0]>[0] = db): Promise<void> {
+    const [linked] = await dbOrTx
       .select({
         companyId: toolActionRequests.companyId,
         interactionId: toolActionRequests.interactionId,
@@ -1458,7 +1486,7 @@ export function createToolGatewayService(
       .limit(1);
     if (!linked?.interactionId) return;
 
-    const [interaction] = await db
+    const [interaction] = await dbOrTx
       .select({
         status: issueThreadInteractions.status,
         result: issueThreadInteractions.result,
@@ -1486,7 +1514,7 @@ export function createToolGatewayService(
     if (!outcome) return;
 
     const now = new Date();
-    await db
+    await dbOrTx
       .update(issueThreadInteractions)
       .set({
         ...(input.status === "expired" && interaction.status === "pending"
@@ -1506,6 +1534,129 @@ export function createToolGatewayService(
         updatedAt: now,
       })
       .where(eq(issueThreadInteractions.id, linked.interactionId));
+  }
+
+  async function expireExecuteOnApproveAction(input: {
+    actionRequestId: string;
+    invocationId: string;
+    now: Date;
+  }): Promise<{ expired: boolean; released: boolean }> {
+    const transition = await db.transaction(async (tx) => {
+      const [cancelled] = await tx
+        .update(toolInvocations)
+        .set({
+          status: "cancelled",
+          approvalState: "expired",
+          idempotencyKey: null,
+          errorCode: "action_expired_pending_lease_release",
+          errorMessage: "Tool action request approval expired before execution",
+          completedAt: input.now,
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(toolInvocations.id, input.invocationId),
+          eq(toolInvocations.status, "awaiting_approval"),
+        ))
+        .returning({ runId: toolInvocations.runId });
+      if (!cancelled) {
+        const [pendingRelease] = await tx
+          .select({ runId: toolInvocations.runId })
+          .from(toolInvocations)
+          .innerJoin(toolActionRequests, eq(toolActionRequests.invocationId, toolInvocations.id))
+          .where(and(
+            eq(toolInvocations.id, input.invocationId),
+            eq(toolInvocations.status, "cancelled"),
+            eq(toolInvocations.errorCode, "action_expired_pending_lease_release"),
+            eq(toolActionRequests.id, input.actionRequestId),
+            eq(toolActionRequests.status, "expired"),
+          ))
+          .limit(1);
+        return pendingRelease ? { expired: false, runId: pendingRelease.runId } : null;
+      }
+      const [expired] = await tx
+        .update(toolActionRequests)
+        .set({ status: "expired", resolvedAt: input.now, updatedAt: input.now })
+        .where(and(
+          eq(toolActionRequests.id, input.actionRequestId),
+          inArray(toolActionRequests.status, ["pending", "approved"]),
+          lte(toolActionRequests.expiresAt, input.now),
+        ))
+        .returning({
+          id: toolActionRequests.id,
+          companyId: toolActionRequests.companyId,
+          interactionId: toolActionRequests.interactionId,
+        });
+      if (!expired) tx.rollback();
+      await reflectToolActionInteractionLifecycle(
+        { actionRequestId: expired.id, status: "expired" },
+        tx,
+      );
+      return { expired: true, runId: cancelled.runId };
+    });
+    if (!transition) return { expired: false, released: false };
+    const released = await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${input.invocationId}))`);
+      const [pendingRelease] = await tx
+        .select({ runId: toolInvocations.runId })
+        .from(toolInvocations)
+        .where(and(
+          eq(toolInvocations.id, input.invocationId),
+          eq(toolInvocations.errorCode, "action_expired_pending_lease_release"),
+        ))
+        .limit(1);
+      if (!pendingRelease) return false;
+      const didRelease = await releaseRunEnvironmentLeasesIfTerminal(pendingRelease.runId);
+      if (!didRelease) return false;
+      await tx.update(toolInvocations).set({ errorCode: "action_expired", updatedAt: input.now }).where(and(
+        eq(toolInvocations.id, input.invocationId),
+        eq(toolInvocations.errorCode, "action_expired_pending_lease_release"),
+      ));
+      return true;
+    });
+    return { expired: transition.expired, released };
+  }
+
+  async function invalidateExpiredActionCandidate(input: {
+    actionRequestId: string;
+    invocationId: string;
+    now: Date;
+  }): Promise<boolean> {
+    return db.transaction(async (tx) => {
+      const [cancelledInvocation] = await tx
+        .update(toolInvocations)
+        .set({
+          status: "cancelled",
+          approvalState: "expired",
+          idempotencyKey: null,
+          errorCode: "action_request_invalidated",
+          errorMessage: "Tool action request signature is invalid",
+          completedAt: input.now,
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(toolInvocations.id, input.invocationId),
+          eq(toolInvocations.status, "awaiting_approval"),
+        ))
+        .returning({ id: toolInvocations.id });
+      if (!cancelledInvocation) return false;
+      const [cancelledRequest] = await tx
+        .update(toolActionRequests)
+        .set({ status: "cancelled", resolvedAt: input.now, updatedAt: input.now })
+        .where(and(
+          eq(toolActionRequests.id, input.actionRequestId),
+          inArray(toolActionRequests.status, ["pending", "approved"]),
+          lte(toolActionRequests.expiresAt, input.now),
+        ))
+        .returning({ id: toolActionRequests.id });
+      if (!cancelledRequest) tx.rollback();
+      await reflectToolActionInteractionLifecycle({
+        actionRequestId: cancelledRequest.id,
+        status: "expired",
+        errorCode: "action_request_invalidated",
+        errorMessage: "Tool action request signature is invalid",
+      }, tx);
+      return true;
+    });
   }
 
   async function approvalRequiredInstructions(issueId: string): Promise<string> {
@@ -4175,6 +4326,7 @@ export function createToolGatewayService(
   async function markApprovedActionFailed(input: {
     actionRequestId: string;
     invocationId: string;
+    runId: string | null;
     error: unknown;
   }) {
     const reasonCode = input.error instanceof ToolGatewayHttpError
@@ -4200,6 +4352,7 @@ export function createToolGatewayService(
       errorCode: reasonCode,
       errorMessage: message,
     });
+    await releaseRunEnvironmentLeasesIfTerminal(input.runId);
     return { reasonCode, message };
   }
 
@@ -4246,7 +4399,7 @@ export function createToolGatewayService(
     });
     if (!signedPayload) {
       const error = new ToolGatewayHttpError(409, "Approved tool action arguments signature is invalid", "signed_arguments_invalid");
-      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, error });
+      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, runId: invocation.runId, error });
       throw error;
     }
     if (signedPayload.executionOnApprove !== true) {
@@ -4284,12 +4437,12 @@ export function createToolGatewayService(
       tool = await findToolForSession(session, invocation.toolName);
       liveApprovalSnapshot = await connectedRemoteApprovalSnapshot(session, tool);
     } catch (error) {
-      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, error });
+      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, runId: invocation.runId, error });
       throw error;
     }
     if (!approvalSnapshotsMatch(signedPayload.approvalSnapshot, liveApprovalSnapshot)) {
       const error = new ToolGatewayHttpError(409, "Approved tool action target changed after review", "approved_tool_target_changed");
-      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, error });
+      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, runId: invocation.runId, error });
       throw error;
     }
     const parameters = signedPayload.arguments;
@@ -4307,7 +4460,7 @@ export function createToolGatewayService(
       })
     ) {
       const error = new ToolGatewayHttpError(409, "Approved tool action arguments do not match reviewed hash", "signed_arguments_mismatch");
-      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, error });
+      await markApprovedActionFailed({ actionRequestId: claimed.id, invocationId: invocation.id, runId: invocation.runId, error });
       throw error;
     }
 
@@ -4332,10 +4485,10 @@ export function createToolGatewayService(
       } else if (tool.providerType === "mcp_local_stdio") {
         result = (await executeLocalStdioTool(session, tool, parameters, executionTimeoutMs)).result;
       } else if (tool.providerType === "paperclip_plugin") {
-        if (!pluginToolDispatcher || !session.runId || !session.projectId) {
+        if (!pluginToolDispatcher || !session.runId) {
           throw new ToolGatewayHttpError(
             409,
-            "Approved plugin action is missing its originating run or project context",
+            "Approved plugin action is missing its originating run context",
             "approved_execution_context_missing",
           );
         }
@@ -4344,8 +4497,8 @@ export function createToolGatewayService(
             agentId: invocation.agentId,
             companyId: invocation.companyId,
             runId: session.runId,
-            projectId: session.projectId,
-          }),
+            projectId: session.projectId ?? "",
+          }, { allowTerminalRunWorkspaceExecution: true }),
           executionTimeoutMs,
         ));
       } else {
@@ -4386,11 +4539,13 @@ export function createToolGatewayService(
         metadata: { durationMs: Date.now() - startedAt, timeoutMs: executionTimeoutMs },
         tool,
       });
+      await releaseRunEnvironmentLeasesIfTerminal(invocation.runId);
       return resultValidation.value;
     } catch (error) {
       const { reasonCode } = await markApprovedActionFailed({
         actionRequestId: claimed.id,
         invocationId: invocation.id,
+        runId: invocation.runId,
         error,
       });
       await writeToolCallEvent({
@@ -4432,21 +4587,15 @@ export function createToolGatewayService(
       .limit(1);
     if (!match) return null;
     if (
-      match.actionRequest.status === "pending"
+      (match.actionRequest.status === "pending" || match.actionRequest.status === "approved")
       && match.actionRequest.expiresAt
       && match.actionRequest.expiresAt.getTime() <= Date.now()
     ) {
-      const now = new Date();
-      await db.update(toolActionRequests).set({ status: "expired", resolvedAt: now, updatedAt: now }).where(and(
-        eq(toolActionRequests.id, match.actionRequest.id),
-        eq(toolActionRequests.status, "pending"),
-      ));
-      await db.update(toolInvocations).set({
-        approvalState: "expired",
-        idempotencyKey: null,
-        updatedAt: now,
-      }).where(eq(toolInvocations.id, match.invocation.id));
-      await reflectToolActionInteractionLifecycle({ actionRequestId: match.actionRequest.id, status: "expired" });
+      await expireExecuteOnApproveAction({
+        actionRequestId: match.actionRequest.id,
+        invocationId: match.invocation.id,
+        now: new Date(),
+      });
       return null;
     }
     return match;
@@ -5341,6 +5490,15 @@ export function createToolGatewayService(
       if (actionRequest.status !== "pending" && actionRequest.status !== "approved") {
         throw new ToolGatewayHttpError(409, "Tool action request is no longer pending", "action_not_pending");
       }
+      if (actionRequest.expiresAt && actionRequest.expiresAt.getTime() <= Date.now()) {
+        const expiredAt = new Date();
+        await expireExecuteOnApproveAction({
+          actionRequestId: actionRequest.id,
+          invocationId: invocation.id,
+          now: expiredAt,
+        });
+        throw new ToolGatewayHttpError(409, "Tool action request approval has expired", "action_expired");
+      }
       let signedPayload: ReturnType<typeof readSignedToolArgumentsPayload> = null;
       try {
         signedPayload = readSignedToolArgumentsPayload({
@@ -5358,6 +5516,7 @@ export function createToolGatewayService(
             .update(toolActionRequests)
             .set({ status: "cancelled", resolvedAt: new Date(), updatedAt: new Date() })
             .where(and(eq(toolActionRequests.id, actionRequest.id), eq(toolActionRequests.status, "pending")));
+          await releaseRunEnvironmentLeasesIfTerminal(invocation.runId);
         }
         throw new ToolGatewayHttpError(
           409,
@@ -5499,6 +5658,7 @@ export function createToolGatewayService(
         .update(toolInvocations)
         .set({ approvalState: "rejected", updatedAt: now })
         .where(eq(toolInvocations.id, invocation.id));
+      await releaseRunEnvironmentLeasesIfTerminal(invocation.runId);
       return updated;
     },
 
@@ -5682,17 +5842,11 @@ export function createToolGatewayService(
         }
         if (actionRequest.expiresAt && actionRequest.expiresAt.getTime() <= Date.now()) {
           const expiredAt = new Date();
-          const [expired] = await db
-            .update(toolActionRequests)
-            .set({ status: "expired", resolvedAt: expiredAt, updatedAt: expiredAt })
-            .where(and(
-              eq(toolActionRequests.id, actionRequest.id),
-              inArray(toolActionRequests.status, ["pending", "approved"]),
-            ))
-            .returning({ id: toolActionRequests.id });
-          if (expired) {
-            await reflectToolActionInteractionLifecycle({ actionRequestId: expired.id, status: "expired" });
-          }
+          await expireExecuteOnApproveAction({
+            actionRequestId: actionRequest.id,
+            invocationId: storedInvocation.id,
+            now: expiredAt,
+          });
           throw new ToolGatewayHttpError(409, "Tool action request approval has expired", "action_expired");
         }
         if (actionRequest.status === "pending" && actionRequest.interactionId) {
@@ -6429,6 +6583,85 @@ export function createToolGatewayService(
         .where(lte(toolGatewaySessions.expiresAt, now))
         .returning({ id: toolGatewaySessions.id });
       return { deletedCount: rows.length };
+    },
+
+    async reconcileExpiredExecuteOnApproveActions(input: { now?: Date; limit?: number; scanCeiling?: number } = {}) {
+      const now = input.now ?? new Date();
+      const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+      const scanCeiling = Math.max(1, Math.min(input.scanCeiling ?? limit * 10, 5_000));
+      let cursor: { expiresAt: Date; id: string } | null = null;
+      let scanned = 0;
+      let reconciled = 0;
+      let released = 0;
+      let invalidated = 0;
+      while (scanned < scanCeiling && reconciled + released + invalidated < limit) {
+        const pageSize = Math.min(limit, scanCeiling - scanned);
+        const candidates = await db
+          .select({ actionRequest: toolActionRequests, invocation: toolInvocations })
+          .from(toolActionRequests)
+          .innerJoin(toolInvocations, eq(toolInvocations.id, toolActionRequests.invocationId))
+          .where(and(
+            or(
+              and(
+                inArray(toolActionRequests.status, ["pending", "approved"]),
+                lte(toolActionRequests.expiresAt, now),
+              ),
+              and(
+                eq(toolActionRequests.status, "expired"),
+                eq(toolInvocations.status, "cancelled"),
+                eq(toolInvocations.errorCode, "action_expired_pending_lease_release"),
+              ),
+            ),
+            cursor
+              ? or(
+                  gt(toolActionRequests.expiresAt, cursor.expiresAt),
+                  and(
+                    eq(toolActionRequests.expiresAt, cursor.expiresAt),
+                    gt(toolActionRequests.id, cursor.id),
+                  ),
+                )
+              : undefined,
+          ))
+          .orderBy(asc(toolActionRequests.expiresAt), asc(toolActionRequests.id))
+          .limit(pageSize);
+        if (candidates.length === 0) break;
+        scanned += candidates.length;
+        const lastCandidate = candidates.at(-1);
+        if (!lastCandidate?.actionRequest.expiresAt) break;
+        cursor = { expiresAt: lastCandidate.actionRequest.expiresAt, id: lastCandidate.actionRequest.id };
+        for (const { actionRequest, invocation } of candidates) {
+          let signedPayload: ReturnType<typeof readSignedToolArgumentsPayload> = null;
+          try {
+            signedPayload = readSignedToolArgumentsPayload({
+              signedArguments: actionRequest.signedArguments,
+              invocationId: invocation.id,
+              toolName: invocation.toolName,
+              signingSecret: options.toolActionSigningSecret,
+            });
+          } catch {
+            signedPayload = null;
+          }
+          if (!signedPayload) {
+            if (await invalidateExpiredActionCandidate({
+              actionRequestId: actionRequest.id,
+              invocationId: invocation.id,
+              now,
+            })) invalidated += 1;
+            continue;
+          }
+          if (signedPayload.executionOnApprove !== true) continue;
+          const result = await expireExecuteOnApproveAction({
+            actionRequestId: actionRequest.id,
+            invocationId: invocation.id,
+            now,
+          });
+          if (result.expired) reconciled += 1;
+          if (result.released) released += 1;
+          if (reconciled + released + invalidated >= limit) break;
+        }
+        if (candidates.length < pageSize) break;
+      }
+      return { scanned, reconciled, released, invalidated };
     },
 
     async listRuntimeSlots(companyId?: string) {

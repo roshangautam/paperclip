@@ -11,6 +11,7 @@ import {
   pluginLogs,
   principalPermissionGrants,
   projects as projectsTable,
+  environmentLeases,
 } from "@paperclipai/db";
 import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, lte } from "drizzle-orm";
 import type {
@@ -25,6 +26,7 @@ import type {
   PluginIssueAssigneeSummary,
   PluginIssueOrchestrationSummary,
   PluginExecutionWorkspaceMetadata,
+  PluginExecutionWorkspaceExecuteInput,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
@@ -32,6 +34,8 @@ import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
+import { environmentService } from "./environments.js";
+import { environmentRuntimeService } from "./environment-runtime.js";
 import { issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
@@ -542,6 +546,10 @@ export function buildHostServices(
   });
   const projects = projectService(db);
   const executionWorkspaces = executionWorkspaceService(db);
+  const environments = environmentService(db);
+  const environmentRuntime = environmentRuntimeService(db, {
+    pluginWorkerManager: options.pluginWorkerManager,
+  });
   const issues = issueService(db);
   const documents = documentService(db);
   const goals = goalService(db);
@@ -648,6 +656,33 @@ export function buildHostServices(
     providerType: workspace.providerType,
     providerMetadata: readProviderMetadata(workspace.metadata),
   });
+
+  const resolveExecutionWorkspaceCommandCwd = (input: {
+    requestedCwd?: string;
+    workspace: NonNullable<Awaited<ReturnType<typeof executionWorkspaces.getById>>>;
+    leaseMetadata: Record<string, unknown> | null | undefined;
+  }): string | undefined => {
+    const remoteCwd = typeof input.leaseMetadata?.remoteCwd === "string"
+      ? input.leaseMetadata.remoteCwd.trim()
+      : "";
+    if (!remoteCwd) return input.requestedCwd;
+
+    const requestedCwd = input.requestedCwd?.trim();
+    if (!requestedCwd) return remoteCwd;
+
+    const hostWorkspaceCwd = input.workspace.cwd ?? input.workspace.providerRef;
+    if (!hostWorkspaceCwd || !path.isAbsolute(hostWorkspaceCwd) || !path.isAbsolute(requestedCwd)) {
+      return input.requestedCwd;
+    }
+
+    const relativeCwd = path.relative(path.resolve(hostWorkspaceCwd), path.resolve(requestedCwd));
+    if (relativeCwd === "") return remoteCwd;
+    if (relativeCwd === ".." || relativeCwd.startsWith(`..${path.sep}`) || path.isAbsolute(relativeCwd)) {
+      return input.requestedCwd;
+    }
+
+    return path.posix.join(remoteCwd, relativeCwd.split(path.sep).join(path.posix.sep));
+  };
 
   const requireInCompany = <T extends { companyId: string | null | undefined }>(
     entityName: string,
@@ -1485,6 +1520,97 @@ export function buildHostServices(
           return toPluginExecutionWorkspaceMetadata(workspace);
         }
         return null;
+      },
+      async execute(
+        params: PluginExecutionWorkspaceExecuteInput,
+        context?: {
+          invocationScope?: {
+            agentId?: string;
+            allowTerminalRunWorkspaceExecution?: boolean;
+          } | null;
+        },
+      ) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const workspace = requireInCompany(
+          "Execution workspace",
+          await executionWorkspaces.getById(params.workspaceId),
+          companyId,
+        );
+
+        const runRows = await db
+          .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.id, params.runId),
+            eq(heartbeatRuns.companyId, companyId),
+          ))
+          .limit(1);
+        const run = runRows[0];
+        const runIsExecutable = run?.status === "queued"
+          || run?.status === "running"
+          || context?.invocationScope?.allowTerminalRunWorkspaceExecution === true;
+        if (!run || !runIsExecutable) {
+          throw new Error("Heartbeat run is not executable");
+        }
+        if (run.agentId !== context?.invocationScope?.agentId) {
+          throw new Error("Heartbeat run is not owned by the invoking agent");
+        }
+
+        const leaseRows = await db
+          .select({ id: environmentLeases.id, expiresAt: environmentLeases.expiresAt })
+          .from(environmentLeases)
+          .where(and(
+            eq(environmentLeases.companyId, companyId),
+            eq(environmentLeases.executionWorkspaceId, params.workspaceId),
+            eq(environmentLeases.heartbeatRunId, params.runId),
+            eq(environmentLeases.status, "active"),
+          ))
+          .limit(2);
+        if (leaseRows.length === 0) {
+          throw new Error("No active environment lease found for execution workspace");
+        }
+        if (leaseRows.length > 1) {
+          throw new Error("Multiple active environment leases found for execution workspace");
+        }
+        if (leaseRows[0]?.expiresAt && leaseRows[0].expiresAt <= new Date()) {
+          throw new Error("No active environment lease found for execution workspace");
+        }
+
+        const lease = await environments.getLeaseById(leaseRows[0]!.id);
+        if (
+          !lease
+          || lease.companyId !== companyId
+          || lease.executionWorkspaceId !== params.workspaceId
+          || lease.heartbeatRunId !== params.runId
+          || lease.status !== "active"
+        ) {
+          throw new Error("No active environment lease found for execution workspace");
+        }
+        const environment = await environments.getById(lease.environmentId);
+        if (!environment) throw new Error("Environment not found");
+
+        return environmentRuntime.execute({
+          environment,
+          lease,
+          command: params.command,
+          args: params.args,
+          cwd: resolveExecutionWorkspaceCommandCwd({
+            requestedCwd: params.cwd,
+            workspace,
+            leaseMetadata: lease.metadata,
+          }),
+          env: params.env,
+          stdin: params.stdin,
+          timeoutMs: params.timeoutMs,
+          ...(lease.metadata?.workspaceRealization
+            ? {
+                workspaceRealization: Object.fromEntries(
+                  Object.entries(lease.metadata.workspaceRealization),
+                ),
+              }
+            : {}),
+        });
       },
     },
 

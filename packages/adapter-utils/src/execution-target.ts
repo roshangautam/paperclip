@@ -22,6 +22,7 @@ import {
   sandboxCallbackBridgeDirectories,
   startSandboxCallbackBridgeServer,
   startSandboxCallbackBridgeWorker,
+  type SandboxCallbackBridgeRequest,
 } from "./sandbox-callback-bridge.js";
 import {
   createSandboxRunLogTailFactory,
@@ -1329,6 +1330,23 @@ function buildBridgeForwardUrl(baseUrl: string, request: { path: string; query: 
   return url;
 }
 
+const managedToolGatewayMcpPath = /^\/api\/tool-gateway\/gateways\/[^/]+\/mcp$/;
+
+function managedToolGatewayBearerToken(
+  request: Pick<SandboxCallbackBridgeRequest, "method" | "path" | "headers">,
+): string | null {
+  const method = request.method.trim().toUpperCase();
+  if ((method !== "GET" && method !== "POST") || !managedToolGatewayMcpPath.test(request.path)) {
+    return null;
+  }
+  for (const [key, value] of Object.entries(request.headers)) {
+    if (key.toLowerCase() !== "x-paperclip-tool-gateway-token") continue;
+    const token = value.trim();
+    return token.length > 0 ? token : null;
+  }
+  return null;
+}
+
 function bridgeResponseBodyLimitError(maxBodyBytes: number): Error {
   return new Error(`Bridge response body exceeded the configured size limit of ${maxBodyBytes} bytes.`);
 }
@@ -1824,7 +1842,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     input.runtimeRootDir?.trim().length
       ? input.runtimeRootDir.trim()
       : path.posix.join(target.remoteCwd, ".paperclip-runtime", input.adapterKey);
-  const bridgeRuntimeDir = path.posix.join(runtimeRootDir, "paperclip-bridge");
+  const bridgeRuntimeDir = path.posix.join(runtimeRootDir, "paperclip-bridge", input.runId);
   const queueDir = path.posix.join(bridgeRuntimeDir, "queue");
   const assetRemoteDir = path.posix.join(bridgeRuntimeDir, "server");
   const bridgeToken = createSandboxCallbackBridgeToken();
@@ -1869,9 +1887,22 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     worker = await startSandboxCallbackBridgeWorker({
       client,
       queueDir,
+      // Each remote queue poll is a sandbox command and may consume a
+      // provider API request. Keep idle bridges below common rate limits.
+      pollIntervalMs: 1_000,
       maxBodyBytes,
       handleRequest: async (request) => {
         const method = request.method.trim().toUpperCase() || "GET";
+        const isManagedToolGatewayMcpRequest = managedToolGatewayMcpPath.test(request.path)
+          && (method === "GET" || method === "POST");
+        const gatewayBearerToken = managedToolGatewayBearerToken(request);
+        if (isManagedToolGatewayMcpRequest && !gatewayBearerToken) {
+          return {
+            status: 401,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ error: "Managed MCP gateway bearer token is required." }),
+          };
+        }
         if (bridgeDebugEnabled) {
           await onLog(
             "stdout",
@@ -1880,10 +1911,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         }
         const headers = new Headers();
         for (const [key, value] of Object.entries(request.headers)) {
+          if (key.toLowerCase() === "x-paperclip-tool-gateway-token") continue;
           if (value.trim().length === 0) continue;
           headers.set(key, value);
         }
-        headers.set("authorization", `Bearer ${hostApiToken}`);
+        headers.set("authorization", `Bearer ${gatewayBearerToken ?? hostApiToken}`);
         headers.set("x-paperclip-run-id", input.runId);
         const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), {
           method,

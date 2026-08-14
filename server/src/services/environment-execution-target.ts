@@ -44,10 +44,16 @@ export async function resolveEnvironmentExecutionTarget(input: {
       return null;
     }
 
+    const agentId = [
+      input.lease?.metadata?.agentId,
+      input.leaseMetadata?.agentId,
+    ].find((value): value is string => typeof value === "string" && value.length > 0);
     const parsed = await resolveEnvironmentDriverConfigForRuntime(input.db, input.companyId, {
       id: input.environment.id,
       driver: input.environment.driver as "sandbox",
       config: parseObject(input.environment.config),
+    }, {
+      resourceScopes: { agent: agentId },
     });
     if (parsed.driver !== "sandbox" && parsed.driver !== "plugin") {
       return null;
@@ -108,10 +114,10 @@ export async function resolveEnvironmentExecutionTarget(input: {
                 command: commandInput.command,
                 args: commandInput.args,
                 cwd: commandInput.cwd ?? remoteCwd,
-                workspaceRealization,
                 env: commandInput.env,
                 stdin: commandInput.stdin,
                 timeoutMs: commandInput.timeoutMs,
+                workspaceRealization,
               });
               if (result.stdout) await commandInput.onLog?.("stdout", result.stdout);
               if (result.stderr) await commandInput.onLog?.("stderr", result.stderr);

@@ -37,6 +37,7 @@ import type {
   ToolRunContext,
   PluginWorkspace,
   PluginExecutionWorkspaceMetadata,
+  PluginExecutionWorkspaceExecuteInput,
   AgentSession,
   AgentSessionEvent,
   PluginLocalFolderEntry,
@@ -80,6 +81,10 @@ export interface TestHarnessOptions {
   capabilities?: PluginCapability[];
   /** Initial config returned by `ctx.config.get(companyId)`. */
   config?: Record<string, unknown>;
+  /** Optional executor for `ctx.executionWorkspaces.execute`. */
+  onExecutionWorkspaceExecute?: (
+    input: PluginExecutionWorkspaceExecuteInput,
+  ) => Promise<PluginEnvironmentExecuteResult>;
 }
 
 export interface TestHarnessLogEntry {
@@ -1293,6 +1298,13 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "execution.workspaces.read");
         const workspace = executionWorkspaces.get(workspaceId);
         return workspace?.companyId === companyId ? workspace : null;
+      },
+      async execute(input) {
+        requireCapability(manifest, capabilitySet, "execution.workspaces.execute");
+        if (!options.onExecutionWorkspaceExecute) {
+          throw new Error("No execution workspace executor configured for this test harness");
+        }
+        return options.onExecutionWorkspaceExecute(input);
       },
     },
     routines: {

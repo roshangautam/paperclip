@@ -305,6 +305,16 @@ describe("environment routes", () => {
                 properties: {
                   template: { type: "string" },
                   apiKey: { type: "string", format: "secret-ref" },
+                  agentCredentials: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        agentId: { type: "string" },
+                        apiToken: { type: "string", format: "secret-ref" },
+                      },
+                    },
+                  },
                   timeoutMs: { type: "number" },
                   reuseLease: { type: "boolean" },
                 },
@@ -387,6 +397,86 @@ describe("environment routes", () => {
       envVars: {},
       metadata: null,
     });
+  });
+
+  it("preserves secret refs but removes historical plaintext from admin environment reads", async () => {
+    mockEnvironmentService.getById.mockResolvedValue({
+      ...createEnvironment(),
+      driver: "sandbox",
+      config: {
+        provider: "secure-plugin",
+        apiKey: "11111111-1111-1111-1111-111111111111",
+        agentCredentials: [
+          { agentId: "agent-1", apiToken: "historical-plaintext-token" },
+        ],
+      },
+    });
+    const app = createApp({
+      type: "board",
+      userId: "user-1",
+      source: "local_implicit",
+    });
+
+    const res = await request(app).get("/api/environments/env-1");
+
+    expect(res.status).toBe(200);
+    expect(res.body.config.apiKey).toBe("11111111-1111-1111-1111-111111111111");
+    expect(res.body.config.agentCredentials).toEqual([{ agentId: "agent-1" }]);
+    expect(JSON.stringify(res.body)).not.toContain("historical-plaintext-token");
+  });
+
+  it("returns only the provider when a sandbox provider schema is unavailable", async () => {
+    mockEnvironmentService.getById.mockResolvedValue({
+      ...createEnvironment(),
+      driver: "sandbox",
+      config: {
+        provider: "missing-plugin",
+        template: "historical-template",
+        apiKey: "historical-plaintext-token",
+      },
+    });
+    const app = createApp({
+      type: "board",
+      userId: "user-1",
+      source: "local_implicit",
+    });
+
+    const res = await request(app).get("/api/environments/env-1");
+
+    expect(res.status).toBe(200);
+    expect(res.body.config).toEqual({ provider: "missing-plugin" });
+  });
+
+  it("returns only the provider when a sandbox provider schema is empty", async () => {
+    mockResolvePluginSandboxProviderDriverByKey.mockResolvedValueOnce({
+      pluginId: "plugin-empty",
+      pluginKey: "acme.empty-sandbox-provider",
+      driver: {
+        driverKey: "empty-plugin",
+        kind: "sandbox_provider",
+        displayName: "Empty Sandbox",
+        configSchema: {},
+      },
+    });
+    mockEnvironmentService.getById.mockResolvedValue({
+      ...createEnvironment(),
+      driver: "sandbox",
+      config: {
+        provider: "empty-plugin",
+        apiKey: "historical-plaintext-token",
+      },
+    });
+    const app = createApp({
+      type: "board",
+      userId: "user-1",
+      source: "local_implicit",
+    });
+
+    const res = await request(app).get("/api/environments/env-1");
+
+    expect(res.status).toBe(200);
+    expect(res.body.config).toEqual({ provider: "empty-plugin" });
+    expect(JSON.stringify(res.body)).not.toContain("historical-plaintext-token");
   });
 
   it("rejects non-admin blast-radius reads for instance-scoped environments", async () => {
@@ -1080,6 +1170,11 @@ describe("environment routes", () => {
   });
 
   it("creates a schema-driven sandbox environment with secret-ref fields persisted as secrets", async () => {
+    const apiSecretId = "11111111-1111-1111-1111-111111111111";
+    const agentSecretIds = [
+      "22222222-2222-2222-2222-222222222222",
+      "33333333-3333-3333-3333-333333333333",
+    ];
     const environment = {
       ...createEnvironment(),
       id: "env-sandbox-secure-plugin",
@@ -1088,7 +1183,11 @@ describe("environment routes", () => {
       config: {
         provider: "secure-plugin",
         template: "base",
-        apiKey: "11111111-1111-1111-1111-111111111111",
+        apiKey: apiSecretId,
+        agentCredentials: [
+          { agentId: "agent-1", apiToken: agentSecretIds[0] },
+          { agentId: "agent-2", apiToken: agentSecretIds[1] },
+        ],
         timeoutMs: 450000,
         reuseLease: true,
       },
@@ -1098,6 +1197,10 @@ describe("environment routes", () => {
       normalizedConfig: {
         template: "base",
         apiKey: "test-provider-key",
+        agentCredentials: [
+          { agentId: "agent-1", apiToken: "agent-token-1" },
+          { agentId: "agent-2", apiToken: "agent-token-2" },
+        ],
         timeoutMs: 450000,
         reuseLease: true,
       },
@@ -1112,6 +1215,16 @@ describe("environment routes", () => {
           properties: {
             template: { type: "string" },
             apiKey: { type: "string", format: "secret-ref" },
+            agentCredentials: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  agentId: { type: "string" },
+                  apiToken: { type: "string", format: "secret-ref" },
+                },
+              },
+            },
             timeoutMs: { type: "number" },
             reuseLease: { type: "boolean" },
           },
@@ -1119,6 +1232,10 @@ describe("environment routes", () => {
       },
     });
     const pluginWorkerManager = {};
+    mockSecretService.create
+      .mockResolvedValueOnce({ id: apiSecretId })
+      .mockResolvedValueOnce({ id: agentSecretIds[0] })
+      .mockResolvedValueOnce({ id: agentSecretIds[1] });
     const app = createApp({
       type: "board",
       userId: "user-1",
@@ -1134,6 +1251,10 @@ describe("environment routes", () => {
           provider: "secure-plugin",
           template: "  base  ",
           apiKey: "  test-provider-key  ",
+          agentCredentials: [
+            { agentId: "agent-1", apiToken: " agent-token-1 " },
+            { agentId: "agent-2", apiToken: " agent-token-2 " },
+          ],
           timeoutMs: "450000",
           reuseLease: true,
         },
@@ -1147,6 +1268,10 @@ describe("environment routes", () => {
       config: {
         template: "  base  ",
         apiKey: "  test-provider-key  ",
+        agentCredentials: [
+          { agentId: "agent-1", apiToken: " agent-token-1 " },
+          { agentId: "agent-2", apiToken: " agent-token-2 " },
+        ],
         timeoutMs: 450000,
         reuseLease: true,
       },
@@ -1158,20 +1283,35 @@ describe("environment routes", () => {
       config: {
         provider: "secure-plugin",
         template: "base",
-        apiKey: "11111111-1111-1111-1111-111111111111",
+        apiKey: apiSecretId,
+        agentCredentials: [
+          { agentId: "agent-1", apiToken: agentSecretIds[0] },
+          { agentId: "agent-2", apiToken: agentSecretIds[1] },
+        ],
         timeoutMs: 450000,
         reuseLease: true,
       },
       envVars: {},
     });
     expect(JSON.stringify(mockEnvironmentService.create.mock.calls[0][0])).not.toContain("test-provider-key");
-    expect(mockSecretService.create).toHaveBeenCalledWith(
+    expect(JSON.stringify(mockEnvironmentService.create.mock.calls[0][0])).not.toContain("agent-token-");
+    expect(mockSecretService.create).toHaveBeenNthCalledWith(
+      1,
       "company-1",
       expect.objectContaining({
         provider: "local_encrypted",
         value: "test-provider-key",
       }),
       expect.any(Object),
+    );
+    expect(mockSecretService.syncSecretRefsForTarget).toHaveBeenCalledWith(
+      "company-1",
+      { targetType: "environment", targetId: environment.id },
+      [
+        { secretId: apiSecretId, configPath: "apiKey", versionSelector: "latest" },
+        { secretId: agentSecretIds[0], configPath: "agentCredentials.0.apiToken", versionSelector: "latest" },
+        { secretId: agentSecretIds[1], configPath: "agentCredentials.1.apiToken", versionSelector: "latest" },
+      ],
     );
   });
 
@@ -1501,8 +1641,57 @@ describe("environment routes", () => {
       driver: "local",
       config: {},
     });
+    expect(mockSecretService.syncSecretRefsForTarget).toHaveBeenCalledWith(
+      "company-1",
+      { targetType: "environment", targetId: environment.id },
+      [],
+      { replaceAll: true },
+    );
     expect(JSON.stringify(mockEnvironmentService.update.mock.calls[0][1])).not.toContain("super-secret-key");
     expect(JSON.stringify(mockEnvironmentService.update.mock.calls[0][1])).not.toContain("known-host");
+  });
+
+  it("preserves env secret bindings while replacing obsolete config bindings", async () => {
+    const envSecretId = "11111111-1111-1111-1111-111111111111";
+    const environment = {
+      ...createEnvironment(),
+      envVars: {
+        GITHUB_TOKEN: {
+          type: "secret_ref",
+          secretId: envSecretId,
+          version: "latest",
+        },
+      },
+    };
+    mockEnvironmentService.getById.mockResolvedValue(environment);
+    mockEnvironmentService.update.mockResolvedValue({
+      ...environment,
+      config: { shell: "bash" },
+    });
+    const app = createApp({
+      type: "board",
+      userId: "user-1",
+      source: "local_implicit",
+    });
+
+    const res = await request(app)
+      .patch(`/api/environments/${environment.id}?companyId=company-1`)
+      .send({ config: { shell: "bash" } });
+
+    expect(res.status).toBe(200);
+    expect(mockSecretService.syncSecretRefsForTarget).toHaveBeenCalledWith(
+      "company-1",
+      { targetType: "environment", targetId: environment.id },
+      [{
+        secretId: envSecretId,
+        configPath: "env.GITHUB_TOKEN",
+        versionSelector: "latest",
+        projectionClass: undefined,
+        projectionAllowlistKey: null,
+      }],
+      { replaceAll: true },
+    );
+    expect(mockSecretService.syncEnvBindingsForTarget).not.toHaveBeenCalled();
   });
 
   it("requires explicit SSH config when switching from local to SSH", async () => {

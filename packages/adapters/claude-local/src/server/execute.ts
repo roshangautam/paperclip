@@ -71,7 +71,9 @@ import {
   isClaudeModelNotFoundError,
 } from "./parse.js";
 import {
+  buildPaperclipClaudeMcpConfig,
   materializeRemoteClaudeConfig,
+  materializeRemoteClaudeMcpConfig,
   prepareClaudeConfigSeed,
   resolveManagedClaudeRuntimeStateDir,
   resolveSharedClaudeConfigDir,
@@ -419,6 +421,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
   const executionTargetIsSandbox = executionTarget?.kind === "remote" && executionTarget.transport === "sandbox";
+  const executionTargetUsesPaperclipBridge =
+    executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(executionTarget);
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -525,7 +529,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const localMcpConfigPath = await writePaperclipClaudeMcpConfig({
     stateDir: claudeRuntimeStateDir,
     runId,
-    servers: runtimeMcpServers,
+    servers: executionTargetUsesPaperclipBridge ? [] : runtimeMcpServers,
   });
   const localMcpConfigDir = path.dirname(localMcpConfigPath);
   const sharedClaudeConfigDir = resolveSharedClaudeConfigDir(process.env);
@@ -688,6 +692,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     if (paperclipBridge) {
       Object.assign(env, paperclipBridge.env);
+      if (runtimeMcpServers.length > 0) {
+        await materializeRemoteClaudeMcpConfig({
+          runId,
+          target: runtimeExecutionTarget,
+          configPath: effectiveMcpConfigPath,
+          contents: buildPaperclipClaudeMcpConfig({
+            servers: runtimeMcpServers,
+            bridge: {
+              url: paperclipBridge.env.PAPERCLIP_API_URL,
+              token: paperclipBridge.env.PAPERCLIP_API_KEY,
+            },
+          }),
+          options: { cwd, env, timeoutSec, graceSec, onLog },
+        });
+      }
       const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
       loggedEnv = buildInvocationEnvForLogs(env, {
         runtimeEnv,
@@ -834,6 +853,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
       targetIsRemote: executionTargetIsRemote,
+      runtimeMcpServerNames: runtimeMcpServers.map(({ name }) => name),
     }));
     if (chrome) args.push("--chrome");
     // For Bedrock: only pass --model when the ID is a Bedrock-native identifier
@@ -883,7 +903,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (dangerouslySkipPermissions && executionTargetIsRemote) {
       commandNotes.push(
-        "Using a broad --allowedTools whitelist for remote execution so hosted targets do not inherit local Claude bypass permissions.",
+        "Using the curated built-in and attached runtime MCP --allowedTools list for remote execution.",
       );
     }
     if (attemptInstructionsFilePath && !resumeSessionId) {
