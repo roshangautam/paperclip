@@ -1023,8 +1023,14 @@ export async function resolveExecutionRunAdapterConfig(input: {
     }
   }
   if (requiredScopedEnvBinding) {
-    const resolvedEnv = parseObject(resolvedConfig.env);
-    if (!requiredScopedEnvBindingsSatisfied((key) => readNonEmptyString(resolvedEnv[key]) !== null)) {
+    const resolvedScopedEnv = {
+      ...(requiredScopedEnvBinding.consumerScopes.includes("agent") ? resolvedAgentEnv : {}),
+      ...(requiredScopedEnvBinding.consumerScopes.includes("project") ? projectEnvResolution.env : {}),
+    };
+    const isSatisfiedByAllowedScope = (key: string) =>
+      !Object.prototype.hasOwnProperty.call(routineEnvResolution.env, key)
+      && readNonEmptyString(resolvedScopedEnv[key]) !== null;
+    if (!requiredScopedEnvBindingsSatisfied(isSatisfiedByAllowedScope)) {
       throw requiredScopedConfigurationFailure(requiredScopedEnvBinding);
     }
   }
