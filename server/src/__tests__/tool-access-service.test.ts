@@ -6818,4 +6818,12 @@ describe("classifyRisk", () => {
     expect(risk("list_items", { writeHint: true })).toBe("write");
     expect(risk("list_items", { readOnlyHint: false })).toBe("write");
   });
+
+  it("does not let a write annotation downgrade a name-destructive tool out of the board-approval tier", () => {
+    expect(risk("delete_records", { readOnlyHint: false })).toBe("destructive");
+    expect(risk("delete_records", { writeHint: true })).toBe("destructive");
+    expect(risk("github:drop_table", { readOnlyHint: false })).toBe("destructive");
+    expect(risk("purgeEntries", { writeHint: true })).toBe("destructive");
+    expect(risk("delete_records", { destructiveHint: false })).toBe("destructive");
+  });
 });

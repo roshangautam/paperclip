@@ -307,10 +307,21 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
 
     await expect(orchestrator.realizeForRun(makeRealizeInput())).rejects.toSatisfy(
-      (err: unknown) =>
-        err instanceof EnvironmentRunError &&
-        err.code === "workspace_realization_failed" &&
-        !err.message.includes("resolved-private-key"),
+      (err: unknown) => {
+        if (!(err instanceof EnvironmentRunError) || err.code !== "workspace_realization_failed") {
+          return false;
+        }
+        const cause = err.cause as Error | undefined;
+        const serialized = JSON.stringify({
+          message: err.message,
+          causeMessage: cause?.message,
+          causeStack: cause?.stack ?? null,
+          causeCause: (cause as { cause?: unknown } | undefined)?.cause ?? null,
+        });
+        return !serialized.includes("resolved-private-key")
+          && cause instanceof Error
+          && cause.stack === undefined;
+      },
     );
   });
 

@@ -155,6 +155,23 @@ function redactForwardedRealizationSecretValuesOnly(
   return redactForwardedRealizationSecrets(path, secretOnlyEnv);
 }
 
+// The raw provider error can echo forwarded credentials in its message, stack, or
+// its own nested cause. Attaching it directly as `cause` leaks the secret to any
+// error serializer (Pino) or caller that walks the chain, even when the outer
+// message is sanitized. Build a plain Error carrying only the scrubbed message and
+// name so the chain retains diagnostic shape without the credential material; the
+// stack and any nested cause are intentionally dropped.
+function buildSanitizedRealizationCause(
+  err: unknown,
+  forwardedEnv: Record<string, string>,
+): Error {
+  const rawMessage = err instanceof Error ? err.message : String(err);
+  const sanitized = new Error(redactForwardedRealizationSecrets(rawMessage, forwardedEnv));
+  sanitized.name = err instanceof Error ? err.name : "Error";
+  delete sanitized.stack;
+  return sanitized;
+}
+
 function firstNonEmptyLine(text: string | null | undefined): string | null {
   if (!text) return null;
   for (const rawLine of text.split(/\r?\n/)) {
@@ -451,7 +468,7 @@ export function environmentRunOrchestrator(
           {
             environmentId: environment.id,
             driver: environment.driver,
-            cause: err,
+            cause: buildSanitizedRealizationCause(err, input.workspaceRealizationEnv),
           },
         );
       }
