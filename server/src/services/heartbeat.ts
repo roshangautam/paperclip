@@ -3381,9 +3381,13 @@ function executionWorkspaceRealizationBelongsToAgent(input: {
   const agentId = readNonEmptyString(providerMetadata.agentId);
   const credentialAgentId = readNonEmptyString(providerMetadata.credentialAgentId);
 
+  // Reuse is permitted only when the realization records no owner markers at
+  // all: local/SSH realizations carry empty provider metadata, so they hold no
+  // cross-agent credential or workspace to protect. Any recorded owner (agent
+  // or credential) must match the current agent on both markers to reuse.
+  if (agentId === null && credentialAgentId === null) return true;
+
   return (
-    agentId !== null &&
-    credentialAgentId !== null &&
     agentId === currentAgentId &&
     credentialAgentId === currentAgentId
   );

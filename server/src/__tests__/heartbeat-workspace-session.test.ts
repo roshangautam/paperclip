@@ -1454,7 +1454,7 @@ describe("effective run execution workspace config freshness", () => {
     });
   });
 
-  it("rejects reuse when nested ownership metadata is absent but currentAgentId is known", () => {
+  it("permits reuse when no credential owner is recorded (local/SSH realization) and currentAgentId is known", () => {
     expect(resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-legacy",
       issueExecutionWorkspacePreference: "reuse_existing",
@@ -1463,8 +1463,8 @@ describe("effective run execution workspace config freshness", () => {
       existingExecutionWorkspaceMetadata: {},
     })).toEqual({
       requestedExecutionWorkspaceId: "workspace-legacy",
-      requestedShouldReuseExisting: false,
-      existingExecutionWorkspaceAvailable: false,
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
     });
   });
 
@@ -1493,7 +1493,7 @@ describe("effective run execution workspace config freshness", () => {
     });
   });
 
-  it("rejects reuse when nested ownership metadata is malformed (missing providerMetadata)", () => {
+  it("permits reuse when provider metadata is present but carries no credential owner", () => {
     expect(resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: "workspace-malformed",
       issueExecutionWorkspacePreference: "reuse_existing",
@@ -1508,8 +1508,8 @@ describe("effective run execution workspace config freshness", () => {
       },
     })).toEqual({
       requestedExecutionWorkspaceId: "workspace-malformed",
-      requestedShouldReuseExisting: false,
-      existingExecutionWorkspaceAvailable: false,
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
     });
   });
 
