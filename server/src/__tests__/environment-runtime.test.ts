@@ -1366,14 +1366,92 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         pluginKey: "acme.reservation-sandbox-provider",
       }),
     });
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.id).toBe(reservation?.id);
-  });
+     expect(rows).toHaveLength(1);
+     expect(rows[0]?.id).toBe(reservation?.id);
+   });
 
-  it.each([
-    ["released", undefined],
-    ["failed", "failed"],
-  ] as const)("preserves %s intent when a plugin sandbox acquisition returns late", async (
+   it("re-stamps the host agent owner over provider-returned lease metadata", async () => {
+     const { pluginId, companyId, environment, agentId } = await seedPluginSandboxEnvironment();
+     const foreignAgentId = randomUUID();
+     const runId = randomUUID();
+     await db.insert(heartbeatRuns).values({
+       id: runId,
+       companyId,
+       agentId,
+       invocationSource: "manual",
+       status: "running",
+       createdAt: new Date(),
+       updatedAt: new Date(),
+     });
+     const workerManager = {
+       isRunning: vi.fn((id: string) => id === pluginId),
+       call: vi.fn(async (_pluginId: string, method: string) => {
+         if (method !== "environmentAcquireLease") {
+           throw new Error(`Unexpected plugin method: ${method}`);
+         }
+         return {
+           providerLeaseId: "restamp-plugin-lease",
+           metadata: {
+             provider: "reservation-plugin",
+             image: "fake:test",
+             agentId: foreignAgentId,
+           },
+         };
+       }),
+     } as unknown as PluginWorkerManager;
+     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+     const acquired = await runtimeWithPlugin.acquireRunLease({
+       companyId,
+       environment,
+       issueId: null,
+       agentId,
+       heartbeatRunId: runId,
+       persistedExecutionWorkspace: null,
+     });
+
+     expect(acquired.lease.metadata).toMatchObject({ agentId });
+     expect(acquired.lease.metadata?.agentId).not.toBe(foreignAgentId);
+     const [persisted] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, acquired.lease.id));
+     expect((persisted?.metadata as Record<string, unknown> | null)?.agentId).toBe(agentId);
+   });
+
+   it("drops a provider-injected agent owner when the host run has no agent", async () => {
+     const { pluginId, companyId, environment } = await seedPluginSandboxEnvironment();
+     const foreignAgentId = randomUUID();
+     const workerManager = {
+       isRunning: vi.fn((id: string) => id === pluginId),
+       call: vi.fn(async (_pluginId: string, method: string) => {
+         if (method !== "environmentAcquireLease") {
+           throw new Error(`Unexpected plugin method: ${method}`);
+         }
+         return {
+           providerLeaseId: "restamp-anon-lease",
+           metadata: { provider: "reservation-plugin", image: "fake:test", agentId: foreignAgentId },
+         };
+       }),
+     } as unknown as PluginWorkerManager;
+     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+     const acquired = await runtimeWithPlugin.acquireRunLease({
+       companyId,
+       environment,
+       issueId: null,
+       agentId: null,
+       heartbeatRunId: null,
+       applyCustomImageTemplate: true,
+       persistedExecutionWorkspace: null,
+     });
+
+     expect(acquired.lease.metadata).not.toHaveProperty("agentId");
+     const [persisted] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, acquired.lease.id));
+     expect(persisted?.metadata as Record<string, unknown> | null).not.toHaveProperty("agentId");
+   });
+
+   it.each([
+     ["released", undefined],
+     ["failed", "failed"],
+   ] as const)("preserves %s intent when a plugin sandbox acquisition returns late", async (
     expectedStatus,
     releaseStatus,
   ) => {

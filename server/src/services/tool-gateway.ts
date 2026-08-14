@@ -4498,19 +4498,27 @@ export function createToolGatewayService(
     const message = input.error instanceof Error ? input.error.message : String(input.error);
     const now = new Date();
     const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(input.runId);
-    await db.update(toolInvocations).set({
-      status: "failed",
-      errorCode: reasonCode,
-      errorMessage: message,
-      completedAt: now,
-      updatedAt: now,
-      leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
-    }).where(eq(toolInvocations.id, input.invocationId));
-    await db.update(toolActionRequests).set({
-      status: "failed",
-      resolvedAt: now,
-      updatedAt: now,
-    }).where(eq(toolActionRequests.id, input.actionRequestId));
+    // Same atomicity invariant as the approved-success path: the terminal
+    // invocation write (with its lease-release marker) and the action-request
+    // "failed" demotion must commit together. A crash between them strands the
+    // request in "executing", where releaseRunLeases returns empty without
+    // releasing and finalizeMarkedLeaseRelease misreads that as success and
+    // clears the marker, permanently leaking the lease and stranding the action.
+    await db.transaction(async (tx) => {
+      await tx.update(toolInvocations).set({
+        status: "failed",
+        errorCode: reasonCode,
+        errorMessage: message,
+        completedAt: now,
+        updatedAt: now,
+        leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
+      }).where(eq(toolInvocations.id, input.invocationId));
+      await tx.update(toolActionRequests).set({
+        status: "failed",
+        resolvedAt: now,
+        updatedAt: now,
+      }).where(eq(toolActionRequests.id, input.actionRequestId));
+    });
     await reflectToolActionInteractionLifecycle({
       actionRequestId: input.actionRequestId,
       status: "failed",
@@ -4677,16 +4685,25 @@ export function createToolGatewayService(
       });
       const now = new Date();
       const scheduleLeaseRelease = await runLeaseReleaseIsSchedulable(invocation.runId);
-      await db.update(toolInvocations).set({
-        status: "succeeded",
-        resultHash: resultValidation.summary.sha256 ?? null,
-        resultSummary: resultValidation.summary,
-        resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
-        completedAt: now,
-        updatedAt: now,
-        leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
-      }).where(eq(toolInvocations.id, invocation.id));
-      await db.update(toolActionRequests).set({ status: "executed", resolvedAt: now, updatedAt: now }).where(eq(toolActionRequests.id, claimed.id));
+      // The terminal invocation write (with its lease-release marker) and the
+      // action-request "executed" transition must commit atomically. Splitting
+      // them lets a crash strand the request in "executing": reconcile then sees
+      // the executing signed action, releaseRunLeases returns empty without
+      // releasing, and finalizeMarkedLeaseRelease misreads empty as success and
+      // clears the marker, stranding both the action and lease permanently
+      // (executing requests are not expiry candidates).
+      await db.transaction(async (tx) => {
+        await tx.update(toolInvocations).set({
+          status: "succeeded",
+          resultHash: resultValidation.summary.sha256 ?? null,
+          resultSummary: resultValidation.summary,
+          resultSizeBytes: resultValidation.summary.sizeBytes ?? null,
+          completedAt: now,
+          updatedAt: now,
+          leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
+        }).where(eq(toolInvocations.id, invocation.id));
+        await tx.update(toolActionRequests).set({ status: "executed", resolvedAt: now, updatedAt: now }).where(eq(toolActionRequests.id, claimed.id));
+      });
       await reflectToolActionInteractionLifecycle({
         actionRequestId: claimed.id,
         status: "executed",

@@ -3158,8 +3158,15 @@ function createSandboxEnvironmentDriver(
             ...fallbackLeaseMetadata,
             ...sanitizedProviderMetadata,
             provider: parsed.config.provider,
+            // Re-stamp the host-authoritative agent owner AFTER the provider
+            // metadata spread. A sandbox provider can otherwise return
+            // { agentId: <other-agent> } (or blank it) and, because this field
+            // scopes agent credential resolution, receive another agent's
+            // resolved secret or hit the fallback:"first" row.
+            ...(input.agentId ? { agentId: input.agentId } : {}),
             ...(reusableScope ? { reusableSandboxLease: reusableScope } : {}),
           };
+          if (!input.agentId) delete (leaseMetadata as Record<string, unknown>).agentId;
           handoffStarted = true;
           return await acquireSandboxLeaseWithCompensation(
             input.environment,

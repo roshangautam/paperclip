@@ -938,7 +938,84 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(2);
   });
 
-  it("persists a lease-release marker when decline release fails transiently and the reconciler retries it", async () => {
+   it("commits the terminal invocation, lease marker, and executed action-request together on approved success", async () => {
+     const releaseRunEnvironmentLeases = vi.fn(async () => undefined);
+     const { company, agent, run } = await createRunFixture(db);
+     await db.insert(toolPolicies).values({
+       companyId: company.id,
+       name: "Review note writes",
+       policyType: "require_approval",
+       selectors: { toolName: "mcp-remote-fixture:update_note" },
+     });
+     const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+     const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+     await expect(gateway.executeTool({
+       sessionToken: session.token,
+       tool: "mcp-remote-fixture:update_note",
+       parameters: { noteId: "n1", body: "reviewed body" },
+     })).rejects.toMatchObject({ reasonCode: "approval_required" });
+     const [actionRequest] = await db.select().from(toolActionRequests);
+     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+       .where(eq(heartbeatRuns.id, run.id));
+
+     const approved = await gateway.approveActionRequest({
+       companyId: company.id,
+       actionRequestId: actionRequest.id,
+       actor: { userId: "board-user" },
+     });
+     expect(approved.status).toBe("executed");
+
+     const [request] = await db.select().from(toolActionRequests)
+       .where(eq(toolActionRequests.id, actionRequest.id));
+     const [invocation] = await db.select().from(toolInvocations)
+       .where(eq(toolInvocations.id, actionRequest.invocationId));
+     expect(invocation.status).toBe("succeeded");
+     expect(request.status).toBe("executed");
+     const invocationTerminal = invocation.status === "succeeded";
+     const requestExecuting = request.status === "executing";
+     expect(invocationTerminal && requestExecuting).toBe(false);
+     expect(invocation.leaseReleasePendingAt).toBeNull();
+   });
+
+   it("commits the terminal invocation, lease marker, and failed action-request together on approved failure", async () => {
+     const releaseRunEnvironmentLeases = vi.fn(async () => undefined);
+     const { company, agent, run } = await createRunFixture(db);
+     await db.insert(toolPolicies).values({
+       companyId: company.id,
+       name: "Review note writes",
+       policyType: "require_approval",
+       selectors: { toolName: "mcp-remote-fixture:update_note" },
+     });
+     const gateway = createTestToolGatewayService(db, { releaseRunEnvironmentLeases });
+     const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+     await expect(gateway.executeTool({
+       sessionToken: session.token,
+       tool: "mcp-remote-fixture:update_note",
+       parameters: { noteId: "n1", body: "" },
+     })).rejects.toMatchObject({ reasonCode: "approval_required" });
+     const [actionRequest] = await db.select().from(toolActionRequests);
+     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+       .where(eq(heartbeatRuns.id, run.id));
+
+     const failed = await gateway.approveActionRequest({
+       companyId: company.id,
+       actionRequestId: actionRequest.id,
+       actor: { userId: "board-user" },
+     });
+     expect(failed.status).toBe("failed");
+
+     const [request] = await db.select().from(toolActionRequests)
+       .where(eq(toolActionRequests.id, actionRequest.id));
+     const [invocation] = await db.select().from(toolInvocations)
+       .where(eq(toolInvocations.id, actionRequest.invocationId));
+     expect(invocation.status).toBe("failed");
+     expect(request.status).toBe("failed");
+     expect(invocation.status === "failed" && request.status === "executing").toBe(false);
+     expect(invocation.leaseReleasePendingAt).toBeNull();
+     expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(1);
+   });
+
+   it("persists a lease-release marker when decline release fails transiently and the reconciler retries it", async () => {
     const releaseRunEnvironmentLeases = vi.fn()
       .mockRejectedValueOnce(new Error("lease provider unavailable"))
       .mockResolvedValueOnce(undefined);
