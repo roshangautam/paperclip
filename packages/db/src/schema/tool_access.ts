@@ -617,6 +617,10 @@ export const toolInvocations = pgTable(
     index("tool_invocations_lease_release_pending_idx")
       .on(table.leaseReleasePendingAt, table.id)
       .where(sql`${table.leaseReleasePendingAt} IS NOT NULL`),
+    check(
+      "tool_invocations_lease_release_requires_run_chk",
+      sql`${table.leaseReleasePendingAt} IS NULL OR ${table.runId} IS NOT NULL`,
+    ),
   ],
 );
 

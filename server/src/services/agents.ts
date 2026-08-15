@@ -775,6 +775,15 @@ export function agentService(db: Db) {
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.agentId, id))
           .for("update");
+        await tx.execute(sql`
+          select ${toolInvocations.id}
+          from ${toolInvocations}
+          where ${toolInvocations.runId} in (
+            select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id}
+          )
+          order by ${toolInvocations.id}
+          for update
+        `);
         const blockingRuns = await tx
           .select({ runId: heartbeatRuns.id })
           .from(heartbeatRuns)

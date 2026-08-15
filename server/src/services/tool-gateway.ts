@@ -849,6 +849,21 @@ export function createToolGatewayService(
     return Boolean(runId && options.releaseRunEnvironmentLeases);
   }
 
+  function toolInvocationMarkerWhere(invocationId: string, runId: string | null, markable: boolean) {
+    return markable && runId
+      ? and(eq(toolInvocations.id, invocationId), eq(toolInvocations.runId, runId))
+      : eq(toolInvocations.id, invocationId);
+  }
+
+  function assertLeaseReleaseMarkerWrite(row: { id: string } | undefined, markable: boolean): void {
+    if (!markable || row) return;
+    throw new ToolGatewayHttpError(
+      409,
+      "Tool invocation run was removed before lease release could be marked",
+      "lease_release_run_missing",
+    );
+  }
+
   // Durable outbox for lease release on non-expiry action resolution. The four
   // terminal-resolution paths (approved-success, approved-failure, invalid
   // decline, explicit decline) commit lease_release_pending_at in the SAME write
@@ -4536,14 +4551,15 @@ export function createToolGatewayService(
     // releasing and finalizeMarkedLeaseRelease misreads that as success and
     // clears the marker, permanently leaking the lease and stranding the action.
     await db.transaction(async (tx) => {
-      await tx.update(toolInvocations).set({
+      const [markerRow] = await tx.update(toolInvocations).set({
         status: "failed",
         errorCode: reasonCode,
         errorMessage: message,
         completedAt: now,
         updatedAt: now,
         leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
-      }).where(eq(toolInvocations.id, input.invocationId));
+      }).where(toolInvocationMarkerWhere(input.invocationId, input.runId, scheduleLeaseRelease)).returning({ id: toolInvocations.id });
+      assertLeaseReleaseMarkerWrite(markerRow, scheduleLeaseRelease);
       await tx.update(toolActionRequests).set({
         status: "failed",
         resolvedAt: now,
@@ -4724,7 +4740,7 @@ export function createToolGatewayService(
       // clears the marker, stranding both the action and lease permanently
       // (executing requests are not expiry candidates).
       await db.transaction(async (tx) => {
-        await tx.update(toolInvocations).set({
+        const [markerRow] = await tx.update(toolInvocations).set({
           status: "succeeded",
           resultHash: resultValidation.summary.sha256 ?? null,
           resultSummary: resultValidation.summary,
@@ -4732,7 +4748,8 @@ export function createToolGatewayService(
           completedAt: now,
           updatedAt: now,
           leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
-        }).where(eq(toolInvocations.id, invocation.id));
+        }).where(toolInvocationMarkerWhere(invocation.id, invocation.runId, scheduleLeaseRelease)).returning({ id: toolInvocations.id });
+        assertLeaseReleaseMarkerWrite(markerRow, scheduleLeaseRelease);
         await tx.update(toolActionRequests).set({ status: "executed", resolvedAt: now, updatedAt: now }).where(eq(toolActionRequests.id, claimed.id));
       });
       await reflectToolActionInteractionLifecycle({
@@ -5735,10 +5752,12 @@ export function createToolGatewayService(
               .set({ status: "cancelled", resolvedAt: now, updatedAt: now })
               .where(and(eq(toolActionRequests.id, actionRequest.id), eq(toolActionRequests.status, "pending")));
             if (scheduleLeaseRelease) {
-              await tx
+              const [markerRow] = await tx
                 .update(toolInvocations)
                 .set({ leaseReleasePendingAt: now, updatedAt: now })
-                .where(eq(toolInvocations.id, invocation.id));
+                .where(toolInvocationMarkerWhere(invocation.id, invocation.runId, scheduleLeaseRelease))
+                .returning({ id: toolInvocations.id });
+              assertLeaseReleaseMarkerWrite(markerRow, scheduleLeaseRelease);
             }
           });
           if (scheduleLeaseRelease) await finalizeMarkedLeaseRelease(invocation.id);
@@ -5887,14 +5906,16 @@ export function createToolGatewayService(
         if (!row) {
           throw new ToolGatewayHttpError(409, "Tool action request has already been resolved", "action_already_resolved");
         }
-        await tx
+        const [markerRow] = await tx
           .update(toolInvocations)
           .set({
             approvalState: "rejected",
             updatedAt: now,
             leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
           })
-          .where(eq(toolInvocations.id, invocation.id));
+          .where(toolInvocationMarkerWhere(invocation.id, invocation.runId, scheduleLeaseRelease))
+          .returning({ id: toolInvocations.id });
+        assertLeaseReleaseMarkerWrite(markerRow, scheduleLeaseRelease);
         return row;
       });
       if (scheduleLeaseRelease) await finalizeMarkedLeaseRelease(invocation.id);
