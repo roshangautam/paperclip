@@ -155,6 +155,7 @@ function makeRealizeInput(overrides: {
   environment?: Environment;
   lease?: EnvironmentLease;
   persistedExecutionWorkspace?: ExecutionWorkspace | null;
+  workspaceRealizationEnv?: Record<string, string>;
 } = {}): Parameters<ReturnType<typeof environmentRunOrchestrator>["realizeForRun"]>[0] {
   return {
     environment: overrides.environment ?? makeEnvironment("local"),
@@ -164,7 +165,7 @@ function makeRealizeInput(overrides: {
     issueId: null,
     heartbeatRunId: "run-1",
     executionWorkspace: makeExecutionWorkspace(),
-    workspaceRealizationEnv: {
+    workspaceRealizationEnv: overrides.workspaceRealizationEnv ?? {
       GITHUB_APP_ID: "app-id",
       GITHUB_INSTALLATION_ID: "installation-id",
       GITHUB_APP_INSTALLATION_ID: "alternate-installation-id",
@@ -315,15 +316,23 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
   });
 
   it("realization failure: forwarded secret values are redacted without hiding App identifiers", async () => {
-    const leaked = new Error('provider rejected token "resolved-private-key" for installation app-id');
-    leaked.name = "RealizationError-resolved-private-key-installation-id";
+    const leaked = new Error('provider rejected token "resolved-private-key-tail" for installation app-id');
+    leaked.name = "RealizationError-resolved-private-key-tail-installation-id";
     const runtime = makeMockRuntime({
       realizeWorkspace: vi.fn().mockRejectedValue(leaked),
     });
     const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
 
     await expect(
-      orchestrator.realizeForRun(makeRealizeInput({ environment: makeEnvironment("sandbox") })),
+      orchestrator.realizeForRun(makeRealizeInput({
+        environment: makeEnvironment("sandbox"),
+        workspaceRealizationEnv: {
+          GITHUB_APP_ID: "app-id",
+          GITHUB_INSTALLATION_ID: "installation-id",
+          GITHUB_APP_PRIVATE_KEY: "resolved-private-key-tail",
+          GH_TOKEN: "resolved-private-key",
+        },
+      })),
     ).rejects.toSatisfy(
       (err: unknown) => {
         if (!(err instanceof EnvironmentRunError) || err.code !== "workspace_realization_failed") {
@@ -338,6 +347,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
           causeCause: (cause as { cause?: unknown } | undefined)?.cause ?? null,
         });
         return !serialized.includes("resolved-private-key")
+          && !serialized.includes("-tail")
           && serialized.includes("installation-id")
           && serialized.includes("app-id")
           && cause instanceof Error

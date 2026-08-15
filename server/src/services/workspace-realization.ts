@@ -29,14 +29,14 @@ function redactForwardedValuesFromPath(
 ): string | null {
   if (value === null || forwardedValues.length === 0) return value;
   let out = value;
+  const variants = new Set<string>();
   for (const forwarded of forwardedValues) {
-    const variants = new Set<string>();
     for (const candidate of [forwarded, forwarded.trim(), JSON.stringify(forwarded), JSON.stringify(forwarded).slice(1, -1)]) {
       if (candidate.length > 0) variants.add(candidate);
     }
-    for (const variant of variants) {
-      out = out.split(variant).join(REDACTED_EVENT_VALUE);
-    }
+  }
+  for (const variant of [...variants].sort((a, b) => b.length - a.length)) {
+    out = out.split(variant).join(REDACTED_EVENT_VALUE);
   }
   return out;
 }

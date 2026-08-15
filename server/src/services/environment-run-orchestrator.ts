@@ -124,15 +124,15 @@ function redactForwardedRealizationSecrets(
   forwardedEnv: Record<string, string>,
 ): string {
   let redacted = message;
+  const variants = new Set<string>();
   for (const rawValue of Object.values(forwardedEnv)) {
     if (typeof rawValue !== "string") continue;
-    const variants = new Set<string>();
     for (const candidate of [rawValue, rawValue.trim(), JSON.stringify(rawValue), JSON.stringify(rawValue).slice(1, -1)]) {
       if (candidate.length > 0) variants.add(candidate);
     }
-    for (const variant of variants) {
-      redacted = redacted.split(variant).join(REDACTED_EVENT_VALUE);
-    }
+  }
+  for (const variant of [...variants].sort((a, b) => b.length - a.length)) {
+    redacted = redacted.split(variant).join(REDACTED_EVENT_VALUE);
   }
   return redactSensitiveText(redacted);
 }

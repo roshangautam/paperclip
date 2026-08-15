@@ -260,7 +260,8 @@ describe("buildWorkspaceRealizationRecordFromDriverInput", () => {
       updatedAt: now,
     } satisfies EnvironmentLease;
 
-    const leaked = "github_pat_smuggled_in_path_token";
+    const leakedPrefix = "github_pat_prefix";
+    const leaked = "github_pat_prefix_tail";
     const record = buildWorkspaceRealizationRecordFromDriverInput({
       environment,
       lease,
@@ -271,10 +272,11 @@ describe("buildWorkspaceRealizationRecordFromDriverInput", () => {
         sandboxId: "sbx-123",
       },
       credentialOwnerAgentId: "agent-voss",
-      forwardedCredentialValues: [leaked],
+      forwardedCredentialValues: [leakedPrefix, leaked],
     });
 
-    expect(record.remote.path).not.toContain(leaked);
+    expect(record.remote.path).not.toContain(leakedPrefix);
+    expect(record.remote.path).not.toContain("_tail");
     expect(JSON.stringify(record)).not.toContain(leaked);
     expect(record.rebuild.remotePath).not.toContain(leaked);
     expect(record.summary).not.toContain(leaked);

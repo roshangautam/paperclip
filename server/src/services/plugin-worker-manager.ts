@@ -417,6 +417,7 @@ export function createPluginWorkerHandle(
   const activeInvocations = new Map<string, ActiveInvocation>();
   const processForwardedEnvValues = new Set<string>();
   let suppressUnscopedWorkerOutput = false;
+  let stopWhenSecretWorkDrains = false;
 
   // Optional methods reported by the worker during initialization
   let supportedMethods: string[] = [];
@@ -543,6 +544,16 @@ export function createPluginWorkerHandle(
       if (SENSITIVE_ENV_KEY_RE.test(key) || SENSITIVE_ENV_KEY_ALLOWLIST.has(key)) return true;
     }
     return false;
+  }
+
+  function maybeStopAfterSecretWorkDrains(): void {
+    if (!stopWhenSecretWorkDrains || pendingRequests.size > 0 || activeInvocations.size > 0) return;
+    stopWhenSecretWorkDrains = false;
+    setImmediate(() => {
+      void stopInternal().catch((err) => {
+        log.warn({ err }, "failed to stop worker after retained credential redaction limit");
+      });
+    });
   }
 
   function collectJsonStringLeaves(raw: string, out: string[]): void {
@@ -1102,6 +1113,7 @@ export function createPluginWorkerHandle(
     setStatus("starting");
     stderrExcerpt = "";
     suppressUnscopedWorkerOutput = false;
+    stopWhenSecretWorkDrains = false;
     processForwardedEnvValues.clear();
 
     const child = spawnProcess();
@@ -1308,12 +1320,9 @@ export function createPluginWorkerHandle(
       const forwardedEnvValues = suppressWorkerOutput ? collectForwardedEnvValues(params) : [];
       if (suppressWorkerOutput) {
         suppressUnscopedWorkerOutput = true;
-        for (const value of forwardedEnvValues) {
-          processForwardedEnvValues.add(value);
-          if (processForwardedEnvValues.size > MAX_RETAINED_FORWARDED_ENV_VALUES) {
-            const oldest = processForwardedEnvValues.values().next().value;
-            if (typeof oldest === "string") processForwardedEnvValues.delete(oldest);
-          }
+        for (const value of forwardedEnvValues) processForwardedEnvValues.add(value);
+        if (processForwardedEnvValues.size > MAX_RETAINED_FORWARDED_ENV_VALUES) {
+          stopWhenSecretWorkDrains = true;
         }
       }
       const invocationScope = deriveInvocationScope(method, params, invocationMetadata);
@@ -1334,6 +1343,7 @@ export function createPluginWorkerHandle(
         pendingRequests.delete(id);
         clearInvocation(invocation);
         fn(value);
+        maybeStopAfterSecretWorkDrains();
       };
 
       const timer = setTimeout(() => {
