@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
+import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { companySecretBindings } from "@paperclipai/db";
 import type {
   Environment,
   EnvironmentDriver,
@@ -192,7 +194,7 @@ export async function resolveSandboxProviderSecretRefPaths(
 
 export async function presentEnvironmentConfigForRead(
   db: Db,
-  environment: { driver: string; config: Record<string, unknown> | null },
+  environment: { id?: string; driver: string; config: Record<string, unknown> | null },
   schemaCache?: SandboxProviderSchemaCache,
 ): Promise<Record<string, unknown>> {
   const config = parseObject(environment.config);
@@ -220,9 +222,29 @@ export async function presentEnvironmentConfigForRead(
   let presented = structuredClone(config) as Record<string, unknown>;
   const inspection = inspectSecretRefPaths(schema, presented);
   if (!inspection.inspectable) return { provider };
+  const boundSecretIdsByPath = new Map<string, Set<string>>();
+  if (environment.id && inspection.paths.size > 0) {
+    const rows = await db
+      .select({ configPath: companySecretBindings.configPath, secretId: companySecretBindings.secretId })
+      .from(companySecretBindings)
+      .where(and(
+        eq(companySecretBindings.targetType, "environment"),
+        eq(companySecretBindings.targetId, environment.id),
+        inArray(companySecretBindings.configPath, [...inspection.paths]),
+      ));
+    for (const row of rows) {
+      const ids = boundSecretIdsByPath.get(row.configPath) ?? new Set<string>();
+      ids.add(row.secretId);
+      boundSecretIdsByPath.set(row.configPath, ids);
+    }
+  }
   for (const path of inspection.paths) {
     const value = readConfigValueAtPath(presented, path);
-    if (typeof value !== "string" || !isUuidSecretRef(value.trim())) {
+    const secretId = typeof value === "string" ? value.trim() : "";
+    const isBoundSecretRef = environment.id
+      ? isUuidSecretRef(secretId) && (boundSecretIdsByPath.get(path)?.has(secretId) ?? false)
+      : isUuidSecretRef(secretId);
+    if (!isBoundSecretRef) {
       presented = writeConfigValueAtPath(presented, path, undefined);
     }
   }

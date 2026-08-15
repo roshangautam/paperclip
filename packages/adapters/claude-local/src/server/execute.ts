@@ -685,6 +685,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
   let remoteMcpConfigMaterialized = false;
+  let primaryError: unknown;
   try {
   if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
     paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
@@ -1275,6 +1276,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+  } catch (err) {
+    primaryError = err;
+    throw err;
   } finally {
     let remoteMcpConfigCleanupFailure: Error | null = null;
     if (remoteMcpConfigMaterialized) {
@@ -1293,6 +1297,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
       ),
     });
-    if (remoteMcpConfigCleanupFailure) throw remoteMcpConfigCleanupFailure;
+    if (remoteMcpConfigCleanupFailure) {
+      if (primaryError instanceof Error) {
+        Object.assign(primaryError, { remoteMcpConfigCleanupFailure });
+      } else if (primaryError === undefined) {
+        throw remoteMcpConfigCleanupFailure;
+      }
+    }
   }
 }

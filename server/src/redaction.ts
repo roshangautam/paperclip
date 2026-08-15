@@ -161,30 +161,29 @@ export function redactPersistedCredentialValues(
 
   function visit(current: unknown, path: string, inheritedSensitive: boolean, key: string | null): unknown {
     if (current === null || current === undefined) return current;
+    const preserveCurrentPath = preserveContainerPaths.has(path);
     if (Array.isArray(current)) {
       return current.map((entry, index) =>
-        visit(entry, path ? `${path}.${index}` : String(index), inheritedSensitive, null),
+        visit(entry, path ? `${path}.${index}` : String(index), preserveCurrentPath ? false : inheritedSensitive, null),
       );
     }
     if (isPlainObject(current)) {
       const result: Record<string, unknown> = {};
       for (const [childKey, childValue] of Object.entries(current)) {
         const childPath = path ? `${path}.${encodeConfigPathSegment(childKey)}` : encodeConfigPathSegment(childKey);
-        if (preserveContainerPaths.has(childPath)) {
-          result[childKey] = childValue;
-          continue;
-        }
+        const childPathPreserved = preserveContainerPaths.has(childPath);
         const sensitiveKey = SECRET_PAYLOAD_KEY_RE.test(childKey)
           && !preservesIdentifierValue(childKey);
         result[childKey] = visit(
           childValue,
           childPath,
-          inheritedSensitive || sensitiveKey,
+          childPathPreserved ? false : inheritedSensitive || sensitiveKey,
           childKey,
         );
       }
       return result;
     }
+    if (preserveCurrentPath) return current;
     if (typeof current === "string" && JWT_VALUE_RE.test(current)) return REDACTED_EVENT_VALUE;
     if (key !== null && preservesIdentifierValue(key)) return current;
     if (key !== null && SECRET_PAYLOAD_KEY_RE.test(key)) return REDACTED_EVENT_VALUE;
