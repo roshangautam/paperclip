@@ -24,7 +24,7 @@ import type {
   PluginToolDeclaration,
 } from "@paperclipai/shared";
 import type { ToolRunContext, ToolResult, ExecuteToolParams } from "@paperclipai/plugin-sdk";
-import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import type { HostInvocationMetadata, PluginWorkerManager } from "./plugin-worker-manager.js";
 import { logger } from "../middleware/logger.js";
 
 // ---------------------------------------------------------------------------
@@ -86,6 +86,8 @@ export interface RegisteredTool {
   description: string;
   /** JSON Schema describing the tool's input parameters. */
   parametersSchema: Record<string, unknown>;
+  /** Behavioral hints supplied by the plugin manifest. */
+  annotations?: Record<string, unknown>;
 }
 
 /**
@@ -203,6 +205,7 @@ export interface PluginToolRegistry {
     namespacedName: string,
     parameters: unknown,
     runContext: ToolRunContext,
+    invocationMetadata?: HostInvocationMetadata,
   ): Promise<ToolExecutionResult>;
 
   /**
@@ -276,6 +279,7 @@ export function createPluginToolRegistry(
       displayName: decl.displayName,
       description: decl.description,
       parametersSchema: decl.parametersSchema,
+      annotations: decl.annotations,
     };
 
     byNamespace.set(namespacedName, entry);
@@ -393,6 +397,7 @@ export function createPluginToolRegistry(
       namespacedName: string,
       parameters: unknown,
       runContext: ToolRunContext,
+      invocationMetadata?: HostInvocationMetadata,
     ): Promise<ToolExecutionResult> {
       // 1. Resolve the namespaced name
       const parsed = parsePluginToolName(namespacedName);
@@ -442,7 +447,7 @@ export function createPluginToolRegistry(
         runContext,
       };
 
-      const result = await workerManager.call(dbId, "executeTool", rpcParams);
+      const result = await workerManager.call(dbId, "executeTool", rpcParams, undefined, invocationMetadata);
 
       log.debug(
         {

@@ -11,6 +11,7 @@ import {
   pluginLogs,
   principalPermissionGrants,
   projects as projectsTable,
+  environmentLeases,
 } from "@paperclipai/db";
 import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, lte } from "drizzle-orm";
 import type {
@@ -25,6 +26,7 @@ import type {
   PluginIssueAssigneeSummary,
   PluginIssueOrchestrationSummary,
   PluginExecutionWorkspaceMetadata,
+  PluginExecutionWorkspaceExecuteInput,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
@@ -32,6 +34,8 @@ import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
+import { environmentService } from "./environments.js";
+import { environmentRuntimeService } from "./environment-runtime.js";
 import { issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
@@ -90,6 +94,15 @@ const DNS_LOOKUP_TIMEOUT_MS = 5_000;
 /** Only these protocols are allowed for plugin HTTP requests. */
 const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
 const TELEMETRY_EVENT_NAME_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
+const PLUGIN_WORKSPACE_EXECUTION_MAX_TIMEOUT_MS = 25_000;
+
+function isTerminalHeartbeatRunStatus(status: string): boolean {
+  return status === "succeeded"
+    || status === "interrupted"
+    || status === "failed"
+    || status === "cancelled"
+    || status === "timed_out";
+}
 
 /**
  * Check if an IP address is in a private/reserved range (RFC 1918, loopback,
@@ -542,6 +555,10 @@ export function buildHostServices(
   });
   const projects = projectService(db);
   const executionWorkspaces = executionWorkspaceService(db);
+  const environments = environmentService(db);
+  const environmentRuntime = environmentRuntimeService(db, {
+    pluginWorkerManager: options.pluginWorkerManager,
+  });
   const issues = issueService(db);
   const documents = documentService(db);
   const goals = goalService(db);
@@ -648,6 +665,42 @@ export function buildHostServices(
     providerType: workspace.providerType,
     providerMetadata: readProviderMetadata(workspace.metadata),
   });
+
+  const resolveExecutionWorkspaceCommandCwd = (input: {
+    requestedCwd?: string;
+    workspace: NonNullable<Awaited<ReturnType<typeof executionWorkspaces.getById>>>;
+    leaseMetadata: Record<string, unknown> | null | undefined;
+  }): string | undefined => {
+    const remoteCwd = typeof input.leaseMetadata?.remoteCwd === "string"
+      ? input.leaseMetadata.remoteCwd.trim()
+      : "";
+    if (!remoteCwd) return input.requestedCwd;
+
+    const requestedCwd = input.requestedCwd?.trim();
+    if (!requestedCwd) return remoteCwd;
+
+    if (!path.isAbsolute(requestedCwd)) {
+      const normalizedRelative = path.posix.normalize(requestedCwd.split(path.sep).join(path.posix.sep));
+      if (normalizedRelative === ".") return remoteCwd;
+      if (normalizedRelative === ".." || normalizedRelative.startsWith("../") || path.posix.isAbsolute(normalizedRelative)) {
+        throw new Error("Execution workspace cwd must stay inside the workspace");
+      }
+      return path.posix.join(remoteCwd, normalizedRelative);
+    }
+
+    const hostWorkspaceCwd = input.workspace.cwd ?? input.workspace.providerRef;
+    if (!hostWorkspaceCwd || !path.isAbsolute(hostWorkspaceCwd)) {
+      throw new Error("Execution workspace cwd must be relative or inside the workspace");
+    }
+
+    const relativeCwd = path.relative(path.resolve(hostWorkspaceCwd), path.resolve(requestedCwd));
+    if (relativeCwd === "") return remoteCwd;
+    if (relativeCwd === ".." || relativeCwd.startsWith(`..${path.sep}`) || path.isAbsolute(relativeCwd)) {
+      throw new Error("Execution workspace cwd must stay inside the workspace");
+    }
+
+    return path.posix.join(remoteCwd, relativeCwd.split(path.sep).join(path.posix.sep));
+  };
 
   const requireInCompany = <T extends { companyId: string | null | undefined }>(
     entityName: string,
@@ -1485,6 +1538,147 @@ export function buildHostServices(
           return toPluginExecutionWorkspaceMetadata(workspace);
         }
         return null;
+      },
+      async execute(
+        params: PluginExecutionWorkspaceExecuteInput,
+        context?: {
+          invocationScope?: {
+            agentId?: string;
+            allowTerminalRunWorkspaceExecution?: boolean;
+          } | null;
+        },
+      ) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const workspace = requireInCompany(
+          "Execution workspace",
+          await executionWorkspaces.getById(params.workspaceId),
+          companyId,
+        );
+
+        const runRows = await db
+          .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.id, params.runId),
+            eq(heartbeatRuns.companyId, companyId),
+          ))
+          .limit(1);
+        const run = runRows[0];
+        const runIsTerminal = run ? isTerminalHeartbeatRunStatus(run.status) : false;
+        const runIsExecutable = run?.status === "queued"
+          || run?.status === "running"
+          || (context?.invocationScope?.allowTerminalRunWorkspaceExecution === true && runIsTerminal);
+        if (!run || !runIsExecutable) {
+          throw new Error("Heartbeat run is not executable");
+        }
+        if (run.agentId !== context?.invocationScope?.agentId) {
+          throw new Error("Heartbeat run is not owned by the invoking agent");
+        }
+
+        const leaseRows = await db
+          .select({ id: environmentLeases.id, expiresAt: environmentLeases.expiresAt })
+          .from(environmentLeases)
+          .where(and(
+            eq(environmentLeases.companyId, companyId),
+            eq(environmentLeases.executionWorkspaceId, params.workspaceId),
+            eq(environmentLeases.heartbeatRunId, params.runId),
+            eq(environmentLeases.status, "active"),
+          ))
+          .limit(2);
+        if (leaseRows.length === 0) {
+          throw new Error("No active environment lease found for execution workspace");
+        }
+        if (leaseRows.length > 1) {
+          throw new Error("Multiple active environment leases found for execution workspace");
+        }
+        if (leaseRows[0]?.expiresAt && leaseRows[0].expiresAt <= new Date()) {
+          throw new Error("No active environment lease found for execution workspace");
+        }
+
+        const lease = await environments.getLeaseById(leaseRows[0]!.id);
+        if (
+          !lease
+          || lease.companyId !== companyId
+          || lease.executionWorkspaceId !== params.workspaceId
+          || lease.heartbeatRunId !== params.runId
+          || lease.status !== "active"
+        ) {
+          throw new Error("No active environment lease found for execution workspace");
+        }
+        const environment = await environments.getById(lease.environmentId);
+        if (!environment) throw new Error("Environment not found");
+
+        const effectiveDriver =
+          typeof lease.metadata?.driver === "string" ? lease.metadata.driver : environment.driver;
+        if (effectiveDriver !== "sandbox" && effectiveDriver !== "plugin") {
+          throw new Error(
+            `Execution workspace command execution is only supported on sandbox and plugin environments, not "${effectiveDriver}".`,
+          );
+        }
+
+        const requestedTimeoutMs = params.timeoutMs;
+        const executionTimeoutMs = typeof requestedTimeoutMs === "number" && Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0
+          ? Math.min(requestedTimeoutMs, PLUGIN_WORKSPACE_EXECUTION_MAX_TIMEOUT_MS)
+          : PLUGIN_WORKSPACE_EXECUTION_MAX_TIMEOUT_MS;
+
+        const executionCwd = resolveExecutionWorkspaceCommandCwd({
+          requestedCwd: params.cwd,
+          workspace,
+          leaseMetadata: lease.metadata,
+        });
+        const auditBase = {
+          workspaceId: params.workspaceId,
+          runId: params.runId,
+          agentId: run.agentId,
+          environmentId: environment.id,
+          driver: effectiveDriver,
+          cwd: executionCwd ?? null,
+          command: params.command,
+          argsCount: Array.isArray(params.args) ? params.args.length : null,
+          timeoutMs: executionTimeoutMs,
+        };
+        try {
+          const result = await environmentRuntime.execute({
+            environment,
+            lease,
+            command: params.command,
+            args: params.args,
+            cwd: executionCwd,
+            env: params.env,
+            stdin: params.stdin,
+            timeoutMs: executionTimeoutMs,
+            ...(lease.metadata?.workspaceRealization
+              ? {
+                  workspaceRealization: Object.fromEntries(
+                    Object.entries(lease.metadata.workspaceRealization),
+                  ),
+                }
+              : {}),
+          });
+          await logPluginActivity({
+            companyId,
+            action: "execution_workspace.command_executed",
+            entityType: "execution_workspace",
+            entityId: params.workspaceId,
+            actor: { actorAgentId: run.agentId, actorRunId: params.runId },
+            details: sanitizeRecord({ ...auditBase, exitCode: result.exitCode, timedOut: result.timedOut }),
+          });
+          return result;
+        } catch (err) {
+          await logPluginActivity({
+            companyId,
+            action: "execution_workspace.command_failed",
+            entityType: "execution_workspace",
+            entityId: params.workspaceId,
+            actor: { actorAgentId: run.agentId, actorRunId: params.runId },
+            details: sanitizeRecord({
+              ...auditBase,
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          });
+          throw err;
+        }
       },
     },
 

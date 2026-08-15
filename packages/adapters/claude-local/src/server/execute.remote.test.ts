@@ -12,6 +12,7 @@ const {
   restoreWorkspaceFromSshExecution,
   syncDirectoryToSsh,
   startAdapterExecutionTargetPaperclipBridge,
+  runAdapterExecutionTargetShellCommand,
 } = vi.hoisted(() => ({
   runChildProcess: vi.fn(async () => ({
     exitCode: 0,
@@ -39,6 +40,15 @@ const {
       PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
     },
     stop: async () => {},
+  })),
+  runAdapterExecutionTargetShellCommand: vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    pid: null,
+    startedAt: new Date().toISOString(),
   })),
 }));
 
@@ -74,6 +84,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   return {
     ...actual,
     startAdapterExecutionTargetPaperclipBridge,
+    runAdapterExecutionTargetShellCommand,
   };
 });
 
@@ -98,11 +109,33 @@ describe("claude remote execution", () => {
     const alternateWorkspaceDir = path.join(rootDir, "workspace-other");
     const instructionsPath = path.join(rootDir, "instructions.md");
     const managedRemoteWorkspace = "/remote/workspace/.paperclip-runtime/runs/run-1/workspace";
+    const expectedRemoteMcpConfigPath = `${managedRemoteWorkspace}/.paperclip-runtime/claude/mcp-config/runs/run-1/mcp-config.json`;
     await mkdir(workspaceDir, { recursive: true });
     await mkdir(alternateWorkspaceDir, { recursive: true });
     await writeFile(instructionsPath, "Use the remote workspace.\n", "utf8");
 
-    await execute({
+    runAdapterExecutionTargetShellCommand
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        pid: null,
+        startedAt: new Date().toISOString(),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 255,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "permission denied",
+        pid: null,
+        startedAt: new Date().toISOString(),
+      });
+    const onLog = vi.fn(async () => {});
+
+    await expect(execute({
       runId: "run-1",
       agent: {
         id: "agent-1",
@@ -164,8 +197,16 @@ describe("claude remote execution", () => {
           strictHostKeyChecking: true,
         },
       },
-      onLog: async () => {},
-    });
+      onLog,
+      runtimeMcp: {
+        getServers: () => [{
+          name: "Plugin: Agent Identities",
+          url: "https://paperclip.example/api/tool-gateway/gateways/gateway-1/mcp",
+          token: "gateway-token",
+          connectionId: "connection-1",
+        }],
+      },
+    })).rejects.toThrow("Failed to remove remote Claude MCP config: exit 255");
 
     expect(prepareWorkspaceForSshExecution).toHaveBeenCalledTimes(1);
     expect(prepareWorkspaceForSshExecution).toHaveBeenCalledWith(expect.objectContaining({
@@ -185,17 +226,21 @@ describe("claude remote execution", () => {
     const call = runChildProcess.mock.calls[0] as unknown as
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
-    expect(call?.[2]).toContain("--allowedTools");
-    expect(call?.[2]).toContain(
-      "Task AskUserQuestion Bash CronCreate CronDelete CronList Edit EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree Glob Grep Monitor NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write",
+    const claudeArgs = call?.[2] ?? [];
+    expect(claudeArgs).toContain("--allowedTools");
+    expect(claudeArgs).toContain(
+      "Task AskUserQuestion Bash CronCreate CronDelete CronList Edit EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree Glob Grep Monitor NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write mcp__Plugin__Agent_Identities__*",
     );
-    expect(call?.[2]).not.toContain("--dangerously-skip-permissions");
-    expect(call?.[2]).toContain("--append-system-prompt-file");
-    expect(call?.[2]).toContain(
+    expect(claudeArgs).not.toContain("--dangerously-skip-permissions");
+    expect(claudeArgs).toContain("--append-system-prompt-file");
+    expect(claudeArgs).toContain(
       `${managedRemoteWorkspace}/.paperclip-runtime/claude/skills/agent-instructions.md`,
     );
-    expect(call?.[2]).toContain("--add-dir");
-    expect(call?.[2]).toContain(`${managedRemoteWorkspace}/.paperclip-runtime/claude/skills`);
+    const mcpConfigFlagIndex = claudeArgs.indexOf("--mcp-config");
+    expect(mcpConfigFlagIndex).toBeGreaterThanOrEqual(0);
+    expect(claudeArgs[mcpConfigFlagIndex + 1]).toBe(expectedRemoteMcpConfigPath);
+    expect(claudeArgs).toContain("--add-dir");
+    expect(claudeArgs).toContain(`${managedRemoteWorkspace}/.paperclip-runtime/claude/skills`);
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe(managedRemoteWorkspace);
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_WORKTREE_PATH).toBeUndefined();
     expect(JSON.parse(call?.[3].env.PAPERCLIP_WORKSPACES_JSON ?? "[]")).toEqual([
@@ -218,6 +263,32 @@ describe("claude remote execution", () => {
     expect(call?.[3].env.OTHER_ENV).toBe(workspaceDir);
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
+    expect(runAdapterExecutionTargetShellCommand).toHaveBeenCalledTimes(2);
+    const mcpConfigCall = runAdapterExecutionTargetShellCommand.mock.calls[0] as unknown as
+      | [string, unknown, string, { env: Record<string, string> }]
+      | undefined;
+    expect(mcpConfigCall?.[2]).toContain(expectedRemoteMcpConfigPath);
+    const mcpConfig = JSON.parse(mcpConfigCall?.[3]?.env.PAPERCLIP_CLAUDE_MCP_CONFIG ?? "{}");
+    expect(mcpConfig.mcpServers["Plugin: Agent Identities"]).toEqual({
+      type: "http",
+      url: "http://127.0.0.1:4310/api/tool-gateway/gateways/gateway-1/mcp",
+      headers: {
+        Authorization: "Bearer bridge-token",
+        "x-paperclip-tool-gateway-token": "gateway-token",
+      },
+    });
+    const cleanupCall = runAdapterExecutionTargetShellCommand.mock.calls[1] as unknown as
+      | [string, unknown, string, { env: Record<string, string> }]
+      | undefined;
+    expect(cleanupCall?.[2]).toMatch(/^rm -f /);
+    expect(cleanupCall?.[2]).toContain(expectedRemoteMcpConfigPath);
+    expect(cleanupCall?.[3]?.env.PAPERCLIP_CLAUDE_MCP_CONFIG).toBeUndefined();
+    expect(onLog).toHaveBeenCalledWith(
+      "stderr",
+      "[paperclip] Failed to remove remote Claude MCP config: exit 255\n",
+    );
+    expect(runAdapterExecutionTargetShellCommand.mock.invocationCallOrder[0])
+      .toBeLessThan(runAdapterExecutionTargetShellCommand.mock.invocationCallOrder[1]!);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({
       localDir: workspaceDir,
@@ -343,6 +414,83 @@ describe("claude remote execution", () => {
     const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
     expect(call?.[2]).toContain("--resume");
     expect(call?.[2]).toContain("12345678-1234-4abc-9def-123456789012");
+  });
+
+  it("stops the bridge and restores the workspace when remote MCP materialization fails", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-mcp-fail-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    const bridgeStop = vi.fn(async () => {});
+    startAdapterExecutionTargetPaperclipBridge.mockResolvedValueOnce({
+      env: {
+        PAPERCLIP_API_URL: "http://127.0.0.1:4310",
+        PAPERCLIP_API_KEY: "bridge-token",
+        PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
+      },
+      stop: bridgeStop,
+    });
+    runAdapterExecutionTargetShellCommand.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "permission denied writing mcp config",
+      pid: null,
+      startedAt: new Date().toISOString(),
+    });
+
+    await expect(execute({
+      runId: "run-mcp-fail",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: "claude",
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+      runtimeMcp: {
+        getServers: () => [{
+          name: "Plugin: Agent Identities",
+          url: "https://paperclip.example/api/tool-gateway/gateways/gateway-1/mcp",
+          token: "gateway-token",
+          connectionId: "connection-1",
+        }],
+      },
+    })).rejects.toThrow(/Failed to write remote Claude MCP config/);
+
+    expect(bridgeStop).toHaveBeenCalledTimes(1);
+    expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
+    expect(runChildProcess).not.toHaveBeenCalled();
   });
 
 });

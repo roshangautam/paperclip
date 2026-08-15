@@ -40,6 +40,7 @@ import {
 } from "@paperclipai/plugin-sdk";
 import type {
   JsonRpcId,
+  JsonRpcError,
   PluginInvocationContext,
   PluginInvocationScope,
   JsonRpcResponse,
@@ -53,6 +54,7 @@ import type {
   InitializeParams,
 } from "@paperclipai/plugin-sdk";
 import { logger } from "../middleware/logger.js";
+import { redactSensitiveText, REDACTED_EVENT_VALUE } from "../redaction.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -90,6 +92,16 @@ const CRASH_WINDOW_MS = 10 * 60 * 1_000;
 
 /** Maximum number of stderr characters retained for worker failure context. */
 const MAX_STDERR_EXCERPT_CHARS = 8_000;
+
+const SENSITIVE_ENV_KEY_RE =
+  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|(?:^|[-_])token(?:$|[-_])|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
+
+// Known secret-bearing env values whose name does not match the pattern above.
+// PAPERCLIP_CLAUDE_MCP_CONFIG carries bridge/gateway bearer tokens inside a JSON
+// envelope, so it must suppress worker output even though the key is opaque.
+const SENSITIVE_ENV_KEY_ALLOWLIST = new Set(["PAPERCLIP_CLAUDE_MCP_CONFIG"]);
+const FILE_PATH_ENV_KEY_RE = /(?:^|[-_])(?:file|path)$|[a-z](?:File|Path)$/i;
+const MAX_RETAINED_FORWARDED_ENV_VALUES = 128;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -210,7 +222,16 @@ interface PendingRequest {
 
 interface ActiveInvocation {
   scope: PluginInvocationScope;
+  suppressWorkerOutput: boolean;
   timer?: ReturnType<typeof setTimeout>;
+}
+
+export interface HostInvocationMetadata {
+  allowTerminalRunWorkspaceExecution?: boolean;
+}
+
+interface WorkerMessageContext extends WorkerHostCallContext {
+  suppressWorkerOutput?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +282,7 @@ export interface PluginWorkerHandle {
     method: M,
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
+    invocationMetadata?: HostInvocationMetadata,
   ): Promise<HostToWorkerMethods[M][1]>;
 
   /**
@@ -356,6 +378,7 @@ export interface PluginWorkerManager {
     method: M,
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
+    invocationMetadata?: HostInvocationMetadata,
   ): Promise<HostToWorkerMethods[M][1]>;
 }
 
@@ -392,6 +415,9 @@ export function createPluginWorkerHandle(
   const pendingRequests = new Map<string | number, PendingRequest>();
   let nextRequestId = 1;
   const activeInvocations = new Map<string, ActiveInvocation>();
+  const processForwardedEnvValues = new Set<string>();
+  let suppressUnscopedWorkerOutput = false;
+  let stopWhenSecretWorkDrains = false;
 
   // Optional methods reported by the worker during initialization
   let supportedMethods: string[] = [];
@@ -457,7 +483,11 @@ export function createPluginWorkerHandle(
       message = parseMessage(line);
     } catch (err) {
       if (err instanceof JsonRpcParseError) {
-        log.warn({ rawLine: line.slice(0, 200) }, "unparseable message from worker");
+        if (suppressUnscopedWorkerOutput) {
+          log.warn("unparseable message from worker; output suppressed");
+        } else {
+          log.warn({ rawLine: line.slice(0, 200) }, "unparseable message from worker");
+        }
       } else {
         log.warn({ err }, "error parsing worker message");
       }
@@ -487,7 +517,10 @@ export function createPluginWorkerHandle(
 
     const pending = pendingRequests.get(id);
     if (!pending) {
-      log.warn({ id }, "received response for unknown request id");
+      log.warn(
+        { id: suppressUnscopedWorkerOutput ? REDACTED_EVENT_VALUE : id },
+        "received response for unknown request id",
+      );
       return;
     }
 
@@ -504,9 +537,115 @@ export function createPluginWorkerHandle(
     return typeof value === "object" && value !== null && !Array.isArray(value);
   }
 
+  function containsSensitiveEnv(params: unknown): boolean {
+    if (!isRecord(params) || !isRecord(params.env)) return false;
+    for (const [key, value] of Object.entries(params.env)) {
+      if (typeof value !== "string" || value.length === 0) continue;
+      if (SENSITIVE_ENV_KEY_RE.test(key) || SENSITIVE_ENV_KEY_ALLOWLIST.has(key)) return true;
+    }
+    return false;
+  }
+
+  function maybeStopAfterSecretWorkDrains(): void {
+    if (!stopWhenSecretWorkDrains || pendingRequests.size > 0 || activeInvocations.size > 0) return;
+    stopWhenSecretWorkDrains = false;
+    setImmediate(() => {
+      void stopInternal().catch((err) => {
+        log.warn({ err }, "failed to stop worker after retained credential redaction limit");
+      });
+    });
+  }
+
+  function collectJsonStringLeaves(raw: string, out: string[]): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const visit = (node: unknown): void => {
+      if (typeof node === "string") {
+        if (node.length > 0) out.push(node);
+      } else if (Array.isArray(node)) {
+        for (const entry of node) visit(entry);
+      } else if (node && typeof node === "object") {
+        for (const entry of Object.values(node as Record<string, unknown>)) visit(entry);
+      }
+    };
+    visit(parsed);
+  }
+
+  // Collect only the forwarded values that are themselves credential material,
+  // keyed by a secret-bearing env name (or a known secret envelope). Collecting
+  // every value once any sensitive key is present would over-redact legitimate
+  // provider output: a non-secret value such as GITHUB_APP_ID=app-1 or CI=1
+  // would be rewritten in a returned cwd, and redacting ordinary result JSON can
+  // make it unparseable and collapse the payload to null.
+  function collectForwardedEnvValues(params: unknown): string[] {
+    if (!isRecord(params) || !isRecord(params.env)) return [];
+    const values: string[] = [];
+    for (const [key, value] of Object.entries(params.env)) {
+      if (typeof value !== "string" || value.length === 0) continue;
+      const isSecretEnvelope = SENSITIVE_ENV_KEY_ALLOWLIST.has(key);
+      if (!SENSITIVE_ENV_KEY_RE.test(key) && !isSecretEnvelope) continue;
+      if (!isSecretEnvelope && FILE_PATH_ENV_KEY_RE.test(key)) continue;
+      values.push(value);
+      // A provider can parse a known JSON envelope (e.g. PAPERCLIP_CLAUDE_MCP_CONFIG)
+      // and echo only an extracted nested token, which no longer matches the whole
+      // envelope string. Collect its nested string leaves so they are redacted too.
+      if (isSecretEnvelope) {
+        collectJsonStringLeaves(value, values);
+      }
+    }
+    return values;
+  }
+
+  // A worker's JSON-RPC response for a secret-bearing invocation can echo
+  // forwarded credentials in error.message/error.data OR in a successful
+  // result payload's strings. Side-channel suppression only silences
+  // stdout/stderr, so redact the forwarded values (raw, trimmed, JSON forms)
+  // plus a pattern backstop before either propagates to the host.
+  function redactForwardedString(input: string, forwardedValues: string[], includePatternBackstop: boolean): string {
+    let out = input;
+    for (const rawValue of forwardedValues) {
+      const variants = new Set<string>();
+      for (const candidate of [rawValue, rawValue.trim(), JSON.stringify(rawValue), JSON.stringify(rawValue).slice(1, -1)]) {
+        if (candidate.length > 0) variants.add(candidate);
+      }
+      for (const variant of variants) out = out.split(variant).join(REDACTED_EVENT_VALUE);
+    }
+    return includePatternBackstop ? redactSensitiveText(out) : out;
+  }
+
+  function redactWorkerError(error: JsonRpcError, forwardedValues: string[], includePatternBackstop: boolean): JsonRpcError {
+    const message = redactForwardedString(error.message, forwardedValues, includePatternBackstop);
+    let data = error.data;
+    if (data !== undefined) {
+      try {
+        data = JSON.parse(redactForwardedString(JSON.stringify(data), forwardedValues, includePatternBackstop)) as unknown;
+      } catch {
+        data = undefined;
+      }
+    }
+    return { code: error.code, message, ...(data !== undefined ? { data } : {}) };
+  }
+
+  // Redact forwarded credential variants echoed into a successful result
+  // payload's strings. Falls back to dropping the payload if it cannot be
+  // re-parsed, since returning an unredacted result would leak the credential.
+  function redactWorkerResult(result: unknown, forwardedValues: string[], includePatternBackstop: boolean): unknown {
+    if (result === undefined) return result;
+    try {
+      return JSON.parse(redactForwardedString(JSON.stringify(result), forwardedValues, includePatternBackstop)) as unknown;
+    } catch {
+      return null;
+    }
+  }
+
   function deriveInvocationScope(
     method: HostToWorkerMethodName | string,
     params: unknown,
+    invocationMetadata?: HostInvocationMetadata,
   ): PluginInvocationScope | null {
     if (!isRecord(params)) return null;
 
@@ -520,7 +659,17 @@ export function createPluginWorkerHandle(
 
     if (method === "executeTool" && isRecord(params.runContext)) {
       const companyId = readNonEmptyString(params.runContext.companyId);
-      return companyId ? { companyId } : null;
+      if (!companyId) return null;
+      const runId = readNonEmptyString(params.runContext.runId);
+      const agentId = readNonEmptyString(params.runContext.agentId);
+      return {
+        companyId,
+        ...(runId ? { runId } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(invocationMetadata?.allowTerminalRunWorkspaceExecution === true
+          ? { allowTerminalRunWorkspaceExecution: true }
+          : {}),
+      };
     }
 
     if (method === "onEvent" && isRecord(params.event)) {
@@ -531,12 +680,16 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
+  function registerInvocation(
+    scope: PluginInvocationScope,
+    suppressWorkerOutput: boolean,
+    ttlMs?: number,
+  ): PluginInvocationContext {
     const invocation: PluginInvocationContext = {
       id: randomUUID(),
       scope,
     };
-    const entry: ActiveInvocation = { scope };
+    const entry: ActiveInvocation = { scope, suppressWorkerOutput };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
@@ -554,18 +707,24 @@ export function createPluginWorkerHandle(
     activeInvocations.delete(invocation.id);
   }
 
-  function contextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerHostCallContext {
+  function contextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerMessageContext {
     const invocationId = readNonEmptyString(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
     if (!invocationId) {
       const hasActiveInvocation = activeInvocations.size > 0 ||
         Array.from(pendingRequests.values()).some((pending) => pending.invocationId);
-      return hasActiveInvocation ? { invalidInvocationScope: true } : {};
+      return {
+        ...(hasActiveInvocation ? { invalidInvocationScope: true } : {}),
+        ...(suppressUnscopedWorkerOutput ? { suppressWorkerOutput: true } : {}),
+      };
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
-    return { invocationScope: entry.scope };
+    return {
+      invocationScope: entry.scope,
+      suppressWorkerOutput: entry.suppressWorkerOutput,
+    };
   }
 
   /**
@@ -578,7 +737,10 @@ export function createPluginWorkerHandle(
       | undefined;
 
     if (!handler) {
-      log.warn({ method }, "worker called unregistered host method");
+      log.warn(
+        { method: suppressUnscopedWorkerOutput ? REDACTED_EVENT_VALUE : method },
+        "worker called unregistered host method",
+      );
       try {
         sendMessage(
           createErrorResponse(
@@ -594,7 +756,11 @@ export function createPluginWorkerHandle(
     }
 
     try {
-      const result = await handler(request.params, contextForWorkerMessage(request));
+      const context = contextForWorkerMessage(request);
+      const result = await handler(request.params, {
+        ...(context.invocationScope ? { invocationScope: context.invocationScope } : {}),
+        ...(context.invalidInvocationScope ? { invalidInvocationScope: true } : {}),
+      });
       sendMessage({
         jsonrpc: JSONRPC_VERSION,
         id: request.id,
@@ -602,7 +768,14 @@ export function createPluginWorkerHandle(
       });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      log.error({ method, err: errorMessage }, "host handler error");
+      // A credential-bearing invocation can surface a forwarded secret inside a
+      // host-handler error (e.g. a mismatched company id in a scope error), so
+      // suppress the verbatim error text whenever process-wide worker output
+      // suppression is active — the worker still receives the full error below.
+      log.error(
+        { method, err: suppressUnscopedWorkerOutput ? REDACTED_EVENT_VALUE : errorMessage },
+        "host handler error",
+      );
       try {
         sendMessage(
           createErrorResponse(
@@ -626,6 +799,8 @@ export function createPluginWorkerHandle(
    */
   function handleWorkerNotification(notification: JsonRpcNotification): void {
     if (notification.method === "log") {
+      const context = contextForWorkerMessage(notification);
+      if (suppressUnscopedWorkerOutput || context.invalidInvocationScope || context.suppressWorkerOutput) return;
       const params = notification.params as {
         level?: string;
         message?: string;
@@ -707,7 +882,10 @@ export function createPluginWorkerHandle(
       return;
     }
 
-    log.debug({ method: notification.method }, "received notification from worker");
+    log.debug(
+      { method: suppressUnscopedWorkerOutput ? REDACTED_EVENT_VALUE : notification.method },
+      "received notification from worker",
+    );
   }
 
   // -----------------------------------------------------------------------
@@ -749,6 +927,7 @@ export function createPluginWorkerHandle(
     if (child.stderr) {
       stderrReadline = createInterface({ input: child.stderr });
       stderrReadline.on("line", (line: string) => {
+        if (suppressUnscopedWorkerOutput) return;
         stderrExcerpt = appendStderrExcerpt(stderrExcerpt, line);
         log.warn({ stream: "stderr" }, `[plugin stderr] ${line}`);
       });
@@ -933,6 +1112,9 @@ export function createPluginWorkerHandle(
     intentionalStop = false;
     setStatus("starting");
     stderrExcerpt = "";
+    suppressUnscopedWorkerOutput = false;
+    stopWhenSecretWorkDrains = false;
+    processForwardedEnvValues.clear();
 
     const child = spawnProcess();
     childProcess = child;
@@ -1120,6 +1302,7 @@ export function createPluginWorkerHandle(
     method: M,
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
+    invocationMetadata?: HostInvocationMetadata,
   ): Promise<HostToWorkerMethods[M][1]> {
     const rpcPromise = new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
       if (!childProcess?.stdin?.writable) {
@@ -1133,8 +1316,19 @@ export function createPluginWorkerHandle(
 
       const id = nextRequestId++;
       const timeout = timeoutMs ?? Math.min(rpcTimeoutMs, MAX_RPC_TIMEOUT_MS);
-      const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+      const suppressWorkerOutput = containsSensitiveEnv(params);
+      const forwardedEnvValues = suppressWorkerOutput ? collectForwardedEnvValues(params) : [];
+      if (suppressWorkerOutput) {
+        suppressUnscopedWorkerOutput = true;
+        for (const value of forwardedEnvValues) processForwardedEnvValues.add(value);
+        if (processForwardedEnvValues.size > MAX_RETAINED_FORWARDED_ENV_VALUES) {
+          stopWhenSecretWorkDrains = true;
+        }
+      }
+      const invocationScope = deriveInvocationScope(method, params, invocationMetadata);
+      const invocation = invocationScope
+        ? registerInvocation(invocationScope, suppressWorkerOutput)
+        : null;
 
       // Guard against double-settlement. When a process exits all pending
       // requests are rejected via rejectAllPending(), but the timeout timer
@@ -1149,6 +1343,7 @@ export function createPluginWorkerHandle(
         pendingRequests.delete(id);
         clearInvocation(invocation);
         fn(value);
+        maybeStopAfterSecretWorkDrains();
       };
 
       const timer = setTimeout(() => {
@@ -1165,10 +1360,27 @@ export function createPluginWorkerHandle(
         id,
         method,
         resolve: (response: JsonRpcResponse) => {
+          const retainedValues = Array.from(processForwardedEnvValues);
+          const redactionValues = forwardedEnvValues.length > 0
+            ? Array.from(new Set([...retainedValues, ...forwardedEnvValues]))
+            : retainedValues;
+          const includePatternBackstop = forwardedEnvValues.length > 0;
           if (isJsonRpcSuccessResponse(response)) {
-            settle(resolve, response.result as HostToWorkerMethods[M][1]);
+            settle(
+              resolve,
+              (redactionValues.length > 0
+                ? redactWorkerResult(response.result, redactionValues, includePatternBackstop)
+                : response.result) as HostToWorkerMethods[M][1],
+            );
           } else if ("error" in response && response.error) {
-            settle(reject, new JsonRpcCallError(response.error));
+            settle(
+              reject,
+              new JsonRpcCallError(
+                redactionValues.length > 0
+                  ? redactWorkerError(response.error, redactionValues, includePatternBackstop)
+                  : response.error,
+              ),
+            );
           } else {
             settle(reject, new Error(`Unexpected response format for "${method}"`));
           }
@@ -1243,6 +1455,7 @@ export function createPluginWorkerHandle(
       method: M,
       params: HostToWorkerMethods[M][0],
       timeoutMs?: number,
+      invocationMetadata?: HostInvocationMetadata,
     ): Promise<HostToWorkerMethods[M][1]> {
       if (status !== "running" && status !== "starting") {
         return Promise.reject(
@@ -1260,13 +1473,17 @@ export function createPluginWorkerHandle(
           new Error(`Plugin worker "${pluginId}" does not support required method "${method}".`),
         );
       }
-      return callInternal(method, params, timeoutMs);
+      return callInternal(method, params, timeoutMs, invocationMetadata);
     },
 
     notify(method: string, params: unknown) {
       if (status !== "running") return;
+      const suppressWorkerOutput = containsSensitiveEnv(params);
+      if (suppressWorkerOutput) suppressUnscopedWorkerOutput = true;
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS) : null;
+      const invocation = invocationScope
+        ? registerInvocation(invocationScope, suppressWorkerOutput, MAX_RPC_TIMEOUT_MS)
+        : null;
       try {
         sendMessage({
           jsonrpc: JSONRPC_VERSION,
@@ -1476,6 +1693,7 @@ export function createPluginWorkerManager(
       method: M,
       params: HostToWorkerMethods[M][0],
       timeoutMs?: number,
+      invocationMetadata?: HostInvocationMetadata,
     ): Promise<HostToWorkerMethods[M][1]> {
       const handle = workers.get(pluginId);
       if (!handle) {
@@ -1483,7 +1701,7 @@ export function createPluginWorkerManager(
           new Error(`No worker registered for plugin "${pluginId}"`),
         );
       }
-      return handle.call(method, params, timeoutMs);
+      return handle.call(method, params, timeoutMs, invocationMetadata);
     },
   };
 }

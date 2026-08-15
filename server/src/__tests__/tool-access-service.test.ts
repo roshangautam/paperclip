@@ -877,6 +877,7 @@ describeEmbeddedPostgres("tool access service", () => {
           name: "get-agent-identity",
           displayName: "Get agent identity",
           description: "Return an agent's configured identity.",
+          annotations: { readOnlyHint: false, openWorldHint: true },
           parametersSchema: {
             type: "object",
             properties: { agentId: { type: "string" } },
@@ -921,6 +922,10 @@ describeEmbeddedPostgres("tool access service", () => {
         title: "Get agent identity",
         description: "Return an agent's configured identity.",
         inputSchema: expect.objectContaining({ required: ["agentId"] }),
+        annotations: { readOnlyHint: false, openWorldHint: true },
+        riskLevel: "write",
+        isReadOnly: false,
+        isWrite: true,
       }),
     ]);
 
@@ -6812,5 +6817,13 @@ describe("classifyRisk", () => {
     expect(risk("list_items", { destructiveHint: true })).toBe("destructive");
     expect(risk("list_items", { writeHint: true })).toBe("write");
     expect(risk("list_items", { readOnlyHint: false })).toBe("write");
+  });
+
+  it("does not let a write annotation downgrade a name-destructive tool out of the board-approval tier", () => {
+    expect(risk("delete_records", { readOnlyHint: false })).toBe("destructive");
+    expect(risk("delete_records", { writeHint: true })).toBe("destructive");
+    expect(risk("github:drop_table", { readOnlyHint: false })).toBe("destructive");
+    expect(risk("purgeEntries", { writeHint: true })).toBe("destructive");
+    expect(risk("delete_records", { destructiveHint: false })).toBe("destructive");
   });
 });

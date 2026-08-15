@@ -1232,6 +1232,7 @@ export const PLUGIN_CAPABILITIES = [
   "projects.read",
   "project.workspaces.read",
   "execution.workspaces.read",
+  "execution.workspaces.execute",
   "issues.read",
   "issue.relations.read",
   "issue.subtree.read",

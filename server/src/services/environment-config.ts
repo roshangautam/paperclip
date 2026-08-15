@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
+import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { companySecretBindings } from "@paperclipai/db";
 import type {
   Environment,
   EnvironmentDriver,
@@ -25,11 +27,16 @@ import {
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import {
   collectSecretRefPaths,
+  compactConfigArrays,
+  type ConfigResourceScopes,
+  inspectSecretRefPaths,
   isUuidSecretRef,
   readConfigValueAtPath,
+  scopeConfigResourceArrays,
   writeConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { resolveActiveEnvironmentCustomImageTemplateForRuntime } from "./environment-custom-image-runtime.js";
+import { redactPersistedCredentialValues } from "../redaction.js";
 
 const secretRefSchema = z.object({
   type: z.literal("secret_ref"),
@@ -152,25 +159,102 @@ function parseSandboxEnvironmentConfig(
     : ({ success: false as const, error: parsed.error });
 }
 
+export type SandboxProviderSchemaCache = Map<string, Promise<Record<string, unknown> | null> | Record<string, unknown> | null>;
+
 async function getSandboxProviderConfigSchema(
   db: Db,
   provider: string,
+  schemaCache?: SandboxProviderSchemaCache,
 ): Promise<Record<string, unknown> | null> {
-  const resolved = await resolvePluginSandboxProviderDriverByKey({
-    db,
-    driverKey: provider,
-  });
-  const schema = resolved?.driver.configSchema;
-  return schema && typeof schema === "object" && !Array.isArray(schema)
-    ? schema as Record<string, unknown>
-    : null;
+  const cached = schemaCache?.get(provider);
+  if (cached !== undefined) return await cached;
+  const pending = (async () => {
+    const resolved = await resolvePluginSandboxProviderDriverByKey({
+      db,
+      driverKey: provider,
+    });
+    const schema = resolved?.driver.configSchema;
+    return schema && typeof schema === "object" && !Array.isArray(schema)
+      ? schema as Record<string, unknown>
+      : null;
+  })();
+  schemaCache?.set(provider, pending);
+  const normalized = await pending;
+  schemaCache?.set(provider, normalized);
+  return normalized;
 }
 
 export async function resolveSandboxProviderSecretRefPaths(
   db: Db,
   provider: string,
+  config?: Record<string, unknown>,
 ): Promise<Set<string>> {
-  return collectSecretRefPaths(await getSandboxProviderConfigSchema(db, provider));
+  return collectSecretRefPaths(await getSandboxProviderConfigSchema(db, provider), config);
+}
+
+export async function presentEnvironmentConfigForRead(
+  db: Db,
+  environment: { id?: string; driver: string; config: Record<string, unknown> | null },
+  schemaCache?: SandboxProviderSchemaCache,
+): Promise<Record<string, unknown>> {
+  const config = parseObject(environment.config);
+  if (environment.driver !== "sandbox") return config;
+
+  const provider = getSandboxProvider(config);
+  if (provider === "fake") {
+    // The fake provider has no schema, and getSandboxProvider() defaults a
+    // missing/blank provider to "fake". A historical or malformed config could
+    // therefore carry credential-shaped fields (e.g. { accessToken }); scrub
+    // them residually rather than returning plaintext to admin reads.
+    return compactConfigArrays(
+      redactPersistedCredentialValues(structuredClone(config)) as Record<string, unknown>,
+    );
+  }
+
+  let schema: Record<string, unknown> | null = null;
+  try {
+    schema = await getSandboxProviderConfigSchema(db, provider, schemaCache);
+  } catch {
+    // A missing provider must not expose historical plaintext config.
+  }
+  if (!schema) return { provider };
+
+  let presented = structuredClone(config) as Record<string, unknown>;
+  const inspection = inspectSecretRefPaths(schema, presented);
+  if (!inspection.inspectable) return { provider };
+  const boundSecretIdsByPath = new Map<string, Set<string>>();
+  if (environment.id && inspection.paths.size > 0) {
+    const rows = await db
+      .select({ configPath: companySecretBindings.configPath, secretId: companySecretBindings.secretId })
+      .from(companySecretBindings)
+      .where(and(
+        eq(companySecretBindings.targetType, "environment"),
+        eq(companySecretBindings.targetId, environment.id),
+        inArray(companySecretBindings.configPath, [...inspection.paths]),
+      ));
+    for (const row of rows) {
+      const ids = boundSecretIdsByPath.get(row.configPath) ?? new Set<string>();
+      ids.add(row.secretId);
+      boundSecretIdsByPath.set(row.configPath, ids);
+    }
+  }
+  for (const path of inspection.paths) {
+    const value = readConfigValueAtPath(presented, path);
+    const secretId = typeof value === "string" ? value.trim() : "";
+    const isBoundSecretRef = environment.id
+      ? isUuidSecretRef(secretId) && (boundSecretIdsByPath.get(path)?.has(secretId) ?? false)
+      : isUuidSecretRef(secretId);
+    if (!isBoundSecretRef) {
+      presented = writeConfigValueAtPath(presented, path, undefined);
+    }
+  }
+  // Schema redaction only covers declared secret-ref paths; a plugin config can
+  // still carry undeclared credential-shaped fields. Scrub those residually while
+  // preserving the schema-declared secret-ref paths handled above.
+  presented = redactPersistedCredentialValues(presented, {
+    preserveContainerPaths: inspection.paths,
+  }) as Record<string, unknown>;
+  return compactConfigArrays(presented);
 }
 
 function secretName(input: {
@@ -224,7 +308,19 @@ async function persistConfigSecretRefs(input: {
   actor?: { userId?: string | null; agentId?: string | null };
 }): Promise<Record<string, unknown>> {
   let nextConfig = { ...input.config };
-  for (const path of collectSecretRefPaths(input.schema)) {
+  // Security: a schema whose secret-ref coverage cannot be fully enumerated (an
+  // unsupported keyword governing a credential field) would let a plaintext
+  // secret slip through unminted and persist in cleartext. Reject the write
+  // atomically before any secret creation or DB mutation rather than storing a
+  // partially scrubbed — and silently broken — config.
+  const persistInspection = inspectSecretRefPaths(input.schema, nextConfig);
+  if (input.schema && !persistInspection.complete) {
+    throw unprocessable(
+      "Environment provider schema uses unsupported constructs that hide credential fields; cannot safely persist secret references",
+      { code: "environment_config_secret_ref_schema_uninspectable" },
+    );
+  }
+  for (const path of persistInspection.paths) {
     const rawValue = readConfigValueAtPath(nextConfig, path);
     if (typeof rawValue !== "string") continue;
     const trimmed = rawValue.trim();
@@ -248,7 +344,7 @@ async function persistConfigSecretRefs(input: {
     });
     nextConfig = writeConfigValueAtPath(nextConfig, path, created.secretId);
   }
-  return nextConfig;
+  return compactConfigArrays(nextConfig);
 }
 
 async function resolveConfigSecretRefsForRuntime(input: {
@@ -269,7 +365,7 @@ async function resolveConfigSecretRefsForRuntime(input: {
   const secrets = secretService(input.db);
   let nextConfig = { ...input.config };
   const resolvedSecretVersions: ResolvedEnvironmentSecretVersion[] = [];
-  for (const path of collectSecretRefPaths(input.schema)) {
+  for (const path of collectSecretRefPaths(input.schema, nextConfig)) {
     const current = readConfigValueAtPath(nextConfig, path);
     if (typeof current !== "string") continue;
     const trimmed = current.trim();
@@ -312,7 +408,7 @@ async function resolveConfigSecretRefsForProbe(input: {
 }): Promise<Record<string, unknown>> {
   const secrets = secretService(input.db);
   let nextConfig = { ...input.config };
-  for (const path of collectSecretRefPaths(input.schema)) {
+  for (const path of collectSecretRefPaths(input.schema, nextConfig)) {
     const current = readConfigValueAtPath(nextConfig, path);
     if (typeof current !== "string") continue;
     const trimmed = current.trim();
@@ -352,7 +448,7 @@ export async function collectEnvironmentSecretRefs(input: {
   if (parsed.driver === "sandbox" && parsed.config.provider !== "fake") {
     const schema = await getSandboxProviderConfigSchema(input.db, parsed.config.provider);
     const refs: Array<{ secretId: string; configPath: string; versionSelector?: SecretVersionSelector }> = [];
-    for (const path of collectSecretRefPaths(schema)) {
+    for (const path of collectSecretRefPaths(schema, parsed.config as Record<string, unknown>)) {
       const current = readConfigValueAtPath(parsed.config as Record<string, unknown>, path);
       if (typeof current === "string" && isUuidSecretRef(current.trim())) {
         refs.push({ secretId: current.trim(), configPath: path, versionSelector: "latest" });
@@ -596,6 +692,7 @@ export async function resolveEnvironmentDriverConfigForRuntime(
       targetType: SecretBindingTargetType;
       targetId: string;
     };
+    resourceScopes?: ConfigResourceScopes;
   },
 ): Promise<ParsedEnvironmentConfig> {
   const parsed = parseEnvironmentDriverConfig(environment);
@@ -638,13 +735,18 @@ export async function resolveEnvironmentDriverConfigForRuntime(
 
   if (parsed.driver === "sandbox" && parsed.config.provider !== "fake") {
     const schema = await getSandboxProviderConfigSchema(db, parsed.config.provider);
-    let runtimeConfig = parsed.config;
+    const scopedConfig = scopeConfigResourceArrays(
+      schema,
+      parsed.config as Record<string, unknown>,
+      context?.resourceScopes,
+    );
+    let runtimeConfig = compactConfigArrays(scopedConfig) as SandboxEnvironmentConfig;
     let resolvedSecretVersions: ResolvedEnvironmentSecretVersion[] = [];
     if (companyId) {
       const resolved = await resolveConfigSecretRefsForRuntime({
         db,
         companyId,
-        config: parsed.config as Record<string, unknown>,
+        config: scopedConfig,
         schema,
         context: {
           consumerType: secretBindingTarget?.targetType ?? "environment",
@@ -653,11 +755,11 @@ export async function resolveEnvironmentDriverConfigForRuntime(
           heartbeatRunId: context?.heartbeatRunId ?? null,
         },
       });
-      runtimeConfig = resolved.config as SandboxEnvironmentConfig;
+      runtimeConfig = compactConfigArrays(resolved.config) as SandboxEnvironmentConfig;
       resolvedSecretVersions = resolved.resolvedSecretVersions;
     } else {
-      for (const path of collectSecretRefPaths(schema)) {
-        const current = readConfigValueAtPath(parsed.config as Record<string, unknown>, path);
+      for (const path of collectSecretRefPaths(schema, scopedConfig)) {
+        const current = readConfigValueAtPath(scopedConfig, path);
         if (typeof current === "string" && isUuidSecretRef(current.trim())) {
           throw unprocessable("Runtime secret resolution requires a companyId context");
         }
@@ -673,7 +775,10 @@ export async function resolveEnvironmentDriverConfigForRuntime(
             // Match the capture-time fingerprint exclusions: secret-ref paths
             // are excluded when the template's source fingerprint is computed,
             // so they must be excluded when re-checking it here.
-            secretRefExcludePaths: collectSecretRefPaths(schema),
+            secretRefExcludePaths: collectSecretRefPaths(
+              schema,
+              parsed.config as Record<string, unknown>,
+            ),
           })
         : runtimeConfig,
       resolvedSecretVersions,

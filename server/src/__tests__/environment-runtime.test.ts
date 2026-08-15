@@ -27,6 +27,8 @@ import {
   plugins,
   projects,
   secretAccessEvents,
+  toolActionRequests,
+  toolInvocations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -37,7 +39,7 @@ import {
   PLUGIN_ENVIRONMENT_CLEANUP_VERIFIED_ACQUISITION_ID_KEY,
   PLUGIN_RPC_ERROR_CODES,
 } from "@paperclipai/plugin-sdk";
-import { environmentRuntimeService, findReusableSandboxLeaseId } from "../services/environment-runtime.ts";
+import { environmentRuntimeService, findReusableSandboxLeaseId, resolveForwardedCredentialValues } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import { executionWorkspaceService } from "../services/execution-workspaces.ts";
 import { realizePluginEnvironmentWorkspace } from "../services/plugin-environment-driver.ts";
@@ -46,6 +48,7 @@ import { secretService } from "../services/secrets.ts";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 import { logger } from "../middleware/logger.ts";
+import { signToolArguments } from "../services/tool-content-guards.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -83,6 +86,32 @@ describe("realizePluginEnvironmentWorkspace", () => {
       expect.any(Object),
       91_234,
     );
+  });
+});
+
+describe("resolveForwardedCredentialValues", () => {
+  it("collects only secret-bearing values and preserves non-secret App identifiers", () => {
+    const values = resolveForwardedCredentialValues({
+      env: {
+        GITHUB_APP_ID: "123456",
+        GITHUB_INSTALLATION_ID: "987654",
+        GITHUB_APP_INSTALLATION_ID: "987654",
+        GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/app-987654-key",
+        GITHUB_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----abc",
+        GITHUB_TOKEN: "github_pat_token_value",
+        GH_TOKEN: "gh_token_value",
+      },
+    });
+    expect(values).toContain("-----BEGIN PRIVATE KEY-----abc");
+    expect(values).toContain("github_pat_token_value");
+    expect(values).toContain("gh_token_value");
+    expect(values).not.toContain("123456");
+    expect(values).not.toContain("987654");
+    expect(values).not.toContain("/run/secrets/app-987654-key");
+  });
+
+  it("returns an empty list when no env is forwarded", () => {
+    expect(resolveForwardedCredentialValues({})).toEqual([]);
   });
 });
 
@@ -177,6 +206,7 @@ describe("findReusableSandboxLeaseId", () => {
 });
 
 describeEmbeddedPostgres("environmentRuntimeService", () => {
+  const toolActionSigningSecret = "environment-runtime-test-signing-secret";
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
   let runtime!: ReturnType<typeof environmentRuntimeService>;
@@ -199,6 +229,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
     await db.delete(environmentLeases);
+    await db.delete(toolActionRequests);
+    await db.delete(toolInvocations);
     await db.delete(activityLog);
     await db.delete(secretAccessEvents);
     await db.delete(heartbeatRuns);
@@ -330,6 +362,46 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       } as const,
       runId,
     };
+  }
+
+  async function createRetainedToolAction(input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    toolName?: string;
+  }) {
+    const [invocation] = await db.insert(toolInvocations).values({
+      companyId: input.companyId,
+      actorType: "agent",
+      actorId: input.agentId,
+      agentId: input.agentId,
+      runId: input.runId,
+      toolName: input.toolName ?? `agent-identities:write-${randomUUID()}`,
+      approvalState: "pending",
+    }).returning();
+    const canonicalArguments = "{}";
+    const argumentsHash = createHash("sha256").update(canonicalArguments).digest("hex");
+    const [actionRequest] = await db.insert(toolActionRequests).values({
+      companyId: input.companyId,
+      invocationId: invocation!.id,
+      status: "pending",
+      canonicalArgumentsHash: argumentsHash,
+      canonicalArgumentsSummary: {
+        summary: canonicalArguments,
+        sizeBytes: canonicalArguments.length,
+        sha256: argumentsHash,
+        redactedFields: [],
+      },
+      signedArguments: signToolArguments({
+        invocationId: invocation!.id,
+        toolName: invocation!.toolName,
+        canonicalArguments,
+        executionOnApprove: true,
+        signingSecret: toolActionSigningSecret,
+      }),
+      requestedByAgentId: input.agentId,
+    }).returning();
+    return actionRequest!;
   }
 
   async function seedReusablePluginSandboxLease() {
@@ -998,6 +1070,116 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(rows[0]?.status).toBe("released");
   });
 
+  it("retains a run lease only for a valid signed action awaiting approval execution", async () => {
+    const { companyId, agentId, environment, runId } = await seedEnvironment();
+    const acquired = await runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+    const actionRequest = await createRetainedToolAction({ companyId, agentId, runId });
+    const signedRuntime = environmentRuntimeService(db, { toolActionSigningSecret });
+
+    await expect(signedRuntime.releaseRunLeases(runId)).resolves.toEqual([]);
+    await expect(environmentService(db).getLeaseById(acquired.lease.id)).resolves.toMatchObject({ status: "active" });
+
+    await db.update(toolActionRequests)
+      .set({ status: "cancelled", resolvedAt: new Date(), updatedAt: new Date() })
+      .where(eq(toolActionRequests.id, actionRequest.id));
+    await expect(signedRuntime.releaseRunLeases(runId)).resolves.toHaveLength(1);
+    await expect(environmentService(db).getLeaseById(acquired.lease.id)).resolves.toMatchObject({ status: "released" });
+  });
+
+  it("does not let another run's pending action retain this run's lease", async () => {
+    const { companyId, agentId, environment, runId } = await seedEnvironment();
+    const otherRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+    });
+    await createRetainedToolAction({ companyId, agentId, runId: otherRunId });
+    const acquired = await runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+
+    await expect(environmentRuntimeService(db, { toolActionSigningSecret }).releaseRunLeases(runId))
+      .resolves.toHaveLength(1);
+    await expect(environmentService(db).getLeaseById(acquired.lease.id))
+      .resolves.toMatchObject({ status: "released" });
+  });
+
+  it("retains a run lease until all pending approved-execution actions resolve", async () => {
+    const { companyId, agentId, environment, runId } = await seedEnvironment();
+    const acquired = await runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+    const actions = await Promise.all([
+      createRetainedToolAction({ companyId, agentId, runId }),
+      createRetainedToolAction({ companyId, agentId, runId }),
+    ]);
+    const signedRuntime = environmentRuntimeService(db, { toolActionSigningSecret });
+
+    await db.update(toolActionRequests)
+      .set({ status: "executed", resolvedAt: new Date(), updatedAt: new Date() })
+      .where(eq(toolActionRequests.id, actions[0]!.id));
+    await expect(signedRuntime.releaseRunLeases(runId)).resolves.toEqual([]);
+    await expect(environmentService(db).getLeaseById(acquired.lease.id))
+      .resolves.toMatchObject({ status: "active" });
+
+    await db.update(toolActionRequests)
+      .set({ status: "rejected", resolvedAt: new Date(), updatedAt: new Date() })
+      .where(eq(toolActionRequests.id, actions[1]!.id));
+    await expect(signedRuntime.releaseRunLeases(runId)).resolves.toHaveLength(1);
+    await expect(environmentService(db).getLeaseById(acquired.lease.id))
+      .resolves.toMatchObject({ status: "released" });
+  });
+
+  it("does not retain a run lease for an unsigned legacy action request", async () => {
+    const { companyId, agentId, environment, runId } = await seedEnvironment();
+    await runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+    const [invocation] = await db.insert(toolInvocations).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      runId,
+      toolName: "agent-identities:legacy-write",
+      approvalState: "pending",
+    }).returning();
+    await db.insert(toolActionRequests).values({
+      companyId,
+      invocationId: invocation!.id,
+      status: "pending",
+      canonicalArgumentsHash: "legacy",
+      canonicalArgumentsSummary: { summary: "{}", sizeBytes: 2, sha256: "legacy", redactedFields: [] },
+      signedArguments: null,
+      requestedByAgentId: agentId,
+    });
+
+    await expect(environmentRuntimeService(db, {
+      toolActionSigningSecret: "environment-runtime-test-signing-secret",
+    }).releaseRunLeases(runId)).resolves.toHaveLength(1);
+  });
+
   it("allows projectless runs through the runtime seam", async () => {
     const { companyId, environment, runId } = await seedEnvironment();
 
@@ -1210,14 +1392,92 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         pluginKey: "acme.reservation-sandbox-provider",
       }),
     });
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.id).toBe(reservation?.id);
-  });
+     expect(rows).toHaveLength(1);
+     expect(rows[0]?.id).toBe(reservation?.id);
+   });
 
-  it.each([
-    ["released", undefined],
-    ["failed", "failed"],
-  ] as const)("preserves %s intent when a plugin sandbox acquisition returns late", async (
+   it("re-stamps the host agent owner over provider-returned lease metadata", async () => {
+     const { pluginId, companyId, environment, agentId } = await seedPluginSandboxEnvironment();
+     const foreignAgentId = randomUUID();
+     const runId = randomUUID();
+     await db.insert(heartbeatRuns).values({
+       id: runId,
+       companyId,
+       agentId,
+       invocationSource: "manual",
+       status: "running",
+       createdAt: new Date(),
+       updatedAt: new Date(),
+     });
+     const workerManager = {
+       isRunning: vi.fn((id: string) => id === pluginId),
+       call: vi.fn(async (_pluginId: string, method: string) => {
+         if (method !== "environmentAcquireLease") {
+           throw new Error(`Unexpected plugin method: ${method}`);
+         }
+         return {
+           providerLeaseId: "restamp-plugin-lease",
+           metadata: {
+             provider: "reservation-plugin",
+             image: "fake:test",
+             agentId: foreignAgentId,
+           },
+         };
+       }),
+     } as unknown as PluginWorkerManager;
+     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+     const acquired = await runtimeWithPlugin.acquireRunLease({
+       companyId,
+       environment,
+       issueId: null,
+       agentId,
+       heartbeatRunId: runId,
+       persistedExecutionWorkspace: null,
+     });
+
+     expect(acquired.lease.metadata).toMatchObject({ agentId });
+     expect(acquired.lease.metadata?.agentId).not.toBe(foreignAgentId);
+     const [persisted] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, acquired.lease.id));
+     expect((persisted?.metadata as Record<string, unknown> | null)?.agentId).toBe(agentId);
+   });
+
+   it("drops a provider-injected agent owner when the host run has no agent", async () => {
+     const { pluginId, companyId, environment } = await seedPluginSandboxEnvironment();
+     const foreignAgentId = randomUUID();
+     const workerManager = {
+       isRunning: vi.fn((id: string) => id === pluginId),
+       call: vi.fn(async (_pluginId: string, method: string) => {
+         if (method !== "environmentAcquireLease") {
+           throw new Error(`Unexpected plugin method: ${method}`);
+         }
+         return {
+           providerLeaseId: "restamp-anon-lease",
+           metadata: { provider: "reservation-plugin", image: "fake:test", agentId: foreignAgentId },
+         };
+       }),
+     } as unknown as PluginWorkerManager;
+     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+
+     const acquired = await runtimeWithPlugin.acquireRunLease({
+       companyId,
+       environment,
+       issueId: null,
+       agentId: null,
+       heartbeatRunId: null,
+       applyCustomImageTemplate: true,
+       persistedExecutionWorkspace: null,
+     });
+
+     expect(acquired.lease.metadata).not.toHaveProperty("agentId");
+     const [persisted] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, acquired.lease.id));
+     expect(persisted?.metadata as Record<string, unknown> | null).not.toHaveProperty("agentId");
+   });
+
+   it.each([
+     ["released", undefined],
+     ["failed", "failed"],
+   ] as const)("preserves %s intent when a plugin sandbox acquisition returns late", async (
     expectedStatus,
     releaseStatus,
   ) => {
@@ -1781,6 +2041,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             shellCommand: "bash",
             pluginKey: "provider-config-key",
           }));
+          expect(params.workspaceRealization).toEqual({
+            remote: { path: "/configured/workspace" },
+          });
           return {
             exitCode: 0,
             signal: null,
@@ -1796,12 +2059,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             reuseLease: false,
             remoteCwd: "/configured/workspace",
             shellCommand: "bash",
+            pluginKey: "provider-config-key",
           });
           expect(params.config).not.toHaveProperty("agentId");
           expect(params.config).not.toHaveProperty("driver");
           expect(params.config).not.toHaveProperty("executionWorkspaceMode");
           expect(params.config).not.toHaveProperty("pluginId");
-          expect(params.config).not.toHaveProperty("pluginKey");
           expect(params.config).not.toHaveProperty("providerMetadata");
           expect(params.config).not.toHaveProperty("provider");
           expect(params.config).not.toHaveProperty("reusableSandboxLease");
@@ -1829,6 +2092,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       cwd: "/workspace",
       env: {},
       timeoutMs: 1000,
+      workspaceRealization: {
+        remote: { path: "/configured/workspace" },
+      },
     });
 
     expect(acquired.lease.provider).toBe("fake-plugin");
@@ -1866,7 +2132,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.anything(), 91234);
   });
 
-  it("keeps plugin sandbox cleanup on its lease-scoped secret after the environment changes", async () => {
+  it("keeps non-first plugin sandbox agent credentials lease-scoped after config changes", async () => {
     const pluginId = randomUUID();
     const { companyId, environment: baseEnvironment, runId } = await seedEnvironment();
     const apiSecret = await secretService(db).create(companyId, {
@@ -1874,10 +2140,26 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       provider: "local_encrypted",
       value: "resolved-provider-key",
     });
+    const agentSecrets = await Promise.all([
+      secretService(db).create(companyId, {
+        name: `secure-plugin-agent-key-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "resolved-agent-key-1",
+      }),
+      secretService(db).create(companyId, {
+        name: `secure-plugin-agent-key-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "resolved-agent-key-2",
+      }),
+    ]);
     const providerConfig = {
       provider: "secure-plugin",
       template: "base",
       apiKey: apiSecret.id,
+      agentCredentials: agentSecrets.map((secret, index) => ({
+        agentId: `agent-${index + 1}`,
+        apiToken: secret.id,
+      })),
       timeoutMs: 1234,
       reuseLease: false,
     };
@@ -1894,6 +2176,15 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       targetId: environment.id,
       configPath: "apiKey",
     });
+    for (const [index, secret] of agentSecrets.entries()) {
+      await secretService(db).createBinding({
+        companyId,
+        secretId: secret.id,
+        targetType: "environment",
+        targetId: environment.id,
+        configPath: `agentCredentials.${index}.apiToken`,
+      });
+    }
     await environmentService(db).update(environment.id, {
       driver: "sandbox",
       name: environment.name,
@@ -1926,6 +2217,24 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
               properties: {
                 template: { type: "string" },
                 apiKey: { type: "string", format: "secret-ref" },
+                agentCredentials: {
+                  type: "array",
+                  "x-paperclip-runtime-scope": {
+                    resource: "agent",
+                    field: "agentId",
+                    fallback: "first",
+                  },
+                  items: {
+                    type: "object",
+                    properties: {
+                      agentId: {
+                        type: "string",
+                        "x-paperclip-resource": "agent",
+                      },
+                      apiToken: { type: "string", format: "secret-ref" },
+                    },
+                  },
+                },
                 timeoutMs: { type: "number" },
                 reuseLease: { type: "boolean" },
               },
@@ -1941,6 +2250,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       isRunning: vi.fn((id: string) => id === pluginId),
       call: vi.fn(async (_pluginId: string, method: string, params: any) => {
         expect(params.config.apiKey).toBe("resolved-provider-key");
+        expect(params.config.agentCredentials).toEqual([
+          { agentId: "agent-2", apiToken: "resolved-agent-key-2" },
+        ]);
+        expect(JSON.stringify(params)).not.toContain("agent-1");
+        expect(JSON.stringify(params)).not.toContain("resolved-agent-key-1");
         expect(params.config).not.toHaveProperty("provider");
         if (method === "environmentAcquireLease") {
           return {
@@ -1949,6 +2263,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
               provider: "secure-plugin",
               template: "base",
               apiKey: "resolved-provider-key",
+              agentCredentials: params.config.agentCredentials,
               timeoutMs: 1234,
               reuseLease: false,
               sandboxId: "sandbox-1",
@@ -1977,17 +2292,26 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       companyId,
       environment,
       issueId: null,
+      agentId: "agent-2",
       heartbeatRunId: runId,
       persistedExecutionWorkspace: null,
     });
     expect(acquired.lease.metadata).toMatchObject({
       provider: "secure-plugin",
       template: "base",
-      apiKey: apiSecret.id,
       timeoutMs: 1234,
       sandboxId: "sandbox-1",
       leaseScopedSecretBindings: true,
     });
+    expect(acquired.lease.metadata).not.toHaveProperty("apiKey");
+    expect(acquired.lease.metadata?.agentCredentials).toEqual([
+      { agentId: "agent-2" },
+    ]);
+    const persistedMetadata = JSON.stringify(acquired.lease.metadata);
+    expect(persistedMetadata).not.toContain('"apiToken"');
+    expect(persistedMetadata).not.toContain("resolved-agent-key-1");
+    expect(persistedMetadata).not.toContain("resolved-agent-key-2");
+    expect(persistedMetadata).not.toContain("agent-1");
     const replacementSecret = await secretService(db).create(companyId, {
       name: `replacement-plugin-api-key-${randomUUID()}`,
       provider: "local_encrypted",
@@ -2012,10 +2336,30 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       cwd: "/workspace",
       env: {},
     });
+    const secretAccessCountAfterFirstExecute = await db
+      .select({ id: secretAccessEvents.id })
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.heartbeatRunId, runId))
+      .then((rows) => rows.length);
+    const executedAgain = await runtimeWithPlugin.execute({
+      environment,
+      lease: acquired.lease,
+      command: "printf",
+      args: ["ok"],
+      cwd: "/workspace",
+      env: {},
+    });
 
     const released = await runtimeWithPlugin.releaseRunLeases(runId);
+    const secretAccessCountAfterRelease = await db
+      .select({ id: secretAccessEvents.id })
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.heartbeatRunId, runId))
+      .then((rows) => rows.length);
 
     expect(executed.stdout).toBe("ok\n");
+    expect(executedAgain.stdout).toBe("ok\n");
+    expect(secretAccessCountAfterRelease).toBe(secretAccessCountAfterFirstExecute);
     expect(released).toHaveLength(1);
     expect(released[0]?.lease.status).toBe("released");
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.objectContaining({
@@ -7032,6 +7376,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       env: { FOO: "bar" },
       stdin: "",
       timeoutMs: 1000,
+      workspaceRealization: {
+        sync: { strategy: "sandbox_archive_upload_download" },
+      },
     });
     const destroyed = await runtimeWithPlugin.destroyRunLease({
       environment,
@@ -7089,6 +7436,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       args: ["ok"],
       cwd: "/workspace/project",
       env: { FOO: "bar" },
+      workspaceRealization: {
+        sync: { strategy: "sandbox_archive_upload_download" },
+      },
     }), 91000);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", {
       driverKey: "fake-plugin",

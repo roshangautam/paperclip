@@ -41,6 +41,7 @@ import {
   type AdapterRemoteExecutionSpec,
 } from "@paperclipai/adapter-utils/execution-target";
 import { buildWorkspaceRealizationRequest } from "./workspace-realization.js";
+import { redactSensitiveText, REDACTED_EVENT_VALUE } from "../redaction.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
 import { parseObject } from "../adapters/utils.js";
@@ -112,6 +113,65 @@ export interface EnvironmentRealizationResult {
 export interface EnvironmentReleaseResult {
   released: EnvironmentRuntimeLeaseRecord[];
   errors: Array<{ leaseId: string; error: unknown }>;
+}
+
+// A provider's realization error message can echo back forwarded secret material
+// (e.g. a GitHub App private key). Redact each secret-bearing forwarded value in
+// its raw, trimmed, and JSON-serialized forms before it reaches the run error,
+// then apply pattern-based redaction as a defense-in-depth backstop for derived encodings.
+function redactForwardedRealizationSecrets(
+  message: string,
+  forwardedEnv: Record<string, string>,
+): string {
+  let redacted = message;
+  const variants = new Set<string>();
+  for (const rawValue of Object.values(forwardedEnv)) {
+    if (typeof rawValue !== "string") continue;
+    for (const candidate of [rawValue, rawValue.trim(), JSON.stringify(rawValue), JSON.stringify(rawValue).slice(1, -1)]) {
+      if (candidate.length > 0) variants.add(candidate);
+    }
+  }
+  for (const variant of [...variants].sort((a, b) => b.length - a.length)) {
+    redacted = redacted.split(variant).join(REDACTED_EVENT_VALUE);
+  }
+  return redactSensitiveText(redacted);
+}
+
+// Matches env keys whose VALUE is secret credential material (tokens, private
+// key bodies). Anchored at the end so identifier/path keys like GITHUB_APP_ID or
+// GITHUB_APP_PRIVATE_KEY_FILE are excluded: the realized cwd path legitimately
+// contains such identifiers, and scrubbing them would corrupt the persisted
+// remoteCwd and break execution.
+const REALIZATION_SECRET_VALUE_KEY_RE =
+  /(?:token|secret|password|passwd|credential|bearer|(?:^|[-_])private[-_]?key)$/i;
+
+function redactForwardedRealizationSecretValuesOnly(
+  path: string,
+  forwardedEnv: Record<string, string>,
+): string {
+  const secretOnlyEnv = Object.fromEntries(
+    Object.entries(forwardedEnv).filter(([key]) => REALIZATION_SECRET_VALUE_KEY_RE.test(key)),
+  );
+  return redactForwardedRealizationSecrets(path, secretOnlyEnv);
+}
+
+// The raw provider error can echo forwarded credentials in its message, stack, or
+// its own nested cause. Attaching it directly as `cause` leaks the secret to any
+// error serializer (Pino) or caller that walks the chain, even when the outer
+// message is sanitized. Build a plain Error carrying only the scrubbed message and
+// name so the chain retains diagnostic shape without the credential material; the
+// stack and any nested cause are intentionally dropped.
+function buildSanitizedRealizationCause(
+  err: unknown,
+  forwardedEnv: Record<string, string>,
+): Error {
+  const rawMessage = err instanceof Error ? err.message : String(err);
+  const sanitized = new Error(redactForwardedRealizationSecretValuesOnly(rawMessage, forwardedEnv));
+  sanitized.name = err instanceof Error
+    ? redactForwardedRealizationSecretValuesOnly(err.name, forwardedEnv)
+    : "Error";
+  delete sanitized.stack;
+  return sanitized;
 }
 
 function firstNonEmptyLine(text: string | null | undefined): string | null {
@@ -338,6 +398,7 @@ export function environmentRunOrchestrator(
     issueId: string | null;
     heartbeatRunId: string;
     executionWorkspace: RealizedExecutionWorkspace;
+    workspaceRealizationEnv: Record<string, string>;
     effectiveExecutionWorkspaceMode: string | null;
     persistedExecutionWorkspace: ExecutionWorkspace | null;
   }): Promise<EnvironmentRealizationResult> {
@@ -382,10 +443,21 @@ export function environmentRunOrchestrator(
       environment.driver === "sandbox" ||
       environment.driver === "plugin"
     ) {
+      // Only sandbox/plugin realization drivers consume the forwarded GitHub
+      // credentials (they perform the private-repo clone during realization).
+      // Local/SSH realization never uses input.env — clone auth is ambient/host
+      // git config resolved at lease acquisition — so forwarding the token would
+      // stamp credentialAgentId ownership markers on an otherwise reusable
+      // local/SSH workspace, wrongly pinning it to one agent.
+      const forwardedRealizationEnv =
+        environment.driver === "sandbox" || environment.driver === "plugin"
+          ? input.workspaceRealizationEnv
+          : {};
       try {
         const workspaceRealizationResult = await environmentRuntime.realizeWorkspace({
           environment,
           lease,
+          env: forwardedRealizationEnv,
           workspace: {
             localPath: executionWorkspace.cwd,
             remotePath: leaseRemoteCwd ?? pluginRemoteCwd ?? undefined,
@@ -397,17 +469,18 @@ export function environmentRunOrchestrator(
         });
         realizedWorkspaceCwd =
           typeof workspaceRealizationResult.cwd === "string" && workspaceRealizationResult.cwd.trim().length > 0
-            ? workspaceRealizationResult.cwd.trim()
+            ? redactForwardedRealizationSecretValuesOnly(workspaceRealizationResult.cwd.trim(), forwardedRealizationEnv)
             : null;
         workspaceRealization = parseObject(workspaceRealizationResult.metadata?.workspaceRealization);
       } catch (err) {
+        const rawMessage = err instanceof Error ? err.message : String(err);
         throw new EnvironmentRunError(
           "workspace_realization_failed",
-          `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${redactForwardedRealizationSecretValuesOnly(rawMessage, forwardedRealizationEnv)}`,
           {
             environmentId: environment.id,
             driver: environment.driver,
-            cause: err,
+            cause: buildSanitizedRealizationCause(err, forwardedRealizationEnv),
           },
         );
       }

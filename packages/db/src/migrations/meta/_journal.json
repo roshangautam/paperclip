@@ -1289,6 +1289,20 @@
       "when": 1786300800001,
       "tag": "0185_repair_reusable_environment_lease_ownership",
       "breakpoints": true
+    },
+    {
+      "idx": 186,
+      "version": "7",
+      "when": 1786300800002,
+      "tag": "0186_tool_invocation_lease_release_pending",
+      "breakpoints": true
+    },
+    {
+      "idx": 187,
+      "version": "7",
+      "when": 1786300800003,
+      "tag": "0187_tool_invocation_lease_release_run_constraint",
+      "breakpoints": true
     }
   ]
 }

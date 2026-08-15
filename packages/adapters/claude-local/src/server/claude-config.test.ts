@@ -2,13 +2,84 @@ import * as fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { prepareClaudeConfigSeed } from "./claude-config.js";
+
+const { runAdapterExecutionTargetShellCommand } = vi.hoisted(() => ({
+  runAdapterExecutionTargetShellCommand: vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    pid: null,
+    startedAt: new Date().toISOString(),
+  })),
+}));
+
+vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>("@paperclipai/adapter-utils/execution-target");
+  return {
+    ...actual,
+    runAdapterExecutionTargetShellCommand,
+  };
+});
+
+import {
+  buildPaperclipClaudeMcpConfig,
+  prepareClaudeConfigSeed,
+  removeRemoteClaudeMcpConfig,
+  resolveUniquePaperclipClaudeMcpServerNames,
+} from "./claude-config.js";
+import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
+
+
+describe("removeRemoteClaudeMcpConfig", () => {
+  it("reports a nonzero remote cleanup command without throwing", async () => {
+    runAdapterExecutionTargetShellCommand.mockResolvedValueOnce({
+      exitCode: 255,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "permission denied",
+      pid: null,
+      startedAt: new Date().toISOString(),
+    });
+    const onLog = vi.fn(async () => {});
+
+    const failure = await removeRemoteClaudeMcpConfig({
+      runId: "run-1",
+      target: null,
+      configPath: "/remote/.paperclip-runtime/claude/mcp-config/runs/run-1/mcp-config.json",
+      options: {
+        cwd: "/remote/workspace",
+        env: {},
+        timeoutSec: 30,
+        graceSec: 5,
+        onLog,
+      },
+    });
+
+    expect(failure).toMatchObject({ message: "Failed to remove remote Claude MCP config: exit 255" });
+    expect(onLog).toHaveBeenCalledWith(
+      "stderr",
+      "[paperclip] Failed to remove remote Claude MCP config: exit 255\n",
+    );
+  });
+});
 
 describe("prepareClaudeConfigSeed", () => {
   const cleanupDirs: string[] = [];
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    runAdapterExecutionTargetShellCommand.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      pid: null,
+      startedAt: new Date().toISOString(),
+    });
     while (cleanupDirs.length > 0) {
       const dir = cleanupDirs.pop();
       if (!dir) continue;
@@ -107,5 +178,36 @@ describe("prepareClaudeConfigSeed", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.readFile(path.join(seedDir, "CLAUDE.md"), "utf8"))
       .resolves.toBe("local instructions");
+  });
+});
+
+describe("resolveUniquePaperclipClaudeMcpServerNames", () => {
+  const servers = [
+    { name: "Plugin: Agent Identities", url: "https://a.invalid/mcp", token: "t1", connectionId: "1111aaaa2222" },
+    { name: "Plugin: Agent Identities", url: "https://b.invalid/mcp", token: "t2", connectionId: "3333bbbb4444" },
+    { name: "Plugin: Agent Identities", url: "https://c.invalid/mcp", token: "t3", connectionId: "5555cccc6666" },
+  ];
+
+  it("aligns MCP config keys with remote --allowedTools grants for duplicate server names", () => {
+    const uniqueNames = resolveUniquePaperclipClaudeMcpServerNames(servers);
+    expect(new Set(uniqueNames).size).toBe(servers.length);
+
+    const config = JSON.parse(
+      buildPaperclipClaudeMcpConfig({ servers, bridge: { url: "https://bridge.invalid", token: "bridge-token" } }),
+    );
+    const configKeys = Object.keys(config.mcpServers);
+    expect(configKeys).toEqual(uniqueNames);
+
+    const [, allowedTools] = buildClaudeExecutionPermissionArgs({
+      dangerouslySkipPermissions: true,
+      targetIsRemote: true,
+      runtimeMcpServerNames: uniqueNames,
+    });
+    const grantedPatterns = new Set(allowedTools.split(" "));
+    for (const key of configKeys) {
+      const pattern = `mcp__${key.replace(/[^a-zA-Z0-9_-]/g, "_")}__*`;
+      expect(grantedPatterns.has(pattern)).toBe(true);
+    }
+    expect(allowedTools.match(/mcp__/g)).toHaveLength(servers.length);
   });
 });

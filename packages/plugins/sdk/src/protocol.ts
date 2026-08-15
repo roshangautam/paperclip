@@ -59,6 +59,7 @@ import type {
   PluginIssueWakeupResult,
   PluginJobContext,
   PluginExecutionWorkspaceMetadata,
+  PluginExecutionWorkspaceExecuteInput,
   PluginWorkspace,
   ToolRunContext,
   ToolResult,
@@ -273,6 +274,9 @@ export type PluginRpcErrorCode =
  */
 export interface PluginInvocationScope {
   companyId: string;
+  runId?: string;
+  agentId?: string;
+  allowTerminalRunWorkspaceExecution?: boolean;
 }
 
 /**
@@ -652,6 +656,7 @@ export interface PluginEnvironmentDestroyLeaseParams extends PluginEnvironmentRe
 
 export interface PluginEnvironmentRealizeWorkspaceParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
+  env?: Record<string, string>;
   workspace: {
     localPath?: string;
     remotePath?: string;
@@ -673,6 +678,7 @@ export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverB
   env?: Record<string, string>;
   stdin?: string;
   timeoutMs?: number;
+  workspaceRealization?: Record<string, unknown>;
 }
 
 export interface PluginEnvironmentExecuteResult {
@@ -1195,6 +1201,10 @@ export interface WorkerToHostMethods {
       companyId: string;
     },
     result: PluginExecutionWorkspaceMetadata | null,
+  ];
+  "executionWorkspaces.execute": [
+    params: PluginExecutionWorkspaceExecuteInput,
+    result: PluginEnvironmentExecuteResult,
   ];
   "projects.managed.get": [
     params: { projectKey: string; companyId: string },

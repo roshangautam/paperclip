@@ -43,6 +43,7 @@ const MANIFEST: PaperclipPluginManifestV1 = {
       displayName: "Ping",
       description: "Test tool",
       parametersSchema: { type: "object", properties: {} },
+      annotations: { readOnlyHint: false, openWorldHint: true },
     },
   ],
 } as unknown as PaperclipPluginManifestV1;

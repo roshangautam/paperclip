@@ -2,6 +2,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { logger } from "../middleware/logger.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import {
   createHostClientHandlers,
   JsonRpcCallError,
@@ -146,6 +148,269 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it.each([
+    ["a multiline private key", {
+      GITHUB_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\ntransient-key-material\n-----END PRIVATE KEY-----",
+    }, "transient-key-material"],
+    ["a token-suffixed key", {
+      GITHUB_TOKEN: "github_pat_transient_worker_token",
+    }, "github_pat_transient_worker_token"],
+    ["a known secret-bearing envelope with an opaque key name", {
+      PAPERCLIP_CLAUDE_MCP_CONFIG: '{"mcpServers":{"gw":{"headers":{"Authorization":"Bearer transient-bridge-token"}}}}',
+    }, "transient-bridge-token"],
+  ])("suppresses worker output after forwarding %s", async (_label, env, leakedValue) => {
+    const childLogger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const childSpy = vi.spyOn(logger, "child").mockReturnValue(childLogger as any);
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      await expect(handle.call("environmentRealizeWorkspace", {
+        driverKey: "coder",
+        companyId: "company-1",
+        environmentId: "environment-1",
+        config: { crash: true },
+        lease: { providerLeaseId: "lease-1" },
+        env,
+        workspace: {},
+      })).rejects.toThrow("Worker process exited");
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const logged = JSON.stringify(
+        Object.values(childLogger).flatMap((method) => method.mock.calls),
+      );
+      expect(logged).not.toContain(leakedValue);
+      expect(logged).not.toContain("provider received");
+      expect(logged).not.toContain("[plugin stderr]");
+    } finally {
+      await handle.stop().catch(() => undefined);
+      childSpy.mockRestore();
+    }
+  });
+
+  it("redacts worker-controlled protocol id/method log fields during a sensitive invocation", async () => {
+    const childLogger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const childSpy = vi.spyOn(logger, "child").mockReturnValue(childLogger as any);
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      const leakedValue = "github_pat_transient_protocol_field_token";
+      await expect(
+        handle.call("environmentRealizeWorkspace", {
+          driverKey: "coder",
+          companyId: "company-1",
+          environmentId: "environment-1",
+          config: { protocolFieldLeak: true },
+          lease: { providerLeaseId: "lease-1" },
+          env: { GITHUB_TOKEN: leakedValue },
+          workspace: {},
+        }),
+      ).resolves.toMatchObject({ cwd: "/workspace/project" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const logged = JSON.stringify(
+        Object.values(childLogger).flatMap((method) => method.mock.calls),
+      );
+      expect(logged).not.toContain(leakedValue);
+    } finally {
+      await handle.stop().catch(() => undefined);
+      childSpy.mockRestore();
+    }
+  });
+
+  it("redacts a bearer token extracted from the PAPERCLIP_CLAUDE_MCP_CONFIG envelope in a worker error", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      const bearer = "sk-transient-gateway-bearer-token-abc123";
+      const envelope = JSON.stringify({
+        mcpServers: { gw: { headers: { Authorization: bearer } } },
+      });
+      await expect(
+        handle.call("environmentRealizeWorkspace", {
+          driverKey: "coder",
+          companyId: "company-1",
+          environmentId: "environment-1",
+          config: { errorEchoNestedToken: true },
+          lease: { providerLeaseId: "lease-1" },
+          env: { PAPERCLIP_CLAUDE_MCP_CONFIG: envelope },
+          workspace: {},
+        }),
+      ).rejects.toSatisfy((err) => {
+        if (!(err instanceof JsonRpcCallError)) return false;
+        const serialized = `${err.message}${JSON.stringify(err.data ?? null)}`;
+        return !serialized.includes(bearer);
+      });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("redacts forwarded credentials echoed in a worker JSON-RPC error response", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      const leaked = "github_pat_transient_error_token";
+      await expect(
+        handle.call("environmentRealizeWorkspace", {
+          driverKey: "coder",
+          companyId: "company-1",
+          environmentId: "environment-1",
+          config: { errorEcho: true },
+          lease: { providerLeaseId: "lease-1" },
+          env: { GITHUB_TOKEN: leaked },
+          workspace: {},
+        }),
+      ).rejects.toSatisfy((err) => {
+        if (!(err instanceof JsonRpcCallError)) return false;
+        const serialized = `${err.message}${JSON.stringify(err.data ?? null)}`;
+        return !serialized.includes(leaked);
+      });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("redacts retained forwarded credentials from later non-sensitive worker results", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      const leaked = "github_pat_retained_worker_token";
+      await expect(handle.call("environmentRealizeWorkspace", {
+        driverKey: "coder",
+        companyId: "company-1",
+        environmentId: "environment-1",
+        config: {},
+        lease: { providerLeaseId: "lease-1" },
+        env: { GITHUB_TOKEN: leaked, GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app.pem" },
+        workspace: {},
+      })).resolves.toMatchObject({ cwd: "/workspace/project" });
+
+      const pathResult = await handle.call("environmentExecute", {
+        companyId: "company-1",
+        environmentId: "environment-1",
+        command: "echo",
+        stdout: "/run/secrets/github-app.pem",
+      } as HostToWorkerMethods["environmentExecute"][0]);
+      expect(pathResult.stdout).toBe("/run/secrets/github-app.pem");
+
+      const result = await handle.call("environmentExecute", {
+        companyId: "company-1",
+        environmentId: "environment-1",
+        command: "echo",
+        stdout: leaked,
+      } as HostToWorkerMethods["environmentExecute"][0]);
+      expect(JSON.stringify(result)).not.toContain(leaked);
+      expect(result.stdout).toBe(REDACTED_EVENT_VALUE);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("redacts forwarded credentials echoed in a successful worker result payload", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      const leaked = "github_pat_transient_result_token";
+      const result = await handle.call("environmentRealizeWorkspace", {
+        driverKey: "coder",
+        companyId: "company-1",
+        environmentId: "environment-1",
+        config: { resultEcho: true },
+        lease: { providerLeaseId: "lease-1" },
+        env: { GITHUB_TOKEN: leaked, GITHUB_APP_ID: "app-42" },
+        workspace: {},
+      });
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain(leaked);
+      expect(serialized).toContain("app-42");
+      expect(result.cwd).toBe("/workspace/app-42/project");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("rejects execution when the worker does not advertise environmentExecute", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
@@ -268,6 +533,102 @@ describe("plugin-worker-manager stderr failure context", () => {
         { companyId: "company-a" },
         { invocationScope: { companyId: "company-a" } },
       );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("passes executeTool run and agent scope to nested worker host calls", async () => {
+    const companiesGet = vi.fn(async (
+      params: { companyId: string },
+      context?: { invocationScope?: { companyId?: string | null; runId?: string; agentId?: string } | null },
+    ) => ({
+      id: params.companyId,
+      scope: context?.invocationScope ?? null,
+    }));
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {
+        "companies.get": companiesGet as never,
+      },
+    });
+
+    try {
+      await handle.start();
+
+      await expect(handle.call("executeTool", {
+        toolName: "probe",
+        parameters: {
+          mode: "echo",
+          requestedCompanyId: "company-a",
+        },
+        runContext: {
+          companyId: "company-a",
+          projectId: "project-1",
+          runId: "run-1",
+          agentId: "agent-1",
+        },
+      })).resolves.toEqual({
+        id: "company-a",
+        scope: { companyId: "company-a", runId: "run-1", agentId: "agent-1" },
+      });
+      expect(companiesGet).toHaveBeenCalledWith(
+        { companyId: "company-a" },
+        { invocationScope: { companyId: "company-a", runId: "run-1", agentId: "agent-1" } },
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("adds terminal workspace execution scope only from host invocation metadata", async () => {
+    const companiesGet = vi.fn(async (
+      params: { companyId: string },
+      context?: { invocationScope?: { allowTerminalRunWorkspaceExecution?: boolean } | null },
+    ) => ({
+      id: params.companyId,
+      allowTerminalRunWorkspaceExecution:
+        context?.invocationScope?.allowTerminalRunWorkspaceExecution === true,
+    }));
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: { "companies.get": companiesGet as never },
+    });
+    const params = {
+      toolName: "probe",
+      parameters: { mode: "echo", requestedCompanyId: "company-a" },
+      runContext: {
+        companyId: "company-a",
+        projectId: "project-1",
+        runId: "run-1",
+        agentId: "agent-1",
+        allowTerminalRunWorkspaceExecution: true,
+      },
+    } as HostToWorkerMethods["executeTool"][0];
+
+    try {
+      await handle.start();
+
+      await expect(handle.call("executeTool", params)).resolves.toMatchObject({
+        allowTerminalRunWorkspaceExecution: false,
+      });
+      await expect(handle.call(
+        "executeTool",
+        params,
+        undefined,
+        { allowTerminalRunWorkspaceExecution: true },
+      )).resolves.toMatchObject({ allowTerminalRunWorkspaceExecution: true });
     } finally {
       await handle.stop().catch(() => undefined);
     }

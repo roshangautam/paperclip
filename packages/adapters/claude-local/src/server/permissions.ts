@@ -17,6 +17,10 @@ const SANDBOX_ALLOWED_TOOLS =
   "NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill " +
   "TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write";
 
+function claudeMcpServerToolPattern(name: string): string {
+  return `mcp__${name.replace(/[^a-zA-Z0-9_-]/g, "_")}__*`;
+}
+
 export function buildClaudeProbePermissionArgs(input: {
   dangerouslySkipPermissions: boolean;
   targetIsRemote: boolean;
@@ -34,10 +38,13 @@ export function buildClaudeProbePermissionArgs(input: {
 export function buildClaudeExecutionPermissionArgs(input: {
   dangerouslySkipPermissions: boolean;
   targetIsRemote: boolean;
+  runtimeMcpServerNames?: string[];
 }): string[] {
   if (!input.dangerouslySkipPermissions) return [];
   if (input.targetIsRemote) {
-    return ["--allowedTools", SANDBOX_ALLOWED_TOOLS];
+    const runtimeMcpTools = [...new Set(input.runtimeMcpServerNames ?? [])]
+      .map(claudeMcpServerToolPattern);
+    return ["--allowedTools", [SANDBOX_ALLOWED_TOOLS, ...runtimeMcpTools].join(" ")];
   }
   return ["--dangerously-skip-permissions"];
 }

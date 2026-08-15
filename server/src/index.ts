@@ -702,6 +702,7 @@ export async function startServer(): Promise<StartedServer> {
     resolveSession,
     pluginWorkerManager,
   });
+  const { reconcileExpiredToolActions } = app;
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 
   // Increase keep-alive timeouts to safely outlive default idle timeouts
@@ -832,6 +833,7 @@ export async function startServer(): Promise<StartedServer> {
   let sandboxCleanupStopped = false;
   let sandboxCleanupInterval: ReturnType<typeof setInterval> | null = null;
   const sandboxCleanupInFlight = new Set<Promise<void>>();
+  const toolActionReconciliationInFlight = new Set<Promise<void>>();
   const trackSandboxCleanupWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
     tracked = Promise.resolve(work)
@@ -842,9 +844,18 @@ export async function startServer(): Promise<StartedServer> {
     sandboxCleanupInFlight.add(tracked);
   };
   const waitForSandboxCleanupIdle = async () => {
-    while (sandboxCleanupInFlight.size > 0) {
-      await Promise.allSettled([...sandboxCleanupInFlight]);
+    while (sandboxCleanupInFlight.size > 0 || toolActionReconciliationInFlight.size > 0) {
+      await Promise.allSettled([...sandboxCleanupInFlight, ...toolActionReconciliationInFlight]);
     }
+  };
+  const trackToolActionReconciliationWork = (work: Promise<unknown>) => {
+    let tracked: Promise<void>;
+    tracked = Promise.resolve(work)
+      .then(() => undefined, () => undefined)
+      .finally(() => {
+        toolActionReconciliationInFlight.delete(tracked);
+      });
+    toolActionReconciliationInFlight.add(tracked);
   };
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
@@ -881,6 +892,35 @@ export async function startServer(): Promise<StartedServer> {
     config.heartbeatSchedulerIntervalMs,
   );
   sandboxCleanupInterval.unref?.();
+
+  const runExpiredToolActionReconciliation = (phase: "startup" | "periodic") => {
+    if (sandboxCleanupStopped || toolActionReconciliationInFlight.size > 0) return;
+    trackToolActionReconciliationWork(reconcileExpiredToolActions()
+      .then((result) => {
+        if (result.reconciled > 0 || result.released > 0 || result.markedReleased > 0) {
+          logger.info(
+            result,
+            phase === "startup"
+              ? "startup expired execute-on-approve tool action reconciliation complete"
+              : "periodic expired execute-on-approve tool action reconciliation complete",
+          );
+        }
+      })
+      .catch((err) => {
+        logger.error(
+          { err },
+          phase === "startup"
+            ? "startup expired execute-on-approve tool action reconciliation failed"
+            : "periodic expired execute-on-approve tool action reconciliation failed",
+        );
+      }));
+  };
+  runExpiredToolActionReconciliation("startup");
+  const toolActionReconciliationInterval = setInterval(
+    () => runExpiredToolActionReconciliation("periodic"),
+    config.heartbeatSchedulerIntervalMs,
+  );
+  toolActionReconciliationInterval.unref?.();
 
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
@@ -1249,6 +1289,7 @@ export async function startServer(): Promise<StartedServer> {
         clearInterval(sandboxCleanupInterval);
         sandboxCleanupInterval = null;
       }
+      clearInterval(toolActionReconciliationInterval);
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
         signal,

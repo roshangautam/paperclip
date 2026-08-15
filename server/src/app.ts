@@ -73,6 +73,7 @@ import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
 import { createToolGatewayService } from "./services/tool-gateway.js";
+import { environmentRuntimeService } from "./services/environment-runtime.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-services.js";
@@ -297,11 +298,24 @@ export async function createApp(
     lifecycleManager: lifecycle,
     db,
   });
+  const toolActionEnvironmentRuntime = environmentRuntimeService(db, {
+    pluginWorkerManager: workerManager,
+  });
   const toolGateway = createToolGatewayService(db, {
     pluginToolDispatcher: toolDispatcher,
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
     trustedLocalStdioRuntimeHost,
+    releaseRunEnvironmentLeases: async ({ runId, runStatus }) => {
+      await toolActionEnvironmentRuntime.releaseRunLeases(
+        runId,
+        runStatus === "cancelled"
+          ? "expired"
+          : runStatus === "failed" || runStatus === "timed_out"
+            ? "failed"
+            : "released",
+      );
+    },
   });
   // Issue routes are intentionally mounted after the gateway is constructed because
   // issue approval endpoints delegate to it. The intervening routers use distinct
@@ -501,6 +515,7 @@ export async function createApp(
 
   jobCoordinator.start();
   scheduler.start();
+  const reconcileExpiredToolActions = () => toolGateway.reconcileExpiredExecuteOnApproveActions();
   let feedbackExportShuttingDown = false;
   let feedbackExportTimer: ReturnType<typeof setInterval> | null = null;
   const disableFeedbackExportFlushes = () => {
@@ -628,5 +643,5 @@ export async function createApp(
     void flushPluginLogBuffer();
   });
 
-  return app;
+  return Object.assign(app, { reconcileExpiredToolActions });
 }

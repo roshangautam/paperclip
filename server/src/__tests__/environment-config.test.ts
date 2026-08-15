@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { HttpError } from "../errors.js";
-import { normalizeEnvironmentConfig, parseEnvironmentDriverConfig } from "../services/environment-config.ts";
+import {
+  normalizeEnvironmentConfig,
+  parseEnvironmentDriverConfig,
+  presentEnvironmentConfigForRead,
+  type SandboxProviderSchemaCache,
+} from "../services/environment-config.ts";
 
 describe("environment config helpers", () => {
   it("normalizes SSH config into its canonical stored shape", () => {
@@ -247,5 +252,72 @@ describe("environment config helpers", () => {
         template: "base",
       },
     });
+  });
+
+  it("residually redacts undeclared credential-shaped fields when presenting sandbox config for read", async () => {
+    const schemaCache: SandboxProviderSchemaCache = new Map([
+      [
+        "acme.provider",
+        {
+          type: "object",
+          properties: {
+            apiKeySecretRef: { type: "string", format: "secret-ref" },
+            region: { type: "string" },
+          },
+        },
+      ],
+    ]);
+
+    const presented = await presentEnvironmentConfigForRead(
+      {} as never,
+      {
+        driver: "sandbox",
+        config: {
+          provider: "acme.provider",
+          region: "us-east-1",
+          apiKeySecretRef: "11111111-1111-1111-1111-111111111111",
+          accessToken: "ghs_undeclared_plaintext_secret",
+        },
+      },
+      schemaCache,
+    );
+
+    expect(presented.region).toBe("us-east-1");
+    expect(presented.apiKeySecretRef).toBe("11111111-1111-1111-1111-111111111111");
+    expect(presented.accessToken).not.toBe("ghs_undeclared_plaintext_secret");
+    expect(JSON.stringify(presented)).not.toContain("ghs_undeclared_plaintext_secret");
+  });
+
+  it("residually redacts credential-shaped fields for fake/defaulted sandbox providers", async () => {
+    const presented = await presentEnvironmentConfigForRead(
+      {} as never,
+      {
+        driver: "sandbox",
+        config: {
+          provider: "fake",
+          region: "us-east-1",
+          accessToken: "ghs_fake_provider_plaintext_secret",
+        },
+      },
+    );
+
+    expect(presented.provider).toBe("fake");
+    expect(presented.region).toBe("us-east-1");
+    expect(presented.accessToken).not.toBe("ghs_fake_provider_plaintext_secret");
+    expect(JSON.stringify(presented)).not.toContain("ghs_fake_provider_plaintext_secret");
+  });
+
+  it("residually redacts credential-shaped fields for a blank sandbox provider defaulting to fake", async () => {
+    const presented = await presentEnvironmentConfigForRead(
+      {} as never,
+      {
+        driver: "sandbox",
+        config: {
+          accessToken: "ghs_blank_provider_plaintext_secret",
+        },
+      },
+    );
+
+    expect(JSON.stringify(presented)).not.toContain("ghs_blank_provider_plaintext_secret");
   });
 });

@@ -208,9 +208,13 @@ export interface HostServices {
     resetManaged(params: WorkerToHostMethods["projects.managed.reset"][0]): Promise<WorkerToHostMethods["projects.managed.reset"][1]>;
   };
 
-  /** Provides `executionWorkspaces.get`. */
+  /** Provides `executionWorkspaces.get` and `executionWorkspaces.execute`. */
   executionWorkspaces: {
     get(params: WorkerToHostMethods["executionWorkspaces.get"][0]): Promise<WorkerToHostMethods["executionWorkspaces.get"][1]>;
+    execute(
+      params: WorkerToHostMethods["executionWorkspaces.execute"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["executionWorkspaces.execute"][1]>;
   };
 
   /** Provides `routines.managed.*`. */
@@ -425,6 +429,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "projects.getPrimaryWorkspace": "project.workspaces.read",
   "projects.getWorkspaceForIssue": "project.workspaces.read",
   "executionWorkspaces.get": "execution.workspaces.read",
+  "executionWorkspaces.execute": "execution.workspaces.execute",
   "projects.managed.get": "projects.managed",
   "projects.managed.reconcile": "projects.managed",
     "projects.managed.reset": "projects.managed",
@@ -645,6 +650,34 @@ export function createHostClientHandlers(
     throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
   }
 
+  function requireExecutionWorkspaceInvocationScope(
+    params: WorkerToHostMethods["executionWorkspaces.execute"][0],
+    context?: WorkerHostCallContext,
+  ): void {
+    const method = "executionWorkspaces.execute";
+    if (context?.invalidInvocationScope) {
+      throw new InvocationScopeDeniedError(
+        pluginId,
+        method,
+        "the worker referenced a missing, expired, or unknown invocation scope",
+      );
+    }
+
+    const scope = context?.invocationScope;
+    const scopedRunId = readNonEmptyString(scope?.runId);
+    const scopedAgentId = readNonEmptyString(scope?.agentId);
+    if (!scopedRunId || !scopedAgentId) {
+      throw new InvocationScopeDeniedError(pluginId, method, "run and agent context are required");
+    }
+    if (params.runId !== scopedRunId) {
+      throw new InvocationScopeDeniedError(
+        pluginId,
+        method,
+        `requested run "${params.runId}" but the current invocation is scoped to run "${scopedRunId}"`,
+      );
+    }
+  }
+
   /**
    * Assert that the plugin has the required capability for a method.
    * Throws `CapabilityDeniedError` if the capability is missing.
@@ -829,6 +862,10 @@ export function createHostClientHandlers(
     }),
     "executionWorkspaces.get": gated("executionWorkspaces.get", async (params) => {
       return services.executionWorkspaces.get(params);
+    }),
+    "executionWorkspaces.execute": gated("executionWorkspaces.execute", async (params, context) => {
+      requireExecutionWorkspaceInvocationScope(params, context);
+      return services.executionWorkspaces.execute(params, context);
     }),
     "projects.managed.get": gated("projects.managed.get", async (params) => {
       return services.projects.getManaged(params);

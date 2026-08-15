@@ -6,6 +6,7 @@ import type {
   WorkspaceRealizationRequest,
 } from "@paperclipai/shared";
 import type { RealizedExecutionWorkspace } from "./workspace-runtime.js";
+import { redactPersistedCredentialValues, REDACTED_EVENT_VALUE } from "../redaction.js";
 
 function parseObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -15,6 +16,54 @@ function parseObject(value: unknown): Record<string, unknown> {
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+// Provider-returned path strings (result.cwd / remoteCwd / remotePath) are
+// deliberately preserved by redactPersistedCredentialValues (*Path/*Cwd keys),
+// so a provider that smuggles a forwarded token into a path would persist it in
+// realizedCwd / remote.path / summary. Strip the raw and trimmed forms of every
+// forwarded credential value from provider-controlled paths before use.
+function redactForwardedValuesFromPath(
+  value: string | null,
+  forwardedValues: readonly string[],
+): string | null {
+  if (value === null || forwardedValues.length === 0) return value;
+  let out = value;
+  const variants = new Set<string>();
+  for (const forwarded of forwardedValues) {
+    for (const candidate of [forwarded, forwarded.trim(), JSON.stringify(forwarded), JSON.stringify(forwarded).slice(1, -1)]) {
+      if (candidate.length > 0) variants.add(candidate);
+    }
+  }
+  for (const variant of [...variants].sort((a, b) => b.length - a.length)) {
+    out = out.split(variant).join(REDACTED_EVENT_VALUE);
+  }
+  return out;
+}
+
+// redactPersistedCredentialValues deliberately preserves identifier-shaped keys
+// (ending in id/name/ref/path/cwd/url), so a provider could smuggle a forwarded
+// credential into e.g. { sandboxId: <GITHUB_TOKEN> } — or as a property NAME,
+// { [GITHUB_TOKEN]: "x" } — and have it survive into remote.sandboxId, summary,
+// and persisted metadata. Deep-scrub every forwarded value variant from both the
+// keys and the values of the whole metadata object before any field is read.
+function deepRedactForwardedValues(value: unknown, forwardedValues: readonly string[]): unknown {
+  if (forwardedValues.length === 0) return value;
+  if (typeof value === "string") {
+    return redactForwardedValuesFromPath(value, forwardedValues);
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => deepRedactForwardedValues(entry, forwardedValues));
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      const scrubbedKey = redactForwardedValuesFromPath(key, forwardedValues) ?? key;
+      out[scrubbedKey] = deepRedactForwardedValues(entry, forwardedValues);
+    }
+    return out;
+  }
+  return value;
 }
 
 function readNumber(value: unknown): number | null {
@@ -113,9 +162,15 @@ export function buildWorkspaceRealizationRecord(input: {
   request: WorkspaceRealizationRequest;
   realizedCwd?: string | null;
   providerMetadata?: Record<string, unknown> | null;
+  credentialOwnerAgentId?: string | null;
+  forwardedCredentialValues?: readonly string[];
 }): WorkspaceRealizationRecord {
   const leaseMetadata = input.lease.metadata ?? {};
-  const providerMetadata = input.providerMetadata ?? {};
+  const forwardedCredentialValues = input.forwardedCredentialValues ?? [];
+  const providerMetadata = deepRedactForwardedValues(
+    input.providerMetadata ?? {},
+    forwardedCredentialValues,
+  ) as Record<string, unknown>;
   const transport =
     input.environment.driver === "ssh" || input.environment.driver === "sandbox" || input.environment.driver === "plugin"
       ? input.environment.driver
@@ -125,7 +180,7 @@ export function buildWorkspaceRealizationRecord(input: {
     readString(leaseMetadata.remoteCwd) ??
     readString(providerMetadata.remotePath) ??
     null;
-  const realizedCwd = readString(input.realizedCwd);
+  const realizedCwd = redactForwardedValuesFromPath(readString(input.realizedCwd), forwardedCredentialValues);
   const remotePath = transport === "plugin" ? realizedCwd ?? providerRemotePath : providerRemotePath;
   const host = readString(leaseMetadata.host);
   const port = readNumber(leaseMetadata.port);
@@ -133,6 +188,27 @@ export function buildWorkspaceRealizationRecord(input: {
   const sandboxId = readString(leaseMetadata.sandboxId) ?? readString(providerMetadata.sandboxId);
   const providerOwnsWorkspaceSync =
     parseObject(parseObject(providerMetadata.workspaceRealization).sync).strategy === "provider_defined";
+
+  // Host-authoritative ownership markers, stamped only when the host forwarded
+  // agent-scoped realization credentials. The credential owner is taken from the
+  // lease metadata (set at acquire time), never from provider-returned data, so
+  // a plugin cannot spoof ownership. A realization with no forwarded credentials
+  // carries no markers and stays freely reusable — it holds nothing to protect —
+  // while a credential-bearing one records both markers so heartbeat reuse
+  // enforces same-agent ownership.
+  const invokingAgentId = readString(leaseMetadata.agentId);
+  const credentialOwnerAgentId = readString(input.credentialOwnerAgentId);
+  const ownershipMarkers: Record<string, unknown> = {};
+  if (credentialOwnerAgentId) {
+    ownershipMarkers.agentId = invokingAgentId ?? credentialOwnerAgentId;
+    ownershipMarkers.credentialAgentId = credentialOwnerAgentId;
+  }
+  // Provider realization results can echo forwarded credentials back in their
+  // metadata (e.g. { accessToken }); the lease-metadata sanitizer does not cover
+  // realization results, so redact secret-like values before persisting them.
+  // providerMetadata is already deep-scrubbed of forwarded credential values.
+  const sanitizedProviderMetadata = redactPersistedCredentialValues(providerMetadata) as Record<string, unknown>;
+  const persistedProviderMetadata = { ...sanitizedProviderMetadata, ...ownershipMarkers };
 
   const sync = (() => {
     if (transport === "local") {
@@ -224,7 +300,7 @@ export function buildWorkspaceRealizationRecord(input: {
         runtimeOverlay: input.request.runtimeOverlay,
         environmentDriver: input.environment.driver,
         provider,
-        providerMetadata,
+        providerMetadata: persistedProviderMetadata,
       },
     },
     summary,
@@ -242,6 +318,8 @@ export function buildWorkspaceRealizationRecordFromDriverInput(input: {
   };
   cwd?: string | null;
   providerMetadata?: Record<string, unknown> | null;
+  credentialOwnerAgentId?: string | null;
+  forwardedCredentialValues?: readonly string[];
 }): WorkspaceRealizationRecord {
   const request =
     readWorkspaceRealizationRequest(input.workspace.metadata?.workspaceRealizationRequest) ??
@@ -277,5 +355,7 @@ export function buildWorkspaceRealizationRecordFromDriverInput(input: {
     request,
     realizedCwd: input.cwd ?? null,
     providerMetadata: input.providerMetadata,
+    credentialOwnerAgentId: input.credentialOwnerAgentId ?? null,
+    forwardedCredentialValues: input.forwardedCredentialValues,
   });
 }

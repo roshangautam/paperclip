@@ -601,6 +601,7 @@ export const toolInvocations = pgTable(
     resultArtifactId: uuid("result_artifact_id"),
     errorCode: text("error_code"),
     errorMessage: text("error_message"),
+    leaseReleasePendingAt: timestamp("lease_release_pending_at", { withTimezone: true }),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -613,6 +614,13 @@ export const toolInvocations = pgTable(
     index("tool_invocations_project_idx").on(table.companyId, table.projectId),
     index("tool_invocations_gateway_idx").on(table.companyId, table.gatewayId),
     uniqueIndex("tool_invocations_company_idempotency_uq").on(table.companyId, table.idempotencyKey),
+    index("tool_invocations_lease_release_pending_idx")
+      .on(table.leaseReleasePendingAt, table.id)
+      .where(sql`${table.leaseReleasePendingAt} IS NOT NULL`),
+    check(
+      "tool_invocations_lease_release_requires_run_chk",
+      sql`${table.leaseReleasePendingAt} IS NULL OR ${table.runId} IS NOT NULL`,
+    ),
   ],
 );
 

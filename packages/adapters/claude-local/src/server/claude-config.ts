@@ -153,9 +153,17 @@ export async function writePaperclipClaudeMcpConfig(input: {
 }): Promise<string> {
   const configDir = path.join(input.stateDir, "runs", input.runId, "mcp");
   const configPath = path.join(configDir, "mcp-config.json");
+  await fs.mkdir(configDir, { recursive: true });
+  await fs.writeFile(configPath, buildPaperclipClaudeMcpConfig(input), { mode: 0o600 });
+  return configPath;
+}
+
+export function resolveUniquePaperclipClaudeMcpServerNames(
+  servers: AdapterRuntimeMcpServer[],
+): string[] {
   const usedNames = new Set<string>();
-  const mcpServers: Record<string, unknown> = {};
-  for (const server of input.servers) {
+  const names: string[] = [];
+  for (const server of servers) {
     let name = server.name;
     if (usedNames.has(name)) name = `${name}-${server.connectionId.slice(0, 8)}`;
     let suffix = 2;
@@ -164,15 +172,93 @@ export async function writePaperclipClaudeMcpConfig(input: {
       suffix += 1;
     }
     usedNames.add(name);
+    names.push(name);
+  }
+  return names;
+}
+
+export function buildPaperclipClaudeMcpConfig(input: {
+  servers: AdapterRuntimeMcpServer[];
+  bridge?: { url: string; token: string };
+}): string {
+  const uniqueNames = resolveUniquePaperclipClaudeMcpServerNames(input.servers);
+  const mcpServers: Record<string, unknown> = {};
+  input.servers.forEach((server, index) => {
+    const name = uniqueNames[index]!;
+    const endpoint = input.bridge ? new URL(server.url) : null;
     mcpServers[name] = {
       type: "http",
-      url: server.url,
-      headers: { Authorization: `Bearer ${server.token}` },
+      url: endpoint
+        ? new URL(`${endpoint.pathname}${endpoint.search}`, `${input.bridge!.url.replace(/\/+$/, "")}/`).toString()
+        : server.url,
+      headers: input.bridge
+        ? {
+            Authorization: `Bearer ${input.bridge.token}`,
+            "x-paperclip-tool-gateway-token": server.token,
+          }
+        : { Authorization: `Bearer ${server.token}` },
     };
+  });
+  return JSON.stringify({ mcpServers });
+}
+
+export async function materializeRemoteClaudeMcpConfig(input: {
+  runId: string;
+  target: AdapterExecutionTarget | null | undefined;
+  configPath: string;
+  contents: string;
+  options: AdapterExecutionTargetShellOptions;
+}): Promise<void> {
+  const result = await runAdapterExecutionTargetShellCommand(
+    input.runId,
+    input.target,
+    `mkdir -p ${shellQuote(path.posix.dirname(input.configPath))} && ` +
+      `printf '%s' "$PAPERCLIP_CLAUDE_MCP_CONFIG" > ${shellQuote(input.configPath)} && ` +
+      `chmod 600 ${shellQuote(input.configPath)}`,
+    {
+      ...input.options,
+      env: { ...input.options.env, PAPERCLIP_CLAUDE_MCP_CONFIG: input.contents },
+    },
+  );
+  if (result.timedOut || result.exitCode !== 0) {
+    throw new Error(`Failed to write remote Claude MCP config${result.timedOut ? ": timed out" : `: exit ${result.exitCode ?? "unknown"}`}`);
   }
-  await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(configPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
-  return configPath;
+}
+
+// The materialized remote MCP config embeds the callback-bridge bearer token and
+// managed tool-gateway tokens. The managed workspace restore excludes
+// .paperclip-runtime, so this file would otherwise persist readable on the
+// remote resource after the run; attempt removal on both success and failure,
+// and report cleanup failures without blocking bridge teardown or workspace restore.
+export async function removeRemoteClaudeMcpConfig(input: {
+  runId: string;
+  target: AdapterExecutionTarget | null | undefined;
+  configPath: string;
+  options: AdapterExecutionTargetShellOptions;
+}): Promise<Error | null> {
+  let result: Awaited<ReturnType<typeof runAdapterExecutionTargetShellCommand>>;
+  try {
+    result = await runAdapterExecutionTargetShellCommand(
+      input.runId,
+      input.target,
+      `rm -f ${shellQuote(input.configPath)}`,
+      input.options,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const failure = new Error(`Failed to remove remote Claude MCP config: ${message}`);
+    const logPromise = input.options.onLog?.("stderr", `[paperclip] ${failure.message}\n`);
+    if (logPromise) await logPromise.catch(() => undefined);
+    return failure;
+  }
+  if (result.timedOut || result.exitCode !== 0) {
+    const reason = result.timedOut ? "timed out" : `exit ${result.exitCode ?? "unknown"}`;
+    const failure = new Error(`Failed to remove remote Claude MCP config: ${reason}`);
+    const logPromise = input.options.onLog?.("stderr", `[paperclip] ${failure.message}\n`);
+    if (logPromise) await logPromise.catch(() => undefined);
+    return failure;
+  }
+  return null;
 }
 
 export async function prepareClaudeConfigSeed(

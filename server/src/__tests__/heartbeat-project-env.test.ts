@@ -10,6 +10,30 @@ import {
   resolveExecutionRunAdapterConfig,
 } from "../services/heartbeat.ts";
 
+const GITHUB_APP_PUSH_CREDENTIAL_KEY_SETS = [
+  ["GITHUB_APP_ID", "GITHUB_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
+  ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
+  ["GITHUB_APP_ID", "GITHUB_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY_FILE"],
+  ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY_FILE"],
+] as const;
+const GITHUB_PUSH_CREDENTIAL_REQUIRED_KEYS = [
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GITHUB_APP_ID",
+  "GITHUB_INSTALLATION_ID",
+  "GITHUB_APP_PRIVATE_KEY",
+  "GITHUB_APP_INSTALLATION_ID",
+  "GITHUB_APP_PRIVATE_KEY_FILE",
+];
+const GITHUB_PUSH_CREDENTIAL_REQUIREMENT = {
+  keys: ["GH_TOKEN", "GITHUB_TOKEN"],
+  alternativeKeySets: GITHUB_APP_PUSH_CREDENTIAL_KEY_SETS,
+  consumerScopes: ["agent", "project"],
+  reason: "push_write_credential_missing",
+  remediation:
+    "GitHub PR workflow requires GH_TOKEN, GITHUB_TOKEN, or a complete GitHub App identity bound at project or agent scope.",
+} as const;
+
 describe("resolveExecutionRunAdapterConfig", () => {
   it("overlays environment, project, and routine env on top of agent env and unions secret keys", async () => {
     const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
@@ -352,36 +376,37 @@ describe("resolveExecutionRunAdapterConfig", () => {
     expect(resolveEnvBindings).not.toHaveBeenCalled();
   });
 
-  it("rejects inline sensitive env values for low-trust runs", async () => {
-    await expect(resolveExecutionRunAdapterConfig({
-      companyId: "company-1",
-      agentId: "agent-1",
-      issueId: "issue-1",
-      executionRunConfig: {
-        env: {
-          OPENAI_API_KEY: "inline-secret",
+  it.each(["OPENAI_API_KEY", "GH_TOKEN"])(
+    "rejects inline sensitive %s values for low-trust runs",
+    async (envKey) => {
+      await expect(resolveExecutionRunAdapterConfig({
+        companyId: "company-1",
+        agentId: "agent-1",
+        issueId: "issue-1",
+        executionRunConfig: {
+          env: { [envKey]: "inline-secret" },
         },
-      },
-      projectEnv: null,
-      trustPreset: {
-        kind: "low_trust_review",
-        preset: LOW_TRUST_REVIEW_PRESET,
-        boundary: {
-          mode: LOW_TRUST_REVIEW_PRESET,
-          companyId: "company-1",
-          issueIds: ["issue-1"],
+        projectEnv: null,
+        trustPreset: {
+          kind: "low_trust_review",
+          preset: LOW_TRUST_REVIEW_PRESET,
+          boundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: "company-1",
+            issueIds: ["issue-1"],
+          },
+          sourcePresets: {},
         },
-        sourcePresets: {},
-      },
-      secretsSvc: {
-        resolveAdapterConfigForRuntime: vi.fn(),
-        resolveEnvBindings: vi.fn(),
-      } as any,
-    })).rejects.toMatchObject({
-      status: 422,
-      details: { code: "low_trust_inline_sensitive_env_denied" },
-    });
-  });
+        secretsSvc: {
+          resolveAdapterConfigForRuntime: vi.fn(),
+          resolveEnvBindings: vi.fn(),
+        } as any,
+      })).rejects.toMatchObject({
+        status: 422,
+        details: { code: "low_trust_inline_sensitive_env_denied" },
+      });
+    },
+  );
 
   it("fails push-capability preflight when no GitHub write credential is bound at agent or project scope", async () => {
     await expect(resolveExecutionRunAdapterConfig({
@@ -390,23 +415,18 @@ describe("resolveExecutionRunAdapterConfig", () => {
       issueId: "issue-1",
       executionRunConfig: { env: { AGENT_ONLY: "agent-only" } },
       projectEnv: { PROJECT_ONLY: "project-only" },
-      requiredScopedEnvBinding: {
-        keys: ["GH_TOKEN", "GITHUB_TOKEN"],
-        consumerScopes: ["agent", "project"],
-        reason: "push_write_credential_missing",
-        remediation: "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
-      },
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
       secretsSvc: {
         resolveAdapterConfigForRuntime: vi.fn(),
         resolveEnvBindings: vi.fn(),
       } as any,
     })).rejects.toMatchObject({
       code: "configuration_incomplete",
-      message: expect.stringContaining("GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN"),
+      message: expect.stringContaining("complete GitHub App identity"),
       resultJson: {
         configurationIncomplete: {
           reason: "push_write_credential_missing",
-          requiredEnvKeys: ["GH_TOKEN", "GITHUB_TOKEN"],
+          requiredEnvKeys: GITHUB_PUSH_CREDENTIAL_REQUIRED_KEYS,
           requiredScopes: ["agent", "project"],
           missingBindings: [],
         },
@@ -434,12 +454,7 @@ describe("resolveExecutionRunAdapterConfig", () => {
       projectId: "project-1",
       executionRunConfig: { env: { AGENT_ONLY: "agent-only" } },
       projectEnv: { GH_TOKEN: { type: "plain", value: "github-token" } },
-      requiredScopedEnvBinding: {
-        keys: ["GH_TOKEN", "GITHUB_TOKEN"],
-        consumerScopes: ["agent", "project"],
-        reason: "push_write_credential_missing",
-        remediation: "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
-      },
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
       secretsSvc: {
         resolveAdapterConfigForRuntime,
         resolveEnvBindings,
@@ -457,6 +472,359 @@ describe("resolveExecutionRunAdapterConfig", () => {
       consumerType: "project",
       consumerId: "project-1",
     });
+  });
+
+  it.each([
+    ["installation ID and inline private key", {
+      GITHUB_INSTALLATION_ID: "installation-1",
+      GITHUB_APP_PRIVATE_KEY: "private-key-1",
+    }],
+    ["App installation ID and inline private key", {
+      GITHUB_APP_INSTALLATION_ID: "installation-2",
+      GITHUB_APP_PRIVATE_KEY: "private-key-2",
+    }],
+    ["installation ID and private-key file", {
+      GITHUB_INSTALLATION_ID: "installation-3",
+      GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app-3.pem",
+    }],
+    ["App installation ID and private-key file", {
+      GITHUB_APP_INSTALLATION_ID: "installation-4",
+      GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app-4.pem",
+    }],
+  ])("passes push-capability preflight with a complete GitHub App tuple using %s", async (_label, projectEnv) => {
+    const resolveAdapterConfigForRuntime = vi.fn(async (_companyId, config: Record<string, unknown>) => ({
+      config,
+      secretKeys: new Set<string>(),
+      manifest: [],
+    }));
+    const resolveEnvBindings = vi.fn(async (_companyId, env: Record<string, unknown>) => ({
+      env,
+      secretKeys: new Set<string>(),
+      manifest: [],
+    }));
+    const collectMissingRuntimeBindings = vi.fn().mockResolvedValue([]);
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      projectId: "project-1",
+      executionRunConfig: { env: { GITHUB_APP_ID: "app-1" } },
+      projectEnv,
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+        collectMissingRuntimeBindings,
+      } as any,
+    });
+
+    expect(result.resolvedConfig.env).toEqual({
+      GITHUB_APP_ID: "app-1",
+      ...projectEnv,
+    });
+    expect(resolveAdapterConfigForRuntime).toHaveBeenCalledOnce();
+    expect(resolveEnvBindings).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["App ID", {
+      GITHUB_INSTALLATION_ID: "installation-without-app-id",
+      GITHUB_APP_PRIVATE_KEY: "private-key-without-app-id",
+    }],
+    ["installation ID", {
+      GITHUB_APP_ID: "app-without-installation-id",
+      GITHUB_APP_PRIVATE_KEY: "private-key-without-installation-id",
+    }],
+    ["private key", {
+      GITHUB_APP_ID: "app-without-private-key",
+      GITHUB_INSTALLATION_ID: "installation-without-private-key",
+    }],
+  ])("rejects an incomplete GitHub App tuple missing %s before secret resolution", async (_label, env) => {
+    const resolveAdapterConfigForRuntime = vi.fn();
+    const resolveEnvBindings = vi.fn();
+    const collectMissingRuntimeBindings = vi.fn();
+
+    await expect(resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      executionRunConfig: { env },
+      projectEnv: null,
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+        collectMissingRuntimeBindings,
+      } as any,
+    })).rejects.toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          reason: "push_write_credential_missing",
+          requiredEnvKeys: GITHUB_PUSH_CREDENTIAL_REQUIRED_KEYS,
+          missingBindings: [],
+        },
+      },
+    });
+    expect(collectMissingRuntimeBindings).not.toHaveBeenCalled();
+    expect(resolveAdapterConfigForRuntime).not.toHaveBeenCalled();
+    expect(resolveEnvBindings).not.toHaveBeenCalled();
+  });
+
+  it("rejects a GitHub App tuple when project env blanks a required agent binding", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn();
+    const resolveEnvBindings = vi.fn();
+    const collectMissingRuntimeBindings = vi.fn();
+
+    await expect(resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      projectId: "project-1",
+      executionRunConfig: {
+        env: {
+          GITHUB_APP_ID: "app-1",
+          GITHUB_INSTALLATION_ID: "installation-1",
+          GITHUB_APP_PRIVATE_KEY: "private-key-1",
+        },
+      },
+      projectEnv: { GITHUB_APP_PRIVATE_KEY: "" },
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+        collectMissingRuntimeBindings,
+      } as any,
+    })).rejects.toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          reason: "push_write_credential_missing",
+          requiredEnvKeys: GITHUB_PUSH_CREDENTIAL_REQUIRED_KEYS,
+          missingBindings: [],
+        },
+      },
+    });
+    expect(collectMissingRuntimeBindings).not.toHaveBeenCalled();
+    expect(resolveAdapterConfigForRuntime).not.toHaveBeenCalled();
+    expect(resolveEnvBindings).not.toHaveBeenCalled();
+  });
+
+  it("rejects a GitHub App tuple when routine env overrides a required agent binding", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn();
+    const resolveEnvBindings = vi.fn();
+    const collectMissingRuntimeBindings = vi.fn();
+
+    await expect(resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      routineId: "routine-1",
+      executionRunConfig: {
+        env: {
+          GITHUB_APP_ID: "app-1",
+          GITHUB_INSTALLATION_ID: "installation-1",
+          GITHUB_APP_PRIVATE_KEY: "private-key-1",
+        },
+      },
+      projectEnv: null,
+      routineEnv: { GITHUB_APP_PRIVATE_KEY: "" },
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+        collectMissingRuntimeBindings,
+      } as any,
+    })).rejects.toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          reason: "push_write_credential_missing",
+          requiredEnvKeys: GITHUB_PUSH_CREDENTIAL_REQUIRED_KEYS,
+          missingBindings: [],
+        },
+      },
+    });
+    expect(collectMissingRuntimeBindings).not.toHaveBeenCalled();
+    expect(resolveAdapterConfigForRuntime).not.toHaveBeenCalled();
+    expect(resolveEnvBindings).not.toHaveBeenCalled();
+  });
+
+  it("retains the push-credential blocker when a required GitHub App secret binding is missing", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn();
+    const resolveEnvBindings = vi.fn();
+    const collectMissingRuntimeBindings = vi.fn(async (_companyId, _env, context) =>
+      context.consumerType === "project"
+        ? [{
+            consumerType: "project",
+            consumerId: "project-1",
+            configPath: "env.GITHUB_APP_PRIVATE_KEY",
+            envKey: "GITHUB_APP_PRIVATE_KEY",
+            bindingType: "user_secret_ref",
+            secretId: null,
+            secretName: null,
+            userSecretDefinitionId: "definition-1",
+            userSecretDefinitionKey: "github_app_private_key",
+            userSecretDefinitionName: "GitHub App private key",
+            responsibleUserId: context.responsibleUserId,
+            errorCode: "user_secret_missing",
+          }]
+        : [],
+    );
+    const credentialValues = [
+      "app-id-value-must-not-leak",
+      "installation-value-must-not-leak",
+      "private-key-value-must-not-leak",
+    ];
+
+    const error = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      projectId: "project-1",
+      responsibleUserId: "user-1",
+      executionRunConfig: { env: { GITHUB_APP_ID: credentialValues[0] } },
+      projectEnv: {
+        GITHUB_INSTALLATION_ID: credentialValues[1],
+        GITHUB_APP_PRIVATE_KEY: {
+          type: "user_secret_ref",
+          key: "github_app_private_key",
+          required: true,
+        },
+      },
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+        collectMissingRuntimeBindings,
+      } as any,
+    }).then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+
+    expect(error).toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          reason: "push_write_credential_missing",
+          requiredEnvKeys: GITHUB_PUSH_CREDENTIAL_REQUIRED_KEYS,
+          missingBindings: [expect.objectContaining({
+            envKey: "GITHUB_APP_PRIVATE_KEY",
+            bindingType: "user_secret_ref",
+          })],
+        },
+      },
+    });
+    const serializedFailure = JSON.stringify(error);
+    expect(serializedFailure).toContain("GITHUB_APP_PRIVATE_KEY");
+    for (const value of credentialValues) {
+      expect(serializedFailure).not.toContain(value);
+    }
+    expect(collectMissingRuntimeBindings).toHaveBeenCalledTimes(2);
+    expect(resolveAdapterConfigForRuntime).not.toHaveBeenCalled();
+    expect(resolveEnvBindings).not.toHaveBeenCalled();
+  });
+
+  it("rejects a GitHub App tuple when an optional secret ref resolves to no value", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
+      config: { env: { GITHUB_APP_ID: "app-1" } },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+    const resolveEnvBindings = vi.fn().mockResolvedValue({
+      env: { GITHUB_INSTALLATION_ID: "installation-1" },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+    const collectMissingRuntimeBindings = vi.fn().mockResolvedValue([]);
+
+    await expect(resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      projectId: "project-1",
+      executionRunConfig: { env: { GITHUB_APP_ID: "app-1" } },
+      projectEnv: {
+        GITHUB_INSTALLATION_ID: "installation-1",
+        GITHUB_APP_PRIVATE_KEY: {
+          type: "user_secret_ref",
+          key: "github_app_private_key",
+          required: false,
+        },
+      },
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+        collectMissingRuntimeBindings,
+      } as any,
+    })).rejects.toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          reason: "push_write_credential_missing",
+          requiredEnvKeys: GITHUB_PUSH_CREDENTIAL_REQUIRED_KEYS,
+          missingBindings: [],
+        },
+      },
+    });
+    expect(resolveAdapterConfigForRuntime).toHaveBeenCalledOnce();
+    expect(resolveEnvBindings).toHaveBeenCalledOnce();
+  });
+
+  it("does not let an environment token mask an unresolved agent-scoped token", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
+      config: { env: {} },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+    const resolveEnvBindings = vi.fn().mockResolvedValue({
+      env: { GITHUB_TOKEN: "environment-token-must-not-satisfy-agent-scope" },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    });
+    const collectMissingRuntimeBindings = vi.fn().mockResolvedValue([]);
+
+    const error = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      environmentId: "environment-1",
+      environmentEnv: { GITHUB_TOKEN: "environment-token-must-not-satisfy-agent-scope" },
+      executionRunConfig: {
+        env: {
+          GITHUB_TOKEN: {
+            type: "user_secret_ref",
+            key: "github_token",
+            required: false,
+          },
+        },
+      },
+      projectEnv: null,
+      requiredScopedEnvBinding: GITHUB_PUSH_CREDENTIAL_REQUIREMENT,
+      secretsSvc: {
+        resolveAdapterConfigForRuntime,
+        resolveEnvBindings,
+        collectMissingRuntimeBindings,
+      } as any,
+    }).then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+
+    expect(error).toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          reason: "push_write_credential_missing",
+          requiredEnvKeys: GITHUB_PUSH_CREDENTIAL_REQUIRED_KEYS,
+          missingBindings: [],
+        },
+      },
+    });
+    expect(JSON.stringify(error)).not.toContain("environment-token-must-not-satisfy-agent-scope");
   });
 });
 

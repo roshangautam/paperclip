@@ -10,6 +10,8 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issues,
+  toolActionRequests,
+  toolInvocations,
 } from "@paperclipai/db";
 import type {
   Environment,
@@ -66,11 +68,18 @@ import {
   resolvePluginExecuteRpcTimeoutMs,
   resumePluginEnvironmentLease,
 } from "./plugin-environment-driver.js";
-import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
+import {
+  collectSecretRefPaths,
+  inspectSecretRefPaths,
+  scopeConfigResourceArrays,
+  writeConfigValueAtPath,
+} from "./json-schema-secret-refs.js";
 import { assertClass3StaticLeaseAllowed, secretService } from "./secrets.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
+import { redactPersistedCredentialValues } from "../redaction.js";
+import { readSignedToolArgumentsPayload } from "./tool-content-guards.js";
 import {
   isAutomaticReusableEnvironmentLeaseCleanupCandidate,
   isReusableEnvironmentLeaseDestroyRequestCandidate,
@@ -94,51 +103,62 @@ export function buildEnvironmentLeaseContext(input: {
   };
 }
 
-function stripSecretRefValuesFromPluginLeaseMetadata(input: {
+function secretRefContainerPaths(paths: Iterable<string>): Set<string> {
+  const containers = new Set<string>();
+  for (const path of paths) {
+    const segments = path.split(".");
+    for (let length = 1; length < segments.length; length += 1) {
+      containers.add(segments.slice(0, length).join("."));
+    }
+  }
+  return containers;
+}
+
+function stripSecretRefsFromPluginConfigSnapshot(input: {
+  config: Record<string, unknown> | null | undefined;
+  schema: Record<string, unknown> | null | undefined;
+}): Record<string, unknown> {
+  let sanitized = structuredClone(input.config ?? {}) as Record<string, unknown>;
+  // A schema-governed config snapshot is reconstructed on reuse by re-inserting
+  // secret-refs at DB-bound config paths, so structure must be preserved and only
+  // schema-declared secret values removed. Without a schema there is no safe
+  // reconstruction contract, so fall back to value-level credential redaction.
+  if (!input.schema) {
+    return redactPersistedCredentialValues(sanitized) as Record<string, unknown>;
+  }
+  // Security: when the schema's secret-ref coverage cannot be fully enumerated,
+  // removing only the declared paths could leave a plaintext credential in the
+  // reuse snapshot. A reuse snapshot is intentionally credential-free, so fall
+  // back to the value-level redactor (as the no-schema branch does) whenever
+  // inspection is incomplete.
+  const inspection = inspectSecretRefPaths(input.schema, sanitized);
+  for (const path of inspection.paths) {
+    sanitized = writeConfigValueAtPath(sanitized, path, undefined);
+  }
+  if (!inspection.complete) {
+    return redactPersistedCredentialValues(sanitized, {
+      preserveContainerPaths: secretRefContainerPaths(inspection.paths),
+    }) as Record<string, unknown>;
+  }
+  return sanitized;
+}
+
+function sanitizePluginProviderLeaseMetadata(input: {
   metadata: Record<string, unknown> | null | undefined;
   schema: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
-  const sanitized = structuredClone(input.metadata ?? {}) as Record<string, unknown>;
-
-  for (const path of collectSecretRefPaths(input.schema)) {
-    const keys = path.split(".");
-    const parents: Array<{ container: Record<string, unknown>; key: string }> = [];
-    let cursor: Record<string, unknown> | null = sanitized;
-
-    for (let index = 0; index < keys.length - 1; index += 1) {
-      const key = keys[index]!;
-      const next = cursor?.[key];
-      if (!next || typeof next !== "object" || Array.isArray(next)) {
-        cursor = null;
-        break;
-      }
-      parents.push({ container: cursor, key });
-      cursor = next as Record<string, unknown>;
-    }
-
-    if (!cursor) continue;
-
-    const leafKey = keys[keys.length - 1]!;
-    if (!Object.prototype.hasOwnProperty.call(cursor, leafKey)) continue;
-    delete cursor[leafKey];
-
-    for (let index = parents.length - 1; index >= 0; index -= 1) {
-      const { container, key } = parents[index]!;
-      const value = container[key];
-      if (
-        value &&
-        typeof value === "object" &&
-        !Array.isArray(value) &&
-        Object.keys(value as Record<string, unknown>).length === 0
-      ) {
-        delete container[key];
-      } else {
-        break;
-      }
-    }
+  let sanitized = structuredClone(input.metadata ?? {}) as Record<string, unknown>;
+  // Provider-returned lease metadata is an untrusted persistence boundary: the
+  // config schema identifies restorable secret-ref paths but does not constrain
+  // arbitrary fields a provider returns, so remove declared refs and then redact
+  // residual credential-shaped values without collapsing reuse-critical structure.
+  const secretRefPaths = collectSecretRefPaths(input.schema, sanitized);
+  for (const path of secretRefPaths) {
+    sanitized = writeConfigValueAtPath(sanitized, path, undefined);
   }
-
-  return sanitized;
+  return redactPersistedCredentialValues(sanitized, {
+    preserveContainerPaths: secretRefContainerPaths(secretRefPaths),
+  }) as Record<string, unknown>;
 }
 
 export interface EnvironmentDriverAcquireInput {
@@ -178,6 +198,62 @@ export interface EnvironmentDriverReleaseInput {
   cleanupClaimId?: string;
 }
 
+const REALIZATION_CREDENTIAL_ENV_KEYS = new Set([
+  "GITHUB_APP_ID",
+  "GITHUB_INSTALLATION_ID",
+  "GITHUB_APP_INSTALLATION_ID",
+  "GITHUB_APP_PRIVATE_KEY",
+  "GITHUB_APP_PRIVATE_KEY_FILE",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+]);
+
+// The agent that owns a realization's forwarded credentials, or null when no
+// agent-scoped realization credentials were supplied. Used to stamp the
+// heartbeat reuse ownership marker so a workspace realized with one agent's
+// credentials is not reused by another agent.
+function resolveRealizationCredentialOwnerAgentId(input: {
+  lease: Pick<EnvironmentLease, "metadata">;
+  env?: Record<string, string>;
+}): string | null {
+  const env = input.env ?? {};
+  const suppliesCredentials = Object.entries(env).some(
+    ([key, value]) => REALIZATION_CREDENTIAL_ENV_KEYS.has(key) && typeof value === "string" && value.length > 0,
+  );
+  if (!suppliesCredentials) return null;
+  return readString(input.lease.metadata?.agentId);
+}
+
+// Env keys whose forwarded VALUE is secret credential material rather than a
+// non-secret identifier. Only these are stripped from a returned realization
+// path: GITHUB_APP_ID, installation IDs, and the GITHUB_APP_PRIVATE_KEY_FILE
+// path are identifiers the orchestrator intentionally preserves, and scrubbing
+// them would corrupt cwd/remotePath and diverge from the separately persisted
+// lease.metadata.remoteCwd.
+const REALIZATION_SECRET_VALUE_ENV_KEYS = new Set([
+  "GITHUB_APP_PRIVATE_KEY",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+]);
+
+// Forwarded secret-bearing env values that a provider could smuggle back into a
+// returned path. Passed to the realization record builder so any such token is
+// stripped before it persists, while non-secret identifiers are retained.
+export function resolveForwardedCredentialValues(input: { env?: Record<string, string> }): string[] {
+  const env = input.env ?? {};
+  const values: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (
+      REALIZATION_SECRET_VALUE_ENV_KEYS.has(key)
+      && typeof value === "string"
+      && value.trim().length > 0
+    ) {
+      values.push(value);
+    }
+  }
+  return values;
+}
+
 function resolvePluginSandboxRpcTimeoutMs(config: Record<string, unknown>): number | undefined {
   const timeoutCandidates = [
     typeof config.timeoutMs === "number" ? config.timeoutMs : undefined,
@@ -204,6 +280,7 @@ export interface EnvironmentDriverLeaseInput {
 }
 
 export interface EnvironmentDriverRealizeWorkspaceInput extends EnvironmentDriverLeaseInput {
+  env?: Record<string, string>;
   workspace: {
     localPath?: string;
     remotePath?: string;
@@ -219,6 +296,7 @@ export interface EnvironmentDriverExecuteInput extends EnvironmentDriverLeaseInp
   env?: Record<string, string>;
   stdin?: string;
   timeoutMs?: number;
+  workspaceRealization?: Record<string, unknown>;
 }
 
 export interface EnvironmentRuntimeDriver {
@@ -244,6 +322,13 @@ export interface EnvironmentRuntimeLeaseRecord {
 
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_TIMEOUT_MS = 5_000;
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS = 100;
+// Bounded lifetime for the in-memory sandbox runtime-config cache. Entries hold
+// resolved lease credentials, so they must not outlive the lease. Because a
+// lease can be released by a different runtime-service instance (whose eviction
+// path never runs here), a TTL and size cap guarantee released-lease secrets
+// cannot be retained for the lifetime of this process.
+const SANDBOX_RUNTIME_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000;
+const SANDBOX_RUNTIME_CONFIG_CACHE_MAX_ENTRIES = 256;
 const SANDBOX_CLEANUP_RETRY_DELAY_MS = 5 * 60 * 1000;
 const SANDBOX_CLEANUP_CLAIM_STALE_MS = 5 * 60 * 1000;
 const SANDBOX_CLEANUP_CLAIM_RENEW_MS = 60 * 1000;
@@ -330,12 +415,12 @@ function buildSandboxCustomImageReplay(input: {
   runtimeConfig: SandboxEnvironmentConfig;
   schema?: Record<string, unknown> | null;
 }): SandboxCustomImageReplay | null {
-  const storedConfig = stripSecretRefValuesFromPluginLeaseMetadata({
-    metadata: input.storedConfig as unknown as Record<string, unknown>,
+  const storedConfig = stripSecretRefsFromPluginConfigSnapshot({
+    config: input.storedConfig as unknown as Record<string, unknown>,
     schema: input.schema,
   });
-  const runtimeConfig = stripSecretRefValuesFromPluginLeaseMetadata({
-    metadata: input.runtimeConfig as unknown as Record<string, unknown>,
+  const runtimeConfig = stripSecretRefsFromPluginConfigSnapshot({
+    config: input.runtimeConfig as unknown as Record<string, unknown>,
     schema: input.schema,
   });
   const setEntries: Array<[string, unknown]> = [];
@@ -731,6 +816,7 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         lease: input.lease,
         workspace: input.workspace,
         cwd: input.workspace.localPath ?? input.workspace.remotePath ?? null,
+        credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
       });
       return {
         cwd: input.workspace.localPath ?? input.workspace.remotePath ?? "/",
@@ -794,6 +880,7 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
           typeof input.lease.metadata?.remoteCwd === "string" && input.lease.metadata.remoteCwd.trim().length > 0
             ? input.lease.metadata.remoteCwd.trim()
             : input.workspace.remotePath ?? input.workspace.localPath ?? null,
+        credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
       });
       return {
         cwd: record.remote.path ?? record.local.path,
@@ -859,6 +946,26 @@ function createSandboxEnvironmentDriver(
   const pluginWorkerReadyPollMs = options.pluginWorkerReadyPollMs ?? DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS;
   const environmentsSvc = environmentService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
+  const runtimeConfigByLeaseId = new Map<string, {
+    provider: string;
+    promise: Promise<Record<string, unknown>>;
+    expiresAt: number;
+  }>();
+
+  function clearSandboxRuntimeConfig(leaseId: string) {
+    runtimeConfigByLeaseId.delete(leaseId);
+  }
+
+  function pruneExpiredSandboxRuntimeConfig(now: number) {
+    for (const [leaseId, entry] of runtimeConfigByLeaseId) {
+      if (entry.expiresAt <= now) runtimeConfigByLeaseId.delete(leaseId);
+    }
+    while (runtimeConfigByLeaseId.size > SANDBOX_RUNTIME_CONFIG_CACHE_MAX_ENTRIES) {
+      const oldest = runtimeConfigByLeaseId.keys().next().value;
+      if (oldest === undefined) break;
+      runtimeConfigByLeaseId.delete(oldest);
+    }
+  }
 
   function secretBindingTargetForLease(lease: EnvironmentLease) {
     return lease.metadata?.[LEASE_SCOPED_SECRET_BINDINGS_KEY] === true
@@ -954,9 +1061,12 @@ function createSandboxEnvironmentDriver(
     const resolvedVersionsByPath = new Map(
       input.resolvedSecretVersions.map((resolved) => [resolved.configPath, resolved]),
     );
+    const runtimeSecretRefs = input.secretRefs.filter((ref) =>
+      resolvedVersionsByPath.has(ref.configPath),
+    );
     if (
       resolvedVersionsByPath.size !== input.resolvedSecretVersions.length ||
-      input.secretRefs.length !== input.resolvedSecretVersions.length
+      runtimeSecretRefs.length !== input.resolvedSecretVersions.length
     ) {
       throw new Error("Sandbox secret resolution changed while acquiring lease.");
     }
@@ -968,12 +1078,12 @@ function createSandboxEnvironmentDriver(
         eq(companySecretBindings.companyId, input.companyId),
         eq(companySecretBindings.targetType, "environment"),
         eq(companySecretBindings.targetId, input.environmentId),
-        inArray(companySecretBindings.configPath, input.secretRefs.map((ref) => ref.configPath)),
+        inArray(companySecretBindings.configPath, runtimeSecretRefs.map((ref) => ref.configPath)),
       ));
     const bindingsByPath = new Map(bindings.map((binding) => [binding.configPath, binding]));
     const bindingsToValidate: Parameters<typeof validateSandboxSecretVersions>[0]["bindings"] = [];
     const leaseBindings: Array<typeof companySecretBindings.$inferInsert> = [];
-    for (const ref of input.secretRefs) {
+    for (const ref of runtimeSecretRefs) {
       const binding = bindingsByPath.get(ref.configPath);
       const resolved = resolvedVersionsByPath.get(ref.configPath);
       if (
@@ -1796,11 +1906,13 @@ function createSandboxEnvironmentDriver(
     cleanupClaimId?: string;
     clearReusableResourceOwner?: boolean;
   }, transactionDb?: Db): Promise<EnvironmentLease | null> {
-    return await releaseEnvironmentLeaseAndDeleteBindings({
+    const released = await releaseEnvironmentLeaseAndDeleteBindings({
       db,
       ...input,
       transactionDb,
     });
+    if (released) clearSandboxRuntimeConfig(input.lease.id);
+    return released;
   }
 
   async function persistSandboxRelease(input: {
@@ -1930,6 +2042,9 @@ function createSandboxEnvironmentDriver(
     }
 
     await reconcileExecutionWorkspaceAfterSandboxCleanup(finalizedLease);
+    if (finalizedLease?.status !== "pending_cleanup") {
+      clearSandboxRuntimeConfig(input.release.lease.id);
+    }
     return finalizedLease;
   }
 
@@ -2026,13 +2141,73 @@ function createSandboxEnvironmentDriver(
     provider: string;
     acquisitionContext?: SandboxAcquisitionContext;
   }): Promise<Record<string, unknown>> {
+    const now = Date.now();
+    pruneExpiredSandboxRuntimeConfig(now);
+    const cached = runtimeConfigByLeaseId.get(input.lease.id);
+    if (cached && cached.expiresAt > now) {
+      if (cached.provider !== input.provider) {
+        throw new Error(
+          `Sandbox lease "${input.lease.id}" cannot change providers from "${cached.provider}" to "${input.provider}".`,
+        );
+      }
+      return await cached.promise;
+    }
+
+    const promise = resolveSandboxRuntimeConfigUncached(input);
+    runtimeConfigByLeaseId.set(input.lease.id, {
+      provider: input.provider,
+      promise,
+      expiresAt: now + SANDBOX_RUNTIME_CONFIG_CACHE_TTL_MS,
+    });
+    try {
+      return await promise;
+    } catch (error) {
+      if (runtimeConfigByLeaseId.get(input.lease.id)?.promise === promise) {
+        clearSandboxRuntimeConfig(input.lease.id);
+      }
+      throw error;
+    }
+  }
+
+  async function resolveSandboxRuntimeConfigUncached(input: {
+    environment: Environment;
+    lease: EnvironmentLease;
+    provider: string;
+    acquisitionContext?: SandboxAcquisitionContext;
+  }): Promise<Record<string, unknown>> {
+    const resourceScopes = {
+      agent: input.acquisitionContext?.agentId
+        ?? readString(input.lease.metadata?.agentId),
+    };
     const secretBindingTarget = secretBindingTargetForLease(input.lease);
+    const leaseSecretBindings = secretBindingTarget
+      ? await db
+          .select({
+            secretId: companySecretBindings.secretId,
+            configPath: companySecretBindings.configPath,
+          })
+          .from(companySecretBindings)
+          .where(and(
+            eq(companySecretBindings.companyId, input.lease.companyId),
+            eq(companySecretBindings.targetType, secretBindingTarget.targetType),
+            eq(companySecretBindings.targetId, secretBindingTarget.targetId),
+          ))
+      : [];
+    const restoreLeaseSecretRefs = (config: Record<string, unknown>) =>
+      leaseSecretBindings.reduce(
+        (restored, binding) => writeConfigValueAtPath(
+          restored,
+          binding.configPath,
+          binding.secretId,
+        ),
+        config,
+      );
     if (input.acquisitionContext) {
       const hasPinnedCustomImageReplay = input.acquisitionContext.customImageReplay !== undefined;
       const parsed = await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, {
         ...(hasPinnedCustomImageReplay ? {} : { id: input.environment.id }),
         driver: "sandbox",
-        config: input.acquisitionContext.config,
+        config: restoreLeaseSecretRefs(input.acquisitionContext.config),
       }, {
         issueId: input.lease.issueId,
         heartbeatRunId: input.lease.heartbeatRunId,
@@ -2040,6 +2215,7 @@ function createSandboxEnvironmentDriver(
           ? false
           : input.acquisitionContext.applyCustomImageTemplate,
         ...(secretBindingTarget ? { secretBindingTarget } : {}),
+        resourceScopes,
       });
       const config = parsed.driver === "sandbox" && input.acquisitionContext.customImageReplay
         ? applySandboxCustomImageReplay(
@@ -2056,17 +2232,37 @@ function createSandboxEnvironmentDriver(
     }
 
     const storedProviderConfig = input.lease.metadata?.[PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY];
-    if (isRecord(storedProviderConfig) && storedProviderConfig.provider === input.provider) {
+    let preferCurrentConfig = false;
+    if (
+      secretBindingTarget &&
+      leaseSecretBindings.length === 0 &&
+      input.environment.driver === "sandbox"
+    ) {
+      try {
+        preferCurrentConfig = (await collectEnvironmentSecretRefs({
+          db,
+          environment: input.environment,
+        })).length > 0;
+      } catch {
+        // The durable lease snapshot remains the fallback for invalid current config.
+      }
+    }
+    if (
+      !preferCurrentConfig &&
+      isRecord(storedProviderConfig) &&
+      storedProviderConfig.provider === input.provider
+    ) {
       try {
         const parsed = await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, {
           id: input.environment.id,
           driver: "sandbox",
-          config: storedProviderConfig,
+          config: restoreLeaseSecretRefs(storedProviderConfig),
         }, {
           issueId: input.lease.issueId,
           heartbeatRunId: input.lease.heartbeatRunId,
           applyCustomImageTemplate: false,
           ...(secretBindingTarget ? { secretBindingTarget } : {}),
+          resourceScopes,
         });
         if (parsed.driver === "sandbox") {
           return parsed.config as unknown as Record<string, unknown>;
@@ -2082,6 +2278,7 @@ function createSandboxEnvironmentDriver(
           db,
           input.lease.companyId,
           input.environment,
+          { resourceScopes },
         );
         if (parsed.driver === "sandbox" && parsed.config.provider === input.provider) {
           return parsed.config as unknown as Record<string, unknown>;
@@ -2096,17 +2293,19 @@ function createSandboxEnvironmentDriver(
       const parsed = await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, {
         id: input.environment.id,
         driver: "sandbox",
-        config: sanitizePluginSandboxConfigFromLeaseMetadata(metadataConfig),
+        config: restoreLeaseSecretRefs(sanitizePluginSandboxConfigFromLeaseMetadata(metadataConfig)),
+      }, {
+        ...(secretBindingTarget ? { secretBindingTarget } : {}),
+        resourceScopes,
       });
       if (parsed.driver === "sandbox") {
         return parsed.config as unknown as Record<string, unknown>;
       }
     }
 
-    return {
-      provider: input.provider,
-      ...sanitizePluginSandboxConfigFromLeaseMetadata(input.lease.metadata),
-    };
+    throw new Error(
+      `Sandbox lease "${input.lease.id}" has no schema-resolvable runtime config for provider "${input.provider}".`,
+    );
   }
 
   async function recoverSandboxLeaseAcquisition(input: {
@@ -2307,7 +2506,7 @@ function createSandboxEnvironmentDriver(
         throw new Error(`Plugin-backed sandbox acquisition "${acquisitionId}" returned no provider lease id.`);
       }
       providerMetadata = sanitizePluginSandboxConfigFromLeaseMetadata(
-        stripSecretRefValuesFromPluginLeaseMetadata({
+        sanitizePluginProviderLeaseMetadata({
           metadata: providerLease.metadata,
           schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
         }),
@@ -2543,6 +2742,7 @@ function createSandboxEnvironmentDriver(
         issueId: input.issueId,
         heartbeatRunId: input.heartbeatRunId,
         applyCustomImageTemplate: input.applyCustomImageTemplate ?? false,
+        resourceScopes: { agent: input.agentId },
       });
       if (parsed.driver !== "sandbox" || storedParsed.driver !== "sandbox") {
         throw new Error(`Expected sandbox environment config for driver "${input.environment.driver}".`);
@@ -2576,7 +2776,21 @@ function createSandboxEnvironmentDriver(
 
         const workerConfig = stripSandboxProviderEnvelope(parsed.config);
         const storedConfig = storedParsed.config;
-        const providerConfigForLease = sandboxConfigForLeaseMetadata(storedConfig);
+        const providerConfigSchema = pluginProvider.resolved.driver.configSchema as
+          | Record<string, unknown>
+          | null
+          | undefined;
+        // Preserve original indexes for lease-scoped binding paths. Runtime
+        // resolution compacts the selected rows before the provider RPC.
+        const scopedStoredConfig = scopeConfigResourceArrays(
+          providerConfigSchema,
+          storedConfig as unknown as Record<string, unknown>,
+          { agent: input.agentId },
+        ) as SandboxEnvironmentConfig;
+        const providerConfigForLease = stripSecretRefsFromPluginConfigSnapshot({
+          config: sandboxConfigForLeaseMetadata(scopedStoredConfig),
+          schema: providerConfigSchema,
+        });
         const supportsReusableLeases = pluginProvider.resolved.driver.supportsReusableLeases === true;
         const leaseFingerprint =
           supportsReusableLeases &&
@@ -2668,7 +2882,7 @@ function createSandboxEnvironmentDriver(
           pluginId: pluginProvider.resolved.plugin.id,
           pluginKey: pluginProvider.resolved.plugin.pluginKey,
           sandboxProviderPlugin: true,
-          ...sanitizePluginSandboxConfigFromLeaseMetadata(storedConfig),
+          ...sanitizePluginSandboxConfigFromLeaseMetadata(providerConfigForLease),
           [PLUGIN_SANDBOX_PROVIDER_CONFIG_KEY]: providerConfigForLease,
         };
         const acquisitionContext: SandboxAcquisitionContext = {
@@ -2691,7 +2905,7 @@ function createSandboxEnvironmentDriver(
           customImageReplay: buildSandboxCustomImageReplay({
             storedConfig,
             runtimeConfig: parsed.config,
-            schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
+            schema: providerConfigSchema,
           }),
           reusableProviderLeaseId,
           leaseFingerprint: serializeLeaseFingerprint(leaseFingerprint),
@@ -2762,9 +2976,9 @@ function createSandboxEnvironmentDriver(
                 const replacementMetadata = {
                   ...fallbackLeaseMetadata,
                   ...sanitizePluginSandboxConfigFromLeaseMetadata(
-                    stripSecretRefValuesFromPluginLeaseMetadata({
+                    sanitizePluginProviderLeaseMetadata({
                       metadata: providerLease.metadata,
-                      schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
+                      schema: providerConfigSchema,
                     }),
                   ),
                   provider: parsed.config.provider,
@@ -2951,9 +3165,9 @@ function createSandboxEnvironmentDriver(
           // as `reuse_by_environment` would let a concurrent heartbeat resume
           // the test's provider lease and lose its sandbox when the test ends.
           const sanitizedProviderMetadata = sanitizePluginSandboxConfigFromLeaseMetadata(
-            stripSecretRefValuesFromPluginLeaseMetadata({
+            sanitizePluginProviderLeaseMetadata({
               metadata: acquiredLease.metadata,
-              schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
+              schema: providerConfigSchema,
             }),
           );
           const reusableScope = resolvedLeasePolicy === "reuse_by_environment"
@@ -2973,8 +3187,15 @@ function createSandboxEnvironmentDriver(
             ...fallbackLeaseMetadata,
             ...sanitizedProviderMetadata,
             provider: parsed.config.provider,
+            // Re-stamp the host-authoritative agent owner AFTER the provider
+            // metadata spread. A sandbox provider can otherwise return
+            // { agentId: <other-agent> } (or blank it) and, because this field
+            // scopes agent credential resolution, receive another agent's
+            // resolved secret or hit the fallback:"first" row.
+            ...(input.agentId ? { agentId: input.agentId } : {}),
             ...(reusableScope ? { reusableSandboxLease: reusableScope } : {}),
           };
+          if (!input.agentId) delete (leaseMetadata as Record<string, unknown>).agentId;
           handoffStarted = true;
           return await acquireSandboxLeaseWithCompensation(
             input.environment,
@@ -3413,7 +3634,7 @@ function createSandboxEnvironmentDriver(
             lease: input.lease,
             provider: providerKey,
           });
-          return await pluginWorkerManager.call(pluginId, "environmentRealizeWorkspace", {
+          const result = await pluginWorkerManager.call(pluginId, "environmentRealizeWorkspace", {
             driverKey: providerKey,
             companyId: input.lease.companyId,
             environmentId: input.environment.id,
@@ -3424,8 +3645,24 @@ function createSandboxEnvironmentDriver(
               metadata: input.lease.metadata ?? undefined,
               expiresAt: input.lease.expiresAt?.toISOString() ?? null,
             },
+            env: input.env,
             workspace: input.workspace,
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig)));
+          const record = buildWorkspaceRealizationRecordFromDriverInput({
+            environment: input.environment,
+            lease: input.lease,
+            workspace: input.workspace,
+            cwd: result.cwd,
+            providerMetadata: result.metadata,
+            credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
+            forwardedCredentialValues: resolveForwardedCredentialValues(input),
+          });
+          return {
+            cwd: result.cwd,
+            metadata: {
+              workspaceRealization: record,
+            },
+          };
         }
       }
 
@@ -3437,6 +3674,7 @@ function createSandboxEnvironmentDriver(
           typeof input.lease.metadata?.remoteCwd === "string" && input.lease.metadata.remoteCwd.trim().length > 0
             ? input.lease.metadata.remoteCwd.trim()
             : input.workspace.remotePath ?? input.workspace.localPath ?? null,
+        credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
       });
       return {
         cwd: record.remote.path ?? record.local.path,
@@ -3475,6 +3713,9 @@ function createSandboxEnvironmentDriver(
             env: input.env,
             stdin: input.stdin,
             timeoutMs: input.timeoutMs,
+            ...(input.workspaceRealization
+              ? { workspaceRealization: input.workspaceRealization }
+              : {}),
           }, resolvePluginExecuteRpcTimeoutMs({
             requestedTimeoutMs: input.timeoutMs,
             config: sanitizedConfig,
@@ -3529,12 +3770,14 @@ function createSandboxEnvironmentDriver(
     }
 
     if (isProviderLeaseIdentityMissingCleanupError(cleanupError)) {
-      return await environmentsSvc.releaseLease(input.lease.id, "failed", {
+      const released = await environmentsSvc.releaseLease(input.lease.id, "failed", {
         failureReason: PROVIDER_LEASE_IDENTITY_MISSING_MANUAL_CLEANUP_REASON,
         cleanupStatus: "failed",
         expectedCleanupClaimId: input.cleanupClaimId,
         expectedStatus: "pending_cleanup",
       });
+      if (released) clearSandboxRuntimeConfig(input.lease.id);
+      return released;
     }
 
     return await finalizeSandboxRelease({
@@ -3664,12 +3907,14 @@ function createSandboxEnvironmentDriver(
     }
 
     if (isProviderLeaseIdentityMissingCleanupError(cleanupError)) {
-      return await environmentsSvc.releaseLease(lease.id, "failed", {
+      const released = await environmentsSvc.releaseLease(lease.id, "failed", {
         failureReason: PROVIDER_LEASE_IDENTITY_MISSING_MANUAL_CLEANUP_REASON,
         cleanupStatus: "failed",
         expectedCleanupClaimId: cleanupClaimId,
         expectedStatus: "pending_cleanup",
       });
+      if (released) clearSandboxRuntimeConfig(lease.id);
+      return released;
     }
 
     return await finalizeSandboxRelease({
@@ -4142,6 +4387,7 @@ function createPluginEnvironmentDriver(
             metadata: input.lease.metadata ?? undefined,
             expiresAt: input.lease.expiresAt?.toISOString() ?? null,
           },
+          env: input.env,
           workspace: input.workspace,
         },
       });
@@ -4154,6 +4400,8 @@ function createPluginEnvironmentDriver(
         workspace: input.workspace,
         cwd: result.cwd,
         providerMetadata: result.metadata,
+        credentialOwnerAgentId: resolveRealizationCredentialOwnerAgentId(input),
+        forwardedCredentialValues: resolveForwardedCredentialValues(input),
       });
       return {
         ...result,
@@ -4196,6 +4444,9 @@ function createPluginEnvironmentDriver(
           env: input.env,
           stdin: input.stdin,
           timeoutMs: input.timeoutMs,
+          ...(input.workspaceRealization
+            ? { workspaceRealization: input.workspaceRealization }
+            : {}),
         },
       });
     },
@@ -4209,6 +4460,7 @@ export function environmentRuntimeService(
     pluginWorkerManager?: PluginWorkerManager;
     pluginWorkerReadyTimeoutMs?: number;
     pluginWorkerReadyPollMs?: number;
+    toolActionSigningSecret?: string;
   } = {},
 ) {
   const environmentsSvc = environmentService(db);
@@ -4749,6 +5001,32 @@ export function environmentRuntimeService(
       heartbeatRunId: string,
       status: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed"> = "released",
     ): Promise<EnvironmentRuntimeLeaseRecord[]> {
+      const pendingApprovedExecutions = await db
+        .select({
+          invocationId: toolInvocations.id,
+          toolName: toolInvocations.toolName,
+          signedArguments: toolActionRequests.signedArguments,
+        })
+        .from(toolActionRequests)
+        .innerJoin(toolInvocations, eq(toolInvocations.id, toolActionRequests.invocationId))
+        .where(and(
+          eq(toolInvocations.runId, heartbeatRunId),
+          inArray(toolActionRequests.status, ["pending", "approved", "executing"]),
+        ));
+      const retainForApprovedExecution = pendingApprovedExecutions.some((row) => {
+        try {
+          return readSignedToolArgumentsPayload({
+            signedArguments: row.signedArguments,
+            invocationId: row.invocationId,
+            toolName: row.toolName,
+            signingSecret: options.toolActionSigningSecret,
+          })?.executionOnApprove === true;
+        } catch {
+          return false;
+        }
+      });
+      if (retainForApprovedExecution) return [];
+
       const leaseRows = await db
         .select()
         .from(environmentLeases)

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -15,6 +15,8 @@ import {
   issueExecutionDecisions,
   issues,
   issueComments,
+  environmentLeases,
+  toolInvocations,
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -741,6 +743,77 @@ export function agentService(db: Db) {
       }
 
       return db.transaction(async (tx) => {
+        // Deleting an agent hard-deletes its heartbeat runs, which sets
+        // environment_leases.heartbeat_run_id and tool_invocations.run_id to
+        // NULL (ON DELETE SET NULL). A still-active lease or an un-reconciled
+        // lease-release outbox marker (leaseReleasePendingAt) would then lose
+        // its run identity permanently: the reconciler inner-joins heartbeatRuns
+        // and releaseRunLeases selects by heartbeatRunId, so neither can recover
+        // it, leaking the lease (and any external provider resource). Block the
+        // deletion until those runs' leases are released and markers cleared.
+        //
+        // Two locks are both required, closing symmetric holes:
+        //   1. Lock the AGENT row FOR UPDATE. A concurrent heartbeat inserting a
+        //      brand-new run takes a FOR KEY SHARE lock on the referenced agents
+        //      row for the foreign key; that conflicts with our FOR UPDATE and
+        //      blocks until this transaction commits (then fails, agent gone).
+        //      This is what a run-row lock cannot do: row locks cannot block the
+        //      INSERT of a phantom new run.
+        //   2. Lock the existing run rows FOR UPDATE. A lease insert on an
+        //      EXISTING run takes a FOR KEY SHARE lock only on that run row (the
+        //      environment_leases FK references heartbeat_runs, not agents), so
+        //      the agent-row lock alone does not serialize it; the run-row lock
+        //      does. Without it a lease inserted on an existing run after the
+        //      blockingRuns check but before the run deletion is orphaned.
+        await tx
+          .select({ id: agents.id })
+          .from(agents)
+          .where(eq(agents.id, id))
+          .for("update");
+        await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, id))
+          .for("update");
+        await tx.execute(sql`
+          select ${toolInvocations.id}
+          from ${toolInvocations}
+          where ${toolInvocations.runId} in (
+            select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id}
+          )
+          order by ${toolInvocations.id}
+          for update
+        `);
+        const blockingRuns = await tx
+          .select({ runId: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .leftJoin(
+            environmentLeases,
+            and(
+              eq(environmentLeases.heartbeatRunId, heartbeatRuns.id),
+              eq(environmentLeases.status, "active"),
+            ),
+          )
+          .leftJoin(
+            toolInvocations,
+            and(
+              eq(toolInvocations.runId, heartbeatRuns.id),
+              isNotNull(toolInvocations.leaseReleasePendingAt),
+            ),
+          )
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, id),
+              or(isNotNull(environmentLeases.id), isNotNull(toolInvocations.id)),
+            ),
+          )
+          .limit(1);
+        if (blockingRuns.length > 0) {
+          throw conflict(
+            "Agent has runs with active environment leases pending release; cancel the agent and retry after leases are released",
+            { code: "agent_delete_blocked_by_pending_lease_release" },
+          );
+        }
         await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
         await tx
           .update(issues)

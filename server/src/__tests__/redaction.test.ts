@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { REDACTED_EVENT_VALUE, redactEventPayload, redactSensitiveText, sanitizeRecord } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, redactEventPayload, redactPersistedCredentialValues, redactSensitiveText, sanitizeRecord } from "../redaction.js";
 
 describe("redaction", () => {
   it("redacts sensitive keys and nested secret values", () => {
@@ -134,5 +134,85 @@ describe("redaction", () => {
 
     expect(result?.args).toEqual(["--api-key", "not-a-command-secret"]);
     expect(result?.argv).toEqual(["--api-key", REDACTED_EVENT_VALUE]);
+  });
+
+  it("redacts credential-shaped ref/id fields unless their path is preserved", () => {
+    expect(redactPersistedCredentialValues({
+      accessTokenRef: "ghp_plaintext",
+      secretId: "plain-secret-id",
+      secretName: "provider-secret-name",
+      sandboxId: "sandbox-1",
+    })).toEqual({
+      accessTokenRef: REDACTED_EVENT_VALUE,
+      secretId: REDACTED_EVENT_VALUE,
+      secretName: "provider-secret-name",
+      sandboxId: "sandbox-1",
+    });
+
+    expect(redactPersistedCredentialValues(
+      { accessTokenRef: "ghp_plaintext" },
+      { preserveContainerPaths: new Set(["accessTokenRef"]) },
+    )).toEqual({ accessTokenRef: "ghp_plaintext" });
+  });
+
+});
+
+describe("redactPersistedCredentialValues", () => {
+  it("redacts credential-shaped values while preserving reuse-critical structure", () => {
+    const result = redactPersistedCredentialValues({
+      accessToken: "provider-plaintext",
+      agentCredentials: [{ agentId: "agent-2" }],
+      secretName: "provider-runtime-secret-name",
+      sandboxId: "sandbox-1",
+      remoteCwd: "/workspace",
+    });
+
+    expect(result).toEqual({
+      accessToken: REDACTED_EVENT_VALUE,
+      agentCredentials: [{ agentId: "agent-2" }],
+      secretName: "provider-runtime-secret-name",
+      sandboxId: "sandbox-1",
+      remoteCwd: "/workspace",
+    });
+  });
+
+  it("keeps values under preserved secret-ref container paths intact", () => {
+    const result = redactPersistedCredentialValues(
+      { agentCredentials: [{ agentId: "agent-2", apiToken: undefined }] },
+      { preserveContainerPaths: new Set(["agentCredentials", "agentCredentials.0"]) },
+    );
+
+    expect(result).toEqual({ agentCredentials: [{ agentId: "agent-2", apiToken: undefined }] });
+  });
+
+  it("does not treat words merely ending in identifier letters as identifiers", () => {
+    const result = redactPersistedCredentialValues({
+      credentials: {
+        valid: "plaintext-secret-1",
+        hybrid: "plaintext-secret-2",
+        solid: "plaintext-secret-3",
+        agentId: "agent-9",
+      },
+    }) as { credentials: Record<string, unknown> };
+
+    expect(result.credentials.valid).toBe(REDACTED_EVENT_VALUE);
+    expect(result.credentials.hybrid).toBe(REDACTED_EVENT_VALUE);
+    expect(result.credentials.solid).toBe(REDACTED_EVENT_VALUE);
+    expect(result.credentials.agentId).toBe("agent-9");
+  });
+
+  it("redacts a JWT stored under an identifier-shaped key while preserving ordinary ids", () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abc-DEF_123";
+    const result = redactPersistedCredentialValues({
+      tokenId: jwt,
+      sessionId: jwt,
+      sandboxId: "sandbox-1",
+      remoteCwd: "/workspace",
+    }) as Record<string, unknown>;
+
+    expect(result.tokenId).toBe(REDACTED_EVENT_VALUE);
+    expect(result.sessionId).toBe(REDACTED_EVENT_VALUE);
+    expect(result.sandboxId).toBe("sandbox-1");
+    expect(result.remoteCwd).toBe("/workspace");
   });
 });

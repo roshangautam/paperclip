@@ -1,4 +1,5 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
+import { encodeConfigPathSegment } from "./services/json-schema-secret-refs.js";
 
 const SECRET_FIELD_NAME_PATTERN =
   String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)[A-Za-z0-9_-]*`;
@@ -131,6 +132,66 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
   if (!payload) return null;
   if (!isPlainObject(payload)) return payload;
   return sanitizeRecord(payload);
+}
+
+// An identifier-reference key is a whole identifier word (`id`, `name`, ...), a
+// delimiter-suffixed form (`user_id`, `TOKEN_ID`), or a genuine camelCase suffix
+// (`agentId`, `sandboxId`). Plain words that merely end in those letters — e.g.
+// `valid`, `hybrid`, `solid` — are NOT identifiers, so a credential-shaped parent
+// no longer preserves a nested `{ valid: "secret" }` value.
+const IDENTIFIER_WORD_OR_DELIMITED_KEY_RE = /(?:^|[-_])(?:id|name|ref|path|url|uri|host)$/i;
+const IDENTIFIER_CAMEL_SUFFIX_KEY_RE = /[a-z](?:Id|Name|Ref|Path|Url|Uri|Host)$/;
+
+const SENSITIVE_REFERENCE_IDENTIFIER_KEY_RE = /(?:^|[-_])(?:id|ref)$|[a-z](?:Id|Ref)$/;
+
+function isIdentifierReferenceKey(key: string): boolean {
+  return IDENTIFIER_WORD_OR_DELIMITED_KEY_RE.test(key) || IDENTIFIER_CAMEL_SUFFIX_KEY_RE.test(key);
+}
+
+function preservesIdentifierValue(key: string): boolean {
+  return isIdentifierReferenceKey(key)
+    && !(SECRET_PAYLOAD_KEY_RE.test(key) && SENSITIVE_REFERENCE_IDENTIFIER_KEY_RE.test(key));
+}
+
+export function redactPersistedCredentialValues(
+  value: unknown,
+  options: { preserveContainerPaths?: ReadonlySet<string> } = {},
+): unknown {
+  const preserveContainerPaths = options.preserveContainerPaths ?? new Set<string>();
+
+  function visit(current: unknown, path: string, inheritedSensitive: boolean, key: string | null): unknown {
+    if (current === null || current === undefined) return current;
+    const preserveCurrentPath = preserveContainerPaths.has(path);
+    if (Array.isArray(current)) {
+      return current.map((entry, index) =>
+        visit(entry, path ? `${path}.${index}` : String(index), preserveCurrentPath ? false : inheritedSensitive, null),
+      );
+    }
+    if (isPlainObject(current)) {
+      const result: Record<string, unknown> = {};
+      for (const [childKey, childValue] of Object.entries(current)) {
+        const childPath = path ? `${path}.${encodeConfigPathSegment(childKey)}` : encodeConfigPathSegment(childKey);
+        const childPathPreserved = preserveContainerPaths.has(childPath);
+        const sensitiveKey = SECRET_PAYLOAD_KEY_RE.test(childKey)
+          && !preservesIdentifierValue(childKey);
+        result[childKey] = visit(
+          childValue,
+          childPath,
+          childPathPreserved ? false : inheritedSensitive || sensitiveKey,
+          childKey,
+        );
+      }
+      return result;
+    }
+    if (preserveCurrentPath) return current;
+    if (typeof current === "string" && JWT_VALUE_RE.test(current)) return REDACTED_EVENT_VALUE;
+    if (key !== null && preservesIdentifierValue(key)) return current;
+    if (key !== null && SECRET_PAYLOAD_KEY_RE.test(key)) return REDACTED_EVENT_VALUE;
+    if (inheritedSensitive) return REDACTED_EVENT_VALUE;
+    return current;
+  }
+
+  return visit(value, "", false, null);
 }
 
 export function redactSensitiveText(input: string): string {

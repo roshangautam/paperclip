@@ -13,6 +13,7 @@ const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
 const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
 const DEFAULT_BRIDGE_MAX_BODY_BYTES = MAX_CAPTURE_BYTES;
+const DEFAULT_BRIDGE_WORKER_CONCURRENCY = 4;
 const REMOTE_WRITE_BASE64_CHUNK_SIZE = 32 * 1024;
 const SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT = "paperclip-bridge-server.mjs";
 const SANDBOX_EXEC_CHANNEL_ENV = "PAPERCLIP_SANDBOX_EXEC_CHANNEL";
@@ -87,6 +88,10 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/approvals\/[^/]+\/comments$/ },
   { method: "POST", path: /^\/api\/companies\/[^/]+\/approvals$/ },
 
+  // Managed MCP gateways. The bridge authenticates the sandbox request with
+  // its own bearer token and carries the run-scoped gateway token separately.
+  { method: "POST", path: /^\/api\/tool-gateway\/gateways\/[^/]+\/mcp$/ },
+
   // Execution workspaces and runtime services (start/stop/restart dev servers)
   { method: "GET", path: /^\/api\/execution-workspaces\/[^/]+$/ },
   { method: "POST", path: /^\/api\/execution-workspaces\/[^/]+\/runtime-services\/(?:start|stop|restart)$/ },
@@ -107,6 +112,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST = [
   "content-type",
   "if-match",
   "if-none-match",
+  "x-paperclip-tool-gateway-token",
 ] as const;
 
 export interface SandboxCallbackBridgeRequest {
@@ -602,9 +608,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
     body?: string;
   }>;
   maxBodyBytes?: number | null;
+  maxConcurrency?: number | null;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
   const maxBodyBytes = normalizeTimeoutMs(input.maxBodyBytes, DEFAULT_BRIDGE_MAX_BODY_BYTES);
+  const maxConcurrency = Math.max(1, normalizeTimeoutMs(input.maxConcurrency, DEFAULT_BRIDGE_WORKER_CONCURRENCY));
   const directories = sandboxCallbackBridgeDirectories(input.queueDir);
   await input.client.makeDir(directories.rootDir);
   await input.client.makeDir(directories.requestsDir);
@@ -728,14 +736,18 @@ export async function startSandboxCallbackBridgeWorker(input: {
           await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
           continue;
         }
-        for (const fileName of fileNames) {
+        for (let index = 0; index < fileNames.length; index += maxConcurrency) {
           if (stopping && Date.now() >= stopDeadline) break;
-          inFlight += 1;
-          try {
-            await processRequestFile(fileName);
-          } finally {
-            inFlight -= 1;
-          }
+          const batch = fileNames.slice(index, index + maxConcurrency);
+          await Promise.all(batch.map(async (fileName) => {
+            if (stopping && Date.now() >= stopDeadline) return;
+            inFlight += 1;
+            try {
+              await processRequestFile(fileName);
+            } finally {
+              inFlight -= 1;
+            }
+          }));
         }
         if (stopping && Date.now() >= stopDeadline) {
           break;
@@ -1079,6 +1091,23 @@ async function queueDepth() {
   return entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).length;
 }
 
+let reservedQueueSlots = 0;
+
+async function tryReserveQueueSlot() {
+  if (reservedQueueSlots >= maxQueueDepth) return false;
+  reservedQueueSlots += 1;
+  const depth = await queueDepth();
+  if (depth + reservedQueueSlots > maxQueueDepth) {
+    releaseQueueSlot();
+    return false;
+  }
+  return true;
+}
+
+function releaseQueueSlot() {
+  if (reservedQueueSlots > 0) reservedQueueSlots -= 1;
+}
+
 function tokensMatch(received) {
   const expected = Buffer.from(bridgeToken, "utf8");
   const actual = Buffer.from(typeof received === "string" ? received : "", "utf8");
@@ -1101,6 +1130,7 @@ async function waitForResponse(requestId) {
 }
 
 const server = createServer(async (req, res) => {
+  let queueSlotReserved = false;
   try {
     const auth = req.headers.authorization || "";
     const receivedToken = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
@@ -1111,12 +1141,13 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    if (await queueDepth() >= maxQueueDepth) {
+    if (!await tryReserveQueueSlot()) {
       res.statusCode = 503;
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ error: "Bridge request queue is full." }));
       return;
     }
+    queueSlotReserved = true;
 
     const url = new URL(req.url || "/", "http://127.0.0.1");
     const contentType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
@@ -1141,6 +1172,10 @@ const server = createServer(async (req, res) => {
     const tempPath = \`\${requestPath}.tmp\`;
     await fs.writeFile(tempPath, \`\${JSON.stringify(payload)}\\n\`, "utf8");
     await fs.rename(tempPath, requestPath);
+    if (queueSlotReserved) {
+      releaseQueueSlot();
+      queueSlotReserved = false;
+    }
 
     const response = await waitForResponse(requestId);
     res.statusCode = typeof response.status === "number" ? response.status : 200;
@@ -1153,6 +1188,8 @@ const server = createServer(async (req, res) => {
     res.statusCode = 502;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+  } finally {
+    if (queueSlotReserved) releaseQueueSlot();
   }
 });
 

@@ -613,8 +613,101 @@ export function requiresPushCapabilityPreflight(input: {
     && hasGithubPrWorkflowSkill(input.explicitRunScopedSkillKeys);
 }
 
+// A GitHub App tuple authenticates the initial private clone DURING workspace
+// realization, but the runtime git/gh push happens after
+// partitionWorkspaceRealizationAdapterConfig strips every GITHUB_APP_* value,
+// and no realization path is guaranteed to exchange the tuple for a usable
+// runtime push token (the built-in sandbox fallback ignores env, and plugin
+// realize hooks are optional). Push preflight therefore requires a real token;
+// an App tuple alone is not accepted as push capability.
+export function buildPushCapabilityScopedEnvBinding(): {
+  keys: string[];
+  alternativeKeySets?: readonly (readonly string[])[];
+  consumerScopes: readonly ("agent" | "project")[];
+  reason: string;
+  remediation: string;
+} {
+  return {
+    keys: [...PUSH_CAPABILITY_ENV_KEYS],
+    consumerScopes: ["agent", "project"],
+    reason: "push_write_credential_missing",
+    remediation: "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
+  };
+}
+
 const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
-  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
+  /(api[-_]?key|access[-_]?token|auth(?:_?token)?|(?:^|[-_])token(?:$|[-_])|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
+
+const WORKSPACE_REALIZATION_ONLY_ENV_KEYS = new Set([
+  "GITHUB_APP_ID",
+  "GITHUB_INSTALLATION_ID",
+  "GITHUB_APP_INSTALLATION_ID",
+  "GITHUB_APP_PRIVATE_KEY",
+  "GITHUB_APP_PRIVATE_KEY_FILE",
+]);
+
+// Tokens the workspace realization needs for the initial private-repo clone but
+// that the adapter runtime also uses for its git push preflight. Unlike the App
+// identity keys above, these are copied into the realization env AND retained in
+// the adapter runtime rather than moved out.
+const WORKSPACE_REALIZATION_SHARED_ENV_KEYS = new Set([
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+]);
+
+function isWorkspaceRealizationOnlyEnvKey(key: string) {
+  return WORKSPACE_REALIZATION_ONLY_ENV_KEYS.has(key);
+}
+
+function isWorkspaceRealizationSharedEnvKey(key: string) {
+  return WORKSPACE_REALIZATION_SHARED_ENV_KEYS.has(key);
+}
+
+function stripWorkspaceRealizationOnlyEnvBindings(envValue: unknown): unknown {
+  if (envValue == null) return envValue;
+  return Object.fromEntries(
+    Object.entries(parseObject(envValue)).filter(([key]) => !isWorkspaceRealizationOnlyEnvKey(key)),
+  );
+}
+
+function isWorkspaceRealizationOnlySecret(
+  entry: EffectiveRunConfigSecretManifestEntry,
+) {
+  const record = entry as Record<string, unknown>;
+  const envKey = readNonEmptyString(record.envKey);
+  if (envKey && isWorkspaceRealizationOnlyEnvKey(envKey)) return true;
+  const configPath = readNonEmptyString(record.configPath);
+  return Boolean(
+    configPath?.startsWith("env.")
+    && isWorkspaceRealizationOnlyEnvKey(configPath.slice("env.".length)),
+  );
+}
+
+export function partitionWorkspaceRealizationAdapterConfig(
+  config: Record<string, unknown>,
+): {
+  runtimeAdapterConfig: Record<string, unknown>;
+  workspaceRealizationEnv: Record<string, string>;
+} {
+  const env = parseObject(config.env);
+  const workspaceRealizationEnv = Object.fromEntries(
+    Object.entries(env).filter(
+      (entry): entry is [string, string] =>
+        (isWorkspaceRealizationOnlyEnvKey(entry[0]) || isWorkspaceRealizationSharedEnvKey(entry[0]))
+        && typeof entry[1] === "string",
+    ),
+  );
+  if (!Object.prototype.hasOwnProperty.call(config, "env")) {
+    return { runtimeAdapterConfig: config, workspaceRealizationEnv };
+  }
+  return {
+    runtimeAdapterConfig: {
+      ...config,
+      env: stripWorkspaceRealizationOnlyEnvBindings(env),
+    },
+    workspaceRealizationEnv,
+  };
+}
 
 function isPaperclipRuntimeEnvKey(key: string) {
   return key.startsWith("PAPERCLIP_");
@@ -671,8 +764,9 @@ export async function resolveExecutionRunAdapterConfig(input: {
   secretsSvc: RuntimeConfigSecretResolver;
   trustPreset?: TrustPresetResolution;
   requiredScopedEnvBinding?: {
-    keys: string[];
-    consumerScopes: Array<"agent" | "project">;
+    keys: readonly string[];
+    alternativeKeySets?: readonly (readonly string[])[];
+    consumerScopes: readonly ("agent" | "project")[];
     reason: string;
     remediation: string;
   };
@@ -692,29 +786,47 @@ export async function resolveExecutionRunAdapterConfig(input: {
     assertLowTrustEnvConfigAllowed(routineEnv, "routine.env");
   }
   const requiredScopedEnvBinding = input.requiredScopedEnvBinding ?? null;
-  const requiredScopedBindingsConfigured = requiredScopedEnvBinding
-    ? requiredScopedEnvBinding.keys.some((key) => (
-      requiredScopedEnvBinding.consumerScopes.includes("agent")
-      && isConfiguredEnvBindingValue(agentEnv[key])
-    ) || (
-      requiredScopedEnvBinding.consumerScopes.includes("project")
-      && isConfiguredEnvBindingValue(projectEnv?.[key])
-    ))
-    : false;
-  if (requiredScopedEnvBinding && !requiredScopedBindingsConfigured) {
-    throw new ConfigurationIncompleteFailure(`configuration incomplete: ${requiredScopedEnvBinding.remediation}`, {
+  const requiredScopedEnvKeys = requiredScopedEnvBinding
+    ? [...new Set([
+        ...requiredScopedEnvBinding.keys,
+        ...(requiredScopedEnvBinding.alternativeKeySets ?? []).flat(),
+      ])]
+    : [];
+  const effectiveRequiredScopedEnv = {
+    ...(requiredScopedEnvBinding?.consumerScopes.includes("agent") ? agentEnv : {}),
+    ...(requiredScopedEnvBinding?.consumerScopes.includes("project") ? projectEnv ?? {} : {}),
+  };
+  const isOverriddenByLaterDisallowedScope = (key: string) =>
+    routineEnv !== null && Object.prototype.hasOwnProperty.call(routineEnv, key);
+  const isRequiredScopedEnvKeyConfigured = (key: string) => requiredScopedEnvBinding !== null
+    && !isOverriddenByLaterDisallowedScope(key)
+    && isConfiguredEnvBindingValue(effectiveRequiredScopedEnv[key]);
+  const requiredScopedEnvBindingsSatisfied = (isKeyConfigured: (key: string) => boolean) =>
+    requiredScopedEnvBinding !== null && (
+      requiredScopedEnvBinding.keys.some(isKeyConfigured)
+      || (requiredScopedEnvBinding.alternativeKeySets ?? []).some((keySet) =>
+        keySet.length > 0 && keySet.every(isKeyConfigured))
+    );
+  const requiredScopedConfigurationFailure = (
+    binding: NonNullable<typeof input.requiredScopedEnvBinding>,
+  ) => new ConfigurationIncompleteFailure(
+    `configuration incomplete: ${binding.remediation}`,
+    {
       configurationIncomplete: {
-        reason: requiredScopedEnvBinding.reason,
+        reason: binding.reason,
         companyId: input.companyId,
         agentId: input.agentId ?? null,
         issueId: input.issueId ?? null,
         projectId: input.projectId ?? null,
         routineId: input.routineId ?? null,
-        requiredEnvKeys: requiredScopedEnvBinding.keys,
-        requiredScopes: requiredScopedEnvBinding.consumerScopes,
+        requiredEnvKeys: requiredScopedEnvKeys,
+        requiredScopes: binding.consumerScopes,
         missingBindings: [],
       },
-    });
+    },
+  );
+  if (requiredScopedEnvBinding && !requiredScopedEnvBindingsSatisfied(isRequiredScopedEnvKeyConfigured)) {
+    throw requiredScopedConfigurationFailure(requiredScopedEnvBinding);
   }
   // Pre-dispatch binding-validation gate: detect declared secret refs that have
   // no binding before resolving any secret value. Missing bindings short-circuit
@@ -789,7 +901,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       );
     }
     if (requiredScopedEnvBinding) {
-      const requiredEnvKeys = new Set(requiredScopedEnvBinding.keys);
+      const requiredEnvKeys = new Set(requiredScopedEnvKeys);
       const requiredScopes = new Set(requiredScopedEnvBinding.consumerScopes);
       const requiredMissingBindings = missingBindings.filter((binding) =>
         requiredScopes.has(binding.consumerType as "agent" | "project")
@@ -807,7 +919,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
               issueId: input.issueId ?? null,
               projectId: input.projectId ?? null,
               routineId: input.routineId ?? null,
-              requiredEnvKeys: requiredScopedEnvBinding.keys,
+              requiredEnvKeys: requiredScopedEnvKeys,
               requiredScopes: requiredScopedEnvBinding.consumerScopes,
               missingBindings: requiredMissingBindings,
             },
@@ -865,6 +977,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       : undefined,
     { adapterType: input.adapterType ?? null },
   );
+  const resolvedAgentEnv = parseObject(resolvedConfig.env);
   if (Object.keys(environmentEnvResolution.env).length > 0) {
     resolvedConfig.env = {
       ...environmentEnvResolution.env,
@@ -892,6 +1005,17 @@ export async function resolveExecutionRunAdapterConfig(input: {
           : undefined,
       )
     : { env: {}, secretKeys: new Set<string>(), manifest: [] };
+  if (requiredScopedEnvBinding) {
+    const resolvedRequiredScopedEnv = {
+      ...(requiredScopedEnvBinding.consumerScopes.includes("agent") ? resolvedAgentEnv : {}),
+      ...(requiredScopedEnvBinding.consumerScopes.includes("project") ? projectEnvResolution.env : {}),
+    };
+    if (!requiredScopedEnvBindingsSatisfied(
+      (key) => readNonEmptyString(resolvedRequiredScopedEnv[key]) !== null,
+    )) {
+      throw requiredScopedConfigurationFailure(requiredScopedEnvBinding);
+    }
+  }
   if (Object.keys(projectEnvResolution.env).length > 0) {
     resolvedConfig.env = {
       ...parseObject(resolvedConfig.env),
@@ -926,6 +1050,18 @@ export async function resolveExecutionRunAdapterConfig(input: {
     };
     for (const key of routineEnvResolution.secretKeys) {
       secretKeys.add(key);
+    }
+  }
+  if (requiredScopedEnvBinding) {
+    const resolvedScopedEnv = {
+      ...(requiredScopedEnvBinding.consumerScopes.includes("agent") ? resolvedAgentEnv : {}),
+      ...(requiredScopedEnvBinding.consumerScopes.includes("project") ? projectEnvResolution.env : {}),
+    };
+    const isSatisfiedByAllowedScope = (key: string) =>
+      !Object.prototype.hasOwnProperty.call(routineEnvResolution.env, key)
+      && readNonEmptyString(resolvedScopedEnv[key]) !== null;
+    if (!requiredScopedEnvBindingsSatisfied(isSatisfiedByAllowedScope)) {
+      throw requiredScopedConfigurationFailure(requiredScopedEnvBinding);
     }
   }
   // Pre-dispatch credential gate for codex_local: a managed Codex home with no
@@ -3259,14 +3395,46 @@ export type ExecutionWorkspaceReuseRequestForIssue = {
   existingExecutionWorkspaceAvailable: boolean;
 };
 
+function executionWorkspaceRealizationBelongsToAgent(input: {
+  currentAgentId?: string | null;
+  existingExecutionWorkspaceMetadata?: unknown;
+}) {
+  const currentAgentId = readNonEmptyString(input.currentAgentId);
+  if (!currentAgentId) return true;
+
+  const metadata = parseObject(input.existingExecutionWorkspaceMetadata);
+  const workspaceRealization = parseObject(metadata.workspaceRealization);
+  const rebuild = parseObject(workspaceRealization.rebuild);
+  const rebuildMetadata = parseObject(rebuild.metadata);
+  const providerMetadata = parseObject(rebuildMetadata.providerMetadata);
+
+  const agentId = readNonEmptyString(providerMetadata.agentId);
+  const credentialAgentId = readNonEmptyString(providerMetadata.credentialAgentId);
+
+  // Reuse is permitted only when the realization records no owner markers at
+  // all: local/SSH realizations carry empty provider metadata, so they hold no
+  // cross-agent credential or workspace to protect. Any recorded owner (agent
+  // or credential) must match the current agent on both markers to reuse.
+  if (agentId === null && credentialAgentId === null) return true;
+
+  return (
+    agentId === currentAgentId &&
+    credentialAgentId === currentAgentId
+  );
+}
+
 export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
   existingExecutionWorkspaceStatus?: string | null;
+  currentAgentId?: string | null;
+  existingExecutionWorkspaceMetadata?: unknown;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
   const requestedShouldReuseExisting =
-    input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
+    input.issueExecutionWorkspacePreference === "reuse_existing" &&
+    requestedExecutionWorkspaceId !== null &&
+    executionWorkspaceRealizationBelongsToAgent(input);
 
   return {
     requestedExecutionWorkspaceId,
@@ -3747,20 +3915,25 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   runtimeSkills: unknown;
   agentConfigRevision?: unknown;
 }): Promise<EffectiveRunSessionConfigMetadata> {
-  const secretManifest = input.secretManifest ?? [];
-  const instructions = await resolveInstructionsConfigFingerprintMetadata(input.effectiveAdapterConfig);
+  const secretManifest = (input.secretManifest ?? []).filter(
+    (entry) => !isWorkspaceRealizationOnlySecret(entry),
+  );
+  const { runtimeAdapterConfig } = partitionWorkspaceRealizationAdapterConfig(
+    input.effectiveAdapterConfig,
+  );
+  const instructions = await resolveInstructionsConfigFingerprintMetadata(runtimeAdapterConfig);
   const categoryValues = buildSessionConfigCategoryValues({
     adapterType: input.adapterType,
-    effectiveAdapterConfig: input.effectiveAdapterConfig,
+    effectiveAdapterConfig: runtimeAdapterConfig,
     agentRuntimeConfig: input.agentRuntimeConfig,
     modelProfile: input.modelProfile,
     instructions,
     issueOverrides: input.issueOverrides,
     workspaceConfig: input.workspaceConfig,
     environment: input.environment,
-    environmentEnv: input.environmentEnv,
-    projectEnv: input.projectEnv,
-    routineEnv: input.routineEnv,
+    environmentEnv: stripWorkspaceRealizationOnlyEnvBindings(input.environmentEnv),
+    projectEnv: stripWorkspaceRealizationOnlyEnvBindings(input.projectEnv),
+    routineEnv: stripWorkspaceRealizationOnlyEnvBindings(input.routineEnv),
     secretManifest,
     runtimeSkills: input.runtimeSkills,
     agentConfigRevision: input.agentConfigRevision ?? null,
@@ -12341,6 +12514,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
+      currentAgentId: agent.id,
+      existingExecutionWorkspaceMetadata: existingExecutionWorkspace?.metadata ?? null,
     });
     const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
     const reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable
@@ -12499,15 +12674,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       secretsSvc,
       trustPreset,
       requiredScopedEnvBinding: pushCapabilityPreflightRequired
-        ? {
-            keys: [...PUSH_CAPABILITY_ENV_KEYS],
-            consumerScopes: ["agent", "project"],
-            reason: "push_write_credential_missing",
-            remediation:
-              "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at project or agent scope.",
-          }
+        ? buildPushCapabilityScopedEnvBinding()
         : undefined,
     });
+    const { runtimeAdapterConfig: resolvedRuntimeConfig, workspaceRealizationEnv } =
+      partitionWorkspaceRealizationAdapterConfig(resolvedConfig);
+    const runtimeAdapterEnv = Object.fromEntries(
+      Object.entries(parseObject(resolvedRuntimeConfig.env)).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
     if (secretManifest.length > 0) {
       context.paperclipSecrets = {
         manifest: secretManifest,
@@ -12516,7 +12692,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delete context.paperclipSecrets;
     }
     const effectiveResolvedConfig = applyRunScopedMentionedSkillKeys(
-      resolvedConfig,
+      resolvedRuntimeConfig,
       runScopedMentionedSkillKeys,
     );
     const runtimeSkillPreference = readPaperclipSkillSyncPreference(effectiveResolvedConfig);
@@ -13018,6 +13194,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueId: issueId ?? null,
       heartbeatRunId: run.id,
       executionWorkspace,
+      workspaceRealizationEnv,
       effectiveExecutionWorkspaceMode,
       persistedExecutionWorkspace,
     });
@@ -13491,11 +13668,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : null,
         cwd: executionWorkspace.cwd,
       });
-      const adapterEnv = Object.fromEntries(
-        Object.entries(parseObject(resolvedConfig.env)).filter(
-          (entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string",
-        ),
-      );
       const runtimeServices = await ensureRuntimeServicesForRun({
         db,
         runId: run.id,
@@ -13508,7 +13680,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         workspace: executionWorkspace,
         executionWorkspaceId: persistedExecutionWorkspace?.id ?? issueRef?.executionWorkspaceId ?? null,
         config: hostExecutionWorkspaceConfig,
-        adapterEnv,
+        adapterEnv: runtimeAdapterEnv,
         onLog,
       });
       if (runtimeServices.length > 0) {
@@ -15635,6 +15807,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const outcome = await db.transaction(async (tx) => {
+        // Lock the target agent row FOR KEY SHARE before taking any child-row
+        // lock. agentService.remove() locks this agent FOR UPDATE first and only
+        // then updates issues assigned to it, establishing an agents -> issues
+        // hierarchy. Without this pre-lock, requestWake would lock the issue
+        // first (below) and then acquire an implicit FOR KEY SHARE on agents via
+        // the heartbeat_runs FK insert, producing an ABBA deadlock against a
+        // concurrent agent delete. FOR KEY SHARE (not FOR UPDATE) still permits
+        // concurrent wakes for the same agent while conflicting with delete's
+        // FOR UPDATE, so the delete correctly waits behind an in-flight wake.
+        await tx.execute(
+          sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for key share`,
+        );
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
@@ -15971,20 +16155,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             legacyUseProjectWorkspace: null,
           });
           const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, workspaceManagedConfig);
-          const existingExecutionWorkspaceStatus = issue.executionWorkspaceId
+          const existingExecutionWorkspace = issue.executionWorkspaceId
             ? await tx
-              .select({ status: executionWorkspaces.status })
+              .select({
+                status: executionWorkspaces.status,
+                metadata: executionWorkspaces.metadata,
+              })
               .from(executionWorkspaces)
               .where(and(
                 eq(executionWorkspaces.id, issue.executionWorkspaceId),
                 eq(executionWorkspaces.companyId, issue.companyId),
               ))
-              .then((rows) => rows[0]?.status ?? null)
+              .then((rows) => rows[0] ?? null)
             : null;
           const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
             issueExecutionWorkspaceId: issue.executionWorkspaceId,
             issueExecutionWorkspacePreference: issue.executionWorkspacePreference,
-            existingExecutionWorkspaceStatus,
+            existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
+            currentAgentId: agent.id,
+            existingExecutionWorkspaceMetadata: existingExecutionWorkspace?.metadata ?? null,
           });
           const hasResolvablePriorSessionWorkspace = await resolveHasResolvablePriorSessionWorkspace();
 

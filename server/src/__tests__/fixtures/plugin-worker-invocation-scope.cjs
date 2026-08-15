@@ -11,6 +11,8 @@ function sendNestedHostRequest(originalRequest, invocationId) {
   const nestedId = `nested-${nextRequestId++}`;
   const params = originalRequest.method === "handleWebhook"
     ? originalRequest.params?.parsedBody ?? {}
+    : originalRequest.method === "executeTool"
+      ? originalRequest.params?.parameters ?? {}
     : originalRequest.params?.params ?? {};
   const mode = params.mode;
   const requestedCompanyId = params.requestedCompanyId;
@@ -81,13 +83,13 @@ rl.on("line", (line) => {
       id: message.id,
       result: {
         ok: true,
-        supportedMethods: ["getData", "performAction", "handleWebhook"],
+        supportedMethods: ["getData", "performAction", "handleWebhook", "executeTool"],
       },
     });
     return;
   }
 
-  if (method === "getData" || method === "performAction" || method === "handleWebhook") {
+  if (method === "getData" || method === "performAction" || method === "handleWebhook" || method === "executeTool") {
     sendNestedHostRequest(message, message.paperclipInvocation?.id);
     return;
   }

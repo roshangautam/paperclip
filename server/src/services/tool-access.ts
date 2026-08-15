@@ -1191,8 +1191,13 @@ function verbMatches(toolName: string, verbs: string): boolean {
 export function classifyRisk(tool: McpToolDescriptor): Extract<ToolRiskLevel, "read" | "write" | "destructive"> {
   const annotations = tool.annotations ?? {};
   if (annotations.destructiveHint === true || annotations.destructive === true) return "destructive";
-  if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
+  // Name-implied destructive is matched before the write-annotation branch so a
+  // plugin/server annotation (readOnlyHint:false / writeHint) can only escalate
+  // risk, never downgrade a "delete"/"drop"-style tool out of the board-approval
+  // tier. Per the MCP spec destructiveHint defaults to true for non-read-only
+  // tools, so an omitted hint must not lower a name-destructive tool to write.
   if (verbMatches(tool.name, "delete|destroy|remove|drop|truncate|wipe|purge|unpublish")) return "destructive";
+  if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
   if (verbMatches(tool.name, "create|update|write|edit|patch|post|send|publish|merge|commit|apply|set|mutate|mark|archive")) return "write";
   return "read";
 }
@@ -2499,7 +2504,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             title: tool.displayName,
             description: tool.description,
             inputSchema: tool.parametersSchema,
-            annotations: {},
+            annotations: tool.annotations ?? {},
           })).filter((tool): tool is McpToolDescriptor => Boolean(tool));
           if (tools.length === 0) return [];
           return [{ plugin, manifest: parsed.data, tools, lifecycle: pluginLifecycleProjection(plugin) }];
@@ -3550,7 +3555,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         title: tool.displayName,
         description: tool.description,
         inputSchema: tool.parametersSchema,
-        annotations: {},
+        annotations: tool.annotations ?? {},
       })),
     };
   }
