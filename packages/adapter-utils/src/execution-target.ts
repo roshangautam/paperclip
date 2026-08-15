@@ -1332,6 +1332,18 @@ function buildBridgeForwardUrl(baseUrl: string, request: { path: string; query: 
 
 const managedToolGatewayMcpPath = /^\/api\/tool-gateway\/gateways\/[^/]+\/mcp$/;
 
+// Ordered timeout budget for bridged managed-MCP tool calls. The gateway clamps
+// a single tool execution to 60s (tool-gateway.ts APPROVED_EXECUTION_TIMEOUT_MS
+// / the 60s ceiling in timeoutMs()), so the bridge boundaries must sit strictly
+// above that to avoid failing a still-running call: tool exec (60s) < host fetch
+// (65s) < sandbox response wait (75s). Non-MCP bridged routes are fast host API
+// calls and keep the 30s default. Equal deadlines are unsafe because polling,
+// queue pickup, serialization, and delivery all consume time.
+const BRIDGE_DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+const BRIDGE_MCP_FETCH_TIMEOUT_MS = 65_000;
+const BRIDGE_MCP_RESPONSE_WAIT_MS = 75_000;
+
+
 function managedToolGatewayBearerToken(
   request: Pick<SandboxCallbackBridgeRequest, "method" | "path" | "headers">,
 ): string | null {
@@ -1921,7 +1933,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
           method,
           headers,
           ...(method === "GET" || method === "HEAD" ? {} : { body: request.body }),
-          signal: AbortSignal.timeout(30_000),
+          signal: AbortSignal.timeout(
+            isManagedToolGatewayMcpRequest && method === "POST"
+              ? BRIDGE_MCP_FETCH_TIMEOUT_MS
+              : BRIDGE_DEFAULT_FETCH_TIMEOUT_MS,
+          ),
         });
         if (bridgeDebugEnabled) {
           await onLog(
@@ -1944,6 +1960,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       bridgeToken,
       bridgeAsset,
       timeoutMs: bridgeTimeoutMs,
+      responseTimeoutMs: BRIDGE_MCP_RESPONSE_WAIT_MS,
       maxBodyBytes,
       shellCommand,
     });

@@ -944,6 +944,14 @@ describe("sandbox adapter execution targets", () => {
       throw new Error("Expected the bridge test API server to listen on a TCP port.");
     }
 
+    const capturedRunnerEnvs: Array<Record<string, string>> = [];
+    const baseBridgeRunner = createLocalSandboxRunner();
+    const bridgeRunner = {
+      execute: async (input: Parameters<typeof baseBridgeRunner.execute>[0]) => {
+        if (input.env) capturedRunnerEnvs.push(input.env);
+        return baseBridgeRunner.execute(input);
+      },
+    };
     const target: AdapterSandboxExecutionTarget = {
       kind: "remote",
       transport: "sandbox",
@@ -951,7 +959,7 @@ describe("sandbox adapter execution targets", () => {
       environmentId: "env-1",
       leaseId: "lease-1",
       remoteCwd,
-      runner: createLocalSandboxRunner(),
+      runner: bridgeRunner,
       timeoutMs: 30_000,
     };
 
@@ -968,6 +976,11 @@ describe("sandbox adapter execution targets", () => {
       expect(bridge?.env.PAPERCLIP_API_URL).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
       expect(bridge?.env.PAPERCLIP_API_KEY).not.toBe("real-run-jwt");
       expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      expect(
+        capturedRunnerEnvs.some(
+          (env) => env.PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS === "75000",
+        ),
+      ).toBe(true);
 
       const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/agents/me`, {
         headers: {

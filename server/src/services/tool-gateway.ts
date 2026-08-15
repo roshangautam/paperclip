@@ -1721,7 +1721,7 @@ export function createToolGatewayService(
     finalErrorCode: "action_expired" | "action_request_invalidated";
     now: Date;
   }): Promise<boolean> {
-    return db.transaction(async (tx) => {
+    return runExclusiveLeaseReleaseFinalize(db, () => db.transaction(async (tx) => {
       await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${input.invocationId}))`);
       const [pendingRelease] = await tx
         .select({ runId: toolInvocations.runId })
@@ -1744,7 +1744,7 @@ export function createToolGatewayService(
         ))
         .returning({ id: toolInvocations.id });
       return Boolean(finalized);
-    });
+    }));
   }
 
   async function invalidateExpiredActionCandidate(input: {
