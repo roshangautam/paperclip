@@ -1590,6 +1590,14 @@ export function buildHostServices(
         const environment = await environments.getById(lease.environmentId);
         if (!environment) throw new Error("Environment not found");
 
+        const effectiveDriver =
+          typeof lease.metadata?.driver === "string" ? lease.metadata.driver : environment.driver;
+        if (effectiveDriver !== "sandbox" && effectiveDriver !== "plugin") {
+          throw new Error(
+            `Execution workspace command execution is only supported on sandbox and plugin environments, not "${effectiveDriver}".`,
+          );
+        }
+
         return environmentRuntime.execute({
           environment,
           lease,

@@ -444,6 +444,68 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     })).resolves.toMatchObject({ exitCode: 0, stdout: "approved-ok" });
   });
 
+  it("rejects execution on non-sandbox/plugin drivers with a clear boundary error", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    const environmentId = randomUUID();
+    const hostWorkspaceCwd = "/Users/tester/.paperclip/instances/local-audit/workspace-1";
+    await db.insert(projects).values({ id: projectId, companyId, name: "Workspaces", status: "in_progress" });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Feature workspace",
+      status: "active",
+      cwd: hostWorkspaceCwd,
+      providerRef: hostWorkspaceCwd,
+    });
+    await db.insert(environments).values({
+      id: environmentId,
+      name: `Local ${environmentId}`,
+      driver: "local",
+      config: {},
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+    });
+    await db.insert(environmentLeases).values({
+      companyId,
+      environmentId,
+      executionWorkspaceId: workspaceId,
+      heartbeatRunId: runId,
+      status: "active",
+      metadata: { driver: "local" },
+    });
+    const pluginWorkerManager = { call: vi.fn() } as any;
+    const services = buildHostServices(
+      db,
+      "plugin-record-id",
+      "paperclip.workspace",
+      createEventBusStub(),
+      undefined,
+      { pluginWorkerManager },
+    );
+
+    await expect(services.executionWorkspaces.execute({
+      workspaceId,
+      companyId,
+      runId,
+      command: "git",
+      args: ["status"],
+      cwd: hostWorkspaceCwd,
+    }, { invocationScope: { companyId, runId, agentId } }))
+      .rejects.toThrow(/only supported on sandbox and plugin environments/);
+    expect(pluginWorkerManager.call).not.toHaveBeenCalled();
+  });
+
   it("creates plugin-origin issues with full orchestration fields and audit activity", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const blockerIssueId = randomUUID();
