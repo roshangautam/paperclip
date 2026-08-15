@@ -981,6 +981,11 @@ describe("sandbox adapter execution targets", () => {
           (env) => env.PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS === "75000",
         ),
       ).toBe(true);
+      expect(
+        capturedRunnerEnvs.some(
+          (env) => env.PAPERCLIP_BRIDGE_MAX_QUEUE_DEPTH === "4",
+        ),
+      ).toBe(true);
 
       const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/agents/me`, {
         headers: {

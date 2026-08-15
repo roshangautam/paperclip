@@ -88,6 +88,7 @@ const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
 // `tool_timeout` even though the approval succeeded. Give approved executions
 // the full permitted headroom instead.
 const APPROVED_EXECUTION_TIMEOUT_MS = 60_000;
+const RETRYABLE_MARKED_LEASE_RELEASE_DELAY_MS = 60_000;
 const MAX_REMOTE_MCP_RESPONSE_BYTES = 1_000_000;
 const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -6977,6 +6978,7 @@ export function createToolGatewayService(
             .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, toolInvocations.runId))
             .where(and(
               isNotNull(toolInvocations.leaseReleasePendingAt),
+              lte(toolInvocations.leaseReleasePendingAt, now),
               inArray(heartbeatRuns.status, RUN_LEASE_RELEASE_TERMINAL_STATUSES),
               markedCursor
                 ? or(
@@ -6999,6 +7001,12 @@ export function createToolGatewayService(
           for (const row of marked) {
             const outcome = await finalizeMarkedLeaseRelease(row.id);
             if (outcome === "released") markedReleased += 1;
+            if (outcome === "retryable" && row.pendingAt) {
+              await db
+                .update(toolInvocations)
+                .set({ leaseReleasePendingAt: new Date(now.getTime() + RETRYABLE_MARKED_LEASE_RELEASE_DELAY_MS) })
+                .where(and(eq(toolInvocations.id, row.id), eq(toolInvocations.leaseReleasePendingAt, row.pendingAt)));
+            }
             if (markedReleased >= limit) break;
           }
           if (marked.length < pageSize) break;

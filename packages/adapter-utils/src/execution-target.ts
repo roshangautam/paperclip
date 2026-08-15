@@ -1342,6 +1342,7 @@ const managedToolGatewayMcpPath = /^\/api\/tool-gateway\/gateways\/[^/]+\/mcp$/;
 const BRIDGE_DEFAULT_FETCH_TIMEOUT_MS = 30_000;
 const BRIDGE_MCP_FETCH_TIMEOUT_MS = 65_000;
 const BRIDGE_MCP_RESPONSE_WAIT_MS = 75_000;
+const BRIDGE_MCP_QUEUE_DEPTH = 4;
 
 
 function managedToolGatewayBearerToken(
@@ -1961,6 +1962,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       bridgeAsset,
       timeoutMs: bridgeTimeoutMs,
       responseTimeoutMs: BRIDGE_MCP_RESPONSE_WAIT_MS,
+      maxQueueDepth: BRIDGE_MCP_QUEUE_DEPTH,
       maxBodyBytes,
       shellCommand,
     });
