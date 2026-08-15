@@ -897,7 +897,7 @@ export async function startServer(): Promise<StartedServer> {
     if (sandboxCleanupStopped || toolActionReconciliationInFlight.size > 0) return;
     trackToolActionReconciliationWork(reconcileExpiredToolActions()
       .then((result) => {
-        if (result.reconciled > 0 || result.released > 0) {
+        if (result.reconciled > 0 || result.released > 0 || result.markedReleased > 0) {
           logger.info(
             result,
             phase === "startup"
