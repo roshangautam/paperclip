@@ -1383,6 +1383,99 @@ describe("environment routes", () => {
     expect(JSON.stringify(mockEnvironmentService.create.mock.calls[0][0])).not.toContain("null");
   });
 
+  it("rejects persistence when the schema hides a credential behind an unsupported keyword", async () => {
+    mockValidatePluginSandboxProviderConfig.mockResolvedValue({
+      normalizedConfig: {
+        mode: "token",
+        apiKey: "plaintext-secret-value",
+      },
+      driver: {
+        driverKey: "secure-plugin",
+        kind: "sandbox_provider",
+        displayName: "Secure Sandbox",
+        configSchema: {
+          type: "object",
+          if: { properties: { mode: { const: "token" } } },
+          then: { properties: { apiKey: { type: "string", format: "secret-ref" } } },
+        },
+      },
+    });
+    const pluginWorkerManager = {};
+    const app = createApp({
+      type: "board",
+      userId: "user-1",
+      source: "local_implicit",
+    }, { pluginWorkerManager });
+
+    const res = await request(app)
+      .post("/api/companies/company-1/environments")
+      .send({
+        name: "Uninspectable Sandbox",
+        driver: "sandbox",
+        config: {
+          provider: "secure-plugin",
+          mode: "token",
+          apiKey: "plaintext-secret-value",
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(JSON.stringify(res.body)).not.toContain("plaintext-secret-value");
+    expect(mockSecretService.create).not.toHaveBeenCalled();
+    expect(mockEnvironmentService.create).not.toHaveBeenCalled();
+  });
+
+  it("persists normally when an unsupported keyword governs no credential field", async () => {
+    const apiSecretId = "66666666-6666-4666-8666-666666666666";
+    const environment = {
+      ...createEnvironment(),
+      id: "env-sandbox-benign-plugin",
+      name: "Benign Sandbox",
+      driver: "sandbox" as const,
+      config: { provider: "secure-plugin", apiKey: apiSecretId },
+    };
+    mockEnvironmentService.create.mockResolvedValue(environment);
+    mockValidatePluginSandboxProviderConfig.mockResolvedValue({
+      normalizedConfig: {
+        apiKey: "provider-secret",
+      },
+      driver: {
+        driverKey: "secure-plugin",
+        kind: "sandbox_provider",
+        displayName: "Secure Sandbox",
+        configSchema: {
+          type: "object",
+          not: { properties: { forbidden: { const: true } } },
+          properties: {
+            apiKey: { type: "string", format: "secret-ref" },
+          },
+        },
+      },
+    });
+    const pluginWorkerManager = {};
+    mockSecretService.create.mockResolvedValueOnce({ id: apiSecretId });
+    const app = createApp({
+      type: "board",
+      userId: "user-1",
+      source: "local_implicit",
+    }, { pluginWorkerManager });
+
+    const res = await request(app)
+      .post("/api/companies/company-1/environments")
+      .send({
+        name: "Benign Sandbox",
+        driver: "sandbox",
+        config: { provider: "secure-plugin", apiKey: "provider-secret" },
+      });
+
+    expect(res.status).toBe(201);
+    const persistedConfig = mockEnvironmentService.create.mock.calls[0][0].config as {
+      apiKey: string;
+    };
+    expect(persistedConfig.apiKey).toBe(apiSecretId);
+    expect(JSON.stringify(mockEnvironmentService.create.mock.calls[0][0])).not.toContain("provider-secret");
+  });
+
   it("uses the configured provider for schema-driven sandbox secret fields", async () => {
     process.env.PAPERCLIP_SECRETS_PROVIDER = "aws_secrets_manager";
     const environment = {

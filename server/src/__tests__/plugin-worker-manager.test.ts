@@ -203,6 +203,53 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("redacts worker-controlled protocol id/method log fields during a sensitive invocation", async () => {
+    const childLogger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const childSpy = vi.spyOn(logger, "child").mockReturnValue(childLogger as any);
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      const leakedValue = "github_pat_transient_protocol_field_token";
+      await expect(
+        handle.call("environmentRealizeWorkspace", {
+          driverKey: "coder",
+          companyId: "company-1",
+          environmentId: "environment-1",
+          config: { protocolFieldLeak: true },
+          lease: { providerLeaseId: "lease-1" },
+          env: { GITHUB_TOKEN: leakedValue },
+          workspace: {},
+        }),
+      ).resolves.toMatchObject({ cwd: "/workspace/project" });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const logged = JSON.stringify(
+        Object.values(childLogger).flatMap((method) => method.mock.calls),
+      );
+      expect(logged).not.toContain(leakedValue);
+    } finally {
+      await handle.stop().catch(() => undefined);
+      childSpy.mockRestore();
+    }
+  });
+
   it("redacts a bearer token extracted from the PAPERCLIP_CLAUDE_MCP_CONFIG envelope in a worker error", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: DELAYED_WORKER_ENTRYPOINT,

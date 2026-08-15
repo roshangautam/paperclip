@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   collectSecretRefPaths,
   compactConfigArrays,
+  inspectSecretRefPaths,
   readConfigValueAtPath,
   scopeConfigResourceArrays,
   writeConfigValueAtPath,
@@ -317,5 +318,56 @@ describe("collectSecretRefPaths", () => {
     const compacted = compactConfigArrays(updated);
     expect(compacted).toEqual({ tokens: ["keep-me"] });
     expect(JSON.stringify(compacted)).not.toContain("null");
+  });
+});
+
+describe("inspectSecretRefPaths completeness", () => {
+  it("marks incomplete when an unsupported keyword hides a secret-ref", () => {
+    const result = inspectSecretRefPaths({
+      type: "object",
+      if: { properties: { mode: { const: "token" } } },
+      then: { properties: { apiKey: { type: "string", format: "secret-ref" } } },
+    }, { mode: "token", apiKey: "plaintext-secret" });
+    expect(result.complete).toBe(false);
+    expect(Array.from(result.paths)).not.toContain("apiKey");
+  });
+
+  it("stays complete when an unsupported keyword governs no secret-ref", () => {
+    const result = inspectSecretRefPaths({
+      type: "object",
+      not: { properties: { forbidden: { const: true } } },
+      properties: { apiKey: { type: "string", format: "secret-ref" } },
+    }, { apiKey: "22222222-2222-4222-8222-222222222222" });
+    expect(result.complete).toBe(true);
+    expect(Array.from(result.paths)).toEqual(["apiKey"]);
+  });
+
+  it("marks incomplete for an opaque $dynamicRef governing credentials", () => {
+    const result = inspectSecretRefPaths({
+      type: "object",
+      then: { $dynamicRef: "#meta" },
+    }, { apiKey: "plaintext" });
+    expect(result.complete).toBe(false);
+  });
+
+  it("marks incomplete when draft-07 dependencies schema-form hides a secret-ref", () => {
+    const result = inspectSecretRefPaths({
+      type: "object",
+      dependencies: {
+        trigger: { properties: { apiKey: { type: "string", format: "secret-ref" } } },
+      },
+    }, { trigger: "on", apiKey: "plaintext-secret" });
+    expect(result.complete).toBe(false);
+    expect(Array.from(result.paths)).not.toContain("apiKey");
+  });
+
+  it("stays complete for a draft-07 dependencies property-dependency array form", () => {
+    const result = inspectSecretRefPaths({
+      type: "object",
+      dependencies: { trigger: ["companion"] },
+      properties: { apiKey: { type: "string", format: "secret-ref" } },
+    }, { apiKey: "33333333-3333-4333-8333-333333333333" });
+    expect(result.complete).toBe(true);
+    expect(Array.from(result.paths)).toEqual(["apiKey"]);
   });
 });

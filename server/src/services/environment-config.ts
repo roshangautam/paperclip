@@ -283,7 +283,19 @@ async function persistConfigSecretRefs(input: {
   actor?: { userId?: string | null; agentId?: string | null };
 }): Promise<Record<string, unknown>> {
   let nextConfig = { ...input.config };
-  for (const path of collectSecretRefPaths(input.schema, nextConfig)) {
+  // Security: a schema whose secret-ref coverage cannot be fully enumerated (an
+  // unsupported keyword governing a credential field) would let a plaintext
+  // secret slip through unminted and persist in cleartext. Reject the write
+  // atomically before any secret creation or DB mutation rather than storing a
+  // partially scrubbed — and silently broken — config.
+  const persistInspection = inspectSecretRefPaths(input.schema, nextConfig);
+  if (input.schema && !persistInspection.complete) {
+    throw unprocessable(
+      "Environment provider schema uses unsupported constructs that hide credential fields; cannot safely persist secret references",
+      { code: "environment_config_secret_ref_schema_uninspectable" },
+    );
+  }
+  for (const path of persistInspection.paths) {
     const rawValue = readConfigValueAtPath(nextConfig, path);
     if (typeof rawValue !== "string") continue;
     const trimmed = rawValue.trim();

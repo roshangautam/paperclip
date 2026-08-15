@@ -70,6 +70,7 @@ import {
 } from "./plugin-environment-driver.js";
 import {
   collectSecretRefPaths,
+  inspectSecretRefPaths,
   scopeConfigResourceArrays,
   writeConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
@@ -125,8 +126,19 @@ function stripSecretRefsFromPluginConfigSnapshot(input: {
   if (!input.schema) {
     return redactPersistedCredentialValues(sanitized) as Record<string, unknown>;
   }
-  for (const path of collectSecretRefPaths(input.schema, sanitized)) {
+  // Security: when the schema's secret-ref coverage cannot be fully enumerated,
+  // removing only the declared paths could leave a plaintext credential in the
+  // reuse snapshot. A reuse snapshot is intentionally credential-free, so fall
+  // back to the value-level redactor (as the no-schema branch does) whenever
+  // inspection is incomplete.
+  const inspection = inspectSecretRefPaths(input.schema, sanitized);
+  for (const path of inspection.paths) {
     sanitized = writeConfigValueAtPath(sanitized, path, undefined);
+  }
+  if (!inspection.complete) {
+    return redactPersistedCredentialValues(sanitized, {
+      preserveContainerPaths: secretRefContainerPaths(inspection.paths),
+    }) as Record<string, unknown>;
   }
   return sanitized;
 }

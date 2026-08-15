@@ -66,12 +66,53 @@ function resolveLocalSchemaRef(
   return isPlainRecord(current) ? current : null;
 }
 
+// Security: the inspection walk cannot enumerate secret-ref paths hidden behind
+// unsupported schema keywords (if/then/else, contains, dependentSchemas, not,
+// prefixItems, unevaluated*, $dynamicRef). A caller that fails closed on an
+// incomplete inspection would over-reject any schema merely CONTAINING such a
+// keyword, even where it governs no credential. This scan decides whether an
+// unsupported subtree could actually hide a `format: "secret-ref"` leaf, so the
+// completeness flag only drops when a real secret could be missed. It follows
+// local $ref conservatively and treats $dynamicRef / unresolved / external refs
+// as capable of hiding a secret-ref (fail closed on the opaque case).
+function schemaFragmentMayHideSecretRef(
+  rootSchema: Record<string, unknown>,
+  fragment: unknown,
+  seenRefs: ReadonlySet<string>,
+): boolean {
+  if (Array.isArray(fragment)) {
+    return fragment.some((entry) => schemaFragmentMayHideSecretRef(rootSchema, entry, seenRefs));
+  }
+  if (!isPlainRecord(fragment)) return false;
+
+  if (fragment.format === "secret-ref") return true;
+  if (fragment.$dynamicRef !== undefined) return true;
+
+  const ref = fragment.$ref;
+  if (ref !== undefined) {
+    if (typeof ref !== "string") return true;
+    if (!seenRefs.has(ref)) {
+      const resolved = resolveLocalSchemaRef(rootSchema, ref);
+      if (!resolved) return true;
+      const nextSeenRefs = new Set(seenRefs);
+      nextSeenRefs.add(ref);
+      if (schemaFragmentMayHideSecretRef(rootSchema, resolved, nextSeenRefs)) return true;
+    }
+  }
+
+  for (const child of Object.values(fragment)) {
+    if (child === fragment.$ref) continue;
+    if (schemaFragmentMayHideSecretRef(rootSchema, child, seenRefs)) return true;
+  }
+  return false;
+}
+
 export function inspectSecretRefPaths(
   schema: Record<string, unknown> | null | undefined,
   config?: Record<string, unknown>,
-): { paths: Set<string>; inspectable: boolean } {
+): { paths: Set<string>; inspectable: boolean; complete: boolean } {
   const paths = new Set<string>();
-  if (!schema || typeof schema !== "object") return { paths, inspectable: false };
+  if (!schema || typeof schema !== "object") return { paths, inspectable: false, complete: false };
   const rootSchema = schema;
 
   const hasConfig = config !== undefined;
@@ -241,6 +282,7 @@ export function inspectSecretRefPaths(
     for (const unsupportedKeyword of [
       "$dynamicRef",
       "contains",
+      "dependencies",
       "dependentSchemas",
       "if",
       "then",
@@ -250,7 +292,12 @@ export function inspectSecretRefPaths(
       "unevaluatedItems",
       "unevaluatedProperties",
     ] as const) {
-      if (node[unsupportedKeyword] !== undefined) complete = false;
+      if (
+        node[unsupportedKeyword] !== undefined
+        && schemaFragmentMayHideSecretRef(rootSchema, node[unsupportedKeyword], seenRefs)
+      ) {
+        complete = false;
+      }
     }
   }
 
@@ -258,6 +305,7 @@ export function inspectSecretRefPaths(
   return {
     paths,
     inspectable: complete && sawInspectableStructure,
+    complete,
   };
 }
 

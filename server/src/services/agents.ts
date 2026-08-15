@@ -752,12 +752,24 @@ export function agentService(db: Db) {
         // it, leaking the lease (and any external provider resource). Block the
         // deletion until those runs' leases are released and markers cleared.
         //
-        // Lock the agent's run rows FOR UPDATE before the check so this is
-        // serialized with lease acquisition: a concurrent lease insert takes a
-        // FOR KEY SHARE lock on the referenced heartbeat_run row, which conflicts
-        // with our FOR UPDATE and blocks until this transaction commits. Without
-        // the lock a lease could be inserted after the check returns empty but
-        // before the run deletion nulls heartbeat_run_id, re-orphaning the lease.
+        // Two locks are both required, closing symmetric holes:
+        //   1. Lock the AGENT row FOR UPDATE. A concurrent heartbeat inserting a
+        //      brand-new run takes a FOR KEY SHARE lock on the referenced agents
+        //      row for the foreign key; that conflicts with our FOR UPDATE and
+        //      blocks until this transaction commits (then fails, agent gone).
+        //      This is what a run-row lock cannot do: row locks cannot block the
+        //      INSERT of a phantom new run.
+        //   2. Lock the existing run rows FOR UPDATE. A lease insert on an
+        //      EXISTING run takes a FOR KEY SHARE lock only on that run row (the
+        //      environment_leases FK references heartbeat_runs, not agents), so
+        //      the agent-row lock alone does not serialize it; the run-row lock
+        //      does. Without it a lease inserted on an existing run after the
+        //      blockingRuns check but before the run deletion is orphaned.
+        await tx
+          .select({ id: agents.id })
+          .from(agents)
+          .where(eq(agents.id, id))
+          .for("update");
         await tx
           .select({ id: heartbeatRuns.id })
           .from(heartbeatRuns)

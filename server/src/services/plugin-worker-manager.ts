@@ -513,7 +513,10 @@ export function createPluginWorkerHandle(
 
     const pending = pendingRequests.get(id);
     if (!pending) {
-      log.warn({ id }, "received response for unknown request id");
+      log.warn(
+        { id: suppressUnscopedWorkerOutput ? REDACTED_EVENT_VALUE : id },
+        "received response for unknown request id",
+      );
       return;
     }
 
@@ -719,7 +722,10 @@ export function createPluginWorkerHandle(
       | undefined;
 
     if (!handler) {
-      log.warn({ method }, "worker called unregistered host method");
+      log.warn(
+        { method: suppressUnscopedWorkerOutput ? REDACTED_EVENT_VALUE : method },
+        "worker called unregistered host method",
+      );
       try {
         sendMessage(
           createErrorResponse(
@@ -861,7 +867,10 @@ export function createPluginWorkerHandle(
       return;
     }
 
-    log.debug({ method: notification.method }, "received notification from worker");
+    log.debug(
+      { method: suppressUnscopedWorkerOutput ? REDACTED_EVENT_VALUE : notification.method },
+      "received notification from worker",
+    );
   }
 
   // -----------------------------------------------------------------------

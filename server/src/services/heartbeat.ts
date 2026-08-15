@@ -15807,6 +15807,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const outcome = await db.transaction(async (tx) => {
+        // Lock the target agent row FOR KEY SHARE before taking any child-row
+        // lock. agentService.remove() locks this agent FOR UPDATE first and only
+        // then updates issues assigned to it, establishing an agents -> issues
+        // hierarchy. Without this pre-lock, requestWake would lock the issue
+        // first (below) and then acquire an implicit FOR KEY SHARE on agents via
+        // the heartbeat_runs FK insert, producing an ABBA deadlock against a
+        // concurrent agent delete. FOR KEY SHARE (not FOR UPDATE) still permits
+        // concurrent wakes for the same agent while conflicting with delete's
+        // FOR UPDATE, so the delete correctly waits behind an in-flight wake.
+        await tx.execute(
+          sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for key share`,
+        );
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );

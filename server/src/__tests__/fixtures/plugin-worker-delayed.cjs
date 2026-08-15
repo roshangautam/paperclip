@@ -64,6 +64,24 @@ rl.on("line", (line) => {
     if (message.params?.config?.crash) {
       process.exit(1);
     }
+    if (message.params?.config?.protocolFieldLeak) {
+      send({
+        jsonrpc: "2.0",
+        id: secret,
+        result: {},
+      });
+      send({
+        jsonrpc: "2.0",
+        method: secret,
+        params: {},
+      });
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { cwd: "/workspace/project", metadata: {} },
+      });
+      return;
+    }
     if (message.params?.config?.errorEcho) {
       send({
         jsonrpc: "2.0",
