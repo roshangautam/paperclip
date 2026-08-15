@@ -1763,6 +1763,70 @@ export function createToolGatewayService(
     }));
   }
 
+  async function recoverStaleExecutingAction(input: {
+    actionRequestId: string;
+    invocationId: string;
+    now: Date;
+  }): Promise<{ recovered: boolean; released: boolean }> {
+    const transition = await db.transaction(async (tx) => {
+      const [cancelledInvocation] = await tx
+        .update(toolInvocations)
+        .set({
+          status: "cancelled",
+          approvalState: "expired",
+          idempotencyKey: null,
+          errorCode: "action_expired_pending_lease_release",
+          errorMessage: "Tool action request execution did not complete before recovery",
+          completedAt: input.now,
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(toolInvocations.id, input.invocationId),
+          eq(toolInvocations.status, "executing"),
+        ))
+        .returning({ id: toolInvocations.id });
+      if (!cancelledInvocation) {
+        const [pendingRelease] = await tx
+          .select({ id: toolInvocations.id })
+          .from(toolInvocations)
+          .innerJoin(toolActionRequests, eq(toolActionRequests.invocationId, toolInvocations.id))
+          .where(and(
+            eq(toolInvocations.id, input.invocationId),
+            eq(toolInvocations.status, "cancelled"),
+            eq(toolInvocations.errorCode, "action_expired_pending_lease_release"),
+            eq(toolActionRequests.id, input.actionRequestId),
+            eq(toolActionRequests.status, "expired"),
+          ))
+          .limit(1);
+        return pendingRelease ? { recovered: false } : null;
+      }
+      const [expiredRequest] = await tx
+        .update(toolActionRequests)
+        .set({ status: "expired", resolvedAt: input.now, updatedAt: input.now })
+        .where(and(
+          eq(toolActionRequests.id, input.actionRequestId),
+          eq(toolActionRequests.status, "executing"),
+        ))
+        .returning({ id: toolActionRequests.id });
+      if (!expiredRequest) tx.rollback();
+      await reflectToolActionInteractionLifecycle({
+        actionRequestId: expiredRequest.id,
+        status: "expired",
+        errorCode: "action_expired",
+        errorMessage: "Tool action request execution did not complete before recovery",
+      }, tx);
+      return { recovered: true };
+    });
+    if (!transition) return { recovered: false, released: false };
+    const released = await finalizePendingLeaseRelease({
+      invocationId: input.invocationId,
+      pendingErrorCode: "action_expired_pending_lease_release",
+      finalErrorCode: "action_expired",
+      now: input.now,
+    });
+    return { recovered: transition.recovered, released };
+  }
+
   async function invalidateExpiredActionCandidate(input: {
     actionRequestId: string;
     invocationId: string;
@@ -6856,6 +6920,7 @@ export function createToolGatewayService(
       let released = 0;
       let invalidated = 0;
       let legacyExpired = 0;
+      const staleExecutingStartedBefore = new Date(now.getTime() - APPROVED_EXECUTION_TIMEOUT_MS);
       while (scanned < scanCeiling && reconciled + released + invalidated + legacyExpired < limit) {
         const pageSize = Math.min(limit, scanCeiling - scanned);
         const candidates = await db
@@ -6867,6 +6932,11 @@ export function createToolGatewayService(
               and(
                 inArray(toolActionRequests.status, ["pending", "approved"]),
                 lte(toolActionRequests.expiresAt, now),
+              ),
+              and(
+                eq(toolActionRequests.status, "executing"),
+                eq(toolInvocations.status, "executing"),
+                lte(toolInvocations.startedAt, staleExecutingStartedBefore),
               ),
               and(
                 eq(toolActionRequests.status, "expired"),
@@ -6915,6 +6985,17 @@ export function createToolGatewayService(
               now,
             });
             if (result.invalidated) invalidated += 1;
+            if (result.released) released += 1;
+            if (reconciled + released + invalidated + legacyExpired >= limit) break;
+            continue;
+          }
+          if (actionRequest.status === "executing") {
+            const result = await recoverStaleExecutingAction({
+              actionRequestId: actionRequest.id,
+              invocationId: invocation.id,
+              now,
+            });
+            if (result.recovered) reconciled += 1;
             if (result.released) released += 1;
             if (reconciled + released + invalidated + legacyExpired >= limit) break;
             continue;

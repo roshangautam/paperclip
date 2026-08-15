@@ -261,6 +261,32 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       115_000,
     );
 
+
+    pluginWorkerManager.call.mockClear();
+    await expect(services.executionWorkspaces.execute({
+      workspaceId,
+      companyId,
+      runId,
+      command: "git",
+      args: ["status"],
+      cwd: "packages/server",
+    }, { invocationScope: { companyId, runId, agentId } })).resolves.toMatchObject({ exitCode: 0 });
+    expect(pluginWorkerManager.call).toHaveBeenCalledWith(
+      providerPluginId,
+      "environmentExecute",
+      expect.objectContaining({ cwd: "/home/coder/workspace/packages/server" }),
+      115_000,
+    );
+
+    await expect(services.executionWorkspaces.execute({
+      workspaceId,
+      companyId,
+      runId,
+      command: "git",
+      args: ["status"],
+      cwd: "/Users/other/workspace",
+    }, { invocationScope: { companyId, runId, agentId } })).rejects.toThrow("Execution workspace cwd must stay inside the workspace");
+
     pluginWorkerManager.call.mockClear();
     await expect(services.executionWorkspaces.execute({
       workspaceId,

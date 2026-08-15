@@ -679,15 +679,24 @@ export function buildHostServices(
     const requestedCwd = input.requestedCwd?.trim();
     if (!requestedCwd) return remoteCwd;
 
+    if (!path.isAbsolute(requestedCwd)) {
+      const normalizedRelative = path.posix.normalize(requestedCwd.split(path.sep).join(path.posix.sep));
+      if (normalizedRelative === ".") return remoteCwd;
+      if (normalizedRelative === ".." || normalizedRelative.startsWith("../") || path.posix.isAbsolute(normalizedRelative)) {
+        throw new Error("Execution workspace cwd must stay inside the workspace");
+      }
+      return path.posix.join(remoteCwd, normalizedRelative);
+    }
+
     const hostWorkspaceCwd = input.workspace.cwd ?? input.workspace.providerRef;
-    if (!hostWorkspaceCwd || !path.isAbsolute(hostWorkspaceCwd) || !path.isAbsolute(requestedCwd)) {
-      return input.requestedCwd;
+    if (!hostWorkspaceCwd || !path.isAbsolute(hostWorkspaceCwd)) {
+      throw new Error("Execution workspace cwd must be relative or inside the workspace");
     }
 
     const relativeCwd = path.relative(path.resolve(hostWorkspaceCwd), path.resolve(requestedCwd));
     if (relativeCwd === "") return remoteCwd;
     if (relativeCwd === ".." || relativeCwd.startsWith(`..${path.sep}`) || path.isAbsolute(relativeCwd)) {
-      return input.requestedCwd;
+      throw new Error("Execution workspace cwd must stay inside the workspace");
     }
 
     return path.posix.join(remoteCwd, relativeCwd.split(path.sep).join(path.posix.sep));

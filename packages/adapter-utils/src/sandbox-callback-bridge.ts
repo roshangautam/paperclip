@@ -1173,6 +1173,10 @@ const server = createServer(async (req, res) => {
     const tempPath = \`\${requestPath}.tmp\`;
     await fs.writeFile(tempPath, \`\${JSON.stringify(payload)}\\n\`, "utf8");
     await fs.rename(tempPath, requestPath);
+    if (queueSlotReserved) {
+      releaseQueueSlot();
+      queueSlotReserved = false;
+    }
 
     const response = await waitForResponse(requestId);
     res.statusCode = typeof response.status === "number" ? response.status : 200;

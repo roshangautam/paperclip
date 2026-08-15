@@ -1198,8 +1198,12 @@ describeEmbeddedPostgres("tool gateway service", () => {
     await db.update(toolActionRequests).set({ expiresAt: expiredAt }).where(eq(toolActionRequests.id, pendingRequest.id));
     await db.update(toolActionRequests).set({ status: "approved", expiresAt: expiredAt })
       .where(eq(toolActionRequests.id, approvedRequest.id));
-    await db.update(toolActionRequests).set({ status: "executing", expiresAt: expiredAt })
+    await db.update(toolActionRequests).set({ status: "executing", expiresAt: new Date(Date.now() + 3_600_000) })
       .where(eq(toolActionRequests.id, executingRequest.id));
+    await db.update(toolInvocations).set({
+      status: "executing",
+      startedAt: new Date(Date.now() - 61_000),
+    }).where(eq(toolInvocations.id, executingRequest.invocationId));
     await db.update(toolActionRequests).set({ expiresAt: expiredAt, signedArguments: "unrelated-approval" })
       .where(eq(toolActionRequests.id, invalidRequest.id));
 
@@ -1209,32 +1213,33 @@ describeEmbeddedPostgres("tool gateway service", () => {
     ]);
     const third = await gateway.reconcileExpiredExecuteOnApproveActions({ limit: 10 });
 
-    expect(first.reconciled + second.reconciled).toBe(2);
+    expect(first.reconciled + second.reconciled).toBe(3);
     expect(third.reconciled).toBe(0);
     const reconciledRequests = await db.select().from(toolActionRequests).orderBy(toolActionRequests.createdAt);
     expect(reconciledRequests.map((request) => request.status)).toEqual([
       "expired",
       "expired",
-      "executing",
+      "expired",
       "cancelled",
     ]);
     const invocations = await db.select().from(toolInvocations).orderBy(toolInvocations.createdAt);
     expect(invocations.map((invocation) => [invocation.status, invocation.approvalState])).toEqual([
       ["cancelled", "expired"],
       ["cancelled", "expired"],
-      ["awaiting_approval", "pending"],
+      ["cancelled", "expired"],
       ["cancelled", "expired"],
     ]);
     const interactions = await db.select().from(issueThreadInteractions).orderBy(issueThreadInteractions.createdAt);
     expect(interactions.map((interaction) => interaction.status)).toEqual([
       "expired",
       "expired",
-      "pending",
+      "expired",
       "expired",
     ]);
-    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(3);
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledTimes(4);
     expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({ runId: pendingFixture.run.id, runStatus: "succeeded" });
     expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({ runId: approvedFixture.run.id, runStatus: "succeeded" });
+    expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({ runId: executingFixture.run.id, runStatus: "succeeded" });
     expect(releaseRunEnvironmentLeases).toHaveBeenCalledWith({ runId: invalidFixture.run.id, runStatus: "succeeded" });
   });
 
