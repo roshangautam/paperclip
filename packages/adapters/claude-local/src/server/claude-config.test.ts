@@ -2,18 +2,82 @@ import * as fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const { runAdapterExecutionTargetShellCommand } = vi.hoisted(() => ({
+  runAdapterExecutionTargetShellCommand: vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    pid: null,
+    startedAt: new Date().toISOString(),
+  })),
+}));
+
+vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>("@paperclipai/adapter-utils/execution-target");
+  return {
+    ...actual,
+    runAdapterExecutionTargetShellCommand,
+  };
+});
+
 import {
   buildPaperclipClaudeMcpConfig,
   prepareClaudeConfigSeed,
+  removeRemoteClaudeMcpConfig,
   resolveUniquePaperclipClaudeMcpServerNames,
 } from "./claude-config.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
+
+
+describe("removeRemoteClaudeMcpConfig", () => {
+  it("reports a nonzero remote cleanup command without throwing", async () => {
+    runAdapterExecutionTargetShellCommand.mockResolvedValueOnce({
+      exitCode: 255,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "permission denied",
+      pid: null,
+      startedAt: new Date().toISOString(),
+    });
+    const onLog = vi.fn(async () => {});
+
+    await expect(removeRemoteClaudeMcpConfig({
+      runId: "run-1",
+      target: null,
+      configPath: "/remote/.paperclip-runtime/claude/mcp-config/runs/run-1/mcp-config.json",
+      options: {
+        cwd: "/remote/workspace",
+        env: {},
+        timeoutSec: 30,
+        graceSec: 5,
+        onLog,
+      },
+    })).resolves.toBeUndefined();
+    expect(onLog).toHaveBeenCalledWith(
+      "stderr",
+      "[paperclip] Failed to remove remote Claude MCP config: exit 255\n",
+    );
+  });
+});
 
 describe("prepareClaudeConfigSeed", () => {
   const cleanupDirs: string[] = [];
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    runAdapterExecutionTargetShellCommand.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      pid: null,
+      startedAt: new Date().toISOString(),
+    });
     while (cleanupDirs.length > 0) {
       const dir = cleanupDirs.pop();
       if (!dir) continue;

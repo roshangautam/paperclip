@@ -114,6 +114,27 @@ describe("claude remote execution", () => {
     await mkdir(alternateWorkspaceDir, { recursive: true });
     await writeFile(instructionsPath, "Use the remote workspace.\n", "utf8");
 
+    runAdapterExecutionTargetShellCommand
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        pid: null,
+        startedAt: new Date().toISOString(),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 255,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "permission denied",
+        pid: null,
+        startedAt: new Date().toISOString(),
+      });
+    const onLog = vi.fn(async () => {});
+
     await execute({
       runId: "run-1",
       agent: {
@@ -176,7 +197,7 @@ describe("claude remote execution", () => {
           strictHostKeyChecking: true,
         },
       },
-      onLog: async () => {},
+      onLog,
       runtimeMcp: {
         getServers: () => [{
           name: "Plugin: Agent Identities",
@@ -262,6 +283,10 @@ describe("claude remote execution", () => {
     expect(cleanupCall?.[2]).toMatch(/^rm -f /);
     expect(cleanupCall?.[2]).toContain(expectedRemoteMcpConfigPath);
     expect(cleanupCall?.[3]?.env.PAPERCLIP_CLAUDE_MCP_CONFIG).toBeUndefined();
+    expect(onLog).toHaveBeenCalledWith(
+      "stderr",
+      "[paperclip] Failed to remove remote Claude MCP config: exit 255\n",
+    );
     expect(runAdapterExecutionTargetShellCommand.mock.invocationCallOrder[0])
       .toBeLessThan(runAdapterExecutionTargetShellCommand.mock.invocationCallOrder[1]!);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);

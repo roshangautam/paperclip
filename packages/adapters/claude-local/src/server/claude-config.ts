@@ -228,20 +228,33 @@ export async function materializeRemoteClaudeMcpConfig(input: {
 // The materialized remote MCP config embeds the callback-bridge bearer token and
 // managed tool-gateway tokens. The managed workspace restore excludes
 // .paperclip-runtime, so this file would otherwise persist readable on the
-// remote resource after the run; remove it (best-effort) on both success and
-// failure so transient credentials do not accumulate.
+// remote resource after the run; attempt removal on both success and failure,
+// and report cleanup failures without blocking bridge teardown or workspace restore.
 export async function removeRemoteClaudeMcpConfig(input: {
   runId: string;
   target: AdapterExecutionTarget | null | undefined;
   configPath: string;
   options: AdapterExecutionTargetShellOptions;
 }): Promise<void> {
-  await runAdapterExecutionTargetShellCommand(
-    input.runId,
-    input.target,
-    `rm -f ${shellQuote(input.configPath)}`,
-    input.options,
-  ).catch(() => undefined);
+  let result: Awaited<ReturnType<typeof runAdapterExecutionTargetShellCommand>>;
+  try {
+    result = await runAdapterExecutionTargetShellCommand(
+      input.runId,
+      input.target,
+      `rm -f ${shellQuote(input.configPath)}`,
+      input.options,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const logPromise = input.options.onLog?.("stderr", `[paperclip] Failed to remove remote Claude MCP config: ${message}\n`);
+    if (logPromise) await logPromise.catch(() => undefined);
+    return;
+  }
+  if (result.timedOut || result.exitCode !== 0) {
+    const reason = result.timedOut ? "timed out" : `exit ${result.exitCode ?? "unknown"}`;
+    const logPromise = input.options.onLog?.("stderr", `[paperclip] Failed to remove remote Claude MCP config: ${reason}\n`);
+    if (logPromise) await logPromise.catch(() => undefined);
+  }
 }
 
 export async function prepareClaudeConfigSeed(
