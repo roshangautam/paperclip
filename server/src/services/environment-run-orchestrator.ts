@@ -115,10 +115,10 @@ export interface EnvironmentReleaseResult {
   errors: Array<{ leaseId: string; error: unknown }>;
 }
 
-// A provider's realization error message can echo back forwarded credentials
-// (e.g. a GitHub App private key). Redact each forwarded value in its raw,
-// trimmed, and JSON-serialized forms before it reaches the run error, then apply
-// pattern-based redaction as a defense-in-depth backstop for derived encodings.
+// A provider's realization error message can echo back forwarded secret material
+// (e.g. a GitHub App private key). Redact each secret-bearing forwarded value in
+// its raw, trimmed, and JSON-serialized forms before it reaches the run error,
+// then apply pattern-based redaction as a defense-in-depth backstop for derived encodings.
 function redactForwardedRealizationSecrets(
   message: string,
   forwardedEnv: Record<string, string>,
@@ -166,8 +166,10 @@ function buildSanitizedRealizationCause(
   forwardedEnv: Record<string, string>,
 ): Error {
   const rawMessage = err instanceof Error ? err.message : String(err);
-  const sanitized = new Error(redactForwardedRealizationSecrets(rawMessage, forwardedEnv));
-  sanitized.name = err instanceof Error ? err.name : "Error";
+  const sanitized = new Error(redactForwardedRealizationSecretValuesOnly(rawMessage, forwardedEnv));
+  sanitized.name = err instanceof Error
+    ? redactForwardedRealizationSecretValuesOnly(err.name, forwardedEnv)
+    : "Error";
   delete sanitized.stack;
   return sanitized;
 }
@@ -474,7 +476,7 @@ export function environmentRunOrchestrator(
         const rawMessage = err instanceof Error ? err.message : String(err);
         throw new EnvironmentRunError(
           "workspace_realization_failed",
-          `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${redactForwardedRealizationSecrets(rawMessage, forwardedRealizationEnv)}`,
+          `Failed to realize workspace for environment "${environment.name}" (${environment.driver}): ${redactForwardedRealizationSecretValuesOnly(rawMessage, forwardedRealizationEnv)}`,
           {
             environmentId: environment.id,
             driver: environment.driver,

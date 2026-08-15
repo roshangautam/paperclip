@@ -158,7 +158,7 @@ export function inspectSecretRefPaths(
       }
       if (branches.length > 0) sawInspectableStructure = true;
       for (const branch of branches) {
-        if (branch === false) continue;
+        if (branch === false || branch === true) continue;
         if (!isPlainRecord(branch)) {
           complete = false;
           continue;
@@ -174,7 +174,7 @@ export function inspectSecretRefPaths(
     } else if (isPlainRecord(properties)) {
       if (Object.keys(properties).length > 0) sawInspectableStructure = true;
       for (const [key, propertySchema] of Object.entries(properties)) {
-        if (propertySchema === false) continue;
+        if (propertySchema === false || propertySchema === true) continue;
         if (!isPlainRecord(propertySchema)) {
           complete = false;
           continue;
@@ -200,7 +200,7 @@ export function inspectSecretRefPaths(
     } else if (isPlainRecord(patternProperties)) {
       if (Object.keys(patternProperties).length > 0) sawInspectableStructure = true;
       for (const [pattern, propertySchema] of Object.entries(patternProperties)) {
-        if (propertySchema === false) continue;
+        if (propertySchema === false || propertySchema === true) continue;
         if (!isPlainRecord(propertySchema)) {
           complete = false;
           continue;
@@ -244,7 +244,7 @@ export function inspectSecretRefPaths(
       if (items.length > 0) sawInspectableStructure = true;
       const visitedIndexes = new Set<number>();
       items.forEach((itemSchema, index) => {
-        if (itemSchema === false) return;
+        if (itemSchema === false || itemSchema === true) return;
         if (!isPlainRecord(itemSchema)) {
           complete = false;
           return;

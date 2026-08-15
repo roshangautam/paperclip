@@ -359,6 +359,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `secrets.read-ref` |
 | | `secrets.bind-ref` |
 | | `environment.drivers.register` |
+| | `execution.workspaces.execute` |
 | | `local.folders` |
 | **Agent** | `agent.tools.register` |
 | | `agents.invoke` |
@@ -378,6 +379,8 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `ui.action.register` |
 
 Full list in code: import `PLUGIN_CAPABILITIES` from `@paperclipai/plugin-sdk`.
+
+`execution.workspaces.execute` allows a worker to run a command in an execution workspace only during a host-authorized tool invocation for the same heartbeat run and agent. The host still requires the run-scoped invocation context, a matching active environment lease, and a sandbox/plugin-backed workspace.
 
 ### External Object Reference Providers
 

@@ -370,4 +370,23 @@ describe("inspectSecretRefPaths completeness", () => {
     expect(result.complete).toBe(true);
     expect(Array.from(result.paths)).toEqual(["apiKey"]);
   });
+
+  it("stays complete for JSON Schema boolean true subschemas", () => {
+    const result = inspectSecretRefPaths({
+      type: "object",
+      allOf: [true],
+      properties: {
+        passthrough: true,
+        apiKey: { type: "string", format: "secret-ref" },
+      },
+      patternProperties: { "^x-": true },
+      items: [true],
+    }, {
+      passthrough: "diagnostic",
+      apiKey: "44444444-4444-4444-8444-444444444444",
+      "x-extra": "safe",
+    });
+    expect(result.complete).toBe(true);
+    expect(Array.from(result.paths)).toEqual(["apiKey"]);
+  });
 });

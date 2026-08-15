@@ -314,11 +314,11 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(mockResolveEnvironmentExecutionTarget).not.toHaveBeenCalled();
   });
 
-  it("realization failure: forwarded credentials echoed in the provider error are redacted", async () => {
+  it("realization failure: forwarded secret values are redacted without hiding App identifiers", async () => {
+    const leaked = new Error('provider rejected token "resolved-private-key" for installation app-id');
+    leaked.name = "RealizationError-resolved-private-key-installation-id";
     const runtime = makeMockRuntime({
-      realizeWorkspace: vi.fn().mockRejectedValue(
-        new Error('provider rejected token "resolved-private-key" for installation'),
-      ),
+      realizeWorkspace: vi.fn().mockRejectedValue(leaked),
     });
     const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
 
@@ -332,11 +332,14 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
         const cause = err.cause as Error | undefined;
         const serialized = JSON.stringify({
           message: err.message,
+          causeName: cause?.name,
           causeMessage: cause?.message,
           causeStack: cause?.stack ?? null,
           causeCause: (cause as { cause?: unknown } | undefined)?.cause ?? null,
         });
         return !serialized.includes("resolved-private-key")
+          && serialized.includes("installation-id")
+          && serialized.includes("app-id")
           && cause instanceof Error
           && cause.stack === undefined;
       },

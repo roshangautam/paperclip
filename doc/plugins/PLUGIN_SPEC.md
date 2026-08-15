@@ -860,6 +860,9 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `secrets.read-ref`
 - `secrets.bind-ref`
 - `environment.drivers.register`
+- `execution.workspaces.execute`
+
+`execution.workspaces.execute` is additionally constrained by invocation scope: the host only permits it from a worker callback that is executing for the same heartbeat run and agent as the requested workspace command, with an active matching lease. Terminal-run workspace execution requires a host-authoritative override and a terminal heartbeat status.
 
 ### Agent Tools
 
