@@ -157,24 +157,27 @@ function parseSandboxEnvironmentConfig(
     : ({ success: false as const, error: parsed.error });
 }
 
-export type SandboxProviderSchemaCache = Map<string, Record<string, unknown> | null>;
+export type SandboxProviderSchemaCache = Map<string, Promise<Record<string, unknown> | null> | Record<string, unknown> | null>;
 
 async function getSandboxProviderConfigSchema(
   db: Db,
   provider: string,
   schemaCache?: SandboxProviderSchemaCache,
 ): Promise<Record<string, unknown> | null> {
-  if (schemaCache?.has(provider)) {
-    return schemaCache.get(provider) ?? null;
-  }
-  const resolved = await resolvePluginSandboxProviderDriverByKey({
-    db,
-    driverKey: provider,
-  });
-  const schema = resolved?.driver.configSchema;
-  const normalized = schema && typeof schema === "object" && !Array.isArray(schema)
-    ? schema as Record<string, unknown>
-    : null;
+  const cached = schemaCache?.get(provider);
+  if (cached !== undefined) return await cached;
+  const pending = (async () => {
+    const resolved = await resolvePluginSandboxProviderDriverByKey({
+      db,
+      driverKey: provider,
+    });
+    const schema = resolved?.driver.configSchema;
+    return schema && typeof schema === "object" && !Array.isArray(schema)
+      ? schema as Record<string, unknown>
+      : null;
+  })();
+  schemaCache?.set(provider, pending);
+  const normalized = await pending;
   schemaCache?.set(provider, normalized);
   return normalized;
 }

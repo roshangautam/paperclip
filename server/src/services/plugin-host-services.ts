@@ -1622,27 +1622,63 @@ export function buildHostServices(
           ? Math.min(requestedTimeoutMs, PLUGIN_WORKSPACE_EXECUTION_MAX_TIMEOUT_MS)
           : PLUGIN_WORKSPACE_EXECUTION_MAX_TIMEOUT_MS;
 
-        return environmentRuntime.execute({
-          environment,
-          lease,
-          command: params.command,
-          args: params.args,
-          cwd: resolveExecutionWorkspaceCommandCwd({
-            requestedCwd: params.cwd,
-            workspace,
-            leaseMetadata: lease.metadata,
-          }),
-          env: params.env,
-          stdin: params.stdin,
-          timeoutMs: executionTimeoutMs,
-          ...(lease.metadata?.workspaceRealization
-            ? {
-                workspaceRealization: Object.fromEntries(
-                  Object.entries(lease.metadata.workspaceRealization),
-                ),
-              }
-            : {}),
+        const executionCwd = resolveExecutionWorkspaceCommandCwd({
+          requestedCwd: params.cwd,
+          workspace,
+          leaseMetadata: lease.metadata,
         });
+        const auditBase = {
+          workspaceId: params.workspaceId,
+          runId: params.runId,
+          agentId: run.agentId,
+          environmentId: environment.id,
+          driver: effectiveDriver,
+          cwd: executionCwd ?? null,
+          command: params.command,
+          argsCount: Array.isArray(params.args) ? params.args.length : null,
+          timeoutMs: executionTimeoutMs,
+        };
+        try {
+          const result = await environmentRuntime.execute({
+            environment,
+            lease,
+            command: params.command,
+            args: params.args,
+            cwd: executionCwd,
+            env: params.env,
+            stdin: params.stdin,
+            timeoutMs: executionTimeoutMs,
+            ...(lease.metadata?.workspaceRealization
+              ? {
+                  workspaceRealization: Object.fromEntries(
+                    Object.entries(lease.metadata.workspaceRealization),
+                  ),
+                }
+              : {}),
+          });
+          await logPluginActivity({
+            companyId,
+            action: "execution_workspace.command_executed",
+            entityType: "execution_workspace",
+            entityId: params.workspaceId,
+            actor: { actorAgentId: run.agentId, actorRunId: params.runId },
+            details: sanitizeRecord({ ...auditBase, exitCode: result.exitCode, timedOut: result.timedOut }),
+          });
+          return result;
+        } catch (err) {
+          await logPluginActivity({
+            companyId,
+            action: "execution_workspace.command_failed",
+            entityType: "execution_workspace",
+            entityId: params.workspaceId,
+            actor: { actorAgentId: run.agentId, actorRunId: params.runId },
+            details: sanitizeRecord({
+              ...auditBase,
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          });
+          throw err;
+        }
       },
     },
 

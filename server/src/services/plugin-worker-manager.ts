@@ -100,6 +100,7 @@ const SENSITIVE_ENV_KEY_RE =
 // PAPERCLIP_CLAUDE_MCP_CONFIG carries bridge/gateway bearer tokens inside a JSON
 // envelope, so it must suppress worker output even though the key is opaque.
 const SENSITIVE_ENV_KEY_ALLOWLIST = new Set(["PAPERCLIP_CLAUDE_MCP_CONFIG"]);
+const FILE_PATH_ENV_KEY_RE = /(?:^|[-_])(?:file|path)$|[a-z](?:File|Path)$/i;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -575,6 +576,7 @@ export function createPluginWorkerHandle(
       if (typeof value !== "string" || value.length === 0) continue;
       const isSecretEnvelope = SENSITIVE_ENV_KEY_ALLOWLIST.has(key);
       if (!SENSITIVE_ENV_KEY_RE.test(key) && !isSecretEnvelope) continue;
+      if (!isSecretEnvelope && FILE_PATH_ENV_KEY_RE.test(key)) continue;
       values.push(value);
       // A provider can parse a known JSON envelope (e.g. PAPERCLIP_CLAUDE_MCP_CONFIG)
       // and echo only an extracted nested token, which no longer matches the whole
@@ -591,7 +593,7 @@ export function createPluginWorkerHandle(
   // result payload's strings. Side-channel suppression only silences
   // stdout/stderr, so redact the forwarded values (raw, trimmed, JSON forms)
   // plus a pattern backstop before either propagates to the host.
-  function redactForwardedString(input: string, forwardedValues: string[]): string {
+  function redactForwardedString(input: string, forwardedValues: string[], includePatternBackstop: boolean): string {
     let out = input;
     for (const rawValue of forwardedValues) {
       const variants = new Set<string>();
@@ -600,15 +602,15 @@ export function createPluginWorkerHandle(
       }
       for (const variant of variants) out = out.split(variant).join(REDACTED_EVENT_VALUE);
     }
-    return redactSensitiveText(out);
+    return includePatternBackstop ? redactSensitiveText(out) : out;
   }
 
-  function redactWorkerError(error: JsonRpcError, forwardedValues: string[]): JsonRpcError {
-    const message = redactForwardedString(error.message, forwardedValues);
+  function redactWorkerError(error: JsonRpcError, forwardedValues: string[], includePatternBackstop: boolean): JsonRpcError {
+    const message = redactForwardedString(error.message, forwardedValues, includePatternBackstop);
     let data = error.data;
     if (data !== undefined) {
       try {
-        data = JSON.parse(redactForwardedString(JSON.stringify(data), forwardedValues)) as unknown;
+        data = JSON.parse(redactForwardedString(JSON.stringify(data), forwardedValues, includePatternBackstop)) as unknown;
       } catch {
         data = undefined;
       }
@@ -619,10 +621,10 @@ export function createPluginWorkerHandle(
   // Redact forwarded credential variants echoed into a successful result
   // payload's strings. Falls back to dropping the payload if it cannot be
   // re-parsed, since returning an unredacted result would leak the credential.
-  function redactWorkerResult(result: unknown, forwardedValues: string[]): unknown {
+  function redactWorkerResult(result: unknown, forwardedValues: string[], includePatternBackstop: boolean): unknown {
     if (result === undefined) return result;
     try {
-      return JSON.parse(redactForwardedString(JSON.stringify(result), forwardedValues)) as unknown;
+      return JSON.parse(redactForwardedString(JSON.stringify(result), forwardedValues, includePatternBackstop)) as unknown;
     } catch {
       return null;
     }
@@ -1341,12 +1343,16 @@ export function createPluginWorkerHandle(
         id,
         method,
         resolve: (response: JsonRpcResponse) => {
-          const redactionValues = Array.from(processForwardedEnvValues);
+          const retainedValues = Array.from(processForwardedEnvValues);
+          const redactionValues = forwardedEnvValues.length > 0
+            ? Array.from(new Set([...retainedValues, ...forwardedEnvValues]))
+            : retainedValues;
+          const includePatternBackstop = forwardedEnvValues.length > 0;
           if (isJsonRpcSuccessResponse(response)) {
             settle(
               resolve,
               (redactionValues.length > 0
-                ? redactWorkerResult(response.result, redactionValues)
+                ? redactWorkerResult(response.result, redactionValues, includePatternBackstop)
                 : response.result) as HostToWorkerMethods[M][1],
             );
           } else if ("error" in response && response.error) {
@@ -1354,7 +1360,7 @@ export function createPluginWorkerHandle(
               reject,
               new JsonRpcCallError(
                 redactionValues.length > 0
-                  ? redactWorkerError(response.error, redactionValues)
+                  ? redactWorkerError(response.error, redactionValues, includePatternBackstop)
                   : response.error,
               ),
             );

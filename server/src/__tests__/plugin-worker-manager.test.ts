@@ -351,9 +351,17 @@ describe("plugin-worker-manager stderr failure context", () => {
         environmentId: "environment-1",
         config: {},
         lease: { providerLeaseId: "lease-1" },
-        env: { GITHUB_TOKEN: leaked },
+        env: { GITHUB_TOKEN: leaked, GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/github-app.pem" },
         workspace: {},
       })).resolves.toMatchObject({ cwd: "/workspace/project" });
+
+      const pathResult = await handle.call("environmentExecute", {
+        companyId: "company-1",
+        environmentId: "environment-1",
+        command: "echo",
+        stdout: "/run/secrets/github-app.pem",
+      } as HostToWorkerMethods["environmentExecute"][0]);
+      expect(pathResult.stdout).toBe("/run/secrets/github-app.pem");
 
       const result = await handle.call("environmentExecute", {
         companyId: "company-1",
