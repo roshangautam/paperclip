@@ -135,6 +135,26 @@ describe("redaction", () => {
     expect(result?.args).toEqual(["--api-key", "not-a-command-secret"]);
     expect(result?.argv).toEqual(["--api-key", REDACTED_EVENT_VALUE]);
   });
+
+  it("redacts credential-shaped ref/id fields unless their path is preserved", () => {
+    expect(redactPersistedCredentialValues({
+      accessTokenRef: "ghp_plaintext",
+      secretId: "plain-secret-id",
+      secretName: "provider-secret-name",
+      sandboxId: "sandbox-1",
+    })).toEqual({
+      accessTokenRef: REDACTED_EVENT_VALUE,
+      secretId: REDACTED_EVENT_VALUE,
+      secretName: "provider-secret-name",
+      sandboxId: "sandbox-1",
+    });
+
+    expect(redactPersistedCredentialValues(
+      { accessTokenRef: "ghp_plaintext" },
+      { preserveContainerPaths: new Set(["accessTokenRef"]) },
+    )).toEqual({ accessTokenRef: "ghp_plaintext" });
+  });
+
 });
 
 describe("redactPersistedCredentialValues", () => {

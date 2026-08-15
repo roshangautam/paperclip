@@ -142,8 +142,15 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
 const IDENTIFIER_WORD_OR_DELIMITED_KEY_RE = /(?:^|[-_])(?:id|name|ref|path|url|uri|host)$/i;
 const IDENTIFIER_CAMEL_SUFFIX_KEY_RE = /[a-z](?:Id|Name|Ref|Path|Url|Uri|Host)$/;
 
+const SENSITIVE_REFERENCE_IDENTIFIER_KEY_RE = /(?:^|[-_])(?:id|ref)$|[a-z](?:Id|Ref)$/;
+
 function isIdentifierReferenceKey(key: string): boolean {
   return IDENTIFIER_WORD_OR_DELIMITED_KEY_RE.test(key) || IDENTIFIER_CAMEL_SUFFIX_KEY_RE.test(key);
+}
+
+function preservesIdentifierValue(key: string): boolean {
+  return isIdentifierReferenceKey(key)
+    && !(SECRET_PAYLOAD_KEY_RE.test(key) && SENSITIVE_REFERENCE_IDENTIFIER_KEY_RE.test(key));
 }
 
 export function redactPersistedCredentialValues(
@@ -163,19 +170,24 @@ export function redactPersistedCredentialValues(
       const result: Record<string, unknown> = {};
       for (const [childKey, childValue] of Object.entries(current)) {
         const childPath = path ? `${path}.${encodeConfigPathSegment(childKey)}` : encodeConfigPathSegment(childKey);
+        if (preserveContainerPaths.has(childPath)) {
+          result[childKey] = childValue;
+          continue;
+        }
         const sensitiveKey = SECRET_PAYLOAD_KEY_RE.test(childKey)
-          && !isIdentifierReferenceKey(childKey);
+          && !preservesIdentifierValue(childKey);
         result[childKey] = visit(
           childValue,
           childPath,
-          preserveContainerPaths.has(childPath) ? false : inheritedSensitive || sensitiveKey,
+          inheritedSensitive || sensitiveKey,
           childKey,
         );
       }
       return result;
     }
     if (typeof current === "string" && JWT_VALUE_RE.test(current)) return REDACTED_EVENT_VALUE;
-    if (key !== null && isIdentifierReferenceKey(key)) return current;
+    if (key !== null && preservesIdentifierValue(key)) return current;
+    if (key !== null && SECRET_PAYLOAD_KEY_RE.test(key)) return REDACTED_EVENT_VALUE;
     if (inheritedSensitive) return REDACTED_EVENT_VALUE;
     return current;
   }

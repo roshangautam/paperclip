@@ -1092,6 +1092,23 @@ async function queueDepth() {
   return entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).length;
 }
 
+let reservedQueueSlots = 0;
+
+async function tryReserveQueueSlot() {
+  if (reservedQueueSlots >= maxQueueDepth) return false;
+  reservedQueueSlots += 1;
+  const depth = await queueDepth();
+  if (depth + reservedQueueSlots > maxQueueDepth) {
+    releaseQueueSlot();
+    return false;
+  }
+  return true;
+}
+
+function releaseQueueSlot() {
+  if (reservedQueueSlots > 0) reservedQueueSlots -= 1;
+}
+
 function tokensMatch(received) {
   const expected = Buffer.from(bridgeToken, "utf8");
   const actual = Buffer.from(typeof received === "string" ? received : "", "utf8");
@@ -1114,6 +1131,7 @@ async function waitForResponse(requestId) {
 }
 
 const server = createServer(async (req, res) => {
+  let queueSlotReserved = false;
   try {
     const auth = req.headers.authorization || "";
     const receivedToken = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
@@ -1124,12 +1142,13 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    if (await queueDepth() >= maxQueueDepth) {
+    if (!await tryReserveQueueSlot()) {
       res.statusCode = 503;
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ error: "Bridge request queue is full." }));
       return;
     }
+    queueSlotReserved = true;
 
     const url = new URL(req.url || "/", "http://127.0.0.1");
     const contentType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
@@ -1166,6 +1185,8 @@ const server = createServer(async (req, res) => {
     res.statusCode = 502;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+  } finally {
+    if (queueSlotReserved) releaseQueueSlot();
   }
 });
 

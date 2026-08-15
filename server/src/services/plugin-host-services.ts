@@ -94,6 +94,7 @@ const DNS_LOOKUP_TIMEOUT_MS = 5_000;
 /** Only these protocols are allowed for plugin HTTP requests. */
 const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
 const TELEMETRY_EVENT_NAME_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
+const PLUGIN_WORKSPACE_EXECUTION_MAX_TIMEOUT_MS = 25_000;
 
 function isTerminalHeartbeatRunStatus(status: string): boolean {
   return status === "succeeded"
@@ -1607,6 +1608,11 @@ export function buildHostServices(
           );
         }
 
+        const requestedTimeoutMs = params.timeoutMs;
+        const executionTimeoutMs = typeof requestedTimeoutMs === "number" && Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0
+          ? Math.min(requestedTimeoutMs, PLUGIN_WORKSPACE_EXECUTION_MAX_TIMEOUT_MS)
+          : PLUGIN_WORKSPACE_EXECUTION_MAX_TIMEOUT_MS;
+
         return environmentRuntime.execute({
           environment,
           lease,
@@ -1619,7 +1625,7 @@ export function buildHostServices(
           }),
           env: params.env,
           stdin: params.stdin,
-          timeoutMs: params.timeoutMs,
+          timeoutMs: executionTimeoutMs,
           ...(lease.metadata?.workspaceRealization
             ? {
                 workspaceRealization: Object.fromEntries(

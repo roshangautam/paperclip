@@ -244,6 +244,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       args: ["status"],
       cwd: hostWorkspaceCwd,
       env: { PAPERCLIP_BRIDGE_TEST: "workspace-ok" },
+      timeoutMs: 115_000,
     }, { invocationScope: { companyId, runId, agentId } })).resolves.toMatchObject({ exitCode: 0, stdout: "workspace-ok", timedOut: false });
     expect(pluginWorkerManager.call).toHaveBeenCalledWith(
       providerPluginId,
@@ -255,8 +256,25 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         args: ["status"],
         cwd: "/home/coder/workspace",
         env: { PAPERCLIP_BRIDGE_TEST: "workspace-ok" },
+        timeoutMs: 25_000,
       }),
-      undefined,
+      115_000,
+    );
+
+    pluginWorkerManager.call.mockClear();
+    await expect(services.executionWorkspaces.execute({
+      workspaceId,
+      companyId,
+      runId,
+      command: "git",
+      args: ["status"],
+      timeoutMs: 0,
+    }, { invocationScope: { companyId, runId, agentId } })).resolves.toMatchObject({ exitCode: 0, stdout: "workspace-ok", timedOut: false });
+    expect(pluginWorkerManager.call).toHaveBeenCalledWith(
+      providerPluginId,
+      "environmentExecute",
+      expect.objectContaining({ timeoutMs: 25_000 }),
+      115_000,
     );
   });
 
