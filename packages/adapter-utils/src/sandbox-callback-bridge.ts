@@ -13,6 +13,7 @@ const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
 const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
 const DEFAULT_BRIDGE_MAX_BODY_BYTES = MAX_CAPTURE_BYTES;
+const DEFAULT_BRIDGE_WORKER_CONCURRENCY = 4;
 const REMOTE_WRITE_BASE64_CHUNK_SIZE = 32 * 1024;
 const SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT = "paperclip-bridge-server.mjs";
 const SANDBOX_EXEC_CHANNEL_ENV = "PAPERCLIP_SANDBOX_EXEC_CHANNEL";
@@ -608,9 +609,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
     body?: string;
   }>;
   maxBodyBytes?: number | null;
+  maxConcurrency?: number | null;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
   const maxBodyBytes = normalizeTimeoutMs(input.maxBodyBytes, DEFAULT_BRIDGE_MAX_BODY_BYTES);
+  const maxConcurrency = normalizeTimeoutMs(input.maxConcurrency, DEFAULT_BRIDGE_WORKER_CONCURRENCY);
   const directories = sandboxCallbackBridgeDirectories(input.queueDir);
   await input.client.makeDir(directories.rootDir);
   await input.client.makeDir(directories.requestsDir);
@@ -734,14 +737,18 @@ export async function startSandboxCallbackBridgeWorker(input: {
           await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
           continue;
         }
-        for (const fileName of fileNames) {
+        for (let index = 0; index < fileNames.length; index += maxConcurrency) {
           if (stopping && Date.now() >= stopDeadline) break;
-          inFlight += 1;
-          try {
-            await processRequestFile(fileName);
-          } finally {
-            inFlight -= 1;
-          }
+          const batch = fileNames.slice(index, index + maxConcurrency);
+          await Promise.all(batch.map(async (fileName) => {
+            if (stopping && Date.now() >= stopDeadline) return;
+            inFlight += 1;
+            try {
+              await processRequestFile(fileName);
+            } finally {
+              inFlight -= 1;
+            }
+          }));
         }
         if (stopping && Date.now() >= stopDeadline) {
           break;

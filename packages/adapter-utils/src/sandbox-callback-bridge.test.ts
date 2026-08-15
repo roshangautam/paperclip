@@ -311,6 +311,66 @@ describe("sandbox callback bridge", () => {
     });
   });
 
+  it("processes queued bridge requests concurrently up to the configured limit", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-concurrent-worker-"));
+    cleanupDirs.push(rootDir);
+
+    const queueDir = path.posix.join(rootDir, "queue");
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    let active = 0;
+    let maxActive = 0;
+    let resolveBothStarted: (() => void) | null = null;
+    const bothStarted = new Promise<void>((resolve) => {
+      resolveBothStarted = resolve;
+    });
+    await mkdir(directories.requestsDir, { recursive: true });
+    await mkdir(directories.responsesDir, { recursive: true });
+
+    for (const id of ["req-a", "req-b"]) {
+      await writeFile(
+        path.posix.join(directories.requestsDir, `${id}.json`),
+        `${JSON.stringify({
+          id,
+          method: "POST",
+          path: "/api/agents/me",
+          query: "",
+          headers: {},
+          body: "",
+          createdAt: new Date().toISOString(),
+        })}
+`,
+        "utf8",
+      );
+    }
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      maxConcurrency: 2,
+      authorizeRequest: () => null,
+      handleRequest: async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (active === 2) resolveBothStarted?.();
+        await bothStarted;
+        active -= 1;
+        return { status: 200, body: "ok" };
+      },
+    });
+
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      const entries = await readdir(directories.responsesDir).catch(() => []);
+      if (entries.filter((entry) => entry.endsWith(".json")).length >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(maxActive).toBe(2);
+    await expect(readFile(path.posix.join(directories.responsesDir, "req-a.json"), "utf8")).resolves.toContain("ok");
+    await expect(readFile(path.posix.join(directories.responsesDir, "req-b.json"), "utf8")).resolves.toContain("ok");
+    await worker.stop({ drainTimeoutMs: 1_000 });
+  });
+
   it("drains already-queued requests on stop", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-drain-"));
     cleanupDirs.push(rootDir);
@@ -322,6 +382,7 @@ describe("sandbox callback bridge", () => {
     const worker = await startSandboxCallbackBridgeWorker({
       client: createFileSystemSandboxCallbackBridgeQueueClient(),
       queueDir,
+      maxConcurrency: 1,
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
         processed.push(request.id);
@@ -378,6 +439,7 @@ describe("sandbox callback bridge", () => {
     const worker = await startSandboxCallbackBridgeWorker({
       client: createFileSystemSandboxCallbackBridgeQueueClient(),
       queueDir,
+      maxConcurrency: 1,
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
         processed.push(request.id);

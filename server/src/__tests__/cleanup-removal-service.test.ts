@@ -17,6 +17,7 @@ import {
   issueReadStates,
   issues,
   routines,
+  toolInvocations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -52,6 +53,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await db.delete(documentRevisions);
     await db.delete(documents);
     await db.delete(companySkills);
+    await db.delete(toolInvocations);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(routines);
@@ -259,6 +261,26 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
+  });
+
+  it("removes pending tool invocation release markers before deleting company runs", async () => {
+    const { agentId, companyId, runId } = await seedFixture();
+    const invocationId = randomUUID();
+
+    await db.insert(toolInvocations).values({
+      id: invocationId,
+      companyId,
+      agentId,
+      runId,
+      toolName: "mcp:update_note",
+      leaseReleasePendingAt: new Date(),
+    });
+
+    const removed = await companyService(db).remove(companyId);
+
+    expect(removed?.id).toBe(companyId);
+    await expect(db.select().from(toolInvocations).where(eq(toolInvocations.id, invocationId))).resolves.toHaveLength(0);
+    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
   });
 
   it("removes routines before deleting company agents", async () => {
