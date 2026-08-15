@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import {
   createHostClientHandlers,
   JsonRpcCallError,
@@ -322,6 +323,46 @@ describe("plugin-worker-manager stderr failure context", () => {
         const serialized = `${err.message}${JSON.stringify(err.data ?? null)}`;
         return !serialized.includes(leaked);
       });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("redacts retained forwarded credentials from later non-sensitive worker results", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+      const leaked = "github_pat_retained_worker_token";
+      await expect(handle.call("environmentRealizeWorkspace", {
+        driverKey: "coder",
+        companyId: "company-1",
+        environmentId: "environment-1",
+        config: {},
+        lease: { providerLeaseId: "lease-1" },
+        env: { GITHUB_TOKEN: leaked },
+        workspace: {},
+      })).resolves.toMatchObject({ cwd: "/workspace/project" });
+
+      const result = await handle.call("environmentExecute", {
+        companyId: "company-1",
+        environmentId: "environment-1",
+        command: "echo",
+        stdout: leaked,
+      } as HostToWorkerMethods["environmentExecute"][0]);
+      expect(JSON.stringify(result)).not.toContain(leaked);
+      expect(result.stdout).toBe(REDACTED_EVENT_VALUE);
     } finally {
       await handle.stop().catch(() => undefined);
     }

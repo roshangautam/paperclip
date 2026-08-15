@@ -1202,7 +1202,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
       .where(eq(toolActionRequests.id, executingRequest.id));
     await db.update(toolInvocations).set({
       status: "executing",
-      startedAt: new Date(Date.now() - 61_000),
+      startedAt: new Date(Date.now() - 76_000),
     }).where(eq(toolInvocations.id, executingRequest.invocationId));
     await db.update(toolActionRequests).set({ expiresAt: expiredAt, signedArguments: "unrelated-approval" })
       .where(eq(toolActionRequests.id, invalidRequest.id));

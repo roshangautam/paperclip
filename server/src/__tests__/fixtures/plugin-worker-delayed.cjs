@@ -36,8 +36,8 @@ rl.on("line", (line) => {
           exitCode: 0,
           signal: null,
           timedOut: false,
-          stdout: "ok\n",
-          stderr: "",
+          stdout: typeof message.params?.stdout === "string" ? message.params.stdout : "ok\n",
+          stderr: typeof message.params?.stderr === "string" ? message.params.stderr : "",
         },
       });
     }, delayMs);

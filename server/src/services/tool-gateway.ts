@@ -88,6 +88,7 @@ const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
 // `tool_timeout` even though the approval succeeded. Give approved executions
 // the full permitted headroom instead.
 const APPROVED_EXECUTION_TIMEOUT_MS = 60_000;
+const STALE_EXECUTING_RECOVERY_GRACE_MS = 15_000;
 const RETRYABLE_MARKED_LEASE_RELEASE_DELAY_MS = 60_000;
 const MAX_REMOTE_MCP_RESPONSE_BYTES = 1_000_000;
 const ACTIVE_GATEWAY_RUN_STATUSES = new Set(["running"]);
@@ -854,6 +855,10 @@ export function createToolGatewayService(
     return markable && runId
       ? and(eq(toolInvocations.id, invocationId), eq(toolInvocations.runId, runId))
       : eq(toolInvocations.id, invocationId);
+  }
+
+  function executingToolInvocationMarkerWhere(invocationId: string, runId: string | null, markable: boolean) {
+    return and(toolInvocationMarkerWhere(invocationId, runId, markable), eq(toolInvocations.status, "executing"));
   }
 
   function assertLeaseReleaseMarkerWrite(row: { id: string } | undefined, markable: boolean): void {
@@ -4623,7 +4628,7 @@ export function createToolGatewayService(
         completedAt: now,
         updatedAt: now,
         leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
-      }).where(toolInvocationMarkerWhere(input.invocationId, input.runId, scheduleLeaseRelease)).returning({ id: toolInvocations.id });
+      }).where(executingToolInvocationMarkerWhere(input.invocationId, input.runId, scheduleLeaseRelease)).returning({ id: toolInvocations.id });
       assertLeaseReleaseMarkerWrite(markerRow, scheduleLeaseRelease);
       await tx.update(toolActionRequests).set({
         status: "failed",
@@ -4813,9 +4818,9 @@ export function createToolGatewayService(
           completedAt: now,
           updatedAt: now,
           leaseReleasePendingAt: scheduleLeaseRelease ? now : undefined,
-        }).where(toolInvocationMarkerWhere(invocation.id, invocation.runId, scheduleLeaseRelease)).returning({ id: toolInvocations.id });
+        }).where(executingToolInvocationMarkerWhere(invocation.id, invocation.runId, scheduleLeaseRelease)).returning({ id: toolInvocations.id });
         assertLeaseReleaseMarkerWrite(markerRow, scheduleLeaseRelease);
-        await tx.update(toolActionRequests).set({ status: "executed", resolvedAt: now, updatedAt: now }).where(eq(toolActionRequests.id, claimed.id));
+        await tx.update(toolActionRequests).set({ status: "executed", resolvedAt: now, updatedAt: now }).where(and(eq(toolActionRequests.id, claimed.id), eq(toolActionRequests.status, "executing")));
       });
       await reflectToolActionInteractionLifecycle({
         actionRequestId: claimed.id,
@@ -6920,7 +6925,9 @@ export function createToolGatewayService(
       let released = 0;
       let invalidated = 0;
       let legacyExpired = 0;
-      const staleExecutingStartedBefore = new Date(now.getTime() - APPROVED_EXECUTION_TIMEOUT_MS);
+      const staleExecutingStartedBefore = new Date(
+        now.getTime() - APPROVED_EXECUTION_TIMEOUT_MS - STALE_EXECUTING_RECOVERY_GRACE_MS,
+      );
       while (scanned < scanCeiling && reconciled + released + invalidated + legacyExpired < limit) {
         const pageSize = Math.min(limit, scanCeiling - scanned);
         const candidates = await db

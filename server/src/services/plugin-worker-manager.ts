@@ -413,6 +413,7 @@ export function createPluginWorkerHandle(
   const pendingRequests = new Map<string | number, PendingRequest>();
   let nextRequestId = 1;
   const activeInvocations = new Map<string, ActiveInvocation>();
+  const processForwardedEnvValues = new Set<string>();
   let suppressUnscopedWorkerOutput = false;
 
   // Optional methods reported by the worker during initialization
@@ -1098,6 +1099,7 @@ export function createPluginWorkerHandle(
     setStatus("starting");
     stderrExcerpt = "";
     suppressUnscopedWorkerOutput = false;
+    processForwardedEnvValues.clear();
 
     const child = spawnProcess();
     childProcess = child;
@@ -1300,8 +1302,11 @@ export function createPluginWorkerHandle(
       const id = nextRequestId++;
       const timeout = timeoutMs ?? Math.min(rpcTimeoutMs, MAX_RPC_TIMEOUT_MS);
       const suppressWorkerOutput = containsSensitiveEnv(params);
-      if (suppressWorkerOutput) suppressUnscopedWorkerOutput = true;
       const forwardedEnvValues = suppressWorkerOutput ? collectForwardedEnvValues(params) : [];
+      if (suppressWorkerOutput) {
+        suppressUnscopedWorkerOutput = true;
+        for (const value of forwardedEnvValues) processForwardedEnvValues.add(value);
+      }
       const invocationScope = deriveInvocationScope(method, params, invocationMetadata);
       const invocation = invocationScope
         ? registerInvocation(invocationScope, suppressWorkerOutput)
@@ -1336,19 +1341,20 @@ export function createPluginWorkerHandle(
         id,
         method,
         resolve: (response: JsonRpcResponse) => {
+          const redactionValues = Array.from(processForwardedEnvValues);
           if (isJsonRpcSuccessResponse(response)) {
             settle(
               resolve,
-              (forwardedEnvValues.length > 0
-                ? redactWorkerResult(response.result, forwardedEnvValues)
+              (redactionValues.length > 0
+                ? redactWorkerResult(response.result, redactionValues)
                 : response.result) as HostToWorkerMethods[M][1],
             );
           } else if ("error" in response && response.error) {
             settle(
               reject,
               new JsonRpcCallError(
-                forwardedEnvValues.length > 0
-                  ? redactWorkerError(response.error, forwardedEnvValues)
+                redactionValues.length > 0
+                  ? redactWorkerError(response.error, redactionValues)
                   : response.error,
               ),
             );
