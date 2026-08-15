@@ -646,6 +646,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ? path.posix.join(
         preparedExecutionTargetRuntime?.assetDirs["mcp-config"] ??
           path.posix.join(effectiveExecutionCwd, ".paperclip-runtime", "claude", "mcp-config"),
+        "runs",
+        runId,
         path.basename(localMcpConfigPath),
       )
     : localMcpConfigPath;

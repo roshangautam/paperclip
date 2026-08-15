@@ -95,6 +95,14 @@ const DNS_LOOKUP_TIMEOUT_MS = 5_000;
 const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
 const TELEMETRY_EVENT_NAME_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
 
+function isTerminalHeartbeatRunStatus(status: string): boolean {
+  return status === "succeeded"
+    || status === "interrupted"
+    || status === "failed"
+    || status === "cancelled"
+    || status === "timed_out";
+}
+
 /**
  * Check if an IP address is in a private/reserved range (RFC 1918, loopback,
  * link-local, etc.) that plugins should never be able to reach.
@@ -1547,9 +1555,10 @@ export function buildHostServices(
           ))
           .limit(1);
         const run = runRows[0];
+        const runIsTerminal = run ? isTerminalHeartbeatRunStatus(run.status) : false;
         const runIsExecutable = run?.status === "queued"
           || run?.status === "running"
-          || context?.invocationScope?.allowTerminalRunWorkspaceExecution === true;
+          || (context?.invocationScope?.allowTerminalRunWorkspaceExecution === true && runIsTerminal);
         if (!run || !runIsExecutable) {
           throw new Error("Heartbeat run is not executable");
         }

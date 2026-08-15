@@ -444,6 +444,72 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     })).resolves.toMatchObject({ exitCode: 0, stdout: "approved-ok" });
   });
 
+  it("rejects terminal-override execution for a scheduled retry heartbeat run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    const environmentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Workspaces", status: "in_progress" });
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Retained workspace",
+      status: "active",
+    });
+    await db.insert(environments).values({
+      id: environmentId,
+      name: `Sandbox ${environmentId}`,
+      driver: "sandbox",
+      config: { provider: "fake-provider" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "manual",
+    });
+    await db.insert(environmentLeases).values({
+      companyId,
+      environmentId,
+      executionWorkspaceId: workspaceId,
+      heartbeatRunId: runId,
+      status: "active",
+      expiresAt: new Date(Date.now() + 60_000),
+      metadata: {
+        sandboxProviderPlugin: true,
+        pluginId: "provider-plugin-id",
+        provider: "fake-provider",
+        remoteCwd: "/home/coder/workspace",
+      },
+    });
+    const services = buildHostServices(
+      db,
+      "plugin-record-id",
+      "paperclip.workspace",
+      createEventBusStub(),
+    );
+
+    await expect(services.executionWorkspaces.execute({
+      workspaceId,
+      companyId,
+      runId,
+      command: "git",
+      args: ["status"],
+    }, {
+      invocationScope: {
+        companyId,
+        runId,
+        agentId,
+        allowTerminalRunWorkspaceExecution: true,
+      },
+    })).rejects.toThrow("Heartbeat run is not executable");
+  });
+
   it("rejects execution on non-sandbox/plugin drivers with a clear boundary error", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const projectId = randomUUID();

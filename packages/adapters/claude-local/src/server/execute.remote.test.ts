@@ -109,6 +109,7 @@ describe("claude remote execution", () => {
     const alternateWorkspaceDir = path.join(rootDir, "workspace-other");
     const instructionsPath = path.join(rootDir, "instructions.md");
     const managedRemoteWorkspace = "/remote/workspace/.paperclip-runtime/runs/run-1/workspace";
+    const expectedRemoteMcpConfigPath = `${managedRemoteWorkspace}/.paperclip-runtime/claude/mcp-config/runs/run-1/mcp-config.json`;
     await mkdir(workspaceDir, { recursive: true });
     await mkdir(alternateWorkspaceDir, { recursive: true });
     await writeFile(instructionsPath, "Use the remote workspace.\n", "utf8");
@@ -204,17 +205,21 @@ describe("claude remote execution", () => {
     const call = runChildProcess.mock.calls[0] as unknown as
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
-    expect(call?.[2]).toContain("--allowedTools");
-    expect(call?.[2]).toContain(
+    const claudeArgs = call?.[2] ?? [];
+    expect(claudeArgs).toContain("--allowedTools");
+    expect(claudeArgs).toContain(
       "Task AskUserQuestion Bash CronCreate CronDelete CronList Edit EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree Glob Grep Monitor NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write mcp__Plugin__Agent_Identities__*",
     );
-    expect(call?.[2]).not.toContain("--dangerously-skip-permissions");
-    expect(call?.[2]).toContain("--append-system-prompt-file");
-    expect(call?.[2]).toContain(
+    expect(claudeArgs).not.toContain("--dangerously-skip-permissions");
+    expect(claudeArgs).toContain("--append-system-prompt-file");
+    expect(claudeArgs).toContain(
       `${managedRemoteWorkspace}/.paperclip-runtime/claude/skills/agent-instructions.md`,
     );
-    expect(call?.[2]).toContain("--add-dir");
-    expect(call?.[2]).toContain(`${managedRemoteWorkspace}/.paperclip-runtime/claude/skills`);
+    const mcpConfigFlagIndex = claudeArgs.indexOf("--mcp-config");
+    expect(mcpConfigFlagIndex).toBeGreaterThanOrEqual(0);
+    expect(claudeArgs[mcpConfigFlagIndex + 1]).toBe(expectedRemoteMcpConfigPath);
+    expect(claudeArgs).toContain("--add-dir");
+    expect(claudeArgs).toContain(`${managedRemoteWorkspace}/.paperclip-runtime/claude/skills`);
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe(managedRemoteWorkspace);
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_WORKTREE_PATH).toBeUndefined();
     expect(JSON.parse(call?.[3].env.PAPERCLIP_WORKSPACES_JSON ?? "[]")).toEqual([
@@ -241,6 +246,7 @@ describe("claude remote execution", () => {
     const mcpConfigCall = runAdapterExecutionTargetShellCommand.mock.calls[0] as unknown as
       | [string, unknown, string, { env: Record<string, string> }]
       | undefined;
+    expect(mcpConfigCall?.[2]).toContain(expectedRemoteMcpConfigPath);
     const mcpConfig = JSON.parse(mcpConfigCall?.[3]?.env.PAPERCLIP_CLAUDE_MCP_CONFIG ?? "{}");
     expect(mcpConfig.mcpServers["Plugin: Agent Identities"]).toEqual({
       type: "http",
@@ -254,7 +260,7 @@ describe("claude remote execution", () => {
       | [string, unknown, string, { env: Record<string, string> }]
       | undefined;
     expect(cleanupCall?.[2]).toMatch(/^rm -f /);
-    expect(cleanupCall?.[2]).toContain(".paperclip-runtime/claude/mcp-config");
+    expect(cleanupCall?.[2]).toContain(expectedRemoteMcpConfigPath);
     expect(cleanupCall?.[3]?.env.PAPERCLIP_CLAUDE_MCP_CONFIG).toBeUndefined();
     expect(runAdapterExecutionTargetShellCommand.mock.invocationCallOrder[0])
       .toBeLessThan(runAdapterExecutionTargetShellCommand.mock.invocationCallOrder[1]!);
