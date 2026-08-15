@@ -135,7 +135,7 @@ describe("claude remote execution", () => {
       });
     const onLog = vi.fn(async () => {});
 
-    await execute({
+    await expect(execute({
       runId: "run-1",
       agent: {
         id: "agent-1",
@@ -206,7 +206,7 @@ describe("claude remote execution", () => {
           connectionId: "connection-1",
         }],
       },
-    });
+    })).rejects.toThrow("Failed to remove remote Claude MCP config: exit 255");
 
     expect(prepareWorkspaceForSshExecution).toHaveBeenCalledTimes(1);
     expect(prepareWorkspaceForSshExecution).toHaveBeenCalledWith(expect.objectContaining({

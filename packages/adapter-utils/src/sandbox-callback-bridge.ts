@@ -90,7 +90,6 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
 
   // Managed MCP gateways. The bridge authenticates the sandbox request with
   // its own bearer token and carries the run-scoped gateway token separately.
-  { method: "GET", path: /^\/api\/tool-gateway\/gateways\/[^/]+\/mcp$/ },
   { method: "POST", path: /^\/api\/tool-gateway\/gateways\/[^/]+\/mcp$/ },
 
   // Execution workspaces and runtime services (start/stop/restart dev servers)
@@ -613,7 +612,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
   const maxBodyBytes = normalizeTimeoutMs(input.maxBodyBytes, DEFAULT_BRIDGE_MAX_BODY_BYTES);
-  const maxConcurrency = normalizeTimeoutMs(input.maxConcurrency, DEFAULT_BRIDGE_WORKER_CONCURRENCY);
+  const maxConcurrency = Math.max(1, normalizeTimeoutMs(input.maxConcurrency, DEFAULT_BRIDGE_WORKER_CONCURRENCY));
   const directories = sandboxCallbackBridgeDirectories(input.queueDir);
   await input.client.makeDir(directories.rootDir);
   await input.client.makeDir(directories.requestsDir);

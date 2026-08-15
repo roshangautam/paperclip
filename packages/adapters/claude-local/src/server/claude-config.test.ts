@@ -45,7 +45,7 @@ describe("removeRemoteClaudeMcpConfig", () => {
     });
     const onLog = vi.fn(async () => {});
 
-    await expect(removeRemoteClaudeMcpConfig({
+    const failure = await removeRemoteClaudeMcpConfig({
       runId: "run-1",
       target: null,
       configPath: "/remote/.paperclip-runtime/claude/mcp-config/runs/run-1/mcp-config.json",
@@ -56,7 +56,9 @@ describe("removeRemoteClaudeMcpConfig", () => {
         graceSec: 5,
         onLog,
       },
-    })).resolves.toBeUndefined();
+    });
+
+    expect(failure).toMatchObject({ message: "Failed to remove remote Claude MCP config: exit 255" });
     expect(onLog).toHaveBeenCalledWith(
       "stderr",
       "[paperclip] Failed to remove remote Claude MCP config: exit 255\n",

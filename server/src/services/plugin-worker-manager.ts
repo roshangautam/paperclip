@@ -101,6 +101,7 @@ const SENSITIVE_ENV_KEY_RE =
 // envelope, so it must suppress worker output even though the key is opaque.
 const SENSITIVE_ENV_KEY_ALLOWLIST = new Set(["PAPERCLIP_CLAUDE_MCP_CONFIG"]);
 const FILE_PATH_ENV_KEY_RE = /(?:^|[-_])(?:file|path)$|[a-z](?:File|Path)$/i;
+const MAX_RETAINED_FORWARDED_ENV_VALUES = 128;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1307,7 +1308,13 @@ export function createPluginWorkerHandle(
       const forwardedEnvValues = suppressWorkerOutput ? collectForwardedEnvValues(params) : [];
       if (suppressWorkerOutput) {
         suppressUnscopedWorkerOutput = true;
-        for (const value of forwardedEnvValues) processForwardedEnvValues.add(value);
+        for (const value of forwardedEnvValues) {
+          processForwardedEnvValues.add(value);
+          if (processForwardedEnvValues.size > MAX_RETAINED_FORWARDED_ENV_VALUES) {
+            const oldest = processForwardedEnvValues.values().next().value;
+            if (typeof oldest === "string") processForwardedEnvValues.delete(oldest);
+          }
+        }
       }
       const invocationScope = deriveInvocationScope(method, params, invocationMetadata);
       const invocation = invocationScope

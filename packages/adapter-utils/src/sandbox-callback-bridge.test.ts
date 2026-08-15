@@ -980,7 +980,6 @@ describe("sandbox callback bridge", () => {
       { method: "GET", path: "/api/approvals/ap-1/comments" },
       { method: "POST", path: "/api/approvals/ap-1/comments" },
       { method: "POST", path: "/api/companies/co-1/approvals" },
-      { method: "GET", path: "/api/tool-gateway/gateways/gateway-1/mcp" },
       { method: "POST", path: "/api/tool-gateway/gateways/gateway-1/mcp" },
       { method: "GET", path: "/api/execution-workspaces/ws-1" },
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/start" },
@@ -1020,6 +1019,7 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/companies/co-1/logo" },
       { method: "GET", path: "/api/companies/co-1/secrets" },
       { method: "PATCH", path: "/api/secrets/secret-1" },
+      { method: "GET", path: "/api/tool-gateway/gateways/gateway-1/mcp" },
       { method: "DELETE", path: "/api/tool-gateway/gateways/gateway-1/mcp" },
     ];
     for (const request of denied) {

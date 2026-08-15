@@ -1276,8 +1276,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
   } finally {
+    let remoteMcpConfigCleanupFailure: Error | null = null;
     if (remoteMcpConfigMaterialized) {
-      await removeRemoteClaudeMcpConfig({
+      remoteMcpConfigCleanupFailure = await removeRemoteClaudeMcpConfig({
         runId,
         target: runtimeExecutionTarget,
         configPath: effectiveMcpConfigPath,
@@ -1292,5 +1293,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
       ),
     });
+    if (remoteMcpConfigCleanupFailure) throw remoteMcpConfigCleanupFailure;
   }
 }

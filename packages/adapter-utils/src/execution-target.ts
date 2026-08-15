@@ -1349,7 +1349,7 @@ function managedToolGatewayBearerToken(
   request: Pick<SandboxCallbackBridgeRequest, "method" | "path" | "headers">,
 ): string | null {
   const method = request.method.trim().toUpperCase();
-  if ((method !== "GET" && method !== "POST") || !managedToolGatewayMcpPath.test(request.path)) {
+  if (method !== "POST" || !managedToolGatewayMcpPath.test(request.path)) {
     return null;
   }
   for (const [key, value] of Object.entries(request.headers)) {
@@ -1907,7 +1907,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       handleRequest: async (request) => {
         const method = request.method.trim().toUpperCase() || "GET";
         const isManagedToolGatewayMcpRequest = managedToolGatewayMcpPath.test(request.path)
-          && (method === "GET" || method === "POST");
+          && method === "POST";
         const gatewayBearerToken = managedToolGatewayBearerToken(request);
         if (isManagedToolGatewayMcpRequest && !gatewayBearerToken) {
           return {

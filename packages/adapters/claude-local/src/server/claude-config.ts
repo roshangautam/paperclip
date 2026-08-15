@@ -235,7 +235,7 @@ export async function removeRemoteClaudeMcpConfig(input: {
   target: AdapterExecutionTarget | null | undefined;
   configPath: string;
   options: AdapterExecutionTargetShellOptions;
-}): Promise<void> {
+}): Promise<Error | null> {
   let result: Awaited<ReturnType<typeof runAdapterExecutionTargetShellCommand>>;
   try {
     result = await runAdapterExecutionTargetShellCommand(
@@ -246,15 +246,19 @@ export async function removeRemoteClaudeMcpConfig(input: {
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const logPromise = input.options.onLog?.("stderr", `[paperclip] Failed to remove remote Claude MCP config: ${message}\n`);
+    const failure = new Error(`Failed to remove remote Claude MCP config: ${message}`);
+    const logPromise = input.options.onLog?.("stderr", `[paperclip] ${failure.message}\n`);
     if (logPromise) await logPromise.catch(() => undefined);
-    return;
+    return failure;
   }
   if (result.timedOut || result.exitCode !== 0) {
     const reason = result.timedOut ? "timed out" : `exit ${result.exitCode ?? "unknown"}`;
-    const logPromise = input.options.onLog?.("stderr", `[paperclip] Failed to remove remote Claude MCP config: ${reason}\n`);
+    const failure = new Error(`Failed to remove remote Claude MCP config: ${reason}`);
+    const logPromise = input.options.onLog?.("stderr", `[paperclip] ${failure.message}\n`);
     if (logPromise) await logPromise.catch(() => undefined);
+    return failure;
   }
+  return null;
 }
 
 export async function prepareClaudeConfigSeed(
