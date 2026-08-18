@@ -186,6 +186,7 @@ describe("GET /health", () => {
         status: "degraded",
         version: serverVersion,
         serverVersion,
+        commit: testServerInfo.git.fullSha,
         error: "database_timeout",
         serverInfo: testServerInfo,
       });
@@ -236,6 +237,7 @@ describe("GET /health", () => {
       expect(res.body).toEqual({
         status: "degraded",
         error: "database_timeout",
+        commit: testServerInfo.git.fullSha,
         deploymentMode: "authenticated",
         deploymentExposure: "public",
       });
