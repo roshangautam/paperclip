@@ -151,9 +151,11 @@ export function collectSecretRefPaths(
     prefix: string,
     value: unknown,
     seenRefs: ReadonlySet<string> = new Set(),
-  ): void {
+  ): boolean {
+    let declaresSecretPath = false;
     if (node.format === "secret-ref" && prefix) {
       paths.add(prefix);
+      declaresSecretPath = true;
     }
 
     const ref = node.$ref;
@@ -164,7 +166,7 @@ export function collectSecretRefPaths(
         if (resolved) {
           const nextSeenRefs = new Set(seenRefs);
           nextSeenRefs.add(refAtValue);
-          walk(resolved, prefix, value, nextSeenRefs);
+          declaresSecretPath = walk(resolved, prefix, value, nextSeenRefs) || declaresSecretPath;
         }
       }
     }
@@ -174,7 +176,7 @@ export function collectSecretRefPaths(
       if (!Array.isArray(branches)) continue;
       for (const branch of branches) {
         if (!isRecord(branch)) continue;
-        walk(branch, prefix, value, seenRefs);
+        declaresSecretPath = walk(branch, prefix, value, seenRefs) || declaresSecretPath;
       }
     }
 
@@ -185,12 +187,13 @@ export function collectSecretRefPaths(
       value.forEach((item, index) => {
         const itemSchema = tupleItems[index] ?? sharedItems ?? (index >= tupleItems.length ? additionalItems : null);
         if (!isRecord(itemSchema)) return;
-        walk(itemSchema, prefix ? `${prefix}.${index}` : String(index), item, seenRefs);
+        declaresSecretPath = walk(itemSchema, prefix ? `${prefix}.${index}` : String(index), item, seenRefs)
+          || declaresSecretPath;
       });
     }
 
     const properties = node.properties;
-    if (!isRecord(properties)) return;
+    if (!isRecord(properties)) return declaresSecretPath;
     for (const [key, propertySchema] of Object.entries(properties)) {
       if (!isRecord(propertySchema)) continue;
       const path = prefix ? `${prefix}.${key}` : key;
@@ -198,17 +201,20 @@ export function collectSecretRefPaths(
       // Config-aware callers need only concrete paths. Besides avoiding stale
       // optional bindings, this stops recursive refs once the value tree ends.
       if (config !== undefined && propertyValue === undefined) continue;
-      const pathCountBefore = paths.size;
-      walk(propertySchema, path, propertyValue, seenRefs);
+      const propertyDeclaresSecretPath = walk(propertySchema, path, propertyValue, seenRefs);
+      declaresSecretPath = propertyDeclaresSecretPath || declaresSecretPath;
       // Dot paths are the durable representation used by every secret-ref
       // reader, writer, audit record, and binding. JSON Schema property names
       // may contain dots, but such a name would make a discovered secret path
       // lossy (for example `api.token` becomes two path segments). Reject the
       // configuration before a raw secret could be persisted under that key.
-      if (key.includes(".") && paths.size > pathCountBefore) {
+      // Do not infer this from the global path set: a preceding nested property
+      // can already have added the same lossy path.
+      if (key.includes(".") && propertyDeclaresSecretPath) {
         throw new InvalidSecretRefSchemaPathError(key);
       }
     }
+    return declaresSecretPath;
   }
 
   walk(schema, "", config);

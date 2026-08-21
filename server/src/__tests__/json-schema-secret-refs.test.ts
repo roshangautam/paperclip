@@ -118,6 +118,24 @@ describe("collectSecretRefPaths", () => {
     })).toThrow('Secret-ref schema property "api.token" cannot contain a dot.');
   });
 
+  it("rejects a dotted secret property when its lossy path was already discovered", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      properties: {
+        api: {
+          type: "object",
+          properties: {
+            token: { type: "string", format: "secret-ref" },
+          },
+        },
+        "api.token": { type: "string", format: "secret-ref" },
+      },
+    }, {
+      api: { token: "nested-secret" },
+      "api.token": "raw-secret",
+    })).toThrow('Secret-ref schema property "api.token" cannot contain a dot.');
+  });
+
   it("collects secret refs from tuple items, additional items, and local refs", () => {
     const schema = {
       $defs: {
