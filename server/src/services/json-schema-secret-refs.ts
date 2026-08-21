@@ -99,16 +99,23 @@ export function collectSecretRefPaths(
     return null;
   }
 
-  function resolveLocalSchemaRef(ref: string): Record<string, unknown> | null {
+  function resolveLocalSchemaRef(
+    ref: string,
+    resourceScope: Record<string, unknown>,
+  ): Record<string, unknown> | null {
     let decodedRef: string;
     try {
       decodedRef = decodeURIComponent(ref);
     } catch {
       return null;
     }
-    if (decodedRef === "#") return schema ?? null;
+    // A fragment-only ref is scoped to the nearest JSON Schema resource. A
+    // nested `$id` creates such a resource, so resolving it from the document
+    // root can miss a nested `$defs` secret declaration and persist its value
+    // raw.
+    if (decodedRef === "#") return resourceScope;
     if (decodedRef.startsWith("#/")) {
-      let current: unknown = schema;
+      let current: unknown = resourceScope;
       for (const encodedSegment of decodedRef.slice(2).split("/")) {
         if (!isRecord(current)) return null;
         const segment = encodedSegment.replaceAll("~1", "/").replaceAll("~0", "~");
@@ -124,7 +131,7 @@ export function collectSecretRefPaths(
     }
     if (!decodedRef.startsWith("#")) return null;
     const anchor = decodedRef.slice(1);
-    return findSchemaNode(schema, (candidate) =>
+    return findSchemaNode(resourceScope, (candidate) =>
       candidate.$anchor === anchor
       || candidate.$dynamicAnchor === anchor
       || candidate.$id === decodedRef);
@@ -133,7 +140,18 @@ export function collectSecretRefPaths(
   const refValueIds = new Map<object, number>();
   let nextRefValueId = 1;
 
-  function refValueKey(ref: string, value: unknown): string {
+  function refValueKey(
+    ref: string,
+    value: unknown,
+    resourceScope: Record<string, unknown>,
+  ): string {
+    let scopeId = refValueIds.get(resourceScope);
+    if (scopeId === undefined) {
+      scopeId = nextRefValueId;
+      nextRefValueId += 1;
+      refValueIds.set(resourceScope, scopeId);
+    }
+    const prefix = `${scopeId}\u0000${ref}\u0000`;
     if (value && typeof value === "object") {
       let id = refValueIds.get(value);
       if (id === undefined) {
@@ -141,9 +159,9 @@ export function collectSecretRefPaths(
         nextRefValueId += 1;
         refValueIds.set(value, id);
       }
-      return `${ref}\u0000object:${id}`;
+      return `${prefix}object:${id}`;
     }
-    return `${ref}\u0000${typeof value}:${String(value)}`;
+    return `${prefix}${typeof value}:${String(value)}`;
   }
 
   function walk(
@@ -151,7 +169,11 @@ export function collectSecretRefPaths(
     prefix: string,
     value: unknown,
     seenRefs: ReadonlySet<string> = new Set(),
+    resourceScope: Record<string, unknown> = schema!,
   ): boolean {
+    const currentResourceScope = typeof node.$id === "string" && !node.$id.startsWith("#")
+      ? node
+      : resourceScope;
     let declaresSecretPath = false;
     if (node.format === "secret-ref" && prefix) {
       paths.add(prefix);
@@ -160,13 +182,14 @@ export function collectSecretRefPaths(
 
     const ref = node.$ref;
     if (typeof ref === "string") {
-      const refAtValue = refValueKey(ref, value);
+      const refAtValue = refValueKey(ref, value, currentResourceScope);
       if (!seenRefs.has(refAtValue)) {
-        const resolved = resolveLocalSchemaRef(ref);
+        const resolved = resolveLocalSchemaRef(ref, currentResourceScope);
         if (resolved) {
           const nextSeenRefs = new Set(seenRefs);
           nextSeenRefs.add(refAtValue);
-          declaresSecretPath = walk(resolved, prefix, value, nextSeenRefs) || declaresSecretPath;
+          declaresSecretPath = walk(resolved, prefix, value, nextSeenRefs, currentResourceScope)
+            || declaresSecretPath;
         }
       }
     }
@@ -176,7 +199,8 @@ export function collectSecretRefPaths(
       if (!Array.isArray(branches)) continue;
       for (const branch of branches) {
         if (!isRecord(branch)) continue;
-        declaresSecretPath = walk(branch, prefix, value, seenRefs) || declaresSecretPath;
+        declaresSecretPath = walk(branch, prefix, value, seenRefs, currentResourceScope)
+          || declaresSecretPath;
       }
     }
 
@@ -191,21 +215,34 @@ export function collectSecretRefPaths(
           ?? sharedItems
           ?? (tupleItems && index >= tupleItems.length ? additionalItems : null);
         if (!isRecord(itemSchema)) return;
-        declaresSecretPath = walk(itemSchema, prefix ? `${prefix}.${index}` : String(index), item, seenRefs)
-          || declaresSecretPath;
+        declaresSecretPath = walk(
+          itemSchema,
+          prefix ? `${prefix}.${index}` : String(index),
+          item,
+          seenRefs,
+          currentResourceScope,
+        ) || declaresSecretPath;
       });
     }
 
-    const properties = node.properties;
-    if (!isRecord(properties)) return declaresSecretPath;
+    if (!isRecord(value) && config !== undefined) return declaresSecretPath;
+    const properties = isRecord(node.properties) ? node.properties : {};
+    const visitedKeys = new Set<string>();
     for (const [key, propertySchema] of Object.entries(properties)) {
       if (!isRecord(propertySchema)) continue;
-      const path = prefix ? `${prefix}.${key}` : key;
       const propertyValue = readChild(value, key);
       // Config-aware callers need only concrete paths. Besides avoiding stale
       // optional bindings, this stops recursive refs once the value tree ends.
       if (config !== undefined && propertyValue === undefined) continue;
-      const propertyDeclaresSecretPath = walk(propertySchema, path, propertyValue, seenRefs);
+      visitedKeys.add(key);
+      const path = prefix ? `${prefix}.${key}` : key;
+      const propertyDeclaresSecretPath = walk(
+        propertySchema,
+        path,
+        propertyValue,
+        seenRefs,
+        currentResourceScope,
+      );
       declaresSecretPath = propertyDeclaresSecretPath || declaresSecretPath;
       // Dot paths are the durable representation used by every secret-ref
       // reader, writer, audit record, and binding. JSON Schema property names
@@ -216,6 +253,52 @@ export function collectSecretRefPaths(
       // can already have added the same lossy path.
       if (key.includes(".") && propertyDeclaresSecretPath) {
         throw new InvalidSecretRefSchemaPathError(key);
+      }
+    }
+
+    if (!isRecord(value)) return declaresSecretPath;
+    const patternProperties = isRecord(node.patternProperties) ? node.patternProperties : {};
+    for (const [pattern, propertySchema] of Object.entries(patternProperties)) {
+      if (!isRecord(propertySchema)) continue;
+      let matcher: RegExp;
+      try {
+        matcher = new RegExp(pattern);
+      } catch {
+        continue;
+      }
+      for (const [key, propertyValue] of Object.entries(value)) {
+        if (!matcher.test(key)) continue;
+        visitedKeys.add(key);
+        const path = prefix ? `${prefix}.${key}` : key;
+        const propertyDeclaresSecretPath = walk(
+          propertySchema,
+          path,
+          propertyValue,
+          seenRefs,
+          currentResourceScope,
+        );
+        declaresSecretPath = propertyDeclaresSecretPath || declaresSecretPath;
+        if (key.includes(".") && propertyDeclaresSecretPath) {
+          throw new InvalidSecretRefSchemaPathError(key);
+        }
+      }
+    }
+
+    if (isRecord(node.additionalProperties)) {
+      for (const [key, propertyValue] of Object.entries(value)) {
+        if (visitedKeys.has(key)) continue;
+        const path = prefix ? `${prefix}.${key}` : key;
+        const propertyDeclaresSecretPath = walk(
+          node.additionalProperties,
+          path,
+          propertyValue,
+          seenRefs,
+          currentResourceScope,
+        );
+        declaresSecretPath = propertyDeclaresSecretPath || declaresSecretPath;
+        if (key.includes(".") && propertyDeclaresSecretPath) {
+          throw new InvalidSecretRefSchemaPathError(key);
+        }
       }
     }
     return declaresSecretPath;

@@ -240,6 +240,65 @@ describe("collectSecretRefPaths", () => {
     expect(next.tokens).not.toHaveProperty("1");
   });
 
+  it("collects nested-resource local refs from array items", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        credentials: {
+          type: "array",
+          items: {
+            $id: "credential.json",
+            type: "object",
+            $defs: {
+              secret: { type: "string", format: "secret-ref" },
+            },
+            properties: {
+              apiToken: { $ref: "#/$defs/secret" },
+            },
+          },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      credentials: [{ apiToken: "raw-secret" }],
+    }))).toEqual(["credentials.0.apiToken"]);
+  });
+
+  it("collects dynamic object secret refs from array items", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        credentials: {
+          type: "array",
+          items: {
+            type: "object",
+            patternProperties: {
+              "^token[A-Z]+$": { type: "string", format: "secret-ref" },
+            },
+            additionalProperties: { type: "string", format: "secret-ref" },
+          },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      credentials: [{ tokenAPI: "pattern-secret", fallback: "additional-secret" }],
+    }))).toEqual([
+      "credentials.0.tokenAPI",
+      "credentials.0.fallback",
+    ]);
+  });
+
+  it("rejects dotted dynamic object keys that declare secret refs", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      additionalProperties: { type: "string", format: "secret-ref" },
+    }, { "api.token": "raw-secret" })).toThrow(
+      'Secret-ref schema property "api.token" cannot contain a dot.',
+    );
+  });
+
   it("collects secret-ref paths from JSON Schema composition keywords", () => {
     expect(Array.from(collectSecretRefPaths({
       type: "object",
