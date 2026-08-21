@@ -298,8 +298,18 @@ function stripSecretRefValuesFromPluginLeaseMetadata(input: {
     [...collectSecretRefPaths(input.schema, sanitized)]
       .filter((path) => readConfigValueAtPath(sanitized, path) !== undefined),
   );
+  const secretBearingTopLevelKeys = new Set<string>();
   for (const path of pathsToRemove) {
     sanitized = writeConfigValueAtPath(sanitized, path, undefined);
+    // Provider metadata is shallow-merged onto the durable stored config.
+    // Never let a sanitized nested secret branch (such as an array of agent
+    // credentials) replace the stored branch that retains the secret refs
+    // required for cleanup after the environment is changed or deleted.
+    const topLevelKey = path.split(".")[0];
+    if (topLevelKey) secretBearingTopLevelKeys.add(topLevelKey);
+  }
+  for (const key of secretBearingTopLevelKeys) {
+    delete sanitized[key];
   }
 
   return sanitized;

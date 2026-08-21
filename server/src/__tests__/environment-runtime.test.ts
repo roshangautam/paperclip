@@ -3802,7 +3802,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
   it("resolves every array-item secret ref in sandbox provider config at runtime", async () => {
     const pluginId = randomUUID();
-    const { companyId, environment: baseEnvironment } = await seedEnvironment();
+    const { companyId, environment: baseEnvironment, runId } = await seedEnvironment();
     const [firstSecret, secondSecret] = await Promise.all([
       secretService(db).create(companyId, {
         name: `scoped-provider-first-${randomUUID()}`,
@@ -3913,6 +3913,53 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       { configPath: "agentCredentials.0.apiToken" },
       { configPath: "agentCredentials.1.apiToken" },
     ]);
+
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentReleaseLease"] })),
+      call: vi.fn(async (_pluginId: string, method: string, params: Record<string, unknown>) => {
+        if (method === "environmentAcquireLease") {
+          return {
+            providerLeaseId: "scoped-array-lease",
+            // A provider can echo its resolved config in metadata. Those values
+            // must not overwrite stored refs in the durable lease record.
+            metadata: {
+              agentCredentials: [
+                { agentId: "agent-a", apiToken: "resolved-first-token" },
+                { agentId: "agent-b", apiToken: "resolved-second-token" },
+              ],
+            },
+          };
+        }
+        if (method === "environmentReleaseLease") {
+          expect(params.config).toMatchObject({
+            agentCredentials: [
+              { agentId: "agent-a", apiToken: "resolved-first-token" },
+              { agentId: "agent-b", apiToken: "resolved-second-token" },
+            ],
+          });
+          return undefined;
+        }
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const acquired = await runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+    expect(acquired.lease.metadata).toMatchObject({
+      agentCredentials: [
+        { agentId: "agent-a", apiToken: firstSecret.id },
+        { agentId: "agent-b", apiToken: secondSecret.id },
+      ],
+    });
+
+    await environmentService(db).update(environment.id, { driver: "local", config: {} });
+    await runtimeWithPlugin.releaseRunLeases(runId);
   });
 
   it("waits briefly for a ready sandbox provider plugin worker to come online", async () => {

@@ -16,6 +16,7 @@ import {
 } from "../services/environment-custom-images.js";
 import {
   ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+  buildEnvironmentCustomImageBootRelevantConfig,
   classifyEnvironmentCustomImageConfigChange,
   environmentCustomImageTemplateMatchesBaseConfig,
   fingerprintEnvironmentSandboxProviderConfig,
@@ -569,6 +570,30 @@ describeEmbeddedPostgres("environmentCustomImageService", () => {
 });
 
 describe("fingerprintEnvironmentSandboxProviderConfig", () => {
+  it("excludes a deep concrete array secret from an identity-path parent", () => {
+    const config = {
+      provider: "scoped-provider",
+      deep: {
+        one: {
+          two: {
+            three: {
+              four: { agentCredentials: [{ apiToken: "secret" }] },
+            },
+          },
+        },
+      },
+    } as any;
+    const boot = buildEnvironmentCustomImageBootRelevantConfig({
+      config,
+      binding: { field: "customTemplate", unsetFields: [] },
+      templateIdentityPaths: ["deep"],
+      secretRefExcludePaths: ["deep.one.two.three.four.agentCredentials.0.apiToken"],
+    });
+
+    expect(boot.excludedPaths).toContain("deep");
+    expect(boot.values).not.toHaveProperty("deep");
+  });
+
   it("ignores excluded secret-ref paths so secretizing a credential on save keeps the fingerprint stable", () => {
     // Mirrors the real flow: a template is captured before "Save Environment"
     // rewrites the raw apiKey into a secret ref. Excluding the secret path must
