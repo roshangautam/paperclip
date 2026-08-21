@@ -744,6 +744,42 @@ describe("environmentCustomImageTemplateMatchesBaseConfig", () => {
     })).toBe(false);
   });
 
+  it("matches legacy templates whose fingerprint still included array secret values", () => {
+    const baseConfig = {
+      provider: "scoped-provider",
+      image: "example:base",
+      agentCredentials: [{ agentId: "agent-a", apiToken: "first-secret" }],
+    } as any;
+    const template = {
+      id: "template-1",
+      environmentId: "env-1",
+      provider: "scoped-provider",
+      templateKind: "snapshot",
+      templateRef: "snapshot-active",
+      sourceTemplateRef: "example:base",
+      // This is the pre-array-path fingerprint, which had no indexed secret
+      // exclusion and therefore includes the credential value.
+      sourceEnvironmentConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(baseConfig, {
+        excludePaths: ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+      }),
+      status: "active",
+      createdByUserId: null,
+      createdByAgentId: null,
+      capturedAt: null,
+      lastUsedAt: null,
+      supersededByTemplateId: null,
+      metadata: null,
+      createdAt: new Date("2026-07-09T00:00:00.000Z"),
+      updatedAt: new Date("2026-07-09T00:00:00.000Z"),
+    } as any;
+
+    expect(environmentCustomImageTemplateMatchesBaseConfig({
+      template,
+      baseConfig,
+      secretRefExcludePaths: ["agentCredentials.0.apiToken"],
+    })).toBe(true);
+  });
+
   it("classifies an array credential addition with the path set from each config", () => {
     const previousConfig = {
       provider: "scoped-provider",

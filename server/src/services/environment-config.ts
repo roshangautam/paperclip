@@ -252,8 +252,23 @@ async function persistConfigSecretRefs(input: {
   actor?: { userId?: string | null; agentId?: string | null };
 }): Promise<Record<string, unknown>> {
   let nextConfig = { ...input.config };
+  const secretRefPaths = [...collectSecretRefPaths(input.schema, nextConfig)];
+  // Reject empty direct array items before creating any other secrets. Failing
+  // after another item was secretized would orphan a newly created secret.
+  for (const path of secretRefPaths) {
+    const rawValue = canonicalizeSecretRefValue(readConfigValueAtPath(nextConfig, path), path);
+    const parentPath = path.slice(0, path.lastIndexOf("."));
+    if (
+      typeof rawValue === "string"
+      && rawValue.trim().length === 0
+      && parentPath
+      && Array.isArray(readConfigValueAtPath(nextConfig, parentPath))
+    ) {
+      throw unprocessable(`Secret reference array item at ${path} cannot be empty.`);
+    }
+  }
   const emptySecretRefPaths: string[] = [];
-  for (const path of collectSecretRefPaths(input.schema, nextConfig)) {
+  for (const path of secretRefPaths) {
     const rawValue = canonicalizeSecretRefValue(readConfigValueAtPath(nextConfig, path), path);
     if (typeof rawValue !== "string") continue;
     const trimmed = rawValue.trim();

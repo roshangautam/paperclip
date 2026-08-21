@@ -99,6 +99,25 @@ describe("collectSecretRefPaths", () => {
     }))).toEqual(["tokens.0", "tokens.1"]);
   });
 
+  it("rejects secret refs below schema property names that dot paths cannot represent", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      properties: {
+        credentials: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              "api.token": { type: "string", format: "secret-ref" },
+            },
+          },
+        },
+      },
+    }, {
+      credentials: [{ "api.token": "raw-secret" }],
+    })).toThrow('Secret-ref schema property "api.token" cannot contain a dot.');
+  });
+
   it("collects secret refs from tuple items, additional items, and local refs", () => {
     const schema = {
       $defs: {

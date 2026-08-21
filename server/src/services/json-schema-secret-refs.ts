@@ -34,6 +34,13 @@ type ConfigContainer = Record<string, unknown> | unknown[];
 
 const SCHEMA_REF_PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+export class InvalidSecretRefSchemaPathError extends Error {
+  constructor(propertyName: string) {
+    super(`Secret-ref schema property "${propertyName}" cannot contain a dot.`);
+    this.name = "InvalidSecretRefSchemaPathError";
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -191,7 +198,16 @@ export function collectSecretRefPaths(
       // Config-aware callers need only concrete paths. Besides avoiding stale
       // optional bindings, this stops recursive refs once the value tree ends.
       if (config !== undefined && propertyValue === undefined) continue;
+      const pathCountBefore = paths.size;
       walk(propertySchema, path, propertyValue, seenRefs);
+      // Dot paths are the durable representation used by every secret-ref
+      // reader, writer, audit record, and binding. JSON Schema property names
+      // may contain dots, but such a name would make a discovered secret path
+      // lossy (for example `api.token` becomes two path segments). Reject the
+      // configuration before a raw secret could be persisted under that key.
+      if (key.includes(".") && paths.size > pathCountBefore) {
+        throw new InvalidSecretRefSchemaPathError(key);
+      }
     }
   }
 

@@ -147,11 +147,25 @@ export function environmentCustomImageTemplateMatchesBaseConfig(input: {
     ],
   });
   if (normalizedFingerprint === expectedFingerprint) return true;
+  // Before config-aware array traversal, templates did not exclude any path
+  // containing a concrete array index. Retain that fingerprint interpretation
+  // so an existing capture keeps applying after this upgrade instead of
+  // silently falling back to its base image.
+  const legacySecretRefExcludePaths = secretRefExcludePaths.filter((path) =>
+    !path.split(".").some((segment) => /^(?:0|[1-9]\d*)$/.test(segment)),
+  );
+  if (fingerprintEnvironmentSandboxProviderConfig(input.baseConfig, {
+    excludePaths: [
+      ...ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+      ...legacySecretRefExcludePaths,
+    ],
+  }) === expectedFingerprint) {
+    return true;
+  }
   // Backward compatibility for templates captured before runtime-only fields
-  // were excluded from the source fingerprint (secret-ref paths have always
-  // been excluded at capture time).
+  // were excluded from the source fingerprint.
   return fingerprintEnvironmentSandboxProviderConfig(input.baseConfig, {
-    excludePaths: secretRefExcludePaths,
+    excludePaths: legacySecretRefExcludePaths,
   }) === expectedFingerprint;
 }
 
