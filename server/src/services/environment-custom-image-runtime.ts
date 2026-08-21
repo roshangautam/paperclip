@@ -320,7 +320,10 @@ function environmentCustomImageConfigPathOverlapsSecret(
     // These paths are generated from the current config by the schema walker,
     // so numeric segments are concrete array indexes rather than driver input.
     const secret = canonicalizeEnvironmentCustomImageConfigPathInternal(raw, true, false);
-    if (!secret) continue;
+    // A secret path that cannot be represented by the bounded dot-path format
+    // must never make a boot snapshot retain a possibly secret-bearing value.
+    // Exclude this candidate rather than silently ignoring the secret path.
+    if (!secret) return true;
     if (candidate === secret) return true;
     if (candidate.startsWith(`${secret}.`)) return true;
     if (secret.startsWith(`${candidate}.`)) return true;

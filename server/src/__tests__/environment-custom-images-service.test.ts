@@ -594,6 +594,22 @@ describe("fingerprintEnvironmentSandboxProviderConfig", () => {
     expect(boot.values).not.toHaveProperty("deep");
   });
 
+  it("excludes generated array secret paths with JSON Schema property names outside driver path syntax", () => {
+    const config = {
+      provider: "scoped-provider",
+      agentCredentials: [{ "2fa-token": "secret" }],
+    } as any;
+    const boot = buildEnvironmentCustomImageBootRelevantConfig({
+      config,
+      binding: { field: "customTemplate", unsetFields: [] },
+      templateIdentityPaths: ["agentCredentials"],
+      secretRefExcludePaths: ["agentCredentials.0.2fa-token"],
+    });
+
+    expect(boot.excludedPaths).toContain("agentCredentials");
+    expect(boot.values).not.toHaveProperty("agentCredentials");
+  });
+
   it("ignores excluded secret-ref paths so secretizing a credential on save keeps the fingerprint stable", () => {
     // Mirrors the real flow: a template is captured before "Save Environment"
     // rewrites the raw apiKey into a secret ref. Excluding the secret path must
