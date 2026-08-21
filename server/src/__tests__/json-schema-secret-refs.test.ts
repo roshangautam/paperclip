@@ -168,6 +168,22 @@ describe("collectSecretRefPaths", () => {
     }))).toEqual(["credentials.0.apiToken", "credentials.2.apiToken"]);
   });
 
+  it("ignores additionalItems when items is absent", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        ordinaryValues: {
+          type: "array",
+          additionalItems: { type: "string", format: "secret-ref" },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      ordinaryValues: ["ordinary-a", "ordinary-b"],
+    }))).toEqual([]);
+  });
+
   it("stops recursive local refs after concrete values end", () => {
     const schema = {
       $defs: {

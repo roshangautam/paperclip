@@ -181,11 +181,15 @@ export function collectSecretRefPaths(
     }
 
     if (Array.isArray(value)) {
-      const tupleItems = Array.isArray(node.items) ? node.items : [];
+      // `additionalItems` applies only to tuple-form `items`, never on its own
+      // or alongside a homogeneous item schema (JSON Schema draft-07).
+      const tupleItems = Array.isArray(node.items) ? node.items : null;
       const sharedItems = isRecord(node.items) ? node.items : null;
-      const additionalItems = isRecord(node.additionalItems) ? node.additionalItems : null;
+      const additionalItems = tupleItems && isRecord(node.additionalItems) ? node.additionalItems : null;
       value.forEach((item, index) => {
-        const itemSchema = tupleItems[index] ?? sharedItems ?? (index >= tupleItems.length ? additionalItems : null);
+        const itemSchema = tupleItems?.[index]
+          ?? sharedItems
+          ?? (tupleItems && index >= tupleItems.length ? additionalItems : null);
         if (!isRecord(itemSchema)) return;
         declaresSecretPath = walk(itemSchema, prefix ? `${prefix}.${index}` : String(index), item, seenRefs)
           || declaresSecretPath;
