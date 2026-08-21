@@ -279,17 +279,29 @@ export interface EnvironmentCustomImageDriftedPath {
  * unresolvable path returns `null`; the caller must never persist the raw
  * driver-supplied string.
  */
-export function canonicalizeEnvironmentCustomImageConfigPath(raw: unknown): string | null {
+function canonicalizeEnvironmentCustomImageConfigPathInternal(
+  raw: unknown,
+  allowArrayIndexes = false,
+): string | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
   const segments = trimmed.split(".");
   if (segments.length === 0 || segments.length > BOOT_RELEVANT_CONFIG_MAX_PATH_DEPTH) return null;
   for (const segment of segments) {
-    if (!BOOT_RELEVANT_CONFIG_PATH_SEGMENT_RE.test(segment)) return null;
+    if (
+      !BOOT_RELEVANT_CONFIG_PATH_SEGMENT_RE.test(segment)
+      && !(allowArrayIndexes && /^(?:0|[1-9]\d*)$/.test(segment))
+    ) {
+      return null;
+    }
     if (BOOT_RELEVANT_CONFIG_RESERVED_SEGMENTS.has(segment)) return null;
   }
   return segments.join(".");
+}
+
+export function canonicalizeEnvironmentCustomImageConfigPath(raw: unknown): string | null {
+  return canonicalizeEnvironmentCustomImageConfigPathInternal(raw);
 }
 
 /**
@@ -301,7 +313,9 @@ function environmentCustomImageConfigPathOverlapsSecret(
   secretPaths: Iterable<string>,
 ): boolean {
   for (const raw of secretPaths) {
-    const secret = canonicalizeEnvironmentCustomImageConfigPath(raw);
+    // These paths are generated from the current config by the schema walker,
+    // so numeric segments are concrete array indexes rather than driver input.
+    const secret = canonicalizeEnvironmentCustomImageConfigPathInternal(raw, true);
     if (!secret) continue;
     if (candidate === secret) return true;
     if (candidate.startsWith(`${secret}.`)) return true;

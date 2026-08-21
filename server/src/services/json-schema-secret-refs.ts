@@ -32,6 +32,8 @@ export function parseSecretRefBindingObject(value: unknown): SecretRefBindingObj
 
 type ConfigContainer = Record<string, unknown> | unknown[];
 
+const SCHEMA_REF_PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -66,9 +68,82 @@ export function collectSecretRefPaths(
   const paths = new Set<string>();
   if (!schema || typeof schema !== "object") return paths;
 
-  function walk(node: Record<string, unknown>, prefix: string, value: unknown): void {
+  function findSchemaNode(
+    node: unknown,
+    predicate: (candidate: Record<string, unknown>) => boolean,
+    seen: Set<unknown> = new Set(),
+  ): Record<string, unknown> | null {
+    if (Array.isArray(node)) {
+      if (seen.has(node)) return null;
+      seen.add(node);
+      for (const child of node) {
+        const found = findSchemaNode(child, predicate, seen);
+        if (found) return found;
+      }
+      return null;
+    }
+    if (!isRecord(node) || seen.has(node)) return null;
+    seen.add(node);
+    if (predicate(node)) return node;
+    for (const child of Object.values(node)) {
+      const found = findSchemaNode(child, predicate, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function resolveLocalSchemaRef(ref: string): Record<string, unknown> | null {
+    let decodedRef: string;
+    try {
+      decodedRef = decodeURIComponent(ref);
+    } catch {
+      return null;
+    }
+    if (decodedRef === "#") return schema ?? null;
+    if (decodedRef.startsWith("#/")) {
+      let current: unknown = schema;
+      for (const encodedSegment of decodedRef.slice(2).split("/")) {
+        if (!isRecord(current)) return null;
+        const segment = encodedSegment.replaceAll("~1", "/").replaceAll("~0", "~");
+        if (
+          SCHEMA_REF_PROTOTYPE_KEYS.has(segment)
+          || !Object.prototype.hasOwnProperty.call(current, segment)
+        ) {
+          return null;
+        }
+        current = current[segment];
+      }
+      return isRecord(current) ? current : null;
+    }
+    if (!decodedRef.startsWith("#")) return null;
+    const anchor = decodedRef.slice(1);
+    return findSchemaNode(schema, (candidate) =>
+      candidate.$anchor === anchor
+      || candidate.$dynamicAnchor === anchor
+      || candidate.$id === decodedRef);
+  }
+
+  function walk(
+    node: Record<string, unknown>,
+    prefix: string,
+    value: unknown,
+    seenRefs: ReadonlySet<string> = new Set(),
+  ): void {
     if (node.format === "secret-ref" && prefix) {
       paths.add(prefix);
+    }
+
+    const ref = node.$ref;
+    if (typeof ref === "string") {
+      const refAtPath = `${ref}\u0000${prefix}`;
+      if (!seenRefs.has(refAtPath)) {
+        const resolved = resolveLocalSchemaRef(ref);
+        if (resolved) {
+          const nextSeenRefs = new Set(seenRefs);
+          nextSeenRefs.add(refAtPath);
+          walk(resolved, prefix, value, nextSeenRefs);
+        }
+      }
     }
 
     for (const keyword of ["allOf", "anyOf", "oneOf"] as const) {
@@ -76,15 +151,19 @@ export function collectSecretRefPaths(
       if (!Array.isArray(branches)) continue;
       for (const branch of branches) {
         if (!isRecord(branch)) continue;
-        walk(branch, prefix, value);
+        walk(branch, prefix, value, seenRefs);
       }
     }
 
-    const items = node.items;
-    if (isRecord(items) && Array.isArray(value)) {
-      for (let index = 0; index < value.length; index += 1) {
-        walk(items, prefix ? `${prefix}.${index}` : String(index), value[index]);
-      }
+    if (Array.isArray(value)) {
+      const tupleItems = Array.isArray(node.items) ? node.items : [];
+      const sharedItems = isRecord(node.items) ? node.items : null;
+      const additionalItems = isRecord(node.additionalItems) ? node.additionalItems : null;
+      value.forEach((item, index) => {
+        const itemSchema = tupleItems[index] ?? sharedItems ?? (index >= tupleItems.length ? additionalItems : null);
+        if (!isRecord(itemSchema)) return;
+        walk(itemSchema, prefix ? `${prefix}.${index}` : String(index), item, seenRefs);
+      });
     }
 
     const properties = node.properties;
@@ -93,10 +172,7 @@ export function collectSecretRefPaths(
       if (!isRecord(propertySchema)) continue;
       const path = prefix ? `${prefix}.${key}` : key;
       const propertyValue = readChild(value, key);
-      if (propertySchema.format === "secret-ref") {
-        paths.add(path);
-      }
-      walk(propertySchema, path, propertyValue);
+      walk(propertySchema, path, propertyValue, seenRefs);
     }
   }
 

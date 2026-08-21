@@ -99,6 +99,38 @@ describe("collectSecretRefPaths", () => {
     }))).toEqual(["tokens.0", "tokens.1"]);
   });
 
+  it("collects secret refs from tuple items, additional items, and local refs", () => {
+    const schema = {
+      $defs: {
+        credential: {
+          type: "object",
+          properties: {
+            apiToken: { type: "string", format: "secret-ref" },
+          },
+        },
+      },
+      type: "object",
+      properties: {
+        credentials: {
+          type: "array",
+          items: [
+            { $ref: "#/$defs/credential" },
+            { type: "string" },
+          ],
+          additionalItems: { $ref: "#/$defs/credential" },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      credentials: [
+        { apiToken: "first-secret" },
+        "non-secret",
+        { apiToken: "third-secret" },
+      ],
+    }))).toEqual(["credentials.0.apiToken", "credentials.2.apiToken"]);
+  });
+
   it("reads and writes concrete array-item paths without mutating the source", () => {
     const config = {
       agentCredentials: [

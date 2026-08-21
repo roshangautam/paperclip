@@ -957,8 +957,9 @@ function secretPluginManifest() {
         templateRefKind: "snapshot",
         templateConfigBinding: { field: "customTemplate", unsetFields: ["image"] },
         // apiUrl overlaps a secret exactly; auth.token is a child of secret
-        // `auth`; credentials is a parent of secret `credentials.secret`.
-        templateIdentityPaths: ["apiUrl", "auth.token", "credentials"],
+        // `auth`; credentials is a parent of secret `credentials.secret`;
+        // agentCredentials is a parent of a concrete array-item secret.
+        templateIdentityPaths: ["apiUrl", "auth.token", "credentials", "agentCredentials"],
         supportsTemplateDelete: true,
         configSchema: {
           type: "object",
@@ -968,6 +969,13 @@ function secretPluginManifest() {
             credentials: {
               type: "object",
               properties: { secret: { type: "string", format: "secret-ref" } },
+            },
+            agentCredentials: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { apiToken: { type: "string", format: "secret-ref" } },
+              },
             },
           },
         },
@@ -1118,6 +1126,7 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
       apiUrl: "https://secret-endpoint.example",
       auth: "auth-secret-value",
       credentials: { secret: "cred-secret-value", region: "eu" },
+      agentCredentials: [{ agentId: "agent-1", apiToken: "array-secret-value" }],
       reuseLease: false,
     };
     const { companyId, environmentId } = await seed({ manifest: secretPluginManifest(), config });
@@ -1136,10 +1145,16 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
       values: Record<string, unknown>;
       excludedPaths: string[];
     };
-    expect(boot.excludedPaths).toEqual(expect.arrayContaining(["apiUrl", "auth.token", "credentials"]));
+    expect(boot.excludedPaths).toEqual(expect.arrayContaining([
+      "apiUrl",
+      "auth.token",
+      "credentials",
+      "agentCredentials",
+    ]));
     expect(Object.keys(boot.values)).not.toContain("apiUrl");
     expect(Object.keys(boot.values)).not.toContain("auth.token");
     expect(Object.keys(boot.values)).not.toContain("credentials");
+    expect(Object.keys(boot.values)).not.toContain("agentCredentials");
     // Neither the persisted snapshot nor the response leaks a secret value.
     for (const metadataJson of [
       JSON.stringify(persistedRow.metadata),
@@ -1148,6 +1163,7 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
       expect(metadataJson).not.toContain("secret-endpoint.example");
       expect(metadataJson).not.toContain("auth-secret-value");
       expect(metadataJson).not.toContain("cred-secret-value");
+      expect(metadataJson).not.toContain("array-secret-value");
     }
 
     // An excluded path forces the fail-closed unclassified result: the flag is required.
@@ -1164,6 +1180,7 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
     expect(responseJson).not.toContain("secret-endpoint.example");
     expect(responseJson).not.toContain("auth-secret-value");
     expect(responseJson).not.toContain("cred-secret-value");
+    expect(responseJson).not.toContain("array-secret-value");
 
     const activities = await relinkActivityRows(environmentId);
     const relinkActivity = activities.find((row) => row.action === "environment.custom_image_template.relinked");
@@ -1172,6 +1189,7 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
     expect(activityJson).not.toContain("secret-endpoint.example");
     expect(activityJson).not.toContain("auth-secret-value");
     expect(activityJson).not.toContain("cred-secret-value");
+    expect(activityJson).not.toContain("array-secret-value");
     // Drift detail carries path names only, never a fingerprint value.
     expect(activityJson).not.toContain(promoted.template.sourceEnvironmentConfigFingerprint);
   });
