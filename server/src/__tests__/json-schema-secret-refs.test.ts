@@ -131,6 +131,31 @@ describe("collectSecretRefPaths", () => {
     }))).toEqual(["credentials.0.apiToken", "credentials.2.apiToken"]);
   });
 
+  it("stops recursive local refs after concrete values end", () => {
+    const schema = {
+      $defs: {
+        node: {
+          type: "object",
+          properties: {
+            apiToken: { type: "string", format: "secret-ref" },
+            child: { $ref: "#/$defs/node" },
+          },
+        },
+      },
+      type: "object",
+      properties: {
+        root: { $ref: "#/$defs/node" },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      root: {
+        apiToken: "first-secret",
+        child: { apiToken: "second-secret" },
+      },
+    }))).toEqual(["root.apiToken", "root.child.apiToken"]);
+  });
+
   it("reads and writes concrete array-item paths without mutating the source", () => {
     const config = {
       agentCredentials: [

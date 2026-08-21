@@ -123,6 +123,22 @@ export function collectSecretRefPaths(
       || candidate.$id === decodedRef);
   }
 
+  const refValueIds = new Map<object, number>();
+  let nextRefValueId = 1;
+
+  function refValueKey(ref: string, value: unknown): string {
+    if (value && typeof value === "object") {
+      let id = refValueIds.get(value);
+      if (id === undefined) {
+        id = nextRefValueId;
+        nextRefValueId += 1;
+        refValueIds.set(value, id);
+      }
+      return `${ref}\u0000object:${id}`;
+    }
+    return `${ref}\u0000${typeof value}:${String(value)}`;
+  }
+
   function walk(
     node: Record<string, unknown>,
     prefix: string,
@@ -135,12 +151,12 @@ export function collectSecretRefPaths(
 
     const ref = node.$ref;
     if (typeof ref === "string") {
-      const refAtPath = `${ref}\u0000${prefix}`;
-      if (!seenRefs.has(refAtPath)) {
+      const refAtValue = refValueKey(ref, value);
+      if (!seenRefs.has(refAtValue)) {
         const resolved = resolveLocalSchemaRef(ref);
         if (resolved) {
           const nextSeenRefs = new Set(seenRefs);
-          nextSeenRefs.add(refAtPath);
+          nextSeenRefs.add(refAtValue);
           walk(resolved, prefix, value, nextSeenRefs);
         }
       }
@@ -172,6 +188,9 @@ export function collectSecretRefPaths(
       if (!isRecord(propertySchema)) continue;
       const path = prefix ? `${prefix}.${key}` : key;
       const propertyValue = readChild(value, key);
+      // Config-aware callers need only concrete paths. Besides avoiding stale
+      // optional bindings, this stops recursive refs once the value tree ends.
+      if (config !== undefined && propertyValue === undefined) continue;
       walk(propertySchema, path, propertyValue, seenRefs);
     }
   }
