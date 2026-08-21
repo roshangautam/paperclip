@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { collectSecretRefPaths, parseSecretRefBindingObject } from "../services/json-schema-secret-refs.ts";
+import {
+  collectSecretRefPaths,
+  parseSecretRefBindingObject,
+  readConfigValueAtPath,
+  writeConfigValueAtPath,
+} from "../services/json-schema-secret-refs.ts";
 
 describe("parseSecretRefBindingObject", () => {
   const secretId = "11111111-1111-1111-1111-111111111111";
@@ -47,6 +52,53 @@ describe("collectSecretRefPaths", () => {
         },
       },
     }))).toEqual(["credentials.apiKey"]);
+  });
+
+  it("collects concrete secret-ref paths from array items", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        agentCredentials: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              apiToken: { type: "string", format: "secret-ref" },
+            },
+          },
+        },
+      },
+    };
+    const config = {
+      agentCredentials: [
+        { agentId: "agent-a", apiToken: "secret-a" },
+        { agentId: "agent-b", apiToken: "secret-b" },
+      ],
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, config))).toEqual([
+      "agentCredentials.0.apiToken",
+      "agentCredentials.1.apiToken",
+    ]);
+  });
+
+  it("reads and writes concrete array-item paths without mutating the source", () => {
+    const config = {
+      agentCredentials: [
+        { agentId: "agent-a", apiToken: "secret-a" },
+        { agentId: "agent-b", apiToken: "secret-b" },
+      ],
+    };
+
+    expect(readConfigValueAtPath(config, "agentCredentials.1.apiToken")).toBe("secret-b");
+    expect(readConfigValueAtPath(config, "agentCredentials.one.apiToken")).toBeUndefined();
+    expect(writeConfigValueAtPath(config, "agentCredentials.1.apiToken", "resolved-b")).toEqual({
+      agentCredentials: [
+        { agentId: "agent-a", apiToken: "secret-a" },
+        { agentId: "agent-b", apiToken: "resolved-b" },
+      ],
+    });
+    expect(config.agentCredentials[1]?.apiToken).toBe("secret-b");
   });
 
   it("collects secret-ref paths from JSON Schema composition keywords", () => {

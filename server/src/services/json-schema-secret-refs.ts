@@ -30,35 +30,73 @@ export function parseSecretRefBindingObject(value: unknown): SecretRefBindingObj
   return null;
 }
 
+type ConfigContainer = Record<string, unknown> | unknown[];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function arrayIndex(key: string): number | null {
+  if (!/^(?:0|[1-9]\d*)$/.test(key)) return null;
+  const index = Number(key);
+  return Number.isSafeInteger(index) ? index : null;
+}
+
+function readChild(value: unknown, key: string): unknown {
+  if (Array.isArray(value)) {
+    const index = arrayIndex(key);
+    return index === null ? undefined : value[index];
+  }
+  return isRecord(value) ? value[key] : undefined;
+}
+
+/**
+ * Returns the concrete config paths for schema-declared secret references.
+ *
+ * JSON Schema has no numeric array indexes, but persisted configuration does.
+ * When a schema marks an array item's field as `secret-ref`, `config` expands
+ * that declaration into paths such as `agentCredentials.0.apiToken`. Callers
+ * that read, write, bind, or resolve refs must supply the current config so
+ * every present array item remains individually auditable.
+ */
 export function collectSecretRefPaths(
   schema: Record<string, unknown> | null | undefined,
+  config?: Record<string, unknown>,
 ): Set<string> {
   const paths = new Set<string>();
   if (!schema || typeof schema !== "object") return paths;
 
-  function walk(node: Record<string, unknown>, prefix: string): void {
+  function walk(node: Record<string, unknown>, prefix: string, value: unknown): void {
     for (const keyword of ["allOf", "anyOf", "oneOf"] as const) {
       const branches = node[keyword];
       if (!Array.isArray(branches)) continue;
       for (const branch of branches) {
-        if (!branch || typeof branch !== "object" || Array.isArray(branch)) continue;
-        walk(branch as Record<string, unknown>, prefix);
+        if (!isRecord(branch)) continue;
+        walk(branch, prefix, value);
       }
     }
 
-    const properties = node.properties as Record<string, Record<string, unknown>> | undefined;
-    if (!properties || typeof properties !== "object") return;
+    const items = node.items;
+    if (isRecord(items) && Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        walk(items, prefix ? `${prefix}.${index}` : String(index), value[index]);
+      }
+    }
+
+    const properties = node.properties;
+    if (!isRecord(properties)) return;
     for (const [key, propertySchema] of Object.entries(properties)) {
-      if (!propertySchema || typeof propertySchema !== "object") continue;
+      if (!isRecord(propertySchema)) continue;
       const path = prefix ? `${prefix}.${key}` : key;
+      const propertyValue = readChild(value, key);
       if (propertySchema.format === "secret-ref") {
         paths.add(path);
       }
-      walk(propertySchema, path);
+      walk(propertySchema, path, propertyValue);
     }
   }
 
-  walk(schema, "");
+  walk(schema, "", config);
   return paths;
 }
 
@@ -68,10 +106,8 @@ export function readConfigValueAtPath(
 ): unknown {
   let current: unknown = config;
   for (const key of dotPath.split(".")) {
-    if (!current || typeof current !== "object" || Array.isArray(current)) {
-      return undefined;
-    }
-    current = (current as Record<string, unknown>)[key];
+    current = readChild(current, key);
+    if (current === undefined) return undefined;
   }
   return current;
 }
@@ -83,19 +119,35 @@ export function writeConfigValueAtPath(
 ): Record<string, unknown> {
   const result = structuredClone(config) as Record<string, unknown>;
   const keys = dotPath.split(".");
-  let cursor: Record<string, unknown> = result;
+  let cursor: ConfigContainer = result;
 
   for (let index = 0; index < keys.length - 1; index += 1) {
     const key = keys[index]!;
-    const next = cursor[key];
-    if (!next || typeof next !== "object" || Array.isArray(next)) {
-      cursor[key] = {};
+    const nextKey = keys[index + 1]!;
+    const next = readChild(cursor, key);
+    const replacement: ConfigContainer = isRecord(next) || Array.isArray(next)
+      ? next
+      : arrayIndex(nextKey) === null ? {} : [];
+    if (Array.isArray(cursor)) {
+      const arrayPosition = arrayIndex(key);
+      if (arrayPosition === null) return result;
+      cursor[arrayPosition] = replacement;
+    } else {
+      cursor[key] = replacement;
     }
-    cursor = cursor[key] as Record<string, unknown>;
+    cursor = replacement;
   }
 
   const leafKey = keys[keys.length - 1]!;
-  if (value === undefined) {
+  if (Array.isArray(cursor)) {
+    const arrayPosition = arrayIndex(leafKey);
+    if (arrayPosition === null) return result;
+    if (value === undefined) {
+      delete cursor[arrayPosition];
+    } else {
+      cursor[arrayPosition] = value;
+    }
+  } else if (value === undefined) {
     delete cursor[leafKey];
   } else {
     cursor[leafKey] = value;

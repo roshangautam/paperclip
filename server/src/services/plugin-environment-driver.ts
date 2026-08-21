@@ -294,7 +294,7 @@ export async function validatePluginSandboxProviderConfig(input: {
       ? resolved.driver.configSchema as Record<string, unknown>
       : null;
   let config = input.config;
-  for (const path of collectSecretRefPaths(configSchema)) {
+  for (const path of collectSecretRefPaths(configSchema, config)) {
     const binding = parseSecretRefBindingObject(readConfigValueAtPath(config, path));
     if (!binding) continue;
     if (binding.version !== "latest") {

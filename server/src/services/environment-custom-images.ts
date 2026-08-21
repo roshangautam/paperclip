@@ -636,7 +636,11 @@ export function environmentCustomImageService(
         baseConfig: parsed.config,
         secretRefExcludePaths: parsed.config.provider === "fake"
           ? []
-          : await resolveSandboxProviderSecretRefPaths(db, parsed.config.provider),
+          : await resolveSandboxProviderSecretRefPaths(
+            db,
+            parsed.config.provider,
+            parsed.config as Record<string, unknown>,
+          ),
       });
     } catch {
       return null;
@@ -817,7 +821,11 @@ export function environmentCustomImageService(
         const environment = await requireEnvironment(session.environmentId);
         const parsed = parseEnvironmentDriverConfig(environment);
         const captureSecretRefExcludePaths = parsed.driver === "sandbox"
-          ? [...await resolveSandboxProviderSecretRefPaths(db, parsed.config.provider)]
+          ? [...await resolveSandboxProviderSecretRefPaths(
+            db,
+            parsed.config.provider,
+            parsed.config as Record<string, unknown>,
+          )]
           : [];
         const baseFingerprint = parsed.driver === "sandbox"
           ? fingerprintEnvironmentSandboxProviderConfig(parsed.config, {
@@ -988,7 +996,11 @@ export function environmentCustomImageService(
       if (!template?.templateRef) return { action: "none" };
       const secretRefExcludePaths = previousParsed.config.provider === "fake"
         ? []
-        : [...await resolveSandboxProviderSecretRefPaths(db, previousParsed.config.provider)];
+        : [...await resolveSandboxProviderSecretRefPaths(
+          db,
+          previousParsed.config.provider,
+          previousParsed.config as Record<string, unknown>,
+        )];
       if (!environmentCustomImageTemplateMatchesBaseConfig({
         template,
         baseConfig: previousParsed.config,
@@ -1076,7 +1088,11 @@ export function environmentCustomImageService(
 
       const secretRefExcludePaths = parsed.config.provider === "fake"
         ? []
-        : [...await resolveSandboxProviderSecretRefPaths(db, parsed.config.provider)];
+        : [...await resolveSandboxProviderSecretRefPaths(
+            db,
+            parsed.config.provider,
+            parsed.config as Record<string, unknown>,
+          )];
       // Resolve the current provider contract so the classifier can reject a
       // snapshot captured against a different binding or identity-path set. A
       // driver that no longer resolves fails closed (null contract).

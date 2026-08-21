@@ -63,7 +63,11 @@ import {
   resolvePluginExecuteRpcTimeoutMs,
   resumePluginEnvironmentLease,
 } from "./plugin-environment-driver.js";
-import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
+import {
+  collectSecretRefPaths,
+  readConfigValueAtPath,
+  writeConfigValueAtPath,
+} from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
 import {
   createSandboxOrphanCleanupSpool,
@@ -288,43 +292,11 @@ function stripSecretRefValuesFromPluginLeaseMetadata(input: {
   metadata: Record<string, unknown> | null | undefined;
   schema: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
-  const sanitized = structuredClone(input.metadata ?? {}) as Record<string, unknown>;
+  let sanitized = structuredClone(input.metadata ?? {}) as Record<string, unknown>;
 
-  for (const path of collectSecretRefPaths(input.schema)) {
-    const keys = path.split(".");
-    const parents: Array<{ container: Record<string, unknown>; key: string }> = [];
-    let cursor: Record<string, unknown> | null = sanitized;
-
-    for (let index = 0; index < keys.length - 1; index += 1) {
-      const key = keys[index]!;
-      const next = cursor?.[key];
-      if (!next || typeof next !== "object" || Array.isArray(next)) {
-        cursor = null;
-        break;
-      }
-      parents.push({ container: cursor, key });
-      cursor = next as Record<string, unknown>;
-    }
-
-    if (!cursor) continue;
-
-    const leafKey = keys[keys.length - 1]!;
-    if (!Object.prototype.hasOwnProperty.call(cursor, leafKey)) continue;
-    delete cursor[leafKey];
-
-    for (let index = parents.length - 1; index >= 0; index -= 1) {
-      const { container, key } = parents[index]!;
-      const value = container[key];
-      if (
-        value &&
-        typeof value === "object" &&
-        !Array.isArray(value) &&
-        Object.keys(value as Record<string, unknown>).length === 0
-      ) {
-        delete container[key];
-      } else {
-        break;
-      }
+  for (const path of collectSecretRefPaths(input.schema, sanitized)) {
+    if (readConfigValueAtPath(sanitized, path) !== undefined) {
+      sanitized = writeConfigValueAtPath(sanitized, path, undefined);
     }
   }
 
