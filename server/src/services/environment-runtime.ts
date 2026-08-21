@@ -292,13 +292,18 @@ export function buildEnvironmentLeaseContext(input: {
 function stripSecretRefValuesFromPluginLeaseMetadata(input: {
   metadata: Record<string, unknown> | null | undefined;
   schema: Record<string, unknown> | null | undefined;
+  storedConfig: Record<string, unknown>;
 }): Record<string, unknown> {
   let sanitized = structuredClone(input.metadata ?? {}) as Record<string, unknown>;
   const pathsToRemove = sortConfigPathsForRemoval(
     [...collectSecretRefPaths(input.schema, sanitized)]
       .filter((path) => readConfigValueAtPath(sanitized, path) !== undefined),
   );
-  const secretBearingTopLevelKeys = new Set<string>();
+  const secretBearingTopLevelKeys = new Set<string>(
+    [...collectSecretRefPaths(input.schema, input.storedConfig)]
+      .map((path) => path.split(".")[0])
+      .filter((key): key is string => Boolean(key)),
+  );
   for (const path of pathsToRemove) {
     sanitized = writeConfigValueAtPath(sanitized, path, undefined);
     // Provider metadata is shallow-merged onto the durable stored config.
@@ -1689,6 +1694,7 @@ function createSandboxEnvironmentDriver(
         const sanitizedProviderMetadata = stripSecretRefValuesFromPluginLeaseMetadata({
           metadata: acquiredLease.metadata,
           schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
+          storedConfig: storedConfig as Record<string, unknown>,
         });
         const reusableScope = resolvedLeasePolicy === "reuse_by_environment"
           ? buildReusableSandboxLeaseScope({

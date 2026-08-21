@@ -3924,10 +3924,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             // A provider can echo its resolved config in metadata. Those values
             // must not overwrite stored refs in the durable lease record.
             metadata: {
-              agentCredentials: [
-                { agentId: "agent-a", apiToken: "resolved-first-token" },
-                { agentId: "agent-b", apiToken: "resolved-second-token" },
-              ],
+              // The provider omits secret leaves, which must not replace the
+              // durable array carrying the refs needed by later cleanup.
+              agentCredentials: [{ agentId: "agent-a" }],
             },
           };
         }
