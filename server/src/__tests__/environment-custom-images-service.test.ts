@@ -703,15 +703,18 @@ describe("environmentCustomImageTemplateMatchesBaseConfig", () => {
     })).toBe(false);
   });
 
-  it("classifies an array secret addition with the path set from each config", () => {
+  it("classifies an array credential addition with the path set from each config", () => {
     const previousConfig = {
       provider: "scoped-provider",
       image: "example:base",
-      tokens: ["first-secret"],
+      agentCredentials: [{ agentId: "first-agent", apiToken: "first-secret" }],
     } as any;
     const nextConfig = {
       ...previousConfig,
-      tokens: ["first-secret", "second-secret"],
+      agentCredentials: [
+        ...previousConfig.agentCredentials,
+        { agentId: "second-agent", apiToken: "second-secret" },
+      ],
     } as any;
     const template = {
       id: "template-1",
@@ -723,7 +726,7 @@ describe("environmentCustomImageTemplateMatchesBaseConfig", () => {
       sourceEnvironmentConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(previousConfig, {
         excludePaths: [
           ...ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
-          "tokens.0",
+          "agentCredentials.0.apiToken",
         ],
       }),
       status: "active",
@@ -741,8 +744,11 @@ describe("environmentCustomImageTemplateMatchesBaseConfig", () => {
       template,
       previousConfig,
       nextConfig,
-      previousSecretRefExcludePaths: ["tokens.0"],
-      nextSecretRefExcludePaths: ["tokens.0", "tokens.1"],
+      previousSecretRefExcludePaths: ["agentCredentials.0.apiToken"],
+      nextSecretRefExcludePaths: [
+        "agentCredentials.0.apiToken",
+        "agentCredentials.1.apiToken",
+      ],
     })).toBe("relinkable");
 
     const relinked = {
@@ -750,15 +756,18 @@ describe("environmentCustomImageTemplateMatchesBaseConfig", () => {
       sourceEnvironmentConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(nextConfig, {
         excludePaths: [
           ...ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
-          "tokens.0",
-          "tokens.1",
+          "agentCredentials.0.apiToken",
+          "agentCredentials.1.apiToken",
         ],
       }),
     };
     expect(environmentCustomImageTemplateMatchesBaseConfig({
       template: relinked,
       baseConfig: nextConfig,
-      secretRefExcludePaths: ["tokens.0", "tokens.1"],
+      secretRefExcludePaths: [
+        "agentCredentials.0.apiToken",
+        "agentCredentials.1.apiToken",
+      ],
     })).toBe(true);
   });
 });

@@ -8,7 +8,11 @@ import {
   type EnvironmentCustomImageTemplateKind,
   type SandboxEnvironmentConfig,
 } from "@paperclipai/shared";
-import { readConfigValueAtPath, writeConfigValueAtPath } from "./json-schema-secret-refs.js";
+import {
+  readConfigValueAtPath,
+  sortConfigPathsForRemoval,
+  writeConfigValueAtPath,
+} from "./json-schema-secret-refs.js";
 
 type TemplateRow = typeof environmentCustomImageTemplates.$inferSelect;
 
@@ -99,7 +103,7 @@ export function fingerprintEnvironmentSandboxProviderConfig(
   options?: { excludePaths?: Iterable<string> },
 ): string {
   let normalized = config as Record<string, unknown>;
-  for (const path of options?.excludePaths ?? []) {
+  for (const path of sortConfigPathsForRemoval(options?.excludePaths ?? [])) {
     normalized = writeConfigValueAtPath(normalized, path, undefined);
   }
   return createHash("sha256")
