@@ -178,21 +178,23 @@ export function classifyEnvironmentCustomImageConfigChange(input: {
   template: EnvironmentCustomImageTemplate;
   previousConfig: SandboxEnvironmentConfig;
   nextConfig: SandboxEnvironmentConfig;
-  secretRefExcludePaths?: Iterable<string>;
+  previousSecretRefExcludePaths?: Iterable<string>;
+  nextSecretRefExcludePaths?: Iterable<string>;
   templateIdentityPaths?: Iterable<string>;
 }): EnvironmentCustomImageConfigChangeKind {
-  const secretRefExcludePaths = [...(input.secretRefExcludePaths ?? [])];
+  const previousSecretRefExcludePaths = [...(input.previousSecretRefExcludePaths ?? [])];
+  const nextSecretRefExcludePaths = [...(input.nextSecretRefExcludePaths ?? [])];
   if (!environmentCustomImageTemplateMatchesBaseConfig({
     template: input.template,
     baseConfig: input.previousConfig,
-    secretRefExcludePaths,
+    secretRefExcludePaths: previousSecretRefExcludePaths,
   })) {
     return "none";
   }
   if (environmentCustomImageTemplateMatchesBaseConfig({
     template: input.template,
     baseConfig: input.nextConfig,
-    secretRefExcludePaths,
+    secretRefExcludePaths: nextSecretRefExcludePaths,
   })) {
     return "none";
   }

@@ -16,6 +16,7 @@ import {
 } from "../services/environment-custom-images.js";
 import {
   ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+  classifyEnvironmentCustomImageConfigChange,
   environmentCustomImageTemplateMatchesBaseConfig,
   fingerprintEnvironmentSandboxProviderConfig,
 } from "../services/environment-custom-image-runtime.js";
@@ -700,6 +701,65 @@ describe("environmentCustomImageTemplateMatchesBaseConfig", () => {
       template,
       baseConfig,
     })).toBe(false);
+  });
+
+  it("classifies an array secret addition with the path set from each config", () => {
+    const previousConfig = {
+      provider: "scoped-provider",
+      image: "example:base",
+      tokens: ["first-secret"],
+    } as any;
+    const nextConfig = {
+      ...previousConfig,
+      tokens: ["first-secret", "second-secret"],
+    } as any;
+    const template = {
+      id: "template-1",
+      environmentId: "env-1",
+      provider: "scoped-provider",
+      templateKind: "snapshot",
+      templateRef: "snapshot-active",
+      sourceTemplateRef: "example:base",
+      sourceEnvironmentConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(previousConfig, {
+        excludePaths: [
+          ...ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+          "tokens.0",
+        ],
+      }),
+      status: "active",
+      createdByUserId: null,
+      createdByAgentId: null,
+      capturedAt: null,
+      lastUsedAt: null,
+      supersededByTemplateId: null,
+      metadata: null,
+      createdAt: new Date("2026-07-09T00:00:00.000Z"),
+      updatedAt: new Date("2026-07-09T00:00:00.000Z"),
+    } as any;
+
+    expect(classifyEnvironmentCustomImageConfigChange({
+      template,
+      previousConfig,
+      nextConfig,
+      previousSecretRefExcludePaths: ["tokens.0"],
+      nextSecretRefExcludePaths: ["tokens.0", "tokens.1"],
+    })).toBe("relinkable");
+
+    const relinked = {
+      ...template,
+      sourceEnvironmentConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(nextConfig, {
+        excludePaths: [
+          ...ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+          "tokens.0",
+          "tokens.1",
+        ],
+      }),
+    };
+    expect(environmentCustomImageTemplateMatchesBaseConfig({
+      template: relinked,
+      baseConfig: nextConfig,
+      secretRefExcludePaths: ["tokens.0", "tokens.1"],
+    })).toBe(true);
   });
 });
 

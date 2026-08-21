@@ -67,6 +67,10 @@ export function collectSecretRefPaths(
   if (!schema || typeof schema !== "object") return paths;
 
   function walk(node: Record<string, unknown>, prefix: string, value: unknown): void {
+    if (node.format === "secret-ref" && prefix) {
+      paths.add(prefix);
+    }
+
     for (const keyword of ["allOf", "anyOf", "oneOf"] as const) {
       const branches = node[keyword];
       if (!Array.isArray(branches)) continue;

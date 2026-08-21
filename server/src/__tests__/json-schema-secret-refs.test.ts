@@ -82,6 +82,22 @@ describe("collectSecretRefPaths", () => {
     ]);
   });
 
+  it("collects direct secret-ref array items", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        tokens: {
+          type: "array",
+          items: { type: "string", format: "secret-ref" },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      tokens: ["secret-a", "secret-b"],
+    }))).toEqual(["tokens.0", "tokens.1"]);
+  });
+
   it("reads and writes concrete array-item paths without mutating the source", () => {
     const config = {
       agentCredentials: [

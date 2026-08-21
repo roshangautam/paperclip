@@ -994,7 +994,7 @@ export function environmentCustomImageService(
         provider: previousParsed.config.provider,
       });
       if (!template?.templateRef) return { action: "none" };
-      const secretRefExcludePaths = previousParsed.config.provider === "fake"
+      const previousSecretRefExcludePaths = previousParsed.config.provider === "fake"
         ? []
         : [...await resolveSandboxProviderSecretRefPaths(
           db,
@@ -1004,7 +1004,7 @@ export function environmentCustomImageService(
       if (!environmentCustomImageTemplateMatchesBaseConfig({
         template,
         baseConfig: previousParsed.config,
-        secretRefExcludePaths,
+        secretRefExcludePaths: previousSecretRefExcludePaths,
       })) {
         // Already detached before this save; leave it alone.
         return { action: "none" };
@@ -1012,6 +1012,13 @@ export function environmentCustomImageService(
       if (nextParsed.driver !== "sandbox" || nextParsed.config.provider !== template.provider) {
         return { action: "detached", template };
       }
+      const nextSecretRefExcludePaths = nextParsed.config.provider === "fake"
+        ? []
+        : [...await resolveSandboxProviderSecretRefPaths(
+          db,
+          nextParsed.config.provider,
+          nextParsed.config as Record<string, unknown>,
+        )];
       const resolvedDriver = await resolvePluginSandboxProviderDriverByKey({
         db,
         driverKey: template.provider,
@@ -1024,7 +1031,8 @@ export function environmentCustomImageService(
         template,
         previousConfig: previousParsed.config,
         nextConfig: nextParsed.config,
-        secretRefExcludePaths,
+        previousSecretRefExcludePaths,
+        nextSecretRefExcludePaths,
         templateIdentityPaths: resolvedDriver.driver.templateIdentityPaths ?? [],
       });
       if (changeKind === "none") return { action: "none" };
@@ -1033,7 +1041,7 @@ export function environmentCustomImageService(
       const nextFingerprint = fingerprintEnvironmentSandboxProviderConfig(nextParsed.config, {
         excludePaths: [
           ...ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
-          ...secretRefExcludePaths,
+          ...nextSecretRefExcludePaths,
         ],
       });
       const row = await db
