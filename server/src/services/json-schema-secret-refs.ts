@@ -104,6 +104,12 @@ export function collectSecretRefPaths(
   return paths;
 }
 
+export function sortConfigPathsForRemoval(paths: Iterable<string>): string[] {
+  // Removing an array item shifts each later index. Descending natural order
+  // preserves the meaning of every concrete path collected from one config.
+  return [...paths].sort((left, right) => right.localeCompare(left, undefined, { numeric: true }));
+}
+
 export function readConfigValueAtPath(
   config: Record<string, unknown>,
   dotPath: string,
@@ -147,7 +153,7 @@ export function writeConfigValueAtPath(
     const arrayPosition = arrayIndex(leafKey);
     if (arrayPosition === null) return result;
     if (value === undefined) {
-      delete cursor[arrayPosition];
+      cursor.splice(arrayPosition, 1);
     } else {
       cursor[arrayPosition] = value;
     }

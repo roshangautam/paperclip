@@ -3,6 +3,7 @@ import {
   collectSecretRefPaths,
   parseSecretRefBindingObject,
   readConfigValueAtPath,
+  sortConfigPathsForRemoval,
   writeConfigValueAtPath,
 } from "../services/json-schema-secret-refs.ts";
 
@@ -115,6 +116,18 @@ describe("collectSecretRefPaths", () => {
       ],
     });
     expect(config.agentCredentials[1]?.apiToken).toBe("secret-b");
+  });
+
+  it("removes indexed paths without sparse arrays or shifted path loss", () => {
+    const config = { tokens: ["first", "second", "third"] };
+
+    let next = config;
+    for (const path of sortConfigPathsForRemoval(["tokens.0", "tokens.1"])) {
+      next = writeConfigValueAtPath(next, path, undefined);
+    }
+
+    expect(next).toEqual({ tokens: ["third"] });
+    expect(next.tokens).not.toHaveProperty("1");
   });
 
   it("collects secret-ref paths from JSON Schema composition keywords", () => {

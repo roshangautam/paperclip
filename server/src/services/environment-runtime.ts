@@ -66,6 +66,7 @@ import {
 import {
   collectSecretRefPaths,
   readConfigValueAtPath,
+  sortConfigPathsForRemoval,
   writeConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
@@ -293,11 +294,12 @@ function stripSecretRefValuesFromPluginLeaseMetadata(input: {
   schema: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
   let sanitized = structuredClone(input.metadata ?? {}) as Record<string, unknown>;
-
-  for (const path of collectSecretRefPaths(input.schema, sanitized)) {
-    if (readConfigValueAtPath(sanitized, path) !== undefined) {
-      sanitized = writeConfigValueAtPath(sanitized, path, undefined);
-    }
+  const pathsToRemove = sortConfigPathsForRemoval(
+    [...collectSecretRefPaths(input.schema, sanitized)]
+      .filter((path) => readConfigValueAtPath(sanitized, path) !== undefined),
+  );
+  for (const path of pathsToRemove) {
+    sanitized = writeConfigValueAtPath(sanitized, path, undefined);
   }
 
   return sanitized;

@@ -27,6 +27,7 @@ import {
   isUuidSecretRef,
   parseSecretRefBindingObject,
   readConfigValueAtPath,
+  sortConfigPathsForRemoval,
   writeConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { resolveActiveEnvironmentCustomImageTemplateForRuntime } from "./environment-custom-image-runtime.js";
@@ -251,12 +252,13 @@ async function persistConfigSecretRefs(input: {
   actor?: { userId?: string | null; agentId?: string | null };
 }): Promise<Record<string, unknown>> {
   let nextConfig = { ...input.config };
+  const emptySecretRefPaths: string[] = [];
   for (const path of collectSecretRefPaths(input.schema, nextConfig)) {
     const rawValue = canonicalizeSecretRefValue(readConfigValueAtPath(nextConfig, path), path);
     if (typeof rawValue !== "string") continue;
     const trimmed = rawValue.trim();
     if (trimmed.length === 0) {
-      nextConfig = writeConfigValueAtPath(nextConfig, path, undefined);
+      emptySecretRefPaths.push(path);
       continue;
     }
     if (isUuidSecretRef(trimmed)) {
@@ -274,6 +276,9 @@ async function persistConfigSecretRefs(input: {
       actor: input.actor,
     });
     nextConfig = writeConfigValueAtPath(nextConfig, path, created.secretId);
+  }
+  for (const path of sortConfigPathsForRemoval(emptySecretRefPaths)) {
+    nextConfig = writeConfigValueAtPath(nextConfig, path, undefined);
   }
   return nextConfig;
 }
