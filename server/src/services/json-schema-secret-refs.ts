@@ -39,7 +39,11 @@ const SCHEMA_VALUE_APPLICATORS = ["additionalProperties", "additionalItems", "co
 
 export class InvalidSecretRefSchemaPathError extends Error {
   constructor(propertyName: string) {
-    super(`Secret-ref schema property "${propertyName}" cannot contain a dot.`);
+    super(
+      propertyName
+        ? `Secret-ref schema property "${propertyName}" cannot contain a dot.`
+        : "Secret-ref schema property names cannot be empty.",
+    );
     this.name = "InvalidSecretRefSchemaPathError";
   }
 }
@@ -88,10 +92,17 @@ export function collectSecretRefPaths(
   function findSchemaNode(
     node: unknown,
     predicate: (candidate: Record<string, unknown>) => boolean,
+    resourceScope: Record<string, unknown>,
     seen: Set<unknown> = new Set(),
   ): Record<string, unknown> | null {
     if (!isRecord(node) || seen.has(node)) return null;
     seen.add(node);
+    // Fragment-only references must not search through a nested schema
+    // resource. That resource owns its anchors and can reuse the same name as
+    // the parent resource without changing what this reference resolves to.
+    if (node !== resourceScope && typeof node.$id === "string" && !node.$id.startsWith("#")) {
+      return null;
+    }
     if (predicate(node)) return node;
 
     const children: unknown[] = [];
@@ -115,7 +126,7 @@ export function collectSecretRefPaths(
       if (node[keyword] !== undefined) children.push(node[keyword]);
     }
     for (const child of children) {
-      const found = findSchemaNode(child, predicate, seen);
+      const found = findSchemaNode(child, predicate, resourceScope, seen);
       if (found) return found;
     }
     return null;
@@ -153,7 +164,8 @@ export function collectSecretRefPaths(
     return findSchemaNode(resourceScope, (candidate) =>
       candidate.$anchor === anchor
       || candidate.$dynamicAnchor === anchor
-      || candidate.$id === decodedRef);
+      || candidate.$id === decodedRef,
+    resourceScope);
   }
 
   const refValueIds = new Map<object, number>();
@@ -194,7 +206,10 @@ export function collectSecretRefPaths(
       ? node
       : resourceScope;
     let declaresSecretPath = false;
-    if (node.format === "secret-ref" && prefix) {
+    if (node.format === "secret-ref") {
+      if (!prefix) {
+        throw new InvalidSecretRefSchemaPathError(prefix);
+      }
       paths.add(prefix);
       declaresSecretPath = true;
     }
@@ -294,7 +309,7 @@ export function collectSecretRefPaths(
       // configuration before a raw secret could be persisted under that key.
       // Do not infer this from the global path set: a preceding nested property
       // can already have added the same lossy path.
-      if (key.includes(".") && propertyDeclaresSecretPath) {
+      if ((key.includes(".") || key.length === 0) && propertyDeclaresSecretPath) {
         throw new InvalidSecretRefSchemaPathError(key);
       }
     }
@@ -321,7 +336,7 @@ export function collectSecretRefPaths(
           currentResourceScope,
         );
         declaresSecretPath = propertyDeclaresSecretPath || declaresSecretPath;
-        if (key.includes(".") && propertyDeclaresSecretPath) {
+        if ((key.includes(".") || key.length === 0) && propertyDeclaresSecretPath) {
           throw new InvalidSecretRefSchemaPathError(key);
         }
       }
@@ -339,7 +354,7 @@ export function collectSecretRefPaths(
           currentResourceScope,
         );
         declaresSecretPath = propertyDeclaresSecretPath || declaresSecretPath;
-        if (key.includes(".") && propertyDeclaresSecretPath) {
+        if ((key.includes(".") || key.length === 0) && propertyDeclaresSecretPath) {
           throw new InvalidSecretRefSchemaPathError(key);
         }
       }

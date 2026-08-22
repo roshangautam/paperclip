@@ -118,6 +118,36 @@ describe("validatePluginSandboxProviderConfig secret-ref bindings", () => {
     expect(workerManager.call).not.toHaveBeenCalled();
   });
 
+  it("rejects an unsupported secret-ref schema before calling the plugin", async () => {
+    mockList.mockResolvedValue([{
+      id: PLUGIN_ID,
+      pluginKey: "acme.secure-sandbox-provider",
+      status: "ready",
+      manifestJson: {
+        environmentDrivers: [{
+          driverKey: "secure-plugin",
+          kind: "sandbox_provider",
+          displayName: "Secure Sandbox",
+          configSchema: {
+            type: "object",
+            properties: {
+              apiKey: { $ref: "#/missing" },
+            },
+          },
+        }],
+      },
+    }]);
+    const workerManager = createWorkerManager();
+
+    await expect(validatePluginSandboxProviderConfig({
+      db: {} as Db,
+      workerManager,
+      provider: "secure-plugin",
+      config: { apiKey: "raw-provider-key" },
+    })).rejects.toMatchObject({ status: 422, message: 'Unsupported secret-ref schema reference "#/missing"' });
+    expect(workerManager.call).not.toHaveBeenCalled();
+  });
+
   it("rejects pinned secret binding versions before calling the plugin", async () => {
     const workerManager = createWorkerManager();
 

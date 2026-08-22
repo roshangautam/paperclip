@@ -23,6 +23,7 @@ import type {
 import { unprocessable } from "../errors.js";
 import {
   collectSecretRefPaths,
+  InvalidSecretRefSchemaError,
   InvalidSecretRefSchemaPathError,
   parseSecretRefBindingObject,
   readConfigValueAtPath,
@@ -307,7 +308,7 @@ export async function validatePluginSandboxProviderConfig(input: {
       config = writeConfigValueAtPath(config, path, binding.secretId);
     }
   } catch (error) {
-    if (error instanceof InvalidSecretRefSchemaPathError) {
+    if (error instanceof InvalidSecretRefSchemaPathError || error instanceof InvalidSecretRefSchemaError) {
       throw unprocessable(error.message);
     }
     throw error;

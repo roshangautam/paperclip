@@ -328,6 +328,40 @@ describe("collectSecretRefPaths", () => {
     expect(Array.from(collectSecretRefPaths(schema, { token: "ordinary-value" }))).toEqual([]);
   });
 
+  it("resolves root anchors without crossing nested resource boundaries", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        nested: {
+          $id: "nested.json",
+          type: "object",
+          $anchor: "token",
+          properties: {
+            ignored: { type: "string" },
+          },
+        },
+        apiToken: { $ref: "#token" },
+      },
+      $defs: {
+        token: { $anchor: "token", type: "string", format: "secret-ref" },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      nested: { ignored: "ordinary-value" },
+      apiToken: "raw-secret",
+    }))).toEqual(["apiToken"]);
+  });
+
+  it("rejects secret-bearing empty property names", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      properties: {
+        "": { type: "string", format: "secret-ref" },
+      },
+    }, { "": "raw-secret" })).toThrow("Secret-ref schema property names cannot be empty.");
+  });
+
   it("rejects unresolved schema refs instead of silently omitting secret paths", () => {
     expect(() => collectSecretRefPaths({
       type: "object",
