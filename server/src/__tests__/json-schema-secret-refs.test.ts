@@ -397,18 +397,49 @@ describe("collectSecretRefPaths", () => {
     }))).toEqual(["agentCredentials.0.apiToken"]);
   });
 
-  it("rejects secret refs declared through contains", () => {
-    expect(() => collectSecretRefPaths({
-      type: "object",
-      properties: {
-        tokens: {
-          type: "array",
-          contains: { type: "string", format: "secret-ref" },
+  it("rejects secret refs declared through conditional schema keywords", () => {
+    for (const keyword of ["contains", "if", "then", "else", "not"] as const) {
+      expect(() => collectSecretRefPaths({
+        type: "object",
+        properties: {
+          tokens: {
+            type: "array",
+            [keyword]: { type: "string", format: "secret-ref" },
+          },
         },
-      },
-    }, { tokens: ["raw-secret"] })).toThrow(
-      'Secret-ref schema cannot declare secret refs through conditional keyword "contains"',
-    );
+      }, { tokens: ["raw-secret"] })).toThrow(
+        `Secret-ref schema cannot declare secret refs through conditional keyword "${keyword}"`,
+      );
+    }
+  });
+
+  it("rejects secret refs below unsupported draft-2019-09 and 2020-12 keywords", () => {
+    for (const [keyword, declaration] of [
+      ["prefixItems", [{ type: "string", format: "secret-ref" }]],
+      ["dependentSchemas", { useCredentials: { format: "secret-ref" } }],
+      ["unevaluatedItems", { type: "string", format: "secret-ref" }],
+      ["unevaluatedProperties", { type: "string", format: "secret-ref" }],
+      ["$dynamicRef", "#secret"],
+    ] as const) {
+      let error: unknown;
+      try {
+        collectSecretRefPaths({
+          type: "object",
+          properties: {
+            credentials: {
+              type: "array",
+              [keyword]: declaration,
+            },
+          },
+        }, { credentials: ["raw-secret"] });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error, keyword).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        `Secret-ref schema keyword "${keyword}" is not supported`,
+      );
+    }
   });
 
   it("collects secret-ref paths from JSON Schema composition keywords", () => {

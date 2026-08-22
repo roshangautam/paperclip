@@ -36,6 +36,17 @@ const SCHEMA_ARRAY_APPLICATORS = ["allOf", "anyOf", "oneOf"] as const;
 const SCHEMA_SINGLE_APPLICATORS = ["not", "if", "then", "else"] as const;
 const SCHEMA_MAP_APPLICATORS = ["properties", "patternProperties", "$defs", "definitions"] as const;
 const SCHEMA_VALUE_APPLICATORS = ["additionalProperties", "additionalItems", "contains"] as const;
+// These draft-2019-09/2020-12 keywords have no concrete-path semantics in the
+// config walker. A secret below one must reject the provider schema rather than
+// be silently omitted from persistence, resolution, and audit paths.
+const UNSUPPORTED_SECRET_SCHEMA_KEYWORDS = [
+  "$dynamicRef",
+  "dependentSchemas",
+  "prefixItems",
+  "unevaluatedItems",
+  "unevaluatedProperties",
+] as const;
+const AMBIGUOUS_SECRET_SCHEMA_KEYWORDS = ["contains", "not", "if", "then", "else"] as const;
 
 export class InvalidSecretRefSchemaPathError extends Error {
   constructor(propertyName: string) {
@@ -169,16 +180,22 @@ export function collectSecretRefPaths(
   }
 
   function schemaDeclaresSecretRef(
-    node: Record<string, unknown>,
+    node: unknown,
     resourceScope: Record<string, unknown>,
-    seen: Set<Record<string, unknown>> = new Set(),
+    seen: Set<unknown> = new Set(),
   ): boolean {
+    if (Array.isArray(node)) {
+      if (seen.has(node)) return false;
+      seen.add(node);
+      return node.some((child) => schemaDeclaresSecretRef(child, resourceScope, seen));
+    }
+    if (!isRecord(node)) return false;
     if (seen.has(node)) return false;
     seen.add(node);
     const currentResourceScope = typeof node.$id === "string" && !node.$id.startsWith("#")
       ? node
       : resourceScope;
-    if (node.format === "secret-ref") return true;
+    if (node.format === "secret-ref" || typeof node.$dynamicRef === "string") return true;
 
     if (typeof node.$ref === "string") {
       const resolved = resolveLocalSchemaRef(node.$ref, currentResourceScope);
@@ -210,9 +227,14 @@ export function collectSecretRefPaths(
     for (const keyword of SCHEMA_VALUE_APPLICATORS) {
       if (node[keyword] !== undefined) childSchemas.push(node[keyword]);
     }
+    if (Array.isArray(node.prefixItems)) childSchemas.push(...node.prefixItems);
+    if (isRecord(node.dependentSchemas)) childSchemas.push(...Object.values(node.dependentSchemas));
+    for (const keyword of ["unevaluatedItems", "unevaluatedProperties"] as const) {
+      if (node[keyword] !== undefined) childSchemas.push(node[keyword]);
+    }
 
     return childSchemas.some((child) =>
-      isRecord(child) && schemaDeclaresSecretRef(child, currentResourceScope, seen));
+      schemaDeclaresSecretRef(child, currentResourceScope, seen));
   }
 
   const refValueIds = new Map<object, number>();
@@ -253,10 +275,28 @@ export function collectSecretRefPaths(
       ? node
       : resourceScope;
     let declaresSecretPath = false;
-    if (isRecord(node.contains) && schemaDeclaresSecretRef(node.contains, currentResourceScope)) {
-      throw new InvalidSecretRefSchemaError(
-        'Secret-ref schema cannot declare secret refs through conditional keyword "contains"',
-      );
+    for (const keyword of UNSUPPORTED_SECRET_SCHEMA_KEYWORDS) {
+      const keywordValue = node[keyword];
+      const declaresSecretThroughKeyword = keyword === "dependentSchemas" && isRecord(keywordValue)
+        ? Object.values(keywordValue).some((child) =>
+          schemaDeclaresSecretRef(child, currentResourceScope))
+        : (keyword === "$dynamicRef" && typeof keywordValue === "string")
+          || schemaDeclaresSecretRef(keywordValue, currentResourceScope);
+      if (keywordValue !== undefined && declaresSecretThroughKeyword) {
+        throw new InvalidSecretRefSchemaError(
+          `Secret-ref schema keyword "${keyword}" is not supported`,
+        );
+      }
+    }
+    for (const keyword of AMBIGUOUS_SECRET_SCHEMA_KEYWORDS) {
+      if (
+        node[keyword] !== undefined
+        && schemaDeclaresSecretRef(node[keyword], currentResourceScope)
+      ) {
+        throw new InvalidSecretRefSchemaError(
+          `Secret-ref schema cannot declare secret refs through conditional keyword "${keyword}"`,
+        );
+      }
     }
     if (node.format === "secret-ref") {
       if (!prefix) {
