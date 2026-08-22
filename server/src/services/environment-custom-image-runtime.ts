@@ -8,7 +8,11 @@ import {
   type EnvironmentCustomImageTemplateKind,
   type SandboxEnvironmentConfig,
 } from "@paperclipai/shared";
-import { readConfigValueAtPath, writeConfigValueAtPath } from "./json-schema-secret-refs.js";
+import {
+  readConfigValueAtPath,
+  sortConfigPathsForRemoval,
+  writeConfigValueAtPath,
+} from "./json-schema-secret-refs.js";
 
 type TemplateRow = typeof environmentCustomImageTemplates.$inferSelect;
 
@@ -99,7 +103,7 @@ export function fingerprintEnvironmentSandboxProviderConfig(
   options?: { excludePaths?: Iterable<string> },
 ): string {
   let normalized = config as Record<string, unknown>;
-  for (const path of options?.excludePaths ?? []) {
+  for (const path of sortConfigPathsForRemoval(options?.excludePaths ?? [])) {
     normalized = writeConfigValueAtPath(normalized, path, undefined);
   }
   return createHash("sha256")
@@ -143,11 +147,25 @@ export function environmentCustomImageTemplateMatchesBaseConfig(input: {
     ],
   });
   if (normalizedFingerprint === expectedFingerprint) return true;
+  // Before config-aware array traversal, templates did not exclude any path
+  // containing a concrete array index. Retain that fingerprint interpretation
+  // so an existing capture keeps applying after this upgrade instead of
+  // silently falling back to its base image.
+  const legacySecretRefExcludePaths = secretRefExcludePaths.filter((path) =>
+    !path.split(".").some((segment) => /^(?:0|[1-9]\d*)$/.test(segment)),
+  );
+  if (fingerprintEnvironmentSandboxProviderConfig(input.baseConfig, {
+    excludePaths: [
+      ...ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+      ...legacySecretRefExcludePaths,
+    ],
+  }) === expectedFingerprint) {
+    return true;
+  }
   // Backward compatibility for templates captured before runtime-only fields
-  // were excluded from the source fingerprint (secret-ref paths have always
-  // been excluded at capture time).
+  // were excluded from the source fingerprint.
   return fingerprintEnvironmentSandboxProviderConfig(input.baseConfig, {
-    excludePaths: secretRefExcludePaths,
+    excludePaths: legacySecretRefExcludePaths,
   }) === expectedFingerprint;
 }
 
@@ -178,21 +196,23 @@ export function classifyEnvironmentCustomImageConfigChange(input: {
   template: EnvironmentCustomImageTemplate;
   previousConfig: SandboxEnvironmentConfig;
   nextConfig: SandboxEnvironmentConfig;
-  secretRefExcludePaths?: Iterable<string>;
+  previousSecretRefExcludePaths?: Iterable<string>;
+  nextSecretRefExcludePaths?: Iterable<string>;
   templateIdentityPaths?: Iterable<string>;
 }): EnvironmentCustomImageConfigChangeKind {
-  const secretRefExcludePaths = [...(input.secretRefExcludePaths ?? [])];
+  const previousSecretRefExcludePaths = [...(input.previousSecretRefExcludePaths ?? [])];
+  const nextSecretRefExcludePaths = [...(input.nextSecretRefExcludePaths ?? [])];
   if (!environmentCustomImageTemplateMatchesBaseConfig({
     template: input.template,
     baseConfig: input.previousConfig,
-    secretRefExcludePaths,
+    secretRefExcludePaths: previousSecretRefExcludePaths,
   })) {
     return "none";
   }
   if (environmentCustomImageTemplateMatchesBaseConfig({
     template: input.template,
     baseConfig: input.nextConfig,
-    secretRefExcludePaths,
+    secretRefExcludePaths: nextSecretRefExcludePaths,
   })) {
     return "none";
   }
@@ -273,17 +293,33 @@ export interface EnvironmentCustomImageDriftedPath {
  * unresolvable path returns `null`; the caller must never persist the raw
  * driver-supplied string.
  */
-export function canonicalizeEnvironmentCustomImageConfigPath(raw: unknown): string | null {
+function canonicalizeEnvironmentCustomImageConfigPathInternal(
+  raw: unknown,
+  allowArrayIndexes = false,
+  enforceMaxDepth = true,
+): string | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
   const segments = trimmed.split(".");
-  if (segments.length === 0 || segments.length > BOOT_RELEVANT_CONFIG_MAX_PATH_DEPTH) return null;
+  if (
+    segments.length === 0
+    || (enforceMaxDepth && segments.length > BOOT_RELEVANT_CONFIG_MAX_PATH_DEPTH)
+  ) return null;
   for (const segment of segments) {
-    if (!BOOT_RELEVANT_CONFIG_PATH_SEGMENT_RE.test(segment)) return null;
+    if (
+      !BOOT_RELEVANT_CONFIG_PATH_SEGMENT_RE.test(segment)
+      && !(allowArrayIndexes && /^(?:0|[1-9]\d*)$/.test(segment))
+    ) {
+      return null;
+    }
     if (BOOT_RELEVANT_CONFIG_RESERVED_SEGMENTS.has(segment)) return null;
   }
   return segments.join(".");
+}
+
+export function canonicalizeEnvironmentCustomImageConfigPath(raw: unknown): string | null {
+  return canonicalizeEnvironmentCustomImageConfigPathInternal(raw);
 }
 
 /**
@@ -295,8 +331,13 @@ function environmentCustomImageConfigPathOverlapsSecret(
   secretPaths: Iterable<string>,
 ): boolean {
   for (const raw of secretPaths) {
-    const secret = canonicalizeEnvironmentCustomImageConfigPath(raw);
-    if (!secret) continue;
+    // These paths are generated from the current config by the schema walker,
+    // so numeric segments are concrete array indexes rather than driver input.
+    const secret = canonicalizeEnvironmentCustomImageConfigPathInternal(raw, true, false);
+    // A secret path that cannot be represented by the bounded dot-path format
+    // must never make a boot snapshot retain a possibly secret-bearing value.
+    // Exclude this candidate rather than silently ignoring the secret path.
+    if (!secret) return true;
     if (candidate === secret) return true;
     if (candidate.startsWith(`${secret}.`)) return true;
     if (secret.startsWith(`${candidate}.`)) return true;

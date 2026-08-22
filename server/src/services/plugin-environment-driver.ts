@@ -23,6 +23,8 @@ import type {
 import { unprocessable } from "../errors.js";
 import {
   collectSecretRefPaths,
+  InvalidSecretRefSchemaError,
+  InvalidSecretRefSchemaPathError,
   parseSecretRefBindingObject,
   readConfigValueAtPath,
   writeConfigValueAtPath,
@@ -294,15 +296,22 @@ export async function validatePluginSandboxProviderConfig(input: {
       ? resolved.driver.configSchema as Record<string, unknown>
       : null;
   let config = input.config;
-  for (const path of collectSecretRefPaths(configSchema)) {
-    const binding = parseSecretRefBindingObject(readConfigValueAtPath(config, path));
-    if (!binding) continue;
-    if (binding.version !== "latest") {
-      throw unprocessable(
-        `Secret binding at ${path} pins version ${binding.version}; sandbox provider secret references always resolve the latest version.`,
-      );
+  try {
+    for (const path of collectSecretRefPaths(configSchema, config)) {
+      const binding = parseSecretRefBindingObject(readConfigValueAtPath(config, path));
+      if (!binding) continue;
+      if (binding.version !== "latest") {
+        throw unprocessable(
+          `Secret binding at ${path} pins version ${binding.version}; sandbox provider secret references always resolve the latest version.`,
+        );
+      }
+      config = writeConfigValueAtPath(config, path, binding.secretId);
     }
-    config = writeConfigValueAtPath(config, path, binding.secretId);
+  } catch (error) {
+    if (error instanceof InvalidSecretRefSchemaPathError || error instanceof InvalidSecretRefSchemaError) {
+      throw unprocessable(error.message);
+    }
+    throw error;
   }
 
   const result = await input.workerManager.call(resolved.plugin.id, "environmentValidateConfig", {

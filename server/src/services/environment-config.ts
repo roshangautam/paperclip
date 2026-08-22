@@ -27,6 +27,7 @@ import {
   isUuidSecretRef,
   parseSecretRefBindingObject,
   readConfigValueAtPath,
+  sortConfigPathsForRemoval,
   writeConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { resolveActiveEnvironmentCustomImageTemplateForRuntime } from "./environment-custom-image-runtime.js";
@@ -176,8 +177,9 @@ async function getSandboxProviderConfigSchema(
 export async function resolveSandboxProviderSecretRefPaths(
   db: Db,
   provider: string,
+  config: Record<string, unknown>,
 ): Promise<Set<string>> {
-  return collectSecretRefPaths(await getSandboxProviderConfigSchema(db, provider));
+  return collectSecretRefPaths(await getSandboxProviderConfigSchema(db, provider), config);
 }
 
 function secretName(input: {
@@ -250,12 +252,28 @@ async function persistConfigSecretRefs(input: {
   actor?: { userId?: string | null; agentId?: string | null };
 }): Promise<Record<string, unknown>> {
   let nextConfig = { ...input.config };
-  for (const path of collectSecretRefPaths(input.schema)) {
+  const secretRefPaths = [...collectSecretRefPaths(input.schema, nextConfig)];
+  // Reject empty direct array items before creating any other secrets. Failing
+  // after another item was secretized would orphan a newly created secret.
+  for (const path of secretRefPaths) {
+    const rawValue = canonicalizeSecretRefValue(readConfigValueAtPath(nextConfig, path), path);
+    const parentPath = path.slice(0, path.lastIndexOf("."));
+    if (
+      typeof rawValue === "string"
+      && rawValue.trim().length === 0
+      && parentPath
+      && Array.isArray(readConfigValueAtPath(nextConfig, parentPath))
+    ) {
+      throw unprocessable(`Secret reference array item at ${path} cannot be empty.`);
+    }
+  }
+  const emptySecretRefPaths: string[] = [];
+  for (const path of secretRefPaths) {
     const rawValue = canonicalizeSecretRefValue(readConfigValueAtPath(nextConfig, path), path);
     if (typeof rawValue !== "string") continue;
     const trimmed = rawValue.trim();
     if (trimmed.length === 0) {
-      nextConfig = writeConfigValueAtPath(nextConfig, path, undefined);
+      emptySecretRefPaths.push(path);
       continue;
     }
     if (isUuidSecretRef(trimmed)) {
@@ -274,6 +292,9 @@ async function persistConfigSecretRefs(input: {
     });
     nextConfig = writeConfigValueAtPath(nextConfig, path, created.secretId);
   }
+  for (const path of sortConfigPathsForRemoval(emptySecretRefPaths)) {
+    nextConfig = writeConfigValueAtPath(nextConfig, path, undefined);
+  }
   return nextConfig;
 }
 
@@ -290,7 +311,7 @@ async function resolveConfigSecretRefsForRuntime(input: {
 }): Promise<Record<string, unknown>> {
   const secrets = secretService(input.db);
   let nextConfig = { ...input.config };
-  for (const path of collectSecretRefPaths(input.schema)) {
+  for (const path of collectSecretRefPaths(input.schema, nextConfig)) {
     const current = canonicalizeSecretRefValue(readConfigValueAtPath(nextConfig, path), path);
     if (typeof current !== "string") continue;
     const trimmed = current.trim();
@@ -329,7 +350,7 @@ async function resolveConfigSecretRefsForProbe(input: {
 }): Promise<Record<string, unknown>> {
   const secrets = secretService(input.db);
   let nextConfig = { ...input.config };
-  for (const path of collectSecretRefPaths(input.schema)) {
+  for (const path of collectSecretRefPaths(input.schema, nextConfig)) {
     const current = canonicalizeSecretRefValue(readConfigValueAtPath(nextConfig, path), path);
     if (typeof current !== "string") continue;
     const trimmed = current.trim();
@@ -369,7 +390,7 @@ export async function collectEnvironmentSecretRefs(input: {
   if (parsed.driver === "sandbox" && parsed.config.provider !== "fake") {
     const schema = await getSandboxProviderConfigSchema(input.db, parsed.config.provider);
     const refs: Array<{ secretId: string; configPath: string; versionSelector?: SecretVersionSelector }> = [];
-    for (const path of collectSecretRefPaths(schema)) {
+    for (const path of collectSecretRefPaths(schema, parsed.config as Record<string, unknown>)) {
       const current = readConfigValueAtPath(parsed.config as Record<string, unknown>, path);
       const binding = parseSecretRefBindingObject(current);
       if (binding) {
@@ -688,7 +709,7 @@ export async function resolveEnvironmentDriverConfigForRuntime(
         },
       }) as SandboxEnvironmentConfig;
     } else {
-      for (const path of collectSecretRefPaths(schema)) {
+      for (const path of collectSecretRefPaths(schema, parsed.config as Record<string, unknown>)) {
         const current = readConfigValueAtPath(parsed.config as Record<string, unknown>, path);
         if (parseSecretRefBindingObject(current) || (typeof current === "string" && isUuidSecretRef(current.trim()))) {
           throw unprocessable("Runtime secret resolution requires a companyId context");
@@ -705,7 +726,10 @@ export async function resolveEnvironmentDriverConfigForRuntime(
             // Match the capture-time fingerprint exclusions: secret-ref paths
             // are excluded when the template's source fingerprint is computed,
             // so they must be excluded when re-checking it here.
-            secretRefExcludePaths: collectSecretRefPaths(schema),
+            secretRefExcludePaths: collectSecretRefPaths(
+              schema,
+              parsed.config as Record<string, unknown>,
+            ),
           })
         : runtimeConfig,
     };
@@ -735,7 +759,7 @@ export async function resolveSandboxCleanupConfigSecrets(
   const schema = await getSandboxProviderConfigSchema(db, config.provider);
   const secrets = secretService(db);
   let nextConfig = { ...config } as Record<string, unknown>;
-  for (const path of collectSecretRefPaths(schema)) {
+  for (const path of collectSecretRefPaths(schema, nextConfig)) {
     const current = canonicalizeSecretRefValue(readConfigValueAtPath(nextConfig, path), path);
     if (typeof current !== "string") continue;
     const trimmed = current.trim();

@@ -16,6 +16,8 @@ import {
 } from "../services/environment-custom-images.js";
 import {
   ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+  buildEnvironmentCustomImageBootRelevantConfig,
+  classifyEnvironmentCustomImageConfigChange,
   environmentCustomImageTemplateMatchesBaseConfig,
   fingerprintEnvironmentSandboxProviderConfig,
 } from "../services/environment-custom-image-runtime.js";
@@ -568,6 +570,46 @@ describeEmbeddedPostgres("environmentCustomImageService", () => {
 });
 
 describe("fingerprintEnvironmentSandboxProviderConfig", () => {
+  it("excludes a deep concrete array secret from an identity-path parent", () => {
+    const config = {
+      provider: "scoped-provider",
+      deep: {
+        one: {
+          two: {
+            three: {
+              four: { agentCredentials: [{ apiToken: "secret" }] },
+            },
+          },
+        },
+      },
+    } as any;
+    const boot = buildEnvironmentCustomImageBootRelevantConfig({
+      config,
+      binding: { field: "customTemplate", unsetFields: [] },
+      templateIdentityPaths: ["deep"],
+      secretRefExcludePaths: ["deep.one.two.three.four.agentCredentials.0.apiToken"],
+    });
+
+    expect(boot.excludedPaths).toContain("deep");
+    expect(boot.values).not.toHaveProperty("deep");
+  });
+
+  it("excludes generated array secret paths with JSON Schema property names outside driver path syntax", () => {
+    const config = {
+      provider: "scoped-provider",
+      agentCredentials: [{ "2fa-token": "secret" }],
+    } as any;
+    const boot = buildEnvironmentCustomImageBootRelevantConfig({
+      config,
+      binding: { field: "customTemplate", unsetFields: [] },
+      templateIdentityPaths: ["agentCredentials"],
+      secretRefExcludePaths: ["agentCredentials.0.2fa-token"],
+    });
+
+    expect(boot.excludedPaths).toContain("agentCredentials");
+    expect(boot.values).not.toHaveProperty("agentCredentials");
+  });
+
   it("ignores excluded secret-ref paths so secretizing a credential on save keeps the fingerprint stable", () => {
     // Mirrors the real flow: a template is captured before "Save Environment"
     // rewrites the raw apiKey into a secret ref. Excluding the secret path must
@@ -700,6 +742,110 @@ describe("environmentCustomImageTemplateMatchesBaseConfig", () => {
       template,
       baseConfig,
     })).toBe(false);
+  });
+
+  it("matches legacy templates whose fingerprint still included array secret values", () => {
+    const baseConfig = {
+      provider: "scoped-provider",
+      image: "example:base",
+      agentCredentials: [{ agentId: "agent-a", apiToken: "first-secret" }],
+    } as any;
+    const template = {
+      id: "template-1",
+      environmentId: "env-1",
+      provider: "scoped-provider",
+      templateKind: "snapshot",
+      templateRef: "snapshot-active",
+      sourceTemplateRef: "example:base",
+      // This is the pre-array-path fingerprint, which had no indexed secret
+      // exclusion and therefore includes the credential value.
+      sourceEnvironmentConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(baseConfig, {
+        excludePaths: ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+      }),
+      status: "active",
+      createdByUserId: null,
+      createdByAgentId: null,
+      capturedAt: null,
+      lastUsedAt: null,
+      supersededByTemplateId: null,
+      metadata: null,
+      createdAt: new Date("2026-07-09T00:00:00.000Z"),
+      updatedAt: new Date("2026-07-09T00:00:00.000Z"),
+    } as any;
+
+    expect(environmentCustomImageTemplateMatchesBaseConfig({
+      template,
+      baseConfig,
+      secretRefExcludePaths: ["agentCredentials.0.apiToken"],
+    })).toBe(true);
+  });
+
+  it("classifies an array credential addition with the path set from each config", () => {
+    const previousConfig = {
+      provider: "scoped-provider",
+      image: "example:base",
+      agentCredentials: [{ agentId: "first-agent", apiToken: "first-secret" }],
+    } as any;
+    const nextConfig = {
+      ...previousConfig,
+      agentCredentials: [
+        ...previousConfig.agentCredentials,
+        { agentId: "second-agent", apiToken: "second-secret" },
+      ],
+    } as any;
+    const template = {
+      id: "template-1",
+      environmentId: "env-1",
+      provider: "scoped-provider",
+      templateKind: "snapshot",
+      templateRef: "snapshot-active",
+      sourceTemplateRef: "example:base",
+      sourceEnvironmentConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(previousConfig, {
+        excludePaths: [
+          ...ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+          "agentCredentials.0.apiToken",
+        ],
+      }),
+      status: "active",
+      createdByUserId: null,
+      createdByAgentId: null,
+      capturedAt: null,
+      lastUsedAt: null,
+      supersededByTemplateId: null,
+      metadata: null,
+      createdAt: new Date("2026-07-09T00:00:00.000Z"),
+      updatedAt: new Date("2026-07-09T00:00:00.000Z"),
+    } as any;
+
+    expect(classifyEnvironmentCustomImageConfigChange({
+      template,
+      previousConfig,
+      nextConfig,
+      previousSecretRefExcludePaths: ["agentCredentials.0.apiToken"],
+      nextSecretRefExcludePaths: [
+        "agentCredentials.0.apiToken",
+        "agentCredentials.1.apiToken",
+      ],
+    })).toBe("relinkable");
+
+    const relinked = {
+      ...template,
+      sourceEnvironmentConfigFingerprint: fingerprintEnvironmentSandboxProviderConfig(nextConfig, {
+        excludePaths: [
+          ...ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS,
+          "agentCredentials.0.apiToken",
+          "agentCredentials.1.apiToken",
+        ],
+      }),
+    };
+    expect(environmentCustomImageTemplateMatchesBaseConfig({
+      template: relinked,
+      baseConfig: nextConfig,
+      secretRefExcludePaths: [
+        "agentCredentials.0.apiToken",
+        "agentCredentials.1.apiToken",
+      ],
+    })).toBe(true);
   });
 });
 
@@ -888,8 +1034,9 @@ function secretPluginManifest() {
         templateRefKind: "snapshot",
         templateConfigBinding: { field: "customTemplate", unsetFields: ["image"] },
         // apiUrl overlaps a secret exactly; auth.token is a child of secret
-        // `auth`; credentials is a parent of secret `credentials.secret`.
-        templateIdentityPaths: ["apiUrl", "auth.token", "credentials"],
+        // `auth`; credentials is a parent of secret `credentials.secret`;
+        // agentCredentials is a parent of a concrete array-item secret.
+        templateIdentityPaths: ["apiUrl", "auth.token", "credentials", "agentCredentials"],
         supportsTemplateDelete: true,
         configSchema: {
           type: "object",
@@ -899,6 +1046,13 @@ function secretPluginManifest() {
             credentials: {
               type: "object",
               properties: { secret: { type: "string", format: "secret-ref" } },
+            },
+            agentCredentials: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { apiToken: { type: "string", format: "secret-ref" } },
+              },
             },
           },
         },
@@ -1049,6 +1203,7 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
       apiUrl: "https://secret-endpoint.example",
       auth: "auth-secret-value",
       credentials: { secret: "cred-secret-value", region: "eu" },
+      agentCredentials: [{ agentId: "agent-1", apiToken: "array-secret-value" }],
       reuseLease: false,
     };
     const { companyId, environmentId } = await seed({ manifest: secretPluginManifest(), config });
@@ -1067,10 +1222,16 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
       values: Record<string, unknown>;
       excludedPaths: string[];
     };
-    expect(boot.excludedPaths).toEqual(expect.arrayContaining(["apiUrl", "auth.token", "credentials"]));
+    expect(boot.excludedPaths).toEqual(expect.arrayContaining([
+      "apiUrl",
+      "auth.token",
+      "credentials",
+      "agentCredentials",
+    ]));
     expect(Object.keys(boot.values)).not.toContain("apiUrl");
     expect(Object.keys(boot.values)).not.toContain("auth.token");
     expect(Object.keys(boot.values)).not.toContain("credentials");
+    expect(Object.keys(boot.values)).not.toContain("agentCredentials");
     // Neither the persisted snapshot nor the response leaks a secret value.
     for (const metadataJson of [
       JSON.stringify(persistedRow.metadata),
@@ -1079,6 +1240,7 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
       expect(metadataJson).not.toContain("secret-endpoint.example");
       expect(metadataJson).not.toContain("auth-secret-value");
       expect(metadataJson).not.toContain("cred-secret-value");
+      expect(metadataJson).not.toContain("array-secret-value");
     }
 
     // An excluded path forces the fail-closed unclassified result: the flag is required.
@@ -1095,6 +1257,7 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
     expect(responseJson).not.toContain("secret-endpoint.example");
     expect(responseJson).not.toContain("auth-secret-value");
     expect(responseJson).not.toContain("cred-secret-value");
+    expect(responseJson).not.toContain("array-secret-value");
 
     const activities = await relinkActivityRows(environmentId);
     const relinkActivity = activities.find((row) => row.action === "environment.custom_image_template.relinked");
@@ -1103,6 +1266,7 @@ describeEmbeddedPostgres("environmentCustomImageService relink", () => {
     expect(activityJson).not.toContain("secret-endpoint.example");
     expect(activityJson).not.toContain("auth-secret-value");
     expect(activityJson).not.toContain("cred-secret-value");
+    expect(activityJson).not.toContain("array-secret-value");
     // Drift detail carries path names only, never a fingerprint value.
     expect(activityJson).not.toContain(promoted.template.sourceEnvironmentConfigFingerprint);
   });

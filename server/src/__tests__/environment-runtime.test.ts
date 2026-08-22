@@ -23,6 +23,7 @@ import {
   heartbeatRuns,
   plugins,
   projects,
+  secretAccessEvents,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -3797,6 +3798,167 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       template: "base",
       apiKey: "resolved-provider-key",
     });
+  });
+
+  it("resolves every array-item secret ref in sandbox provider config at runtime", async () => {
+    const pluginId = randomUUID();
+    const { companyId, environment: baseEnvironment, runId } = await seedEnvironment();
+    const [firstSecret, secondSecret] = await Promise.all([
+      secretService(db).create(companyId, {
+        name: `scoped-provider-first-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "resolved-first-token",
+      }),
+      secretService(db).create(companyId, {
+        name: `scoped-provider-second-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "resolved-second-token",
+      }),
+    ]);
+    const providerConfig = {
+      provider: "scoped-plugin",
+      credentialMode: "scoped",
+      agentCredentials: [
+        { agentId: "agent-a", workspaceOwner: "owner-a", apiToken: firstSecret.id },
+        { agentId: "agent-b", workspaceOwner: "owner-b", apiToken: secondSecret.id },
+      ],
+      reuseLease: false,
+    };
+    const environment = {
+      ...baseEnvironment,
+      name: "Scoped Plugin Sandbox",
+      driver: "sandbox" as const,
+      config: providerConfig,
+    };
+    await Promise.all([
+      secretService(db).createBinding({
+        companyId,
+        secretId: firstSecret.id,
+        targetType: "environment",
+        targetId: environment.id,
+        configPath: "agentCredentials.0.apiToken",
+      }),
+      secretService(db).createBinding({
+        companyId,
+        secretId: secondSecret.id,
+        targetType: "environment",
+        targetId: environment.id,
+        configPath: "agentCredentials.1.apiToken",
+      }),
+    ]);
+    await environmentService(db).update(environment.id, {
+      driver: "sandbox",
+      name: environment.name,
+      config: providerConfig,
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.scoped-sandbox-provider",
+      packageName: "@acme/scoped-sandbox-provider",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.scoped-sandbox-provider",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Scoped Sandbox Provider",
+        description: "Test schema-driven scoped provider",
+        author: "Paperclip",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{
+          driverKey: "scoped-plugin",
+          kind: "sandbox_provider",
+          displayName: "Scoped Sandbox",
+          configSchema: {
+            type: "object",
+            properties: {
+              agentCredentials: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    apiToken: { type: "string", format: "secret-ref" },
+                  },
+                },
+              },
+            },
+          },
+        }],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+
+    const resolved = await resolveEnvironmentDriverConfigForRuntime(db, companyId, environment);
+
+    expect(resolved).toMatchObject({
+      driver: "sandbox",
+      config: {
+        provider: "scoped-plugin",
+        agentCredentials: [
+          { agentId: "agent-a", workspaceOwner: "owner-a", apiToken: "resolved-first-token" },
+          { agentId: "agent-b", workspaceOwner: "owner-b", apiToken: "resolved-second-token" },
+        ],
+      },
+    });
+    expect(await db
+      .select({ configPath: secretAccessEvents.configPath })
+      .from(secretAccessEvents)
+      .orderBy(secretAccessEvents.configPath),
+    ).toEqual([
+      { configPath: "agentCredentials.0.apiToken" },
+      { configPath: "agentCredentials.1.apiToken" },
+    ]);
+
+    const workerManager = {
+      isRunning: vi.fn((id: string) => id === pluginId),
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentReleaseLease"] })),
+      call: vi.fn(async (_pluginId: string, method: string, params: Record<string, unknown>) => {
+        if (method === "environmentAcquireLease") {
+          return {
+            providerLeaseId: "scoped-array-lease",
+            // A provider can echo its resolved config in metadata. Those values
+            // must not overwrite stored refs in the durable lease record.
+            metadata: {
+              // The provider omits secret leaves, which must not replace the
+              // durable array carrying the refs needed by later cleanup.
+              agentCredentials: [{ agentId: "agent-a" }],
+            },
+          };
+        }
+        if (method === "environmentReleaseLease") {
+          expect(params.config).toMatchObject({
+            agentCredentials: [
+              { agentId: "agent-a", apiToken: "resolved-first-token" },
+              { agentId: "agent-b", apiToken: "resolved-second-token" },
+            ],
+          });
+          return undefined;
+        }
+        throw new Error(`Unexpected plugin method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const acquired = await runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+    expect(acquired.lease.metadata).toMatchObject({
+      agentCredentials: [
+        { agentId: "agent-a", apiToken: firstSecret.id },
+        { agentId: "agent-b", apiToken: secondSecret.id },
+      ],
+    });
+
+    await environmentService(db).update(environment.id, { driver: "local", config: {} });
+    await runtimeWithPlugin.releaseRunLeases(runId);
   });
 
   it("waits briefly for a ready sandbox provider plugin worker to come online", async () => {

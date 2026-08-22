@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { collectSecretRefPaths, parseSecretRefBindingObject } from "../services/json-schema-secret-refs.ts";
+import {
+  collectSecretRefPaths,
+  parseSecretRefBindingObject,
+  readConfigValueAtPath,
+  sortConfigPathsForRemoval,
+  writeConfigValueAtPath,
+} from "../services/json-schema-secret-refs.ts";
 
 describe("parseSecretRefBindingObject", () => {
   const secretId = "11111111-1111-1111-1111-111111111111";
@@ -47,6 +53,393 @@ describe("collectSecretRefPaths", () => {
         },
       },
     }))).toEqual(["credentials.apiKey"]);
+  });
+
+  it("collects concrete secret-ref paths from array items", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        agentCredentials: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              apiToken: { type: "string", format: "secret-ref" },
+            },
+          },
+        },
+      },
+    };
+    const config = {
+      agentCredentials: [
+        { agentId: "agent-a", apiToken: "secret-a" },
+        { agentId: "agent-b", apiToken: "secret-b" },
+      ],
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, config))).toEqual([
+      "agentCredentials.0.apiToken",
+      "agentCredentials.1.apiToken",
+    ]);
+  });
+
+  it("collects direct secret-ref array items", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        tokens: {
+          type: "array",
+          items: { type: "string", format: "secret-ref" },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      tokens: ["secret-a", "secret-b"],
+    }))).toEqual(["tokens.0", "tokens.1"]);
+  });
+
+  it("rejects secret refs below schema property names that dot paths cannot represent", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      properties: {
+        credentials: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              "api.token": { type: "string", format: "secret-ref" },
+            },
+          },
+        },
+      },
+    }, {
+      credentials: [{ "api.token": "raw-secret" }],
+    })).toThrow('Secret-ref schema property "api.token" cannot contain a dot.');
+  });
+
+  it("rejects a dotted secret property when its lossy path was already discovered", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      properties: {
+        api: {
+          type: "object",
+          properties: {
+            token: { type: "string", format: "secret-ref" },
+          },
+        },
+        "api.token": { type: "string", format: "secret-ref" },
+      },
+    }, {
+      api: { token: "nested-secret" },
+      "api.token": "raw-secret",
+    })).toThrow('Secret-ref schema property "api.token" cannot contain a dot.');
+  });
+
+  it("collects secret refs from tuple items, additional items, and local refs", () => {
+    const schema = {
+      $defs: {
+        credential: {
+          type: "object",
+          properties: {
+            apiToken: { type: "string", format: "secret-ref" },
+          },
+        },
+      },
+      type: "object",
+      properties: {
+        credentials: {
+          type: "array",
+          items: [
+            { $ref: "#/$defs/credential" },
+            { type: "string" },
+          ],
+          additionalItems: { $ref: "#/$defs/credential" },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      credentials: [
+        { apiToken: "first-secret" },
+        "non-secret",
+        { apiToken: "third-secret" },
+      ],
+    }))).toEqual(["credentials.0.apiToken", "credentials.2.apiToken"]);
+  });
+
+  it("ignores additionalItems when items is absent", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        ordinaryValues: {
+          type: "array",
+          additionalItems: { type: "string", format: "secret-ref" },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      ordinaryValues: ["ordinary-a", "ordinary-b"],
+    }))).toEqual([]);
+  });
+
+  it("stops recursive local refs after concrete values end", () => {
+    const schema = {
+      $defs: {
+        node: {
+          type: "object",
+          properties: {
+            apiToken: { type: "string", format: "secret-ref" },
+            child: { $ref: "#/$defs/node" },
+          },
+        },
+      },
+      type: "object",
+      properties: {
+        root: { $ref: "#/$defs/node" },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      root: {
+        apiToken: "first-secret",
+        child: { apiToken: "second-secret" },
+      },
+    }))).toEqual(["root.apiToken", "root.child.apiToken"]);
+  });
+
+  it("reads and writes concrete array-item paths without mutating the source", () => {
+    const config = {
+      agentCredentials: [
+        { agentId: "agent-a", apiToken: "secret-a" },
+        { agentId: "agent-b", apiToken: "secret-b" },
+      ],
+    };
+
+    expect(readConfigValueAtPath(config, "agentCredentials.1.apiToken")).toBe("secret-b");
+    expect(readConfigValueAtPath(config, "agentCredentials.one.apiToken")).toBeUndefined();
+    expect(writeConfigValueAtPath(config, "agentCredentials.1.apiToken", "resolved-b")).toEqual({
+      agentCredentials: [
+        { agentId: "agent-a", apiToken: "secret-a" },
+        { agentId: "agent-b", apiToken: "resolved-b" },
+      ],
+    });
+    expect(config.agentCredentials[1]?.apiToken).toBe("secret-b");
+  });
+
+  it("removes indexed paths without sparse arrays or shifted path loss", () => {
+    const config = { tokens: ["first", "second", "third"] };
+
+    let next = config;
+    for (const path of sortConfigPathsForRemoval(["tokens.0", "tokens.1"])) {
+      next = writeConfigValueAtPath(next, path, undefined);
+    }
+
+    expect(next).toEqual({ tokens: ["third"] });
+    expect(next.tokens).not.toHaveProperty("1");
+  });
+
+  it("collects nested-resource local refs from array items", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        credentials: {
+          type: "array",
+          items: {
+            $id: "credential.json",
+            type: "object",
+            $defs: {
+              secret: { type: "string", format: "secret-ref" },
+            },
+            properties: {
+              apiToken: { $ref: "#/$defs/secret" },
+            },
+          },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      credentials: [{ apiToken: "raw-secret" }],
+    }))).toEqual(["credentials.0.apiToken"]);
+  });
+
+  it("collects dynamic object secret refs from array items", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        credentials: {
+          type: "array",
+          items: {
+            type: "object",
+            patternProperties: {
+              "^token[A-Z]+$": { type: "string", format: "secret-ref" },
+            },
+            additionalProperties: { type: "string", format: "secret-ref" },
+          },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      credentials: [{ tokenAPI: "pattern-secret", fallback: "additional-secret" }],
+    }))).toEqual([
+      "credentials.0.tokenAPI",
+      "credentials.0.fallback",
+    ]);
+  });
+
+  it("rejects dotted dynamic object keys that declare secret refs", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      additionalProperties: { type: "string", format: "secret-ref" },
+    }, { "api.token": "raw-secret" })).toThrow(
+      'Secret-ref schema property "api.token" cannot contain a dot.',
+    );
+  });
+
+  it("resolves JSON Pointer schema keys named constructor", () => {
+    const schema = {
+      $defs: {
+        constructor: { type: "string", format: "secret-ref" },
+      },
+      type: "object",
+      properties: {
+        token: { $ref: "#/$defs/constructor" },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, { token: "raw-secret" }))).toEqual(["token"]);
+  });
+
+  it("does not resolve anchors through annotation values", () => {
+    const schema = {
+      type: "object",
+      default: { $id: "#token", format: "secret-ref" },
+      $defs: {
+        token: { $id: "#token", type: "string" },
+      },
+      properties: {
+        token: { $ref: "#token" },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, { token: "ordinary-value" }))).toEqual([]);
+  });
+
+  it("resolves root anchors without crossing nested resource boundaries", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        nested: {
+          $id: "nested.json",
+          type: "object",
+          $anchor: "token",
+          properties: {
+            ignored: { type: "string" },
+          },
+        },
+        apiToken: { $ref: "#token" },
+      },
+      $defs: {
+        token: { $anchor: "token", type: "string", format: "secret-ref" },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      nested: { ignored: "ordinary-value" },
+      apiToken: "raw-secret",
+    }))).toEqual(["apiToken"]);
+  });
+
+  it("rejects secret-bearing empty property names", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      properties: {
+        "": { type: "string", format: "secret-ref" },
+      },
+    }, { "": "raw-secret" })).toThrow("Secret-ref schema property names cannot be empty.");
+  });
+
+  it("rejects unresolved schema refs instead of silently omitting secret paths", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      properties: {
+        token: { $ref: "#/missing" },
+      },
+    }, { token: "raw-secret" })).toThrow('Unsupported secret-ref schema reference "#/missing"');
+  });
+
+  it("collects secret refs in applicable draft-07 schema dependencies", () => {
+    const schema = {
+      type: "object",
+      dependencies: {
+        useCredentials: {
+          properties: {
+            agentCredentials: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  apiToken: { type: "string", format: "secret-ref" },
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      useCredentials: true,
+      agentCredentials: [{ apiToken: "raw-secret" }],
+    }))).toEqual(["agentCredentials.0.apiToken"]);
+  });
+
+  it("rejects secret refs declared through conditional schema keywords", () => {
+    for (const keyword of ["contains", "if", "then", "else", "not"] as const) {
+      expect(() => collectSecretRefPaths({
+        type: "object",
+        properties: {
+          tokens: {
+            type: "array",
+            [keyword]: { type: "string", format: "secret-ref" },
+          },
+        },
+      }, { tokens: ["raw-secret"] })).toThrow(
+        `Secret-ref schema cannot declare secret refs through conditional keyword "${keyword}"`,
+      );
+    }
+  });
+
+  it("rejects secret refs below unsupported draft-2019-09 and 2020-12 keywords", () => {
+    for (const [keyword, declaration] of [
+      ["prefixItems", [{ type: "string", format: "secret-ref" }]],
+      ["dependentSchemas", { useCredentials: { format: "secret-ref" } }],
+      ["unevaluatedItems", { type: "string", format: "secret-ref" }],
+      ["unevaluatedProperties", { type: "string", format: "secret-ref" }],
+      ["$dynamicRef", "#secret"],
+    ] as const) {
+      let error: unknown;
+      try {
+        collectSecretRefPaths({
+          type: "object",
+          properties: {
+            credentials: {
+              type: "array",
+              [keyword]: declaration,
+            },
+          },
+        }, { credentials: ["raw-secret"] });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error, keyword).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        `Secret-ref schema keyword "${keyword}" is not supported`,
+      );
+    }
   });
 
   it("collects secret-ref paths from JSON Schema composition keywords", () => {
