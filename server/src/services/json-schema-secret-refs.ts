@@ -168,6 +168,53 @@ export function collectSecretRefPaths(
     resourceScope);
   }
 
+  function schemaDeclaresSecretRef(
+    node: Record<string, unknown>,
+    resourceScope: Record<string, unknown>,
+    seen: Set<Record<string, unknown>> = new Set(),
+  ): boolean {
+    if (seen.has(node)) return false;
+    seen.add(node);
+    const currentResourceScope = typeof node.$id === "string" && !node.$id.startsWith("#")
+      ? node
+      : resourceScope;
+    if (node.format === "secret-ref") return true;
+
+    if (typeof node.$ref === "string") {
+      const resolved = resolveLocalSchemaRef(node.$ref, currentResourceScope);
+      if (!resolved) {
+        throw new InvalidSecretRefSchemaError(
+          `Unsupported secret-ref schema reference "${node.$ref}"`,
+        );
+      }
+      if (schemaDeclaresSecretRef(resolved, currentResourceScope, seen)) return true;
+    }
+
+    const childSchemas: unknown[] = [];
+    for (const keyword of SCHEMA_ARRAY_APPLICATORS) {
+      const branches = node[keyword];
+      if (Array.isArray(branches)) childSchemas.push(...branches);
+    }
+    for (const keyword of SCHEMA_SINGLE_APPLICATORS) {
+      if (node[keyword] !== undefined) childSchemas.push(node[keyword]);
+    }
+    for (const keyword of SCHEMA_MAP_APPLICATORS) {
+      const schemas = node[keyword];
+      if (isRecord(schemas)) childSchemas.push(...Object.values(schemas));
+    }
+    if (isRecord(node.dependencies)) {
+      childSchemas.push(...Object.values(node.dependencies).filter((dependency) => !Array.isArray(dependency)));
+    }
+    if (Array.isArray(node.items)) childSchemas.push(...node.items);
+    else if (node.items !== undefined) childSchemas.push(node.items);
+    for (const keyword of SCHEMA_VALUE_APPLICATORS) {
+      if (node[keyword] !== undefined) childSchemas.push(node[keyword]);
+    }
+
+    return childSchemas.some((child) =>
+      isRecord(child) && schemaDeclaresSecretRef(child, currentResourceScope, seen));
+  }
+
   const refValueIds = new Map<object, number>();
   let nextRefValueId = 1;
 
@@ -206,6 +253,11 @@ export function collectSecretRefPaths(
       ? node
       : resourceScope;
     let declaresSecretPath = false;
+    if (isRecord(node.contains) && schemaDeclaresSecretRef(node.contains, currentResourceScope)) {
+      throw new InvalidSecretRefSchemaError(
+        'Secret-ref schema cannot declare secret refs through conditional keyword "contains"',
+      );
+    }
     if (node.format === "secret-ref") {
       if (!prefix) {
         throw new InvalidSecretRefSchemaPathError(prefix);

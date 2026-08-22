@@ -397,6 +397,20 @@ describe("collectSecretRefPaths", () => {
     }))).toEqual(["agentCredentials.0.apiToken"]);
   });
 
+  it("rejects secret refs declared through contains", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      properties: {
+        tokens: {
+          type: "array",
+          contains: { type: "string", format: "secret-ref" },
+        },
+      },
+    }, { tokens: ["raw-secret"] })).toThrow(
+      'Secret-ref schema cannot declare secret refs through conditional keyword "contains"',
+    );
+  });
+
   it("collects secret-ref paths from JSON Schema composition keywords", () => {
     expect(Array.from(collectSecretRefPaths({
       type: "object",
