@@ -32,12 +32,22 @@ export function parseSecretRefBindingObject(value: unknown): SecretRefBindingObj
 
 type ConfigContainer = Record<string, unknown> | unknown[];
 
-const SCHEMA_REF_PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const SCHEMA_ARRAY_APPLICATORS = ["allOf", "anyOf", "oneOf"] as const;
+const SCHEMA_SINGLE_APPLICATORS = ["not", "if", "then", "else"] as const;
+const SCHEMA_MAP_APPLICATORS = ["properties", "patternProperties", "$defs", "definitions"] as const;
+const SCHEMA_VALUE_APPLICATORS = ["additionalProperties", "additionalItems", "contains"] as const;
 
 export class InvalidSecretRefSchemaPathError extends Error {
   constructor(propertyName: string) {
     super(`Secret-ref schema property "${propertyName}" cannot contain a dot.`);
     this.name = "InvalidSecretRefSchemaPathError";
+  }
+}
+
+export class InvalidSecretRefSchemaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidSecretRefSchemaError";
   }
 }
 
@@ -80,19 +90,31 @@ export function collectSecretRefPaths(
     predicate: (candidate: Record<string, unknown>) => boolean,
     seen: Set<unknown> = new Set(),
   ): Record<string, unknown> | null {
-    if (Array.isArray(node)) {
-      if (seen.has(node)) return null;
-      seen.add(node);
-      for (const child of node) {
-        const found = findSchemaNode(child, predicate, seen);
-        if (found) return found;
-      }
-      return null;
-    }
     if (!isRecord(node) || seen.has(node)) return null;
     seen.add(node);
     if (predicate(node)) return node;
-    for (const child of Object.values(node)) {
+
+    const children: unknown[] = [];
+    for (const keyword of SCHEMA_ARRAY_APPLICATORS) {
+      const branches = node[keyword];
+      if (Array.isArray(branches)) children.push(...branches);
+    }
+    for (const keyword of SCHEMA_SINGLE_APPLICATORS) {
+      if (node[keyword] !== undefined) children.push(node[keyword]);
+    }
+    for (const keyword of SCHEMA_MAP_APPLICATORS) {
+      const schemas = node[keyword];
+      if (isRecord(schemas)) children.push(...Object.values(schemas));
+    }
+    if (isRecord(node.dependencies)) {
+      children.push(...Object.values(node.dependencies).filter((dependency) => !Array.isArray(dependency)));
+    }
+    if (Array.isArray(node.items)) children.push(...node.items);
+    else if (node.items !== undefined) children.push(node.items);
+    for (const keyword of SCHEMA_VALUE_APPLICATORS) {
+      if (node[keyword] !== undefined) children.push(node[keyword]);
+    }
+    for (const child of children) {
       const found = findSchemaNode(child, predicate, seen);
       if (found) return found;
     }
@@ -119,10 +141,7 @@ export function collectSecretRefPaths(
       for (const encodedSegment of decodedRef.slice(2).split("/")) {
         if (!isRecord(current)) return null;
         const segment = encodedSegment.replaceAll("~1", "/").replaceAll("~0", "~");
-        if (
-          SCHEMA_REF_PROTOTYPE_KEYS.has(segment)
-          || !Object.prototype.hasOwnProperty.call(current, segment)
-        ) {
+        if (!Object.prototype.hasOwnProperty.call(current, segment)) {
           return null;
         }
         current = current[segment];
@@ -185,12 +204,15 @@ export function collectSecretRefPaths(
       const refAtValue = refValueKey(ref, value, currentResourceScope);
       if (!seenRefs.has(refAtValue)) {
         const resolved = resolveLocalSchemaRef(ref, currentResourceScope);
-        if (resolved) {
-          const nextSeenRefs = new Set(seenRefs);
-          nextSeenRefs.add(refAtValue);
-          declaresSecretPath = walk(resolved, prefix, value, nextSeenRefs, currentResourceScope)
-            || declaresSecretPath;
+        if (!resolved) {
+          throw new InvalidSecretRefSchemaError(
+            `Unsupported secret-ref schema reference "${ref}"`,
+          );
         }
+        const nextSeenRefs = new Set(seenRefs);
+        nextSeenRefs.add(refAtValue);
+        declaresSecretPath = walk(resolved, prefix, value, nextSeenRefs, currentResourceScope)
+          || declaresSecretPath;
       }
     }
 
@@ -223,6 +245,27 @@ export function collectSecretRefPaths(
           currentResourceScope,
         ) || declaresSecretPath;
       });
+    }
+
+    if (isRecord(value) && isRecord(node.dependencies)) {
+      for (const [key, dependentSchema] of Object.entries(node.dependencies)) {
+        if (!Object.prototype.hasOwnProperty.call(value, key) || Array.isArray(dependentSchema)) {
+          continue;
+        }
+        if (dependentSchema === true || dependentSchema === false) continue;
+        if (!isRecord(dependentSchema)) {
+          throw new InvalidSecretRefSchemaError(
+            `Unsupported secret-ref schema dependency "${key}"`,
+          );
+        }
+        declaresSecretPath = walk(
+          dependentSchema,
+          prefix,
+          value,
+          seenRefs,
+          currentResourceScope,
+        ) || declaresSecretPath;
+      }
     }
 
     if (!isRecord(value) && config !== undefined) return declaresSecretPath;

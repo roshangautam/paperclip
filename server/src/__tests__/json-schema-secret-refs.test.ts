@@ -299,6 +299,70 @@ describe("collectSecretRefPaths", () => {
     );
   });
 
+  it("resolves JSON Pointer schema keys named constructor", () => {
+    const schema = {
+      $defs: {
+        constructor: { type: "string", format: "secret-ref" },
+      },
+      type: "object",
+      properties: {
+        token: { $ref: "#/$defs/constructor" },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, { token: "raw-secret" }))).toEqual(["token"]);
+  });
+
+  it("does not resolve anchors through annotation values", () => {
+    const schema = {
+      type: "object",
+      default: { $id: "#token", format: "secret-ref" },
+      $defs: {
+        token: { $id: "#token", type: "string" },
+      },
+      properties: {
+        token: { $ref: "#token" },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, { token: "ordinary-value" }))).toEqual([]);
+  });
+
+  it("rejects unresolved schema refs instead of silently omitting secret paths", () => {
+    expect(() => collectSecretRefPaths({
+      type: "object",
+      properties: {
+        token: { $ref: "#/missing" },
+      },
+    }, { token: "raw-secret" })).toThrow('Unsupported secret-ref schema reference "#/missing"');
+  });
+
+  it("collects secret refs in applicable draft-07 schema dependencies", () => {
+    const schema = {
+      type: "object",
+      dependencies: {
+        useCredentials: {
+          properties: {
+            agentCredentials: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  apiToken: { type: "string", format: "secret-ref" },
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+
+    expect(Array.from(collectSecretRefPaths(schema, {
+      useCredentials: true,
+      agentCredentials: [{ apiToken: "raw-secret" }],
+    }))).toEqual(["agentCredentials.0.apiToken"]);
+  });
+
   it("collects secret-ref paths from JSON Schema composition keywords", () => {
     expect(Array.from(collectSecretRefPaths({
       type: "object",
